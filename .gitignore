@@ -1,0 +1,61 @@
+# Dependencias / build
+/vendor/
+/node_modules/
+/build/
+*.zip
+
+# Secretos y entorno local
+.env
+.env.*
+!.env.example
+/config/database.php
+/config/app.php
+/storage/app.key
+/storage/installed.lock
+
+# Storage runtime (conservar estructura con .gitkeep si aplica)
+/storage/cache/*
+!/storage/cache/.gitkeep
+/storage/logs/*
+!/storage/logs/.gitkeep
+/storage/sessions/*
+!/storage/sessions/.gitkeep
+/storage/backups/*
+!/storage/backups/.gitkeep
+/storage/uploads/*
+!/storage/uploads/.gitkeep
+
+# Uploads de producción
+/public/uploads/avatars/*
+!/public/uploads/avatars/.gitkeep
+/public/uploads/products/*
+!/public/uploads/products/.gitkeep
+/public/uploads/suppliers/*
+!/public/uploads/suppliers/.gitkeep
+/public/uploads/branding/*
+!/public/uploads/branding/.gitkeep
+/public/uploads/purchases/*
+!/public/uploads/purchases/.gitkeep
+/public/uploads/expenses/*
+!/public/uploads/expenses/.gitkeep
+
+# Dumps y logs
+*.sql
+!/database/**/*.sql
+error_log
+**/error_log
+*.log
+
+# IDE / OS
+.cursor/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Diagnósticos temporales
+seri_diag.php
+public/seri_diag.php
+_test_*.php
+_patch_*.py
