@@ -1,0 +1,47 @@
+# Dependencias
+/vendor/
+
+# Entorno y secretos (nunca versionar)
+.env
+.env.*
+!.env.example
+config/database.php
+config/app.php
+storage/installed.lock
+storage/app.key
+
+# Runtime / storage
+/storage/backups/*
+!/storage/backups/.htaccess
+/storage/cache/*
+/storage/logs/*
+/storage/sessions/*
+/storage/uploads/
+
+# Uploads de usuario
+/public/uploads/avatars/*
+/public/uploads/products/*
+/public/uploads/suppliers/*
+/public/uploads/branding/*
+/public/uploads/purchases/*
+/public/uploads/expenses/*
+!/public/uploads/**/.gitkeep
+
+# Artefactos locales
+*.zip
+*.log
+error_log
+**/error_log
+heracons_seri.sql
+app2.zip
+/build/
+node_modules/
+
+# IDE / OS
+.idea/
+.vscode/
+.cusor/
+.cursor/
+Thumbs.db
+Desktop.ini
+.DS_Store

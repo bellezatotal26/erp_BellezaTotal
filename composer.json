@@ -1,0 +1,25 @@
+{
+    "name": "softnova/erp",
+    "description": "EVA ERP - Sistema de Gestión Empresarial Multiempresa",
+    "type": "project",
+    "require": {
+        "php": ">=8.2.0",
+        "dompdf/dompdf": "^3.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "SoftNova\\": "app/",
+            "SoftNova\\Core\\": "core/",
+            "SoftNova\\Config\\": "config/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "SoftNova\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "preferred-install": "dist"
+    }
+}
