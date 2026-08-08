@@ -49,6 +49,7 @@ $userRole = \SoftNova\Core\TenantMiddleware::getRole();
 
 // IA y Soporte ahora están en el header
 
+if (!function_exists('tenantIcon')) {
 function tenantIcon(string $name): string {
     return match ($name) {
         'home' => '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>',
@@ -64,6 +65,7 @@ function tenantIcon(string $name): string {
         'payroll' => '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="18" rx="2"></rect><line x1="6" y1="8" x2="18" y2="8"></line><line x1="6" y1="12" x2="18" y2="12"></line><line x1="6" y1="16" x2="14" y2="16"></line><circle cx="18" cy="18" r="3"></circle><line x1="18" y1="16" x2="18" y2="20"></line><line x1="16" y1="18" x2="20" y2="18"></line></svg>',
         default => '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle></svg>',
     };
+}
 }
 ?>
 

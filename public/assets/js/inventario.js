@@ -8,15 +8,23 @@ function openInventarioModal() {
     document.getElementById('productForm').action = window.invRouteCreate;
     document.getElementById('submitBtn').textContent = 'Crear';
     document.getElementById('statusGroup').style.display = 'none';
-    ['prodId','prodCode','prodName','prodUnit','prodDesc'].forEach(function(id) {
-        document.getElementById(id).value = '';
+    ['prodId','prodCode','prodBarcode','prodName','prodUnit','prodDesc'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.value = '';
     });
     document.getElementById('prodType').value = 'product';
     document.getElementById('prodCat').value = '';
+    var loc = document.getElementById('prodLocation');
+    if (loc) loc.value = '';
     document.getElementById('prodPcompra').value = '';
     document.getElementById('prodPventa').value = '';
     document.getElementById('prodStock').value = '0';
     document.getElementById('prodMinStock').value = '5';
+    document.getElementById('prodMaxStock').value = '';
+    document.getElementById('prodTrackLots').checked = false;
+    document.getElementById('prodAlertDays').value = '30';
+    document.getElementById('prodExpiry').value = '';
+    document.getElementById('prodLotCode').value = '';
     onTypeChange();
     document.getElementById('productModal').style.display = 'flex';
 }
@@ -31,14 +39,24 @@ function editProduct(id) {
     document.getElementById('prodId').value = d.id || '';
     document.getElementById('prodType').value = d.type || 'product';
     document.getElementById('prodCode').value = d.code || '';
+    var barcodeEl = document.getElementById('prodBarcode');
+    if (barcodeEl) barcodeEl.value = d.barcode || '';
     document.getElementById('prodName').value = d.name || '';
     document.getElementById('prodCat').value = d.cat || '';
+    var loc = document.getElementById('prodLocation');
+    if (loc) loc.value = d.location || '';
     document.getElementById('prodUnit').value = d.unit || 'UNIDAD';
     document.getElementById('prodPcompra').value = d.pcompra || 0;
     document.getElementById('prodPventa').value = d.pventa || 0;
     document.getElementById('prodStock').value = d.stock || 0;
     document.getElementById('prodMinStock').value = d.minstock || 5;
     document.getElementById('prodStatus').value = d.status || 'active';
+    document.getElementById('prodMaxStock').value = d.maxstock || '';
+    document.getElementById('prodTrackLots').checked = d.tracklots === '1';
+    document.getElementById('prodAlertDays').value = d.alertdays || 30;
+    // El lote solo se captura en entradas de mercancía, no al editar la ficha.
+    document.getElementById('prodExpiry').value = '';
+    document.getElementById('prodLotCode').value = '';
     onTypeChange();
     document.getElementById('productModal').style.display = 'flex';
 }
@@ -47,6 +65,20 @@ function onTypeChange() {
     var isSvc = document.getElementById('prodType').value === 'service';
     document.getElementById('stockGroup').style.display = isSvc ? 'none' : '';
     document.getElementById('minStockGroup').style.display = isSvc ? 'none' : '';
+    document.getElementById('maxStockGroup').style.display = isSvc ? 'none' : '';
+    document.getElementById('trackLotsGroup').style.display = isSvc ? 'none' : '';
+    onTrackLotsChange();
+}
+
+function onTrackLotsChange() {
+    var isSvc = document.getElementById('prodType').value === 'service';
+    var on = !isSvc && document.getElementById('prodTrackLots').checked;
+    var isNew = !document.getElementById('prodId').value;
+    document.querySelectorAll('.lot-field').forEach(function(el) {
+        // El lote inicial solo tiene sentido al crear el producto con stock.
+        var initialOnly = el.id === 'expiryGroup' || el.id === 'lotCodeGroup';
+        el.style.display = (on && (isNew || !initialOnly)) ? '' : 'none';
+    });
 }
 
 function closeInvModal() {
@@ -75,6 +107,7 @@ function viewDetail(id) {
         h += '<div><strong>Tipo:</strong> ' + (isSvc ? 'Servicio' : 'Producto') + '</div>';
         h += '<div><strong>Código:</strong> ' + esc(p.code || '-') + '</div>';
         h += '<div><strong>Categoría:</strong> ' + esc(p.category_name || '-') + '</div>';
+        h += '<div><strong>Ubicación:</strong> ' + esc(p.location || '-') + '</div>';
         h += '<div><strong>P. Venta:</strong> $' + parseFloat(p.sale_price).toFixed(0) + '</div>';
         h += '<div><strong>Stock:</strong> ' + (isSvc ? 'N/A' : p.stock) + '</div>';
         h += '<div><strong>Creado:</strong> ' + (p.created_at || '').substr(0, 10) + '</div>';
@@ -94,6 +127,41 @@ function viewDetail(id) {
             });
             h += '</tbody></table>';
         }
+        var sups = d.suppliers || [];
+        h += '<h4 style="margin-top:15px;">🚚 Proveedores (' + sups.length + ')</h4>';
+        if (!sups.length) {
+            h += '<p style="text-align:center;color:var(--color-text-secondary);">Sin proveedores vinculados</p>';
+        } else {
+            h += '<table><thead><tr><th>Proveedor</th><th>SKU proveedor</th><th>Último costo</th><th>Entrega</th><th>Mín. pedido</th><th></th></tr></thead><tbody>';
+            sups.forEach(function(s) {
+                h += '<tr><td>' + esc(s.supplier_name) + (s.is_primary === '1' || s.is_primary === 1 ? ' <span class="badge badge-success">Principal</span>' : '') + '</td>';
+                h += '<td>' + esc(s.supplier_sku || '—') + '</td>';
+                h += '<td>' + curSym + ' ' + parseFloat(s.last_cost || 0).toFixed(curDec) + '</td>';
+                h += '<td>' + (parseInt(s.lead_time_days, 10) || 0) + ' d</td>';
+                h += '<td>' + (parseInt(s.min_order_qty, 10) || 1) + '</td>';
+                h += '<td><button type="button" class="btn btn-sm btn-danger" onclick="unlinkSupplier(' + p.id + ',' + s.supplier_id + ')">Quitar</button></td></tr>';
+            });
+            h += '</tbody></table>';
+        }
+        if (window.invCanEdit) {
+            h += '<button type="button" class="btn btn-sm btn-secondary" style="margin-top:8px;" onclick="openSupplierLink(' + p.id + ', ' + JSON.stringify(esc(p.name)) + ')">Vincular proveedor</button>';
+        }
+
+        var lots = d.lots || [];
+        if (lots.length) {
+            h += '<h4 style="margin-top:15px;">🏷️ Lotes (' + lots.length + ')</h4>';
+            h += '<table><thead><tr><th>Lote</th><th>Vence</th><th>Cant</th><th>Costo</th><th>Estado</th></tr></thead><tbody>';
+            lots.forEach(function(l) {
+                var dias = l.days_left === null ? null : parseInt(l.days_left, 10);
+                var color = dias === null ? '' : (dias < 0 ? '#DC2626' : (dias <= 30 ? '#F59E0B' : ''));
+                h += '<tr><td>' + esc(l.lot_code || '-') + '</td>';
+                h += '<td' + (color ? ' style="color:' + color + ';font-weight:600;"' : '') + '>' + (l.expiry_date || '—') + '</td>';
+                h += '<td>' + l.quantity + '</td>';
+                h += '<td>' + curSym + ' ' + parseFloat(l.unit_cost || 0).toFixed(curDec) + '</td>';
+                h += '<td>' + esc(l.status || '-') + '</td></tr>';
+            });
+            h += '</tbody></table>';
+        }
         h += '<h4 style="margin-top:15px;">🛒 Últimas Ventas</h4>';
         if (s.length === 0) {
             h += '<p style="text-align:center;color:var(--color-text-secondary);">Sin ventas</p>';
@@ -109,6 +177,26 @@ function viewDetail(id) {
         document.getElementById('detailContent').innerHTML = h;
         document.getElementById('detailModal').style.display = 'flex';
     });
+}
+
+function openSupplierLink(productId, productName) {
+    document.getElementById('psProductId').value = productId;
+    document.getElementById('psProductName').textContent = productName;
+    document.getElementById('psForm').reset();
+    document.getElementById('psProductId').value = productId;
+    document.getElementById('productSupplierModal').style.display = 'flex';
+}
+
+function closeSupplierLink() {
+    document.getElementById('productSupplierModal').style.display = 'none';
+}
+
+function unlinkSupplier(productId, supplierId) {
+    if (!confirm('¿Quitar este proveedor del producto?')) return;
+    var form = document.getElementById('psUnlinkForm');
+    form.querySelector('[name="product_id"]').value = productId;
+    form.querySelector('[name="supplier_id"]').value = supplierId;
+    form.submit();
 }
 
 function openImageLightbox(src, name) {
@@ -215,4 +303,82 @@ function checkoutCart() {
 
 document.addEventListener('DOMContentLoaded', function() {
     updateCartBadge();
+    var savedView = 'grid';
+    try {
+        savedView = localStorage.getItem('seri_inv_view_mode') || 'grid';
+    } catch (e) {}
+    if (typeof setInventarioView === 'function') {
+        setInventarioView(savedView === 'list' ? 'list' : 'grid', true);
+    }
+    initInvListColumnFilters();
 });
+
+function setInventarioView(mode, skipSave) {
+    var catalog = document.getElementById('invCatalog');
+    if (!catalog) return;
+    var isList = mode === 'list';
+    catalog.classList.toggle('inv-catalog--list', isList);
+    catalog.classList.toggle('inv-catalog--grid', !isList);
+    var gridBtn = document.getElementById('invViewGridBtn');
+    var listBtn = document.getElementById('invViewListBtn');
+    if (gridBtn) gridBtn.classList.toggle('is-active', !isList);
+    if (listBtn) listBtn.classList.toggle('is-active', isList);
+    if (!skipSave) {
+        try { localStorage.setItem('seri_inv_view_mode', isList ? 'list' : 'grid'); } catch (e) {}
+    }
+}
+
+function initInvListColumnFilters() {
+    var table = document.getElementById('invListTable');
+    if (!table || table._filtersReady) return;
+    table._filtersReady = true;
+    var filters = table.querySelectorAll('.inv-col-filter');
+    Array.prototype.forEach.call(filters, function (el) {
+        el.addEventListener('input', applyInvListFilters);
+        el.addEventListener('change', applyInvListFilters);
+        el.addEventListener('keyup', applyInvListFilters);
+    });
+}
+
+function clearInvListFilters() {
+    var table = document.getElementById('invListTable');
+    if (!table) return;
+    Array.prototype.forEach.call(table.querySelectorAll('.inv-col-filter'), function (el) {
+        el.value = '';
+    });
+    applyInvListFilters();
+}
+
+function applyInvListFilters() {
+    var table = document.getElementById('invListTable');
+    var body = document.getElementById('invListBody');
+    if (!table || !body) return;
+
+    var vals = {};
+    Array.prototype.forEach.call(table.querySelectorAll('.inv-col-filter'), function (el) {
+        var col = el.getAttribute('data-col');
+        vals[col] = String(el.value || '').toLowerCase().trim();
+    });
+
+    var rows = body.querySelectorAll('.inv-list-row');
+    var visible = 0;
+    Array.prototype.forEach.call(rows, function (row) {
+        var ok = true;
+        Object.keys(vals).forEach(function (col) {
+            if (!ok || !vals[col]) return;
+            var cell = String(row.getAttribute('data-' + col) || '').toLowerCase();
+            if (col === 'type') {
+                if (cell !== vals[col]) ok = false;
+                return;
+            }
+            if (cell.indexOf(vals[col]) === -1) ok = false;
+        });
+        row.style.display = ok ? '' : 'none';
+        if (ok) visible++;
+    });
+
+    var countEl = document.getElementById('invListFilterCount');
+    if (countEl) countEl.textContent = visible + ' / ' + rows.length + ' filas';
+    var emptyEl = document.getElementById('invListEmpty');
+    if (emptyEl) emptyEl.hidden = visible > 0;
+}

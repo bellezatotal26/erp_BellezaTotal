@@ -4,6 +4,7 @@ namespace SoftNova\Controllers;
 
 use SoftNova\Core\TenantController;
 use SoftNova\Core\TenantMiddleware;
+use SoftNova\Services\SupplyChainSchema;
 use function SoftNova\Core\base_url;
 use function SoftNova\Core\config;
 
@@ -12,6 +13,7 @@ class TenantCajaController extends TenantController
     public function index(): void
     {
         TenantMiddleware::authorize('caja');
+        SupplyChainSchema::ensure($this->db);
         
         $action = $this->request->get('action');
         
@@ -50,8 +52,20 @@ class TenantCajaController extends TenantController
             $this->closingPdf();
             return;
         }
+        if ($action === 'report_whatsapp' && $this->request->method() === 'GET') {
+            $this->reportWhatsapp();
+            return;
+        }
+        if ($action === 'report_email' && $this->request->method() === 'POST') {
+            $this->reportEmail();
+            return;
+        }
         if ($action === 'searchProducts' && $this->request->method() === 'GET') {
             $this->searchProducts();
+            return;
+        }
+        if ($action === 'catalogSnapshot' && $this->request->method() === 'GET') {
+            $this->catalogSnapshot();
             return;
         }
 
@@ -189,6 +203,7 @@ class TenantCajaController extends TenantController
                 : "Se cerraron automaticamente {$autoClosed} cajas al pasar la medianoche.";
         }
         
+        $company = $this->companySettings();
         $this->view('tenant.caja', $this->tenantViewData([
             'openSession' => $openSession,
             'movements' => $movements,
@@ -205,6 +220,7 @@ class TenantCajaController extends TenantController
             'operationalCats' => $operationalCats,
             'expenseSuppliers' => $expenseSuppliers,
             'isPosRole' => $isPosRole,
+            'companyEmail' => (string)($company['company_email'] ?? ''),
             'invoicePrefix' => $this->query(
                 "SELECT setting_value FROM settings WHERE setting_key = 'invoice_prefix' LIMIT 1"
             )->fetchColumn() ?: 'FAC-',
@@ -265,6 +281,46 @@ class TenantCajaController extends TenantController
 
         $this->json(['success' => true, 'products' => $products]);
     }
+
+    /**
+     * Snapshot de catálogo para el POS offline (IndexedDB / búsqueda degradada).
+     */
+    private function catalogSnapshot(): void
+    {
+        TenantMiddleware::authorize('caja');
+        $limit = max(100, min(5000, (int)$this->request->get('limit', 2500)));
+
+        try {
+            $rows = $this->query(
+                "SELECT id, name, code, sale_price, stock, COALESCE(product_type, 'product') AS product_type
+                 FROM products
+                 WHERE status = 'active'
+                 ORDER BY name ASC
+                 LIMIT {$limit}"
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $this->json(['success' => false, 'message' => 'No se pudo cargar el catálogo', 'products' => []]);
+            return;
+        }
+
+        $products = array_map(static function (array $p): array {
+            return [
+                'id' => (int)$p['id'],
+                'name' => (string)$p['name'],
+                'code' => (string)($p['code'] ?? ''),
+                'sale_price' => (float)$p['sale_price'],
+                'stock' => (int)$p['stock'],
+                'product_type' => (string)($p['product_type'] ?? 'product'),
+            ];
+        }, $rows);
+
+        $this->json([
+            'success' => true,
+            'products' => $products,
+            'synced_at' => date('c'),
+            'count' => count($products),
+        ]);
+    }
     
     private function openCash(): void
     {
@@ -315,7 +371,8 @@ class TenantCajaController extends TenantController
         }
 
         $session = $this->query(
-            "SELECT id, notes FROM cash_sessions WHERE id = ? AND status = 'open' LIMIT 1",
+            "SELECT id, notes, opening_amount, opening_date, user_id
+             FROM cash_sessions WHERE id = ? AND status = 'open' LIMIT 1",
             [$sessionId]
         )->fetch();
 
@@ -332,22 +389,106 @@ class TenantCajaController extends TenantController
         $noteLine = $notes !== '' ? ('Cierre: ' . $notes) : 'Cierre manual';
         $newNotes = trim($prevNotes . ($prevNotes !== '' ? "\n" : '') . $noteLine);
 
-        $this->query(
+        $expectedCash = $this->computeExpectedCash($session);
+        $difference = round($closingAmount - $expectedCash, 2);
+
+        $stmt = $this->query(
             "UPDATE cash_sessions
-             SET closing_amount = ?, closing_date = NOW(), status = 'closed', notes = ?
+             SET closing_amount = ?, closing_date = NOW(), status = 'closed', notes = ?,
+                 expected_amount = ?, difference_amount = ?
              WHERE id = ? AND status = 'open'",
-            [$closingAmount, $newNotes, $sessionId]
+            [$closingAmount, $newNotes, $expectedCash, $difference, $sessionId]
         );
+
+        if ($stmt->rowCount() < 1) {
+            $this->json([
+                'success' => false,
+                'message' => 'La caja ya fue cerrada por otro usuario',
+                'redirect' => base_url('/app/caja'),
+            ]);
+            return;
+        }
+
+        $this->postCashClosingAccounting($sessionId);
 
         $base = rtrim((string)config('app.url', ''), '/');
         $pdfUrl = $base . '/app/caja?action=pdf&id=' . $sessionId;
 
+        $message = 'Caja cerrada correctamente.';
+        if (abs($difference) >= 0.01) {
+            $message .= $difference < 0
+                ? ' Faltante de ' . $this->formatMoney(abs($difference)) . '.'
+                : ' Sobrante de ' . $this->formatMoney($difference) . '.';
+        }
+
         $this->json([
             'success' => true,
-            'message' => 'Caja cerrada correctamente.',
-            'redirect' => base_url('/app/caja'),
+            'message' => $message,
+            'redirect' => base_url('/app/caja?share_close=' . $sessionId),
             'pdf_url' => $pdfUrl,
+            'session_id' => $sessionId,
+            'expected_cash' => $expectedCash,
+            'difference' => $difference,
         ]);
+    }
+
+    /**
+     * Efectivo que debería haber en el cajón: base de apertura más los
+     * movimientos de efectivo, más las ventas en efectivo que no quedaron
+     * registradas como movimiento.
+     */
+    private function computeExpectedCash(array $session, ?string $until = null): float
+    {
+        $sessionId = (int)$session['id'];
+        $opening = (float)($session['opening_amount'] ?? 0);
+
+        $movTotals = $this->query(
+            "SELECT
+                COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) incomes,
+                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) expenses
+             FROM cash_movements
+             WHERE cash_session_id = ?",
+            [$sessionId]
+        )->fetch() ?: ['incomes' => 0, 'expenses' => 0];
+
+        $cash = $opening + (float)$movTotals['incomes'] - (float)$movTotals['expenses'];
+
+        // Ventas en efectivo sin movimiento de caja asociado (evita doble conteo).
+        $params = [$sessionId, $sessionId, (string)($session['opening_date'] ?? '')];
+        $untilSql = '';
+        if ($until) {
+            $untilSql = ' AND s.sale_date <= ?';
+            $params[] = $until;
+        }
+
+        $orphanCashSales = $this->query(
+            "SELECT COALESCE(SUM(s.total), 0)
+             FROM sales s
+             WHERE s.status != 'cancelled'
+               AND s.id NOT IN (
+                    SELECT COALESCE(reference_id, 0) FROM cash_movements
+                    WHERE cash_session_id = ? AND reference_type = 'sale'
+               )
+               AND s.id NOT IN (
+                    SELECT COALESCE(reference_id, 0) FROM cash_movements
+                    WHERE cash_session_id = ? AND reference_type = 'sale_payment'
+               )
+               AND s.sale_date >= ?" . $untilSql . "
+               AND COALESCE(s.payment_method, 'cash') IN ('cash', '')",
+            $params
+        )->fetchColumn();
+
+        return round($cash + (float)$orphanCashSales, 2);
+    }
+
+    /** El asiento del arqueo no debe impedir el cierre de la caja. */
+    private function postCashClosingAccounting(int $sessionId): void
+    {
+        try {
+            (new \SoftNova\Services\AccountingService($this->db))->postCashSessionClosing($sessionId);
+        } catch (\Throwable $e) {
+            error_log('Contabilidad arqueo caja ' . $sessionId . ': ' . $e->getMessage());
+        }
     }
     
     private function addMovement(): void
@@ -395,6 +536,13 @@ class TenantCajaController extends TenantController
              VALUES (?, ?, ?, ?, 'manual', ?, NOW())",
             [$sessionId, $type, $amount, $description, $_SESSION['tenant_user_id'] ?? null]
         );
+
+        $movementId = (int)$this->db->lastInsertId();
+        try {
+            (new \SoftNova\Services\AccountingService($this->db))->postCashMovement($movementId);
+        } catch (\Throwable $e) {
+            error_log('Contabilidad movimiento caja ' . $movementId . ': ' . $e->getMessage());
+        }
         
         $label = $type === 'income' ? 'Ingreso' : 'Egreso';
         $this->respond(true, "{$label} registrado: " . $this->formatMoney($amount), '/app/caja');
@@ -405,37 +553,185 @@ class TenantCajaController extends TenantController
         TenantMiddleware::authorize('caja');
 
         $id = (int)$this->request->get('id');
-        $session = $this->query(
-            "SELECT cs.*, u.name as user_name FROM cash_sessions cs JOIN users u ON cs.user_id = u.id WHERE cs.id = ?",
-            [$id]
-        )->fetch();
-        
-        if (!$session) {
+        $report = $this->loadClosingReport($id);
+        if ($report === null) {
             http_response_code(404);
             echo 'Sesion no encontrada';
             exit;
         }
 
+        try {
+            $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
+            $content = $pdf->generateCashClosing(
+                $report['session'],
+                $report['movements'],
+                $report['totals'],
+                $report['sales']
+            );
+            $pdf->download($content, 'Cierre_Caja_' . $id . '_' . date('Ymd_His') . '.pdf');
+        } catch (\Throwable $e) {
+            error_log('closingPdf: ' . $e->getMessage());
+            http_response_code(500);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo 'No se pudo generar el PDF: ' . $e->getMessage();
+            exit;
+        }
+    }
+
+    /** WhatsApp con resumen del cierre (el PDF se descarga aparte). */
+    private function reportWhatsapp(): void
+    {
+        TenantMiddleware::authorize('caja');
+        $id = (int)$this->request->get('id', 0);
+        $report = $this->loadClosingReport($id);
+        if ($report === null) {
+            $this->json(['success' => false, 'message' => 'Sesión de caja no encontrada']);
+            return;
+        }
+
+        $phone = preg_replace('/\D+/', '', (string)$this->request->get('phone', ''));
+        if (strlen($phone) === 10) {
+            $phone = '57' . $phone;
+        }
+
+        $text = $this->closingWhatsappText($report);
+        $link = $phone !== ''
+            ? 'https://wa.me/' . $phone . '?text=' . rawurlencode($text)
+            : 'https://wa.me/?text=' . rawurlencode($text);
+
+        $this->json([
+            'success' => true,
+            'link' => $link,
+            'pdf_url' => rtrim((string)config('app.url', ''), '/') . '/app/caja?action=pdf&id=' . $id,
+        ]);
+    }
+
+    /** Envía el PDF de cierre por correo. */
+    private function reportEmail(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/caja')) {
+            return;
+        }
+        TenantMiddleware::authorize('caja');
+
+        $id = (int)$this->request->post('id', 0);
+        $to = trim((string)$this->request->post('email', ''));
+        $report = $this->loadClosingReport($id);
+        if ($report === null) {
+            $this->respond(false, 'Sesión de caja no encontrada', '/app/caja');
+            return;
+        }
+        if (!filter_var($to, FILTER_VALIDATE_EMAIL)) {
+            $this->respond(false, 'Indique un correo válido', '/app/caja?share_close=' . $id);
+            return;
+        }
+
+        $company = $this->companySettings();
+        $empresa = (string)($company['company_name'] ?? 'Seri ERP');
+        $session = $report['session'];
+        $filename = 'Cierre_Caja_' . $id . '.pdf';
+        $temporal = null;
+
+        try {
+            $pdf = new \SoftNova\Services\PdfService($company, $this->getCurrency());
+            $content = $pdf->generateCashClosing(
+                $session,
+                $report['movements'],
+                $report['totals'],
+                $report['sales']
+            );
+            $temporal = tempnam(sys_get_temp_dir(), 'caja-') . '.pdf';
+            file_put_contents($temporal, $content);
+
+            $apertura = !empty($session['opening_date'])
+                ? date('d/m/Y H:i', strtotime((string)$session['opening_date']))
+                : '—';
+            $cierre = !empty($session['closing_date'])
+                ? date('d/m/Y H:i', strtotime((string)$session['closing_date']))
+                : 'En curso';
+            $body = "Reporte de cierre de caja\n"
+                . "Empresa: {$empresa}\n"
+                . "Sesión #{$id}\n"
+                . "Usuario: " . ($session['user_name'] ?? '') . "\n"
+                . "Apertura: {$apertura}\n"
+                . "Cierre: {$cierre}\n"
+                . "Ventas: " . (int)($report['totals']['sales_count'] ?? 0)
+                . " · Total: " . $this->formatMoney((float)($report['totals']['sales_total'] ?? 0)) . "\n"
+                . "Adjunto encontrará el PDF del cierre.\n";
+
+            $resultado = (new \SoftNova\Services\MailService($company))->send(
+                $to,
+                'Cierre de caja #' . $id . ' - ' . $empresa,
+                $body,
+                $temporal,
+                $filename
+            );
+        } catch (\Throwable $e) {
+            $this->respond(false, 'No se pudo enviar el correo: ' . $e->getMessage(), '/app/caja?share_close=' . $id);
+            return;
+        } finally {
+            if ($temporal !== null && is_file($temporal)) {
+                @unlink($temporal);
+            }
+        }
+
+        $this->respond(
+            (bool)$resultado['success'],
+            (string)$resultado['message'],
+            '/app/caja?focus=cierresReportes'
+        );
+    }
+
+    /**
+     * @return array{session:array,movements:list,totals:array,sales:list}|null
+     */
+    private function loadClosingReport(int $id): ?array
+    {
+        if ($id <= 0) {
+            return null;
+        }
+
+        $session = $this->query(
+            "SELECT cs.*, u.name as user_name FROM cash_sessions cs JOIN users u ON cs.user_id = u.id WHERE cs.id = ?",
+            [$id]
+        )->fetch();
+
+        if (!$session) {
+            return null;
+        }
+
         if (TenantMiddleware::isPosRole()) {
             $uid = (int)($_SESSION['tenant_user_id'] ?? 0);
             if ((int)($session['user_id'] ?? 0) !== $uid) {
-                http_response_code(403);
-                echo 'No autorizado';
-                exit;
+                return null;
             }
         }
-        
+
         $movements = $this->query(
             "SELECT * FROM cash_movements WHERE cash_session_id = ? ORDER BY created_at ASC",
             [$id]
         )->fetchAll();
-        
+
         $totals = $this->query(
             "SELECT COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) as incomes,
                     COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) as expenses
              FROM cash_movements WHERE cash_session_id = ?",
             [$id]
-        )->fetch();
+        )->fetch() ?: ['incomes' => 0, 'expenses' => 0];
+
+        try {
+            $fullTotals = $this->computeSessionTotals($session, $session['closing_date'] ?? null);
+            $totals['incomes'] = $fullTotals['incomes'] ?? $totals['incomes'];
+            $totals['expenses'] = $fullTotals['expenses'] ?? $totals['expenses'];
+            $totals['payment_breakdown'] = $fullTotals['payment_breakdown'] ?? [];
+            $totals['sales_total'] = $fullTotals['sales_total'] ?? 0;
+            $totals['sales_count'] = $fullTotals['sales_count'] ?? 0;
+            $totals['expected_cash'] = $fullTotals['expected_cash'] ?? null;
+            $totals['counted_cash'] = $fullTotals['counted_cash'] ?? null;
+            $totals['difference'] = $fullTotals['difference'] ?? null;
+        } catch (\Throwable $e) {
+            $totals['payment_breakdown'] = [];
+        }
 
         $sales = [];
         try {
@@ -470,17 +766,40 @@ class TenantCajaController extends TenantController
             $sales = [];
         }
 
-        try {
-            $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
-            $content = $pdf->generateCashClosing($session, $movements ?: [], $totals ?: ['incomes' => 0, 'expenses' => 0], $sales);
-            $pdf->download($content, 'Cierre_Caja_' . $id . '_' . date('Ymd_His') . '.pdf');
-        } catch (\Throwable $e) {
-            error_log('closingPdf: ' . $e->getMessage());
-            http_response_code(500);
-            header('Content-Type: text/plain; charset=utf-8');
-            echo 'No se pudo generar el PDF: ' . $e->getMessage();
-            exit;
+        return [
+            'session' => $session,
+            'movements' => $movements ?: [],
+            'totals' => $totals ?: ['incomes' => 0, 'expenses' => 0],
+            'sales' => $sales,
+        ];
+    }
+
+    /** @param array{session:array,totals:array,sales:list} $report */
+    private function closingWhatsappText(array $report): string
+    {
+        $session = $report['session'];
+        $totals = $report['totals'];
+        $empresa = (string)($this->companySettings()['company_name'] ?? 'Seri ERP');
+        $id = (int)($session['id'] ?? 0);
+        $lines = [
+            '*' . $empresa . '* — Cierre de caja #' . $id,
+            'Usuario: ' . ($session['user_name'] ?? ''),
+            'Apertura: ' . (!empty($session['opening_date']) ? date('d/m/Y H:i', strtotime((string)$session['opening_date'])) : '—'),
+            'Cierre: ' . (!empty($session['closing_date']) ? date('d/m/Y H:i', strtotime((string)$session['closing_date'])) : 'En curso'),
+            'Apertura $: ' . $this->formatMoney((float)($session['opening_amount'] ?? 0)),
+            'Cierre $: ' . $this->formatMoney((float)($session['closing_amount'] ?? 0)),
+            'Ventas: ' . (int)($totals['sales_count'] ?? 0) . ' · ' . $this->formatMoney((float)($totals['sales_total'] ?? 0)),
+        ];
+        if (isset($totals['expected_cash'])) {
+            $lines[] = 'Efectivo esperado: ' . $this->formatMoney((float)$totals['expected_cash']);
         }
+        if (isset($totals['difference']) && abs((float)$totals['difference']) >= 0.01) {
+            $diff = (float)$totals['difference'];
+            $lines[] = ($diff < 0 ? 'Faltante: ' : 'Sobrante: ') . $this->formatMoney(abs($diff));
+        }
+        $lines[] = '';
+        $lines[] = 'PDF: ' . rtrim((string)config('app.url', ''), '/') . '/app/caja?action=pdf&id=' . $id;
+        return implode("\n", $lines);
     }
 
     /**
@@ -522,12 +841,12 @@ class TenantCajaController extends TenantController
 
         if ($until) {
             $sales = $this->query(
-                "SELECT id, total, status FROM sales WHERE sale_date >= ? AND sale_date <= ?",
+                "SELECT id, total, status, payment_method FROM sales WHERE sale_date >= ? AND sale_date <= ?",
                 [$openingDate, $until]
             )->fetchAll();
         } else {
             $sales = $this->query(
-                "SELECT id, total, status FROM sales WHERE sale_date >= ?",
+                "SELECT id, total, status, payment_method FROM sales WHERE sale_date >= ?",
                 [$openingDate]
             )->fetchAll();
         }
@@ -535,15 +854,27 @@ class TenantCajaController extends TenantController
         $salesIncome = 0.0;
         $salesCount = 0;
         $salesTotal = 0.0;
+        $paymentBreakdown = [];
         foreach ($sales as $sale) {
             if (($sale['status'] ?? '') === 'cancelled') {
                 continue;
             }
             $salesCount++;
-            $salesTotal += (float)$sale['total'];
+            $saleTotal = (float)$sale['total'];
+            $salesTotal += $saleTotal;
             if (!in_array((int)$sale['id'], $movementSaleIds, true)) {
-                $salesIncome += (float)$sale['total'];
+                $salesIncome += $saleTotal;
             }
+            $methodCode = \SoftNova\Services\PaymentMethodCatalog::normalize((string)($sale['payment_method'] ?? 'cash'));
+            if (!isset($paymentBreakdown[$methodCode])) {
+                $paymentBreakdown[$methodCode] = [
+                    'label' => \SoftNova\Services\PaymentMethodCatalog::label($methodCode),
+                    'total' => 0.0,
+                    'count' => 0,
+                ];
+            }
+            $paymentBreakdown[$methodCode]['total'] += $saleTotal;
+            $paymentBreakdown[$methodCode]['count']++;
         }
 
         $incomes += $salesIncome;
@@ -555,6 +886,15 @@ class TenantCajaController extends TenantController
             'sales_count' => $salesCount,
             'sales_total' => $salesTotal,
             'movements_count' => $movementsCount,
+            'payment_breakdown' => $paymentBreakdown,
+            // Solo efectivo: es lo que debe cuadrar contra el conteo del cajón.
+            'expected_cash' => $this->computeExpectedCash($session, $until),
+            'counted_cash' => isset($session['closing_amount']) && $session['closing_amount'] !== null
+                ? round((float)$session['closing_amount'], 2)
+                : null,
+            'difference' => isset($session['difference_amount']) && $session['difference_amount'] !== null
+                ? round((float)$session['difference_amount'], 2)
+                : null,
         ];
     }
 
@@ -582,15 +922,18 @@ class TenantCajaController extends TenantController
 
             $closingAt = $openDay . ' 23:59:59';
             try {
-                $totals = $this->computeSessionTotals($session, $closingAt);
+                // Cierre ciego: se asume el efectivo esperado, sin faltante ni sobrante.
+                $expectedCash = $this->computeExpectedCash($session, $closingAt);
                 $this->query(
                     "UPDATE cash_sessions
                      SET closing_amount = ?, closing_date = ?, status = 'closed',
+                         expected_amount = ?, difference_amount = 0,
                          notes = CONCAT(IFNULL(notes, ''), ?)
                      WHERE id = ? AND status = 'open'",
                     [
-                        round($totals['balance'], 2),
+                        $expectedCash,
                         $closingAt,
+                        $expectedCash,
                         "\nCierre automatico a medianoche del " . date('d/m/Y', strtotime($openDay)),
                         (int)$session['id'],
                     ]

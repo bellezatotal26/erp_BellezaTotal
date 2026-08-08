@@ -128,6 +128,8 @@ class TenantContabilidadController extends TenantController
             ? $this->accounting->ledger($accountId, $from, $to)
             : [];
         $accountAudit = $this->accounting->auditCriticalAccounts();
+        $reconciliation = $this->accounting->subledgerReconciliation();
+        $pendingSync = $this->accounting->pendingSyncCount();
 
         $commissionCfg = [];
         $commissionList = ['rows' => [], 'pending' => 0, 'paid' => 0, 'cancelled' => 0];
@@ -162,6 +164,8 @@ class TenantContabilidadController extends TenantController
             'expenseByType' => $expenseByType,
             'traceMovements' => $trace['rows'],
             'accountAudit' => $accountAudit,
+            'reconciliation' => $reconciliation,
+            'pendingSync' => $pendingSync,
             'mlOAuthRedirect' => \SoftNova\Core\route('app/contabilidad') . '?action=ml-oauth-callback',
             'commissionCfg' => $commissionCfg,
             'commissionList' => $commissionList,
@@ -489,12 +493,26 @@ class TenantContabilidadController extends TenantController
         TenantMiddleware::authorize('contabilidad', 'create');
         // Procesa por lotes para evitar timeouts con históricos grandes.
         $result = $this->accounting->syncExistingOperations(200);
-        $message = sprintf(
-            'Sincronización: %d ventas, %d abonos y %d gastos contabilizados',
-            $result['sales'],
-            $result['payments'] ?? 0,
-            $result['expenses']
-        );
+
+        $partes = [];
+        foreach ([
+            'sales' => 'ventas',
+            'payments' => 'abonos de clientes',
+            'expenses' => 'gastos',
+            'purchases' => 'compras',
+            'stock' => 'movimientos de inventario',
+            'supplier_payments' => 'abonos a proveedores',
+            'cash' => 'movimientos de caja',
+        ] as $clave => $etiqueta) {
+            $cantidad = (int)($result[$clave] ?? 0);
+            if ($cantidad > 0) {
+                $partes[] = $cantidad . ' ' . $etiqueta;
+            }
+        }
+
+        $message = $partes
+            ? 'Sincronización: ' . implode(', ', $partes) . ' contabilizados'
+            : 'No había operaciones pendientes de contabilizar';
         if (!empty($result['remaining'])) {
             $message .= sprintf('. Quedan %d operaciones: vuelve a ejecutar para continuar', $result['remaining']);
         }

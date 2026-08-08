@@ -11,6 +11,9 @@ class PayrollService
     public function __construct(private \PDO $db)
     {
         TenantOpsSchema::ensure($db);
+        // Nómina depende de accounting_settings / accounting_accounts
+        // (si Contabilidad nunca se abrió, params() reventaba al cargar el módulo).
+        new AccountingService($db);
     }
 
     private function query(string $sql, array $params = []): \PDOStatement
@@ -22,6 +25,13 @@ class PayrollService
 
     public function params(): array
     {
+        static $cache = null;
+        static $cacheOid = null;
+        $oid = spl_object_id($this->db);
+        if ($cache !== null && $cacheOid === $oid) {
+            return $cache;
+        }
+
         $defaults = [
             'smmlv' => '1423500',
             'transport_aid' => '200000',
@@ -77,6 +87,8 @@ class PayrollService
             $val = $this->setting($key, $default);
             $out[$key] = str_ends_with($key, '_account') ? $val : (float)$val;
         }
+        $cache = $out;
+        $cacheOid = $oid;
         return $out;
     }
 
@@ -89,22 +101,66 @@ class PayrollService
         return $row ? (string)$row['setting_value'] : $default;
     }
 
+    /** @var array<string, true>|null */
+    private ?array $employeeColsCache = null;
+
+    /** @return array<string, true> */
+    private function employeeColumns(): array
+    {
+        if ($this->employeeColsCache !== null) {
+            return $this->employeeColsCache;
+        }
+        $this->employeeColsCache = [];
+        try {
+            $rows = $this->db->query('SHOW COLUMNS FROM employees')->fetchAll();
+            foreach ($rows as $row) {
+                $field = (string)($row['Field'] ?? '');
+                if ($field !== '') {
+                    $this->employeeColsCache[$field] = true;
+                }
+            }
+        } catch (\Throwable $e) {
+            $this->employeeColsCache = [];
+        }
+        return $this->employeeColsCache;
+    }
+
     public function employees(string $status = '', string $q = ''): array
     {
+        TenantOpsSchema::ensure($this->db);
+        $this->employeeColsCache = null; // refrescar tras migración de esquema
+        $cols = $this->employeeColumns();
         $where = ['1=1'];
         $params = [];
-        if ($status !== '') {
+        if ($status !== '' && isset($cols['status'])) {
             $where[] = 'status = ?';
             $params[] = $status;
         }
         if ($q !== '') {
-            $where[] = '(first_name LIKE ? OR last_name LIKE ? OR document_number LIKE ? OR position_title LIKE ?)';
-            $like = '%' . $q . '%';
-            array_push($params, $like, $like, $like, $like);
+            $likeParts = [];
+            foreach (['first_name', 'last_name', 'document_number', 'position_title', 'name'] as $c) {
+                if (isset($cols[$c])) {
+                    $likeParts[] = $c . ' LIKE ?';
+                    $params[] = '%' . $q . '%';
+                }
+            }
+            if ($likeParts) {
+                $where[] = '(' . implode(' OR ', $likeParts) . ')';
+            }
         }
+
+        $order = 'id ASC';
+        if (isset($cols['last_name'], $cols['first_name'])) {
+            $order = 'last_name, first_name';
+        } elseif (isset($cols['name'])) {
+            $order = 'name';
+        } elseif (isset($cols['first_name'])) {
+            $order = 'first_name';
+        }
+
         return $this->query(
             'SELECT * FROM employees WHERE ' . implode(' AND ', $where)
-            . ' ORDER BY last_name, first_name',
+            . ' ORDER BY ' . $order,
             $params
         )->fetchAll();
     }

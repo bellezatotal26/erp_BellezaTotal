@@ -34,13 +34,6 @@ class DashboardLayoutService
                 'type' => 'kpi',
                 'description' => 'Monto de ventas de hoy',
             ],
-            'kpi_low_stock' => [
-                'id' => 'kpi_low_stock',
-                'title' => 'Stock Bajo',
-                'module' => 'inventario',
-                'type' => 'kpi',
-                'description' => 'Productos bajo el minimo',
-            ],
             'kpi_total_sales' => [
                 'id' => 'kpi_total_sales',
                 'title' => 'Ventas Totales',
@@ -55,6 +48,13 @@ class DashboardLayoutService
                 'type' => 'list',
                 'description' => 'Saldos pendientes y ultimas ventas saldadas',
             ],
+            'payables' => [
+                'id' => 'payables',
+                'title' => 'Cuentas por pagar',
+                'module' => 'compras',
+                'type' => 'list',
+                'description' => 'Saldos pendientes con proveedores',
+            ],
             'recent_sales' => [
                 'id' => 'recent_sales',
                 'title' => 'Ultimas Ventas',
@@ -64,10 +64,10 @@ class DashboardLayoutService
             ],
             'low_stock_list' => [
                 'id' => 'low_stock_list',
-                'title' => 'Productos con stock bajo',
+                'title' => 'Stock bajo',
                 'module' => 'inventario',
                 'type' => 'list',
-                'description' => 'Detalle de inventario critico',
+                'description' => 'Productos bajo el minimo de inventario',
             ],
         ];
     }
@@ -78,11 +78,11 @@ class DashboardLayoutService
             ['id' => 'kpi_products', 'visible' => true, 'order' => 0, 'column' => 0],
             ['id' => 'kpi_customers', 'visible' => true, 'order' => 1, 'column' => 0],
             ['id' => 'kpi_today_sales', 'visible' => true, 'order' => 2, 'column' => 1],
-            ['id' => 'kpi_low_stock', 'visible' => true, 'order' => 3, 'column' => 1],
-            ['id' => 'kpi_total_sales', 'visible' => false, 'order' => 4, 'column' => 0],
-            ['id' => 'recent_sales', 'visible' => true, 'order' => 5, 'column' => 0],
-            ['id' => 'receivables', 'visible' => true, 'order' => 6, 'column' => 1],
-            ['id' => 'low_stock_list', 'visible' => false, 'order' => 7, 'column' => 1],
+            ['id' => 'kpi_total_sales', 'visible' => false, 'order' => 3, 'column' => 0],
+            ['id' => 'recent_sales', 'visible' => true, 'order' => 4, 'column' => 0],
+            ['id' => 'receivables', 'visible' => true, 'order' => 5, 'column' => 1],
+            ['id' => 'payables', 'visible' => true, 'order' => 6, 'column' => 0],
+            ['id' => 'low_stock_list', 'visible' => true, 'order' => 7, 'column' => 1],
         ];
         return self::normalizeStatic($defaults);
     }
@@ -142,12 +142,26 @@ class DashboardLayoutService
     
     public function resolveVisible(array $layout, callable $canAccessModule): array
     {
+        return array_values(array_filter(
+            $this->resolveBoard($layout, $canAccessModule),
+            static fn(array $w): bool => !empty($w['visible'])
+        ));
+    }
+
+    /**
+     * Todos los widgets accesibles (visibles u ocultos) para pintar el tablero
+     * y poder mostrar/ocultar sin recargar.
+     *
+     * @return list<array<string,mixed>>
+     */
+    public function resolveBoard(array $layout, callable $canAccessModule): array
+    {
         $catalog = self::catalog();
         $items = [];
-        
+
         foreach ($this->normalize($layout) as $item) {
             $id = $item['id'];
-            if (empty($item['visible']) || !isset($catalog[$id])) {
+            if (!isset($catalog[$id])) {
                 continue;
             }
             $meta = $catalog[$id];
@@ -158,15 +172,15 @@ class DashboardLayoutService
             $items[] = array_merge($meta, [
                 'order' => (int)$item['order'],
                 'column' => (int)$item['column'],
-                'visible' => true,
+                'visible' => !empty($item['visible']),
             ]);
         }
-        
+
         usort($items, static function ($a, $b) {
             $c = $a['column'] <=> $b['column'];
             return $c !== 0 ? $c : ($a['order'] <=> $b['order']);
         });
-        
+
         return $items;
     }
     
@@ -179,12 +193,21 @@ class DashboardLayoutService
     {
         $catalog = self::catalog();
         $byId = [];
-        
+        $legacyLowStockVisible = false;
+
         foreach ($layout as $i => $item) {
             if (!is_array($item)) {
                 continue;
             }
             $id = (string)($item['id'] ?? '');
+            // Unifica el KPI antiguo "Stock Bajo" con la lista única.
+            if ($id === 'kpi_low_stock') {
+                $visible = $item['visible'] ?? false;
+                if ($visible === '1' || $visible === 1 || $visible === true || $visible === 'true') {
+                    $legacyLowStockVisible = true;
+                }
+                continue;
+            }
             if ($id === '' || !isset($catalog[$id]) || isset($byId[$id])) {
                 continue;
             }
@@ -204,6 +227,19 @@ class DashboardLayoutService
                 'order' => isset($item['order']) ? (int)$item['order'] : (int)$i,
                 'column' => $column,
             ];
+        }
+
+        if ($legacyLowStockVisible) {
+            if (!isset($byId['low_stock_list'])) {
+                $byId['low_stock_list'] = [
+                    'id' => 'low_stock_list',
+                    'visible' => true,
+                    'order' => count($byId),
+                    'column' => 1,
+                ];
+            } else {
+                $byId['low_stock_list']['visible'] = true;
+            }
         }
         
         $order = count($byId);

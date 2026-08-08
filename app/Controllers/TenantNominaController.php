@@ -61,11 +61,21 @@ class TenantNominaController extends TenantController
             $tab = 'employees';
         }
 
-        $q = trim((string)$this->request->get('q', ''));
-        $status = (string)$this->request->get('status', '');
-        $employees = $this->payroll->employees($status, $q);
-        $runs = $this->payroll->runs(36);
-        $params = $this->payroll->params();
+        try {
+            $q = trim((string)$this->request->get('q', ''));
+            $status = (string)$this->request->get('status', '');
+            $employees = $this->payroll->employees($status, $q);
+            $runs = $this->payroll->runs(36);
+            $params = $this->payroll->params();
+        } catch (\Throwable $e) {
+            error_log('Nomina index: ' . $e->getMessage());
+            $_SESSION['error'] = 'No se pudo cargar nómina: ' . $e->getMessage();
+            $employees = [];
+            $runs = [];
+            $params = [];
+            $q = '';
+            $status = '';
+        }
 
         $activeCount = count(array_filter($employees, fn ($e) => ($e['status'] ?? '') === 'active'));
         $monthPayroll = 0.0;

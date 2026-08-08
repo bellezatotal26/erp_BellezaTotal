@@ -4,10 +4,23 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="csrf-token" content="<?php echo htmlspecialchars(\SoftNova\Core\csrf_token()); ?>">
+    <meta name="theme-color" content="#0F766E">
     <title><?php echo htmlspecialchars($title ?? 'Seri ERP'); ?></title>
     <?php echo \SoftNova\Core\og_meta_tags($title ?? null); ?>
     <link rel="stylesheet" href="<?php echo $viewInstance->asset('css/style.css'); ?>">
     <meta name="barcode-lookup-url" content="<?php echo htmlspecialchars($viewInstance->route('app/dashboard') . '?action=lookup_barcode'); ?>">
+    <meta name="custom-option-url" content="<?php echo htmlspecialchars($viewInstance->route('app/dashboard') . '?action=save_custom_option'); ?>">
+    <?php
+    $publicPrefix = \SoftNova\Core\public_web_prefix();
+    $swUrl = \SoftNova\Core\base_url(ltrim($publicPrefix . '/sw.php', '/'));
+    $manifestUrl = \SoftNova\Core\base_url(ltrim($publicPrefix . '/manifest.php', '/'));
+    $appBase = rtrim(parse_url(\SoftNova\Core\config('app.url', ''), PHP_URL_PATH) ?: '', '/');
+    $swScope = ($appBase === '' ? '/' : $appBase . '/');
+    ?>
+    <link rel="manifest" href="<?php echo htmlspecialchars($manifestUrl); ?>">
+    <meta name="sw-url" content="<?php echo htmlspecialchars($swUrl); ?>">
+    <meta name="sw-scope" content="<?php echo htmlspecialchars($swScope); ?>">
+    <link rel="apple-touch-icon" href="<?php echo htmlspecialchars(\SoftNova\Core\base_url(ltrim($publicPrefix . '/assets/img/pwa-icon-192.png', '/'))); ?>">
     <?php if (!empty($needBarcode)): ?>
     <script src="<?php echo $viewInstance->asset('js/barcode.js'); ?>"></script>
     <?php endif; ?>
@@ -82,7 +95,7 @@
                                     $avatarUrl = $av->fetchColumn() ?: null;
                                 } catch (\Exception $e) { /* silencioso */ }
                                 if ($avatarUrl): ?>
-                                    <img src="<?php echo htmlspecialchars($avatarUrl); ?>" alt="Avatar" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">
+                                    <img src="<?php echo htmlspecialchars(\SoftNova\Core\media_url((string)$avatarUrl)); ?>" alt="Avatar" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">
                                 <?php else: ?>
                                     <?php echo strtoupper(substr($userName ?? 'U', 0, 1)); ?>
                                 <?php endif; ?>
@@ -149,11 +162,20 @@
             </div>
             
             <div class="content">
-                <?php if (!empty($pageTitle)): ?>
-                <div class="breadcrumbs">
-                    <a href="<?php echo $viewInstance->route('app/dashboard'); ?>">Dashboard</a>
-                    <span class="separator">›</span>
-                    <span class="current"><?php echo htmlspecialchars($pageTitle); ?></span>
+                <?php if (!empty($pageTitle) || !empty($pageTopStatsHtml)): ?>
+                <div class="page-topbar<?php echo !empty($pageTopStatsHtml) ? ' page-topbar--with-stats' : ''; ?>">
+                    <?php if (!empty($pageTitle)): ?>
+                    <div class="breadcrumbs">
+                        <a href="<?php echo $viewInstance->route('app/dashboard'); ?>">Dashboard</a>
+                        <span class="separator">›</span>
+                        <span class="current"><?php echo htmlspecialchars($pageTitle); ?></span>
+                    </div>
+                    <?php endif; ?>
+                    <?php if (!empty($pageTopStatsHtml)): ?>
+                    <div class="page-top-stats" aria-label="Resumen de caja">
+                        <?php echo $pageTopStatsHtml; ?>
+                    </div>
+                    <?php endif; ?>
                 </div>
                 <?php endif; ?>
                 <?php echo $content; ?>
@@ -442,6 +464,12 @@
         });
     </script>
     <script src="<?php echo $viewInstance->asset('js/app.js'); ?>"></script>
+    <script src="<?php echo $viewInstance->asset('js/pos-offline.js'); ?>"></script>
+    <script>
+    if (window.SeriPosOffline && typeof SeriPosOffline.registerServiceWorker === 'function') {
+        SeriPosOffline.registerServiceWorker();
+    }
+    </script>
     <?php
     $pageScripts = $pageScripts ?? [];
     if (is_string($pageScripts)) {

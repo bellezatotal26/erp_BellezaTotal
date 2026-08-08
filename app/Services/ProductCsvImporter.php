@@ -21,6 +21,19 @@ class ProductCsvImporter
         return $stmt;
     }
 
+    /** Un fallo contable no debe abortar la importación de la fila. */
+    private function postStockAccounting(int $movementId): void
+    {
+        if ($movementId <= 0) {
+            return;
+        }
+        try {
+            (new AccountingService($this->db))->postStockMovement($movementId);
+        } catch (\Throwable $e) {
+            error_log('Contabilidad importación CSV, movimiento ' . $movementId . ': ' . $e->getMessage());
+        }
+    }
+
     /**
      * Normaliza texto de encabezado: encoding, acentos, basura Excel.
      */
@@ -174,13 +187,14 @@ class ProductCsvImporter
     private function mapHeaders(array $header): array
     {
         $map = [
-            'sku' => null, 'nombre' => null, 'tipo' => null, 'categoria' => null,
+            'sku' => null, 'ean' => null, 'nombre' => null, 'tipo' => null, 'categoria' => null,
             'costo' => null, 'precio' => null, 'stock' => null, 'min' => null,
-            'unidad' => null, 'estado' => null,
+            'unidad' => null, 'estado' => null, 'ubicacion' => null,
         ];
 
         $aliases = [
-            'sku' => ['sku', 'codigo', 'code', 'cod', 'barcode', 'ean', 'referencia', 'ref'],
+            'sku' => ['sku', 'codigo', 'code', 'cod', 'referencia', 'ref'],
+            'ean' => ['ean', 'barcode', 'codigo_barras', 'codigobarras', 'upc', 'gtin'],
             'nombre' => [
                 'nombre', 'name', 'producto', 'product', 'descripcion', 'description',
                 'product_name', 'nombre_producto', 'articulo', 'item', 'titulo', 'title',
@@ -193,6 +207,7 @@ class ProductCsvImporter
             'min' => ['min', 'min_stock', 'stock_min', 'minimo', 'stock_minimo'],
             'unidad' => ['unidad', 'unit', 'um', 'medida'],
             'estado' => ['estado', 'status', 'activo'],
+            'ubicacion' => ['ubicacion', 'location', 'bodega', 'almacen', 'warehouse', 'local'],
         ];
 
         foreach ($header as $i => $col) {
@@ -240,6 +255,7 @@ class ProductCsvImporter
      */
     public function importFromFile(string $path, int $userId = 0): array
     {
+        SupplyChainSchema::ensure($this->db);
         $raw = file_get_contents($path);
         if ($raw === false || $raw === '') {
             throw new \RuntimeException('No se pudo leer el CSV');
@@ -308,6 +324,17 @@ class ProductCsvImporter
                 $errors[] = "Fila {$rowNum}: {$skuError}";
                 continue;
             }
+            [$ean, $eanError] = $this->normalizeProductCode($cell($map, $row, 'ean'));
+            if ($eanError !== null) {
+                $skipped++;
+                $errors[] = "Fila {$rowNum}: EAN — {$eanError}";
+                continue;
+            }
+            if (mb_strlen($ean, 'UTF-8') > 64) {
+                $skipped++;
+                $errors[] = "Fila {$rowNum}: EAN demasiado largo";
+                continue;
+            }
             $type = mb_strtolower($cell($map, $row, 'tipo'));
             if ($type !== 'service') {
                 $type = 'product';
@@ -322,6 +349,12 @@ class ProductCsvImporter
             $minStock = (int)($cell($map, $row, 'min') !== '' ? $cell($map, $row, 'min') : '5');
             $unit = $cell($map, $row, 'unidad') ?: 'UNIDAD';
             $catName = $this->fixMojibake($cell($map, $row, 'categoria'));
+            $location = $this->fixMojibake($cell($map, $row, 'ubicacion'));
+            if ($location !== '' && mb_strlen($location) > 120) {
+                $location = mb_substr($location, 0, 120);
+            }
+            $locationVal = $location !== '' ? $location : null;
+            $eanVal = $ean !== '' ? $ean : null;
 
             $categoryId = null;
             if ($catName !== '') {
@@ -353,25 +386,38 @@ class ProductCsvImporter
                         [$sku]
                     )->fetch();
                 }
+                if (!$existingProduct && $eanVal) {
+                    $existingProduct = $this->query(
+                        "SELECT id, stock FROM products WHERE barcode = ? LIMIT 1",
+                        [$eanVal]
+                    )->fetch();
+                }
                 if ($existingProduct) {
                     $id = (int)$existingProduct['id'];
                     $oldStock = (int)$existingProduct['stock'];
                     $this->query(
                         "UPDATE products SET name = ?, product_type = ?, category_id = ?,
                                 purchase_price = ?, sale_price = ?, stock = ?, min_stock = ?,
-                                unit = ?, status = ? WHERE id = ?",
-                        [$name, $type, $categoryId, $cost, $price, $stock, $minStock, $unit, $status, $id]
+                                unit = ?, status = ?, location = COALESCE(?, location),
+                                barcode = COALESCE(?, barcode) WHERE id = ?",
+                        [$name, $type, $categoryId, $cost, $price, $stock, $minStock, $unit, $status, $locationVal, $eanVal, $id]
                     );
                     if ($type === 'product' && $stock !== $oldStock) {
                         $diff = $stock - $oldStock;
-                        $this->stock->addMovement(
+                        $movementId = $this->stock->addMovement(
                             $id,
                             $diff > 0 ? 'in' : 'out',
                             abs($diff),
-                            'adjustment',
+                            'csv_import',
                             null,
-                            'Ajuste por importación CSV'
+                            ($diff > 0 ? 'Entrada (+): ' : 'Salida (−): ') . 'importación CSV',
+                            $userId ?: null,
+                            $cost,
+                            $stock,
+                            null,
+                            $diff > 0 ? 'equity' : 'loss'
                         );
+                        $this->postStockAccounting($movementId);
                     }
                     $updated++;
                 } else {
@@ -380,14 +426,27 @@ class ProductCsvImporter
                     }
                     $this->query(
                         "INSERT INTO products
-                            (code, name, product_type, category_id, purchase_price, sale_price,
-                             stock, min_stock, unit, status, created_by)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        [$sku, $name, $type, $categoryId, $cost, $price, $stock, $minStock, $unit, $status, $userId ?: null]
+                            (code, barcode, name, product_type, category_id, purchase_price, sale_price,
+                             stock, min_stock, unit, status, location, created_by)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [$sku, $eanVal, $name, $type, $categoryId, $cost, $price, $stock, $minStock, $unit, $status, $locationVal, $userId ?: null]
                     );
                     $newId = (int)$this->db->lastInsertId();
                     if ($stock > 0 && $type === 'product') {
-                        $this->stock->addMovement($newId, 'in', $stock, 'adjustment', null, 'Stock inicial importación CSV');
+                        $movementId = $this->stock->addMovement(
+                            $newId,
+                            'in',
+                            $stock,
+                            'csv_import',
+                            null,
+                            'Stock inicial importación CSV',
+                            $userId ?: null,
+                            $cost,
+                            $stock,
+                            null,
+                            'equity'
+                        );
+                        $this->postStockAccounting($movementId);
                     }
                     $created++;
                 }

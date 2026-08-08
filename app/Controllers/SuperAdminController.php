@@ -68,6 +68,8 @@ class SuperAdminController extends Controller
     
     public function tenants(): void
     {
+        $this->sealLegacyTenantDbPasswords();
+
         $action = $this->request->get('action');
         
         if ($action === 'create') {
@@ -104,6 +106,35 @@ class SuperAdminController extends Controller
         $this->view('superadmin.tenants', ['tenants' => $tenants, 'plans' => $plans]);
     }
     
+    /**
+     * Cifra passwords de BD de tenant que aún estén en texto plano.
+     */
+    private function sealLegacyTenantDbPasswords(): void
+    {
+        try {
+            $rows = $this->db->query(
+                "SELECT id, database_password FROM tenants
+                 WHERE database_password IS NOT NULL AND database_password <> ''"
+            )->fetchAll();
+            foreach ($rows as $row) {
+                $stored = (string)($row['database_password'] ?? '');
+                if ($stored === '' || \SoftNova\Core\Security::isSealed($stored)) {
+                    continue;
+                }
+                $plain = \SoftNova\Core\Security::revealSecret($stored);
+                if ($plain === '') {
+                    continue;
+                }
+                $this->db->query(
+                    "UPDATE tenants SET database_password = ? WHERE id = ?",
+                    [\SoftNova\Core\Security::sealSecret($plain), (int)$row['id']]
+                );
+            }
+        } catch (\Throwable $e) {
+            error_log('sealLegacyTenantDbPasswords: ' . $e->getMessage());
+        }
+    }
+
     /**
      * Verifica planes vencidos y suspende el acceso automaticamente
      */
@@ -200,11 +231,12 @@ class SuperAdminController extends Controller
         // Generar credenciales de base de datos (criptográficamente seguras)
         $database_user = 'tn_' . bin2hex(random_bytes(6));
         $database_password = bin2hex(random_bytes(16));
+        $database_password_sealed = \SoftNova\Core\Security::sealSecret($database_password);
         
         $this->db->query("
             INSERT INTO tenants (company_name, razon_social, documento_tipo, documento_numero, email, phone, address, database_name, database_host, database_port, database_user, database_password, subscription_plan_id, subscription_start_date, subscription_end_date, status, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'localhost', 3306, ?, ?, ?, ?, ?, 'active', NOW())
-        ", [$name, $razon_social, $documento_tipo, $documento_numero, $email, $phone, $address, $database_name, $database_user, $database_password, $subscription_plan_id, $subscription_start_date, $subscription_end_date]);
+        ", [$name, $razon_social, $documento_tipo, $documento_numero, $email, $phone, $address, $database_name, $database_user, $database_password_sealed, $subscription_plan_id, $subscription_start_date, $subscription_end_date]);
         
         $tenant_id = (int)$this->db->lastInsertId();
         

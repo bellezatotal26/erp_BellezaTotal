@@ -25,7 +25,11 @@ storage/app.key
 /public/uploads/branding/*
 /public/uploads/purchases/*
 /public/uploads/expenses/*
+/public/uploads/purchase-invoices/*
 !/public/uploads/**/.gitkeep
+!/public/uploads/.htaccess
+!/public/uploads/index.php
+!/public/uploads/**/.htaccess
 
 # Artefactos locales
 *.zip

@@ -40,12 +40,26 @@ class SalesDocumentService
         if (!isset($cols['received_date'])) {
             $alters[] = "ADD COLUMN received_date DATE NULL AFTER due_date";
         }
+        // UUID del cliente para reintentos offline sin duplicar la venta.
+        if (!isset($cols['client_sale_uuid'])) {
+            $alters[] = "ADD COLUMN client_sale_uuid VARCHAR(64) NULL AFTER notes";
+        }
         if ($alters) {
             try {
                 $this->db->exec('ALTER TABLE sales ' . implode(', ', $alters));
             } catch (\Throwable $e) {
                 error_log('SalesDocumentService: ' . $e->getMessage());
             }
+        }
+        try {
+            $idx = $this->db->query(
+                "SHOW INDEX FROM sales WHERE Key_name = 'uq_sales_client_uuid'"
+            )->fetch();
+            if (!$idx) {
+                $this->db->exec('CREATE UNIQUE INDEX uq_sales_client_uuid ON sales (client_sale_uuid)');
+            }
+        } catch (\Throwable $e) {
+            // silencioso: se reintenta en la próxima petición
         }
         $done = true;
     }

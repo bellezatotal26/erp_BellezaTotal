@@ -4,6 +4,7 @@ namespace SoftNova\Controllers;
 
 use SoftNova\Core\TenantController;
 use SoftNova\Core\TenantMiddleware;
+use SoftNova\Services\PdfService;
 
 /**
  * Reportes del tenant con gating por plan (basic vs full)
@@ -13,11 +14,12 @@ class TenantReportesController extends TenantController
     public function index(): void
     {
         TenantMiddleware::authorize('reportes');
-        
+
         $plan = TenantMiddleware::getPlanContext();
         $reportsFull = ($plan['reports'] ?? 'basic') === 'full';
-        
-        if (($this->request->get('action') ?? '') === 'export') {
+        $action = (string)($this->request->get('action') ?? '');
+
+        if ($action === 'export') {
             if (!TenantMiddleware::canExportReports()) {
                 $this->respond(
                     false,
@@ -30,50 +32,77 @@ class TenantReportesController extends TenantController
             $this->exportReport();
             return;
         }
-        
+
+        if ($action === 'pdf') {
+            if (!TenantMiddleware::canExportReports()) {
+                $this->respond(
+                    false,
+                    'La exportacion PDF esta disponible en planes Pro, Premium o personalizados.',
+                    '/app/reportes'
+                );
+                return;
+            }
+            TenantMiddleware::authorize('reportes', 'export');
+            $this->exportPdf();
+            return;
+        }
+
+        $data = $this->buildReportData($reportsFull);
+        $this->view('tenant.reportes', $this->tenantViewData(array_merge($data, [
+            'plan' => $plan,
+            'reportsFull' => $reportsFull,
+        ])));
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    private function buildReportData(bool $reportsFull): array
+    {
         $this->ensureSaleItemCostColumn();
         \SoftNova\Services\TenantOpsSchema::ensure($this->db);
+        try {
+            new \SoftNova\Services\StockService($this->db);
+        } catch (\Throwable $e) {
+            // schema parcial
+        }
 
-        $currency = $this->getCurrency();
         $dateFrom = $_GET['from'] ?? date('Y-m-d', strtotime('-30 days'));
         $dateTo = $_GET['to'] ?? date('Y-m-d');
-        
+        $chartType = $this->normalizeChartType((string)($_GET['chart'] ?? 'line'));
+
         $diff = strtotime($dateTo) - strtotime($dateFrom);
         $prevFrom = date('Y-m-d', strtotime($dateFrom) - $diff - 86400);
         $prevTo = date('Y-m-d', strtotime($dateFrom) - 86400);
-        
-        // --- Datos basicos (todos los planes) ---
+
         $totalSales = (float)$this->query(
             "SELECT COALESCE(SUM(total), 0) as t FROM sales WHERE status = 'completed' AND DATE(sale_date) BETWEEN ? AND ?",
             [$dateFrom, $dateTo]
         )->fetch()['t'];
-        
+
         $totalSalesCount = (int)$this->query(
             "SELECT COUNT(*) as c FROM sales WHERE status = 'completed' AND DATE(sale_date) BETWEEN ? AND ?",
             [$dateFrom, $dateTo]
         )->fetch()['c'];
-        
+
         $totalProducts = (int)$this->query("SELECT COUNT(*) as c FROM products WHERE status = 'active'")->fetch()['c'];
         $totalCustomers = (int)$this->query("SELECT COUNT(*) as c FROM customers WHERE status = 'active'")->fetch()['c'];
         $lowStock = (int)$this->query("SELECT COUNT(*) as c FROM products WHERE stock <= min_stock AND status = 'active'")->fetch()['c'];
-        
+        $avgTicket = $totalSalesCount > 0 ? $totalSales / $totalSalesCount : 0;
+
         $salesByDay = $this->query(
             "SELECT DATE(sale_date) as day, COALESCE(SUM(total), 0) as total
              FROM sales WHERE status = 'completed' AND DATE(sale_date) BETWEEN ? AND ?
              GROUP BY DATE(sale_date) ORDER BY day ASC",
             [$dateFrom, $dateTo]
         )->fetchAll();
-        
+
         $lowStockProducts = $this->query(
             "SELECT name, stock, min_stock, sale_price FROM products
              WHERE status = 'active' AND stock <= min_stock
              ORDER BY (min_stock - stock) DESC LIMIT 10"
         )->fetchAll();
-        
-        $avgTicket = $totalSalesCount > 0 ? $totalSales / $totalSalesCount : 0;
 
-        // === Reportes gancho (todos los planes) ===
-        // 1) Utilidad del periodo: ingresos - costo de ventas - gastos
         $revenue = (float)$this->query(
             "SELECT COALESCE(SUM(si.subtotal), 0) t
              FROM sale_items si JOIN sales s ON si.sale_id = s.id
@@ -122,7 +151,6 @@ class TenantReportesController extends TenantController
             'margin' => $margin,
         ];
 
-        // 2) Cuentas por cobrar (aging) sobre saldo pendiente
         $receivablesAging = $this->query(
             "SELECT
                 COALESCE(SUM(bal), 0) total,
@@ -151,7 +179,6 @@ class TenantReportesController extends TenantController
              ORDER BY balance DESC LIMIT 8"
         )->fetchAll();
 
-        // 3) Caja del día (sesiones abiertas hoy)
         $cashToday = $this->query(
             "SELECT
                 COALESCE(SUM(CASE WHEN cm.type = 'income' THEN cm.amount ELSE 0 END), 0) income,
@@ -175,43 +202,84 @@ class TenantReportesController extends TenantController
             'session' => $openSession ?: null,
         ];
 
-        // 4) Top productos (compacto, todos los planes) + stock crítico ya calculado
-        $topSellers = $this->query(
-            "SELECT p.name, SUM(si.quantity) qty, SUM(si.subtotal) total
+        // Un solo ranking de productos: unidades + rentabilidad (evita duplicar "más vendidos").
+        $topProducts = $this->query(
+            "SELECT p.name,
+                    SUM(si.quantity) as total_qty,
+                    SUM(si.subtotal) as total_sales,
+                    SUM(si.subtotal) - SUM(si.quantity * COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)) as profit
              FROM sale_items si
-             JOIN products p ON p.id = si.product_id
-             JOIN sales s ON s.id = si.sale_id
+             JOIN products p ON si.product_id = p.id
+             JOIN sales s ON si.sale_id = s.id
              WHERE s.status = 'completed' AND DATE(s.sale_date) BETWEEN ? AND ?
-             GROUP BY p.id, p.name ORDER BY qty DESC LIMIT 5",
+             GROUP BY p.id, p.name
+             ORDER BY total_qty DESC
+             LIMIT " . ($reportsFull ? '10' : '5'),
             [$dateFrom, $dateTo]
         )->fetchAll();
-        
-        // Defaults avanzados
+
+        $profitability = $this->query(
+            "SELECT p.name,
+                    SUM(si.quantity) as qty,
+                    SUM(si.subtotal) as revenue,
+                    SUM(si.subtotal) - SUM(si.quantity * COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)) as profit
+             FROM sale_items si
+             JOIN products p ON si.product_id = p.id
+             JOIN sales s ON si.sale_id = s.id
+             WHERE s.status = 'completed' AND DATE(s.sale_date) BETWEEN ? AND ?
+             GROUP BY p.id, p.name
+             ORDER BY profit DESC
+             LIMIT " . ($reportsFull ? '10' : '5'),
+            [$dateFrom, $dateTo]
+        )->fetchAll();
+
+        $inventoryByMonth = $this->query(
+            "SELECT DATE_FORMAT(COALESCE(sm.movement_date, sm.created_at), '%Y-%m') as month,
+                    COALESCE(SUM(CASE WHEN sm.type = 'in' THEN sm.quantity ELSE 0 END), 0) qty_in,
+                    COALESCE(SUM(CASE WHEN sm.type = 'out' THEN sm.quantity ELSE 0 END), 0) qty_out,
+                    COALESCE(SUM(CASE WHEN sm.type = 'adjustment' THEN sm.quantity ELSE 0 END), 0) qty_adj,
+                    COUNT(*) movements
+             FROM stock_movements sm
+             WHERE COALESCE(sm.movement_date, sm.created_at) >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+             GROUP BY DATE_FORMAT(COALESCE(sm.movement_date, sm.created_at), '%Y-%m')
+             ORDER BY month ASC"
+        )->fetchAll();
+
+        $inventorySalesByMonth = $this->query(
+            "SELECT DATE_FORMAT(s.sale_date, '%Y-%m') as month,
+                    COALESCE(SUM(si.quantity), 0) units_sold,
+                    COALESCE(SUM(si.subtotal), 0) revenue
+             FROM sale_items si
+             JOIN sales s ON s.id = si.sale_id
+             WHERE s.status = 'completed'
+               AND s.sale_date >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+             GROUP BY DATE_FORMAT(s.sale_date, '%Y-%m')
+             ORDER BY month ASC"
+        )->fetchAll();
+
         $prevTotalSales = 0;
         $prevSalesCount = 0;
         $salesTrend = 0;
         $countTrend = 0;
         $ticketTrend = 0;
         $salesByMonth = [];
-        $topProducts = [];
-        $profitability = [];
         $salesByCategory = [];
         $topCustomers = [];
         $stockMovements = [];
         $productTrend = [];
         $paymentMethods = [];
-        
+
         if ($reportsFull) {
             $prevTotalSales = (float)$this->query(
                 "SELECT COALESCE(SUM(total), 0) as t FROM sales WHERE status = 'completed' AND DATE(sale_date) BETWEEN ? AND ?",
                 [$prevFrom, $prevTo]
             )->fetch()['t'];
-            
+
             $prevSalesCount = (int)$this->query(
                 "SELECT COUNT(*) as c FROM sales WHERE status = 'completed' AND DATE(sale_date) BETWEEN ? AND ?",
                 [$prevFrom, $prevTo]
             )->fetch()['c'];
-            
+
             $salesByMonth = $this->query("
                 SELECT DATE_FORMAT(sale_date, '%Y-%m') as month,
                        COALESCE(SUM(total), 0) as total, COUNT(*) as count
@@ -220,30 +288,7 @@ class TenantReportesController extends TenantController
                 GROUP BY DATE_FORMAT(sale_date, '%Y-%m')
                 ORDER BY month ASC
             ")->fetchAll();
-            
-            $topProducts = $this->query("
-                SELECT p.name, SUM(si.quantity) as total_qty, SUM(si.subtotal) as total_sales
-                FROM sale_items si
-                JOIN products p ON si.product_id = p.id
-                JOIN sales s ON si.sale_id = s.id
-                WHERE s.status = 'completed' AND DATE(s.sale_date) BETWEEN ? AND ?
-                GROUP BY p.id, p.name
-                ORDER BY total_qty DESC LIMIT 10
-            ", [$dateFrom, $dateTo])->fetchAll();
-            
-            $profitability = $this->query("
-                SELECT p.name,
-                       SUM(si.quantity) as qty,
-                       SUM(si.subtotal) as revenue,
-                       SUM(si.subtotal) - SUM(si.quantity * COALESCE(p.purchase_price, 0)) as profit
-                FROM sale_items si
-                JOIN products p ON si.product_id = p.id
-                JOIN sales s ON si.sale_id = s.id
-                WHERE s.status = 'completed' AND DATE(s.sale_date) BETWEEN ? AND ?
-                GROUP BY p.id, p.name
-                ORDER BY profit DESC LIMIT 10
-            ", [$dateFrom, $dateTo])->fetchAll();
-            
+
             $salesByCategory = $this->query("
                 SELECT COALESCE(c.name, 'Sin categoria') as category, COALESCE(SUM(si.subtotal), 0) as total
                 FROM sale_items si
@@ -254,7 +299,7 @@ class TenantReportesController extends TenantController
                 GROUP BY c.id, c.name
                 ORDER BY total DESC
             ", [$dateFrom, $dateTo])->fetchAll();
-            
+
             $topCustomers = $this->query("
                 SELECT COALESCE(cu.name, 'General') as customer_name, COUNT(s.id) as purchase_count, COALESCE(SUM(s.total), 0) as total
                 FROM sales s
@@ -263,14 +308,14 @@ class TenantReportesController extends TenantController
                 GROUP BY cu.id, cu.name
                 ORDER BY purchase_count DESC LIMIT 10
             ", [$dateFrom, $dateTo])->fetchAll();
-            
+
             $stockMovements = $this->query("
                 SELECT sm.*, p.name as product_name
                 FROM stock_movements sm
                 JOIN products p ON sm.product_id = p.id
-                ORDER BY sm.created_at DESC LIMIT 20
+                ORDER BY COALESCE(sm.movement_date, sm.created_at) DESC LIMIT 20
             ")->fetchAll();
-            
+
             $productTrend = $this->query("
                 SELECT p.name,
                        COALESCE(SUM(CASE WHEN MONTH(s.sale_date) = MONTH(CURDATE()) AND YEAR(s.sale_date) = YEAR(CURDATE()) THEN si.quantity ELSE 0 END), 0) as current_month,
@@ -283,31 +328,29 @@ class TenantReportesController extends TenantController
                 HAVING current_month > 0 OR last_month > 0
                 ORDER BY current_month DESC LIMIT 10
             ")->fetchAll();
-            
+
             $paymentMethods = $this->query("
                 SELECT payment_method, COUNT(*) as count, COALESCE(SUM(total), 0) as total
                 FROM sales WHERE status = 'completed' AND DATE(sale_date) BETWEEN ? AND ?
                 GROUP BY payment_method ORDER BY count DESC
             ", [$dateFrom, $dateTo])->fetchAll();
-            
+
             $salesTrend = $prevTotalSales > 0 ? round((($totalSales - $prevTotalSales) / $prevTotalSales) * 100, 1) : 0;
             $countTrend = $prevSalesCount > 0 ? round((($totalSalesCount - $prevSalesCount) / $prevSalesCount) * 100, 1) : 0;
             $prevAvgTicket = $prevSalesCount > 0 ? $prevTotalSales / $prevSalesCount : 0;
             $ticketTrend = $prevAvgTicket > 0 ? round((($avgTicket - $prevAvgTicket) / $prevAvgTicket) * 100, 1) : 0;
         }
-        
-        $this->view('tenant.reportes', $this->tenantViewData([
-            'plan' => $plan,
-            'reportsFull' => $reportsFull,
-            'profitSummary' => $profitSummary,
-            'receivablesAging' => $receivablesAging,
-            'topDebtors' => $topDebtors,
-            'cashSummary' => $cashSummary,
-            'topSellers' => $topSellers,
+
+        return [
             'dateFrom' => $dateFrom,
             'dateTo' => $dateTo,
             'prevFrom' => $prevFrom,
             'prevTo' => $prevTo,
+            'chartType' => $chartType,
+            'profitSummary' => $profitSummary,
+            'receivablesAging' => $receivablesAging,
+            'topDebtors' => $topDebtors,
+            'cashSummary' => $cashSummary,
             'totalSales' => $totalSales,
             'totalSalesCount' => $totalSalesCount,
             'prevTotalSales' => $prevTotalSales,
@@ -333,9 +376,17 @@ class TenantReportesController extends TenantController
             'dataphoneRecon' => $dataphoneRecon,
             'expenseBreakdown' => $expenseBreakdown,
             'commissionSummary' => $commissionSummary,
-        ]));
+            'inventoryByMonth' => $inventoryByMonth,
+            'inventorySalesByMonth' => $inventorySalesByMonth,
+        ];
     }
-    
+
+    private function normalizeChartType(string $type): string
+    {
+        $type = strtolower(trim($type));
+        return in_array($type, ['line', 'bar', 'pie', 'doughnut'], true) ? $type : 'line';
+    }
+
     /** Asegura la columna unit_cost en tenants sin migrar (COGS histórico). */
     private function ensureSaleItemCostColumn(): void
     {
@@ -358,7 +409,7 @@ class TenantReportesController extends TenantController
     {
         $dateFrom = $_GET['from'] ?? date('Y-m-d', strtotime('-30 days'));
         $dateTo = $_GET['to'] ?? date('Y-m-d');
-        
+
         $rows = $this->query(
             "SELECT s.invoice_number, COALESCE(c.name, 'General') as customer_name, s.sale_date,
                     s.subtotal, s.tax, s.total, s.payment_method, s.payment_status
@@ -368,7 +419,7 @@ class TenantReportesController extends TenantController
              ORDER BY s.sale_date DESC",
             [$dateFrom, $dateTo]
         )->fetchAll();
-        
+
         $csvRows = [];
         foreach ($rows as $r) {
             $csvRows[] = [
@@ -376,11 +427,30 @@ class TenantReportesController extends TenantController
                 $r['subtotal'], $r['tax'], $r['total'], $r['payment_method'], $r['payment_status'],
             ];
         }
-        
+
         $this->exportCsv(
             'reportes_' . date('Ymd_His') . '.csv',
             ['Factura', 'Cliente', 'Fecha', 'Subtotal', 'Impuesto', 'Total', 'Metodo', 'Pago'],
             $csvRows
         );
+    }
+
+    private function exportPdf(): void
+    {
+        $plan = TenantMiddleware::getPlanContext();
+        $reportsFull = ($plan['reports'] ?? 'basic') === 'full';
+        $data = $this->buildReportData($reportsFull);
+        $data['channelLabels'] = \SoftNova\Core\product_channels();
+        $data['reportsFull'] = $reportsFull;
+        $data['planName'] = (string)($plan['plan_name'] ?? 'Plan');
+
+        try {
+            $pdf = new PdfService($this->companySettings(), $this->getCurrency());
+            $content = $pdf->generateAnalyticsReport($data);
+            $pdf->download($content, 'informe_analitico_' . date('Ymd_His') . '.pdf');
+        } catch (\Throwable $e) {
+            error_log('PDF reportes: ' . $e->getMessage());
+            $this->respond(false, 'No se pudo generar el PDF: ' . $e->getMessage(), '/app/reportes');
+        }
     }
 }

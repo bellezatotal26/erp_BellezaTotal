@@ -11,11 +11,20 @@ $currency = $currency ?? ['symbol'=>'$','name'=>'Peso','decimals'=>0];
 $isPosRole = $isPosRole ?? \SoftNova\Core\TenantMiddleware::isPosRole();
 $needBarcode = true;
 $pageScripts = ['ventas.js', 'caja.js'];
-function fmt(float $a, array $c): string { return $c['symbol'].' '.number_format($a,$c['decimals'],$c['decimal']??',',$c['thousands']??'.'); }
-function hoursOpen(string $date): float { return round((time()-strtotime($date))/3600, 1); }
+if (!function_exists('fmt')) {
+    function fmt(float $a, array $c): string { return $c['symbol'].' '.number_format($a,$c['decimals'],$c['decimal']??',',$c['thousands']??'.'); }
+}
+if (!function_exists('hoursOpen')) {
+    function hoursOpen(string $date): float { return round((time()-strtotime($date))/3600, 1); }
+}
 ?>
 <?php echo flashMessage(); ?>
 <div id="posOfflineBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#FEF3C7;color:#92400E;border:1px solid #F59E0B;font-size:13px;"></div>
+<div id="posNetworkBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#DBEAFE;color:#1E3A8A;border:1px solid #3B82F6;font-size:13px;"></div>
+<div id="posConflictBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#FEE2E2;color:#991B1B;border:1px solid #EF4444;font-size:13px;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+    <span id="posConflictBannerText"></span>
+    <button type="button" class="btn btn-sm btn-danger" id="posConflictReviewBtn">Revisar conflictos</button>
+</div>
 
 <?php if (!$openSession): ?>
 <div class="card neumorphic" style="text-align:center;padding:40px;">
@@ -47,14 +56,15 @@ $canExpense = \SoftNova\Core\TenantMiddleware::canAccess('gastos') && \SoftNova\
 $canCompras = \SoftNova\Core\TenantMiddleware::canAccess('compras');
 ?>
 <!-- CAJA ABIERTA -->
-<?php if (!$isPosRole): ?>
-<div class="stats-grid">
-    <div class="stat-card neumorphic"><h4>Monto Apertura</h4><div class="stat-value"><?php echo fmt($openSession['opening_amount'], $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Ingresos</h4><div class="stat-value" style="color:#10B981;">+<?php echo fmt($totals['incomes'], $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Egresos</h4><div class="stat-value" style="color:#DC2626;">-<?php echo fmt($totals['expenses'], $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Balance Actual</h4><div class="stat-value" style="color:<?php echo $totals['balance']>=0?'#10B981':'#DC2626';?>;"><?php echo fmt($totals['balance'], $currency); ?></div></div>
-</div>
-<?php endif; ?>
+<?php
+if (!$isPosRole) {
+    $pageTopStatsHtml = '
+<div class="page-top-stat"><h4>Monto Apertura</h4><div class="stat-value">' . htmlspecialchars(fmt((float)$openSession['opening_amount'], $currency)) . '</div></div>
+<div class="page-top-stat"><h4>Ingresos</h4><div class="stat-value page-top-stat--in">+' . htmlspecialchars(fmt((float)$totals['incomes'], $currency)) . '</div></div>
+<div class="page-top-stat"><h4>Egresos</h4><div class="stat-value page-top-stat--out">-' . htmlspecialchars(fmt((float)$totals['expenses'], $currency)) . '</div></div>
+<div class="page-top-stat"><h4>Balance Actual</h4><div class="stat-value ' . ($totals['balance'] >= 0 ? 'page-top-stat--in' : 'page-top-stat--out') . '">' . htmlspecialchars(fmt((float)$totals['balance'], $currency)) . '</div></div>';
+}
+?>
 
 <div style="display:flex;gap:15px;margin-bottom:20px;flex-wrap:wrap;align-items:center;">
     <div style="flex:1;min-width:200px;">
@@ -86,13 +96,13 @@ $canCompras = \SoftNova\Core\TenantMiddleware::canAccess('compras');
     <?php endif; ?>
     <?php if (!$isPosRole || \SoftNova\Core\TenantMiddleware::canDo('edit', 'caja')): ?>
     <button type="button" onclick="openCloseCashModal()" class="btn btn-danger"
-            data-balance="<?php echo htmlspecialchars((string)round((float)$totals['balance'], 2)); ?>"
+            data-balance="<?php echo htmlspecialchars((string)round((float)($totals['expected_cash'] ?? $totals['balance'] ?? 0), 2)); ?>"
             data-opening="<?php echo htmlspecialchars(fmt($openSession['opening_amount'], $currency)); ?>"
             data-incomes="<?php echo htmlspecialchars(fmt($totals['incomes'], $currency)); ?>"
             data-expenses="<?php echo htmlspecialchars(fmt($totals['expenses'], $currency)); ?>"
             data-sales-count="<?php echo (int)($totals['sales_count'] ?? 0); ?>"
             data-sales-total="<?php echo htmlspecialchars(fmt($totals['sales_total'] ?? 0, $currency)); ?>"
-            data-balance-label="<?php echo htmlspecialchars(fmt($totals['balance'], $currency)); ?>"
+            data-balance-label="<?php echo htmlspecialchars(fmt((float)($totals['expected_cash'] ?? $totals['balance'] ?? 0), $currency)); ?>"
             id="btnOpenCloseCash">Cerrar Caja</button>
     <?php endif; ?>
 </div>
@@ -103,7 +113,9 @@ $paymentMethods = $paymentMethods ?? \SoftNova\Services\PaymentMethodCatalog::al
 $invoicePrefix = $invoicePrefix ?? 'FAC-';
 $csrfPos = \SoftNova\Core\csrf_token();
 $searchUrl = $viewInstance->route('app/caja') . '?action=searchProducts';
+$catalogUrl = $viewInstance->route('app/caja') . '?action=catalogSnapshot';
 $saleUrl = $viewInstance->route('app/ventas') . '?action=create';
+$syncUrl = $viewInstance->route('app/ventas') . '?action=sync_offline';
 $ventasBase = $viewInstance->route('app/ventas');
 $canSell = \SoftNova\Core\TenantMiddleware::canAccess('ventas') && \SoftNova\Core\TenantMiddleware::canDo('create', 'ventas');
 $canDeleteSale = \SoftNova\Core\TenantMiddleware::canDo('delete', 'ventas');
@@ -117,7 +129,9 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
 <!-- POS rápido (venta en caja) -->
 <section class="pos-panel" id="posPanel"
          data-search-url="<?php echo htmlspecialchars($searchUrl); ?>"
+         data-catalog-url="<?php echo htmlspecialchars($catalogUrl); ?>"
          data-sale-url="<?php echo htmlspecialchars($saleUrl); ?>"
+         data-sync-url="<?php echo htmlspecialchars($syncUrl); ?>"
          data-csrf="<?php echo htmlspecialchars($csrfPos); ?>"
          data-symbol="<?php echo htmlspecialchars($currency['symbol'] ?? '$'); ?>"
          data-decimals="<?php echo (int)($currency['decimals'] ?? 0); ?>"
@@ -156,22 +170,68 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                         <button type="button" class="btn btn-secondary btn-sm" id="posNewCustomerBtn" onclick="document.getElementById('quickCustomerModal').style.display='flex'" title="Nuevo cliente">+ Nuevo</button>
                     <?php endif; ?>
                 </div>
-                <div class="pos-discount-row" style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;">
-                    <label class="pos-label" for="posDiscountPercent" style="margin:0;">Descuento %</label>
-                    <input type="number" id="posDiscountPercent" class="form-control" min="0" max="100" step="0.01" value="0" style="width:90px;" title="Descuento sobre el subtotal">
-                </div>
-                <div class="pos-attendant">
-                    <span class="pos-label">Atendido</span>
-                    <strong id="posAttendant"><?php echo htmlspecialchars(mb_strtoupper($userName)); ?></strong>
+                <div class="pos-discount-row">
+                    <div class="pos-discount-left">
+                        <label class="pos-label" for="posDiscountPreset" style="margin:0;">Descuento %</label>
+                        <select id="posDiscountPreset" class="form-control" style="width:110px;" title="Descuento sobre el subtotal" data-custom-other="discount_percent">
+                            <option value="0" selected>0%</option>
+                            <option value="5">5%</option>
+                            <option value="6">6%</option>
+                            <option value="7">7%</option>
+                            <option value="8">8%</option>
+                            <option value="9">9%</option>
+                            <option value="10">10%</option>
+                            <option value="15">15%</option>
+                            <?php
+                            try {
+                                $discOpts = (new \SoftNova\Services\CustomOptionService(\SoftNova\Core\TenantMiddleware::getDb()))
+                                    ->custom(\SoftNova\Services\CustomOptionService::GROUP_DISCOUNT_PERCENT);
+                                foreach ($discOpts as $dOpt) {
+                                    echo '<option value="' . htmlspecialchars((string)$dOpt['value']) . '">'
+                                        . htmlspecialchars((string)$dOpt['label']) . '</option>';
+                                }
+                            } catch (\Throwable $e) {
+                            }
+                            ?>
+                            <option value="other">Otro</option>
+                        </select>
+                        <span id="posDiscountOtherWrap" style="display:none;">
+                            <input type="number" id="posDiscountPercent" class="form-control" min="0" max="100" step="0.01" value="0" style="width:90px;" placeholder="Otro %" title="Porcentaje manual">
+                        </span>
+                    </div>
+                    <div class="pos-meta-side">
+                        <div class="pos-attendant">
+                            <span class="pos-label">Atendido</span>
+                            <strong id="posAttendant"><?php echo htmlspecialchars(mb_strtoupper($userName)); ?></strong>
+                        </div>
+                        <div class="pos-invoice-side">
+                            <span class="pos-label">Factura</span>
+                            <strong id="posInvoicePreview"><?php echo htmlspecialchars((string)$invoicePrefix . date('Ymd') . '-····'); ?></strong>
+                        </div>
+                    </div>
                 </div>
                 <div class="pos-ticket-meta">
-                    <span>Nº <strong id="posInvoicePreview"><?php echo htmlspecialchars((string)$invoicePrefix . date('Ymd') . '-····'); ?></strong></span>
-                    <span>Total Items: <strong id="posItemCount">0</strong></span>
+                    <span>Items: <strong id="posItemCount">0</strong></span>
                     <span>Registro: <strong id="posClock"><?php echo date('g:i A'); ?></strong></span>
                 </div>
-                <div id="posSubtotalLine" class="pos-sub-line" style="display:none;font-size:13px;color:var(--color-text-secondary);">Subtotal: <span id="posSubtotal"><?php echo fmt(0, $currency); ?></span></div>
-                <div id="posDiscountLine" class="pos-sub-line" style="display:none;font-size:13px;color:#B45309;">Descuento: <span id="posDiscountAmt"><?php echo fmt(0, $currency); ?></span></div>
-                <div class="pos-total-line">TOTAL: <span id="posTotal"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posSubtotalLine" class="pos-sub-line" style="display:none;">Subtotal: <span id="posSubtotal"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posDiscountLine" class="pos-sub-line" style="display:none;color:#B45309;">Descuento: <span id="posDiscountAmt"><?php echo fmt(0, $currency); ?></span></div>
+                <div class="pos-total-block">
+                    <div class="pos-total-line">TOTAL: <span id="posTotal"><?php echo fmt(0, $currency); ?></span></div>
+                    <div class="pos-cash-change" id="posCashChangeBlock">
+                        <div class="pos-cash-field">
+                            <label class="pos-label" for="posCashReceived">Billete / recibido</label>
+                            <input type="number" id="posCashReceived" class="form-control" min="0" step="0.01" placeholder="0" inputmode="decimal"
+                                   oninput="if(window.SoftNovaPos&amp;&amp;SoftNovaPos.updateCashChange)SoftNovaPos.updateCashChange()"
+                                   onkeyup="if(window.SoftNovaPos&amp;&amp;SoftNovaPos.updateCashChange)SoftNovaPos.updateCashChange()"
+                                   onchange="if(window.SoftNovaPos&amp;&amp;SoftNovaPos.updateCashChange)SoftNovaPos.updateCashChange()">
+                        </div>
+                        <div class="pos-cash-field">
+                            <label class="pos-label">Cambio / vueltas</label>
+                            <div class="pos-change-value" id="posCashChange"><?php echo fmt(0, $currency); ?></div>
+                        </div>
+                    </div>
+                </div>
             </div>
             <button type="button" class="pos-pay-btn" id="posPayBtn" disabled>Listo</button>
         </div>
@@ -208,12 +268,8 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                 </div>
                 <div class="form-group" style="margin:0;min-width:140px;flex:1;">
                     <label style="font-size:12px;">Método de pago</label>
-                    <select id="posPayMethod" class="form-control">
-                        <?php foreach ($paymentMethods as $code => $meta): ?>
-                            <option value="<?php echo htmlspecialchars($code); ?>" <?php echo $code === 'cash' ? 'selected' : ''; ?>>
-                                <?php echo htmlspecialchars($meta['label'] ?? $code); ?>
-                            </option>
-                        <?php endforeach; ?>
+                    <select id="posPayMethod" class="form-control" data-custom-other="payment_method">
+                        <?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?>
                     </select>
                 </div>
                 <button type="button" class="btn btn-success" id="posConfirmPay">Cobrar ahora</button>
@@ -375,7 +431,26 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Ingresos</span><strong id="closeSumIncomes" style="color:#10B981;">—</strong></div>
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Egresos</span><strong id="closeSumExpenses" style="color:#DC2626;">—</strong></div>
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Ventas del dia</span><strong id="closeSumSales">—</strong></div>
-                    <div style="display:flex;justify-content:space-between;border-top:1px solid var(--color-border);padding-top:8px;margin-top:4px;"><span>Balance esperado</span><strong id="closeSumBalance" style="color:#10B981;">—</strong></div>
+                    <div id="closeSumPayments" style="margin:8px 0;padding:8px;border:1px dashed var(--color-border);border-radius:6px;font-size:12px;">
+                        <?php
+                        $payBreak = $totals['payment_breakdown'] ?? [];
+                        if (!empty($payBreak)):
+                            uasort($payBreak, static function ($a, $b) {
+                                return ((float)($b['total'] ?? 0) <=> (float)($a['total'] ?? 0));
+                            });
+                        ?>
+                            <div style="font-weight:600;margin-bottom:6px;">Desglose por tipo de pago</div>
+                            <?php foreach ($payBreak as $pb): ?>
+                                <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                                    <span><?php echo htmlspecialchars((string)($pb['label'] ?? '')); ?> (<?php echo (int)($pb['count'] ?? 0); ?>)</span>
+                                    <strong><?php echo fmt((float)($pb['total'] ?? 0), $currency); ?></strong>
+                                </div>
+                            <?php endforeach; ?>
+                        <?php else: ?>
+                            <div style="color:var(--color-text-secondary);">Sin ventas por método de pago en esta sesión.</div>
+                        <?php endif; ?>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;border-top:1px solid var(--color-border);padding-top:8px;margin-top:4px;"><span>Efectivo esperado en cajón</span><strong id="closeSumBalance" style="color:#10B981;">—</strong></div>
                 </div>
                 <p style="margin-bottom:12px;font-size:12px;color:var(--color-text-secondary);">Al cerrar se descargara el reporte PDF. Si no abre, use el historial de reportes.</p>
                 <div class="form-group"><label>Monto Final Contado (<?php echo $currency['symbol'];?>) *</label><input type="number" name="closing_amount" id="closingAmountInput" class="form-control" step="0.01" min="0" placeholder="0" required></div>
@@ -385,8 +460,45 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
         </form>
     </div>
 </div>
+<div id="posConflictModal" class="modal-overlay" style="display:none;z-index:1200;">
+    <div class="modal-content neumorphic" style="max-width:640px;max-height:90vh;overflow:auto;">
+        <div class="modal-header">
+            <h3>Conflictos de sincronización offline</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('posConflictModal').style.display='none'">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p style="font-size:13px;color:var(--color-text-secondary);margin-top:0;">
+                Estas ventas no se pudieron aplicar en el servidor (casi siempre por stock).
+                Ajuste inventario o descarte la venta local. La contabilidad solo se genera cuando el sync es exitoso.
+            </p>
+            <div id="posConflictList"></div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" id="posConflictRetryAll">Reintentar todas</button>
+            <button type="button" class="btn btn-primary" onclick="document.getElementById('posConflictModal').style.display='none'">Cerrar</button>
+        </div>
+    </div>
+</div>
 <script>
 function openCloseCashModal() {
+    if (window.SeriPosOffline && !SeriPosOffline.isOnline()) {
+        if (typeof showAlert === 'function') {
+            showAlert('No puede cerrar caja sin conexión. Espere a recuperar internet y sincronice las ventas pendientes.', 'error');
+        }
+        return;
+    }
+    if (window.SeriPosOffline && SeriPosOffline.loadQueue().length > 0) {
+        if (typeof showAlert === 'function') {
+            showAlert('Hay ventas en cola offline. Espere a que se sincronicen antes de cerrar caja.', 'warning');
+        }
+        return;
+    }
+    if (window.SeriPosOffline && SeriPosOffline.loadConflicts().length > 0) {
+        if (typeof showAlert === 'function') {
+            showAlert('Hay ventas offline con conflicto de stock. Revíselas antes de cerrar caja.', 'warning');
+        }
+        return;
+    }
     var btn = document.getElementById('btnOpenCloseCash');
     if (!btn) return;
     var opening = btn.getAttribute('data-opening') || '—';
@@ -460,8 +572,8 @@ if ($canExpense):
                     </div>
                     <div class="form-group">
                         <label>Medio de pago</label>
-                        <select name="payment_method" class="form-control">
-                            <?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash'); ?>
+                        <select name="payment_method" class="form-control" data-custom-other="payment_method">
+                            <?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?>
                         </select>
                     </div>
                 </div>
@@ -541,7 +653,7 @@ if ($canExpense):
             <input type="hidden" name="sale_id" id="paySaleId">
             <p id="payInfo" style="margin-bottom:10px;"></p>
             <div class="form-group"><label>Monto *</label><input type="number" name="amount" id="payAmount" class="form-control" step="0.01" min="0.01" required></div>
-            <div class="form-group"><label>Método</label><select name="payment_method" class="form-control"><?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', false); ?></select></div>
+            <div class="form-group"><label>Método</label><select name="payment_method" class="form-control" data-custom-other="payment_method"><?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?></select></div>
             <div class="form-group"><label>Notas</label><input type="text" name="notes" class="form-control" placeholder="Abono"></div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('paymentModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-success">Registrar Abono</button></div>
         </form>
@@ -573,6 +685,7 @@ if ($canExpense):
 <?php endif; ?>
 
 <!-- Historial / reportes de cierres -->
+<?php if (!$isPosRole): ?>
 <?php
 $historyFrom = $historyFrom ?? date('Y-m-d', strtotime('-30 days'));
 $historyTo = $historyTo ?? date('Y-m-d');
@@ -600,7 +713,7 @@ $cajaBase = $viewInstance->route('app/caja');
             <p style="color:var(--color-text-secondary);text-align:center;padding:12px;">No hay cierres en el rango seleccionado.</p>
         <?php else: ?>
         <div class="table-container"><table>
-            <thead><tr><th>Apertura</th><th>Cierre</th><th>Usuario</th><th>Monto Ini.</th><th>Monto Fin</th><th>Dif.</th><th>PDF</th></tr></thead>
+            <thead><tr><th>Apertura</th><th>Cierre</th><th>Usuario</th><th>Monto Ini.</th><th>Monto Fin</th><th>Dif.</th><th>Acciones</th></tr></thead>
             <tbody><?php foreach ($historySessions as $h): ?>
                 <?php $diff = (float)($h['closing_amount'] ?? 0) - (float)($h['opening_amount'] ?? 0); ?>
                 <tr>
@@ -610,8 +723,10 @@ $cajaBase = $viewInstance->route('app/caja');
                     <td><?php echo fmt($h['opening_amount'], $currency); ?></td>
                     <td><?php echo fmt($h['closing_amount'] ?? 0, $currency); ?></td>
                     <td style="color:<?php echo $diff >= 0 ? '#10B981' : '#DC2626'; ?>;"><?php echo ($diff >= 0 ? '+' : '') . fmt($diff, $currency); ?></td>
-                    <td>
+                    <td style="white-space:nowrap;">
                         <a href="<?php echo $cajaBase; ?>?action=pdf&id=<?php echo (int)$h['id']; ?>" class="btn btn-sm btn-info" target="_blank" rel="noopener" title="Descargar PDF">PDF</a>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="cajaShareWhatsapp(<?php echo (int)$h['id']; ?>)" title="Enviar por WhatsApp">WhatsApp</button>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="cajaShareEmail(<?php echo (int)$h['id']; ?>)" title="Enviar por correo">Correo</button>
                     </td>
                 </tr>
             <?php endforeach; ?></tbody>
@@ -620,11 +735,184 @@ $cajaBase = $viewInstance->route('app/caja');
     </div>
 </div>
 
+<div id="cajaShareEmailModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content" style="max-width:420px;">
+        <div class="modal-header">
+            <h3>Enviar cierre por correo</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('cajaShareEmailModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $cajaBase; ?>?action=report_email" data-ajax="true">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="id" id="cajaShareEmailId" value="">
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Correo destino</label>
+                    <input type="email" name="email" id="cajaShareEmailTo" class="form-control" required placeholder="correo@empresa.com" value="<?php echo htmlspecialchars((string)($companyEmail ?? '')); ?>">
+                </div>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:0;">Se adjuntará el PDF del reporte de cierre.</p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('cajaShareEmailModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-primary">Enviar</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div id="cajaShareCloseModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content" style="max-width:420px;">
+        <div class="modal-header">
+            <h3>Caja cerrada</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('cajaShareCloseModal').style.display='none'">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p style="margin-top:0;">El PDF se descargó. También puede enviar el reporte:</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <a id="cajaShareClosePdf" href="#" class="btn btn-info" target="_blank" rel="noopener">PDF</a>
+                <button type="button" class="btn btn-secondary" id="cajaShareCloseWa">WhatsApp</button>
+                <button type="button" class="btn btn-secondary" id="cajaShareCloseMail">Correo</button>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-primary" onclick="document.getElementById('cajaShareCloseModal').style.display='none'">Listo</button>
+        </div>
+    </div>
+</div>
+
 <script>
     window.invRouteVentasDetail = '<?php echo $viewInstance->route('app/ventas'); ?>?action=detail';
     window.invRouteVentasShare = '<?php echo $viewInstance->route('app/ventas'); ?>?action=share';
-    if (location.search.indexOf('focus=cierresReportes') >= 0 || location.hash === '#cierresReportes') {
-        var el = document.getElementById('cierresReportes');
-        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    window.cajaBase = <?php echo json_encode($cajaBase); ?>;
+
+    function cajaShareWhatsapp(sessionId) {
+        fetch(window.cajaBase + '?action=report_whatsapp&id=' + sessionId, {
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' }
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (!d.success) {
+                return showAlert((d && d.message) || 'No se pudo preparar WhatsApp', 'error');
+            }
+            var pdfUrl = d.pdf_url || (window.cajaBase + '?action=pdf&id=' + sessionId);
+            if (typeof sharePdfToWhatsApp === 'function') {
+                return sharePdfToWhatsApp({
+                    pdfUrl: pdfUrl,
+                    waLink: d.link || '',
+                    title: 'Cierre de caja #' + sessionId,
+                    filename: 'Cierre_Caja_' + sessionId + '.pdf',
+                    text: 'Cierre de caja #' + sessionId
+                });
+            }
+            if (d.link) window.open(d.link, '_blank', 'noopener');
+        })
+        .catch(function() { showAlert('Error al preparar WhatsApp', 'error'); });
     }
+
+    function cajaShareEmail(sessionId) {
+        document.getElementById('cajaShareEmailId').value = String(sessionId);
+        document.getElementById('cajaShareEmailModal').style.display = 'flex';
+        var input = document.getElementById('cajaShareEmailTo');
+        if (input) setTimeout(function() { input.focus(); }, 50);
+    }
+
+    (function() {
+        var params = new URLSearchParams(window.location.search);
+        var shareId = params.get('share_close');
+        if (shareId) {
+            var modal = document.getElementById('cajaShareCloseModal');
+            var pdf = document.getElementById('cajaShareClosePdf');
+            if (pdf) pdf.href = window.cajaBase + '?action=pdf&id=' + encodeURIComponent(shareId);
+            document.getElementById('cajaShareCloseWa').onclick = function() { cajaShareWhatsapp(shareId); };
+            document.getElementById('cajaShareCloseMail').onclick = function() { cajaShareEmail(shareId); };
+            if (modal) modal.style.display = 'flex';
+            if (window.history && history.replaceState) {
+                params.delete('share_close');
+                var qs = params.toString();
+                history.replaceState({}, '', window.location.pathname + (qs ? '?' + qs : '') + window.location.hash);
+            }
+        }
+        if (location.search.indexOf('focus=cierresReportes') >= 0 || location.hash === '#cierresReportes') {
+            var el = document.getElementById('cierresReportes');
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+    })();
 </script>
+<?php else: ?>
+<script>
+    window.invRouteVentasDetail = '<?php echo $viewInstance->route('app/ventas'); ?>?action=detail';
+    window.invRouteVentasShare = '<?php echo $viewInstance->route('app/ventas'); ?>?action=share';
+    window.cajaBase = <?php echo json_encode($viewInstance->route('app/caja')); ?>;
+
+    function cajaShareWhatsapp(sessionId) {
+        fetch(window.cajaBase + '?action=report_whatsapp&id=' + sessionId, {
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' }
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (!d.success) {
+                return showAlert((d && d.message) || 'No se pudo preparar WhatsApp', 'error');
+            }
+            var pdfUrl = d.pdf_url || (window.cajaBase + '?action=pdf&id=' + sessionId);
+            if (typeof sharePdfToWhatsApp === 'function') {
+                return sharePdfToWhatsApp({
+                    pdfUrl: pdfUrl,
+                    waLink: d.link || '',
+                    title: 'Cierre de caja #' + sessionId,
+                    filename: 'Cierre_Caja_' + sessionId + '.pdf',
+                    text: 'Cierre de caja #' + sessionId
+                });
+            }
+            if (d.link) window.open(d.link, '_blank', 'noopener');
+        })
+        .catch(function() { showAlert('Error al preparar WhatsApp', 'error'); });
+    }
+
+    function cajaShareEmail(sessionId) {
+        var email = prompt('Correo destino para el PDF de cierre:');
+        if (!email) return;
+        var form = document.createElement('form');
+        form.method = 'POST';
+        form.action = window.cajaBase + '?action=report_email';
+        form.setAttribute('data-ajax', 'true');
+        form.style.display = 'none';
+        var csrf = <?php echo json_encode(\SoftNova\Core\csrf_token()); ?>;
+        form.innerHTML = '<input type="hidden" name="csrf_token" value="' + csrf + '">' +
+            '<input type="hidden" name="id" value="' + String(sessionId).replace(/"/g, '') + '">' +
+            '<input type="hidden" name="email" value="">';
+        form.querySelector('[name=email]').value = email;
+        document.body.appendChild(form);
+        if (typeof handleAjaxSubmit === 'function') handleAjaxSubmit(form);
+        else form.submit();
+    }
+
+    (function() {
+        var params = new URLSearchParams(window.location.search);
+        var shareId = params.get('share_close');
+        if (!shareId) return;
+        var wrap = document.createElement('div');
+        wrap.className = 'modal-overlay';
+        wrap.style.display = 'flex';
+        wrap.innerHTML = '<div class="modal-content" style="max-width:420px;">' +
+            '<div class="modal-header"><h3>Caja cerrada</h3>' +
+            '<button type="button" class="modal-close" id="cajaPosShareX">&times;</button></div>' +
+            '<div class="modal-body"><p style="margin-top:0;">Enviar reporte de cierre:</p>' +
+            '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+            '<a class="btn btn-info" target="_blank" rel="noopener" href="' + window.cajaBase + '?action=pdf&id=' + encodeURIComponent(shareId) + '">PDF</a>' +
+            '<button type="button" class="btn btn-secondary" id="cajaPosShareWa">WhatsApp</button>' +
+            '<button type="button" class="btn btn-secondary" id="cajaPosShareMail">Correo</button>' +
+            '</div></div>' +
+            '<div class="modal-footer"><button type="button" class="btn btn-primary" id="cajaPosShareOk">Listo</button></div></div>';
+        document.body.appendChild(wrap);
+        function close() { wrap.remove(); }
+        document.getElementById('cajaPosShareX').onclick = close;
+        document.getElementById('cajaPosShareOk').onclick = close;
+        document.getElementById('cajaPosShareWa').onclick = function() { cajaShareWhatsapp(shareId); };
+        document.getElementById('cajaPosShareMail').onclick = function() { cajaShareEmail(shareId); };
+        if (window.history && history.replaceState) {
+            params.delete('share_close');
+            var qs = params.toString();
+            history.replaceState({}, '', window.location.pathname + (qs ? '?' + qs : '') + window.location.hash);
+        }
+    })();
+</script>
+<?php endif; ?>

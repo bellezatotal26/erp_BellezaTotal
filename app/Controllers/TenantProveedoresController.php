@@ -146,8 +146,7 @@ class TenantProveedoresController extends TenantController
         $dest = $uploadDir . $filename;
         
         if (move_uploaded_file($_FILES['image']['tmp_name'], $dest)) {
-            $baseUrl = \SoftNova\Core\config('app.url', 'http://localhost/SoftNova/public');
-            return rtrim($baseUrl, '/') . '/uploads/suppliers/' . $filename;
+            return 'uploads/suppliers/' . $filename;
         }
         return null;
     }

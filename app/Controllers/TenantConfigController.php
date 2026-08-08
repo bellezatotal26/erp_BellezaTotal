@@ -833,7 +833,7 @@ class TenantConfigController extends Controller
             return;
         }
         
-        $avatarUrl = \SoftNova\Core\base_url('uploads/avatars/' . $filename);
+        $avatarUrl = 'uploads/avatars/' . $filename;
         
         $this->upsertSetting('user_avatar', $avatarUrl);
         

@@ -133,13 +133,49 @@ foreach ($accounts as $account) {
     $profit = (float)($statements['profit'] ?? 0);
     ?>
     <?php if ($canCreate): ?>
-        <div style="display:flex;justify-content:flex-end;margin-bottom:12px;">
+        <div style="display:flex;justify-content:flex-end;align-items:center;gap:12px;margin-bottom:12px;">
+            <?php if ((int)($pendingSync ?? 0) > 0): ?>
+                <span style="font-size:13px;color:#DC2626;font-weight:600;">
+                    <?php echo (int)$pendingSync; ?> operación(es) sin comprobante contable
+                </span>
+            <?php endif; ?>
             <form method="POST" action="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=sync" data-ajax="true">
                 <?php echo \SoftNova\Core\csrf_field(); ?>
-                <button type="submit" class="btn btn-secondary" onclick="return confirm('¿Contabilizar ventas y gastos anteriores que aún no tienen asiento?')">
+                <button type="submit" class="btn btn-secondary" onclick="return confirm('¿Contabilizar las operaciones anteriores que aún no tienen asiento? Incluye ventas, abonos, gastos, compras, movimientos de inventario y caja.')">
                     Sincronizar operaciones existentes
                 </button>
             </form>
+        </div>
+    <?php endif; ?>
+
+    <?php $reconciliation = $reconciliation ?? []; ?>
+    <?php if (!empty($reconciliation)): ?>
+        <div class="card neumorphic" style="margin-bottom:18px;">
+            <div class="card-header"><h3>Conciliación operativa vs contable</h3></div>
+            <div class="card-body">
+                <div class="table-container"><table>
+                    <thead><tr><th>Concepto</th><th>Cuenta</th><th>Saldo operativo</th><th>Saldo contable</th><th>Diferencia</th></tr></thead>
+                    <tbody>
+                    <?php foreach ($reconciliation as $rec): ?>
+                        <?php $cuadra = abs((float)$rec['gap']) < 1; ?>
+                        <tr>
+                            <td>
+                                <?php echo htmlspecialchars($rec['label']); ?>
+                                <?php if (!$cuadra): ?>
+                                    <div style="font-size:12px;color:var(--color-text-secondary);"><?php echo htmlspecialchars($rec['hint']); ?></div>
+                                <?php endif; ?>
+                            </td>
+                            <td><?php echo htmlspecialchars($rec['account']); ?></td>
+                            <td><?php echo acctFmt((float)$rec['operational'], $currency); ?></td>
+                            <td><?php echo acctFmt((float)$rec['accounting'], $currency); ?></td>
+                            <td style="font-weight:600;color:<?php echo $cuadra ? '#10B981' : '#DC2626'; ?>;">
+                                <?php echo acctFmt((float)$rec['gap'], $currency); ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table></div>
+            </div>
         </div>
     <?php endif; ?>
     <div class="stats-grid">

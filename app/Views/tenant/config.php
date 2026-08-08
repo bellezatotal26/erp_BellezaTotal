@@ -10,7 +10,9 @@ $languages = $languages ?? [];
 $currentUser = $currentUser ?? null;
 $subscription = $subscription ?? null;
 $currentLang = $settings['language'] ?? 'es';
-$avatarUrl = $settings['user_avatar'] ?? null;
+$avatarUrl = !empty($settings['user_avatar'])
+    ? \SoftNova\Core\media_url((string)$settings['user_avatar'])
+    : null;
 $isAdmin = $isAdmin ?? (\SoftNova\Core\TenantMiddleware::getRole() === 'admin');
 $teamUsers = $teamUsers ?? [];
 $jobsPending = $jobsPending ?? 0;

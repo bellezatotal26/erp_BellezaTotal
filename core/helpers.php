@@ -332,3 +332,70 @@ function og_meta_tags(?string $pageTitle = null): string
 
     return $html;
 }
+
+/**
+ * Normaliza una ruta relativa bajo public/uploads/ (sin path traversal).
+ */
+function normalize_upload_rel(string $pathOrUrl): ?string
+{
+    $raw = trim($pathOrUrl);
+    if ($raw === '') {
+        return null;
+    }
+    // URL absoluta → quedarnos con el path
+    if (preg_match('#^https?://#i', $raw)) {
+        $parts = parse_url($raw);
+        $raw = (string)($parts['path'] ?? '');
+    }
+    $raw = str_replace('\\', '/', $raw);
+    $raw = rawurldecode($raw);
+    // Quitar prefijos conocidos
+    $raw = preg_replace('#^.*?/public/#', '', $raw) ?? $raw;
+    $raw = ltrim($raw, '/');
+    if (str_starts_with($raw, 'app/media')) {
+        return null;
+    }
+    // Si viene solo el nombre tras uploads/
+    if (!str_starts_with($raw, 'uploads/')) {
+        if (preg_match('#(?:^|/)(uploads/.+)$#', $raw, $m)) {
+            $raw = $m[1];
+        } else {
+            return null;
+        }
+    }
+    // Path traversal
+    if (str_contains($raw, '..') || str_contains($raw, "\0")) {
+        return null;
+    }
+    // Solo uploads/ (excepto que branding pueda seguir siendo público vía disco)
+    if (!preg_match('#^uploads/[a-zA-Z0-9_\-./]+$#', $raw)) {
+        return null;
+    }
+    return $raw;
+}
+
+/**
+ * URL autenticada para un archivo en public/uploads/.
+ */
+function media_url(?string $pathOrUrl): string
+{
+    $pathOrUrl = trim((string)$pathOrUrl);
+    if ($pathOrUrl === '') {
+        return '';
+    }
+    // Ya es endpoint protegido
+    if (str_contains($pathOrUrl, '/app/media')) {
+        return $pathOrUrl;
+    }
+    $rel = normalize_upload_rel($pathOrUrl);
+    if ($rel === null) {
+        // No es un upload conocido: devolver tal cual (assets, externos)
+        return $pathOrUrl;
+    }
+    // Branding puede seguir siendo público
+    if (str_starts_with($rel, 'uploads/branding/')) {
+        return base_url($rel);
+    }
+    return base_url('/app/media?f=' . rawurlencode($rel));
+}
+

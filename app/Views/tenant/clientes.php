@@ -6,7 +6,8 @@ $tenantName = $tenantName ?? 'Mi Empresa';
 $userName = $userName ?? 'Usuario';
 $customers = $customers ?? [];
 
-$sourceOptions = ['Facebook', 'Instagram', 'WhatsApp', 'Google', 'Recomendación', 'Tienda Física', 'Llamada', 'Email', 'Feria/Evento', 'Otro'];
+$customOpts = new \SoftNova\Services\CustomOptionService(\SoftNova\Core\TenantMiddleware::getDb());
+$sourceOptions = $customOpts->options(\SoftNova\Services\CustomOptionService::GROUP_CUSTOMER_SOURCE, true);
 ?>
 <?php echo flashMessage(); ?>
 
@@ -69,7 +70,7 @@ $sourceOptions = ['Facebook', 'Instagram', 'WhatsApp', 'Google', 'Recomendación
                 <div class="form-group"><label>Nombre * <span class="field-tip" data-tip="Nombre(s) del cliente. Campo obligatorio.">?</span></label><input type="text" name="first_name" id="custFirstName" class="form-control" placeholder="Nombres" required></div>
                 <div class="form-group"><label>Apellido <span class="field-tip" data-tip="Apellido(s) del cliente.">?</span></label><input type="text" name="last_name" id="custLastName" class="form-control" placeholder="Apellidos"></div>
                 <div class="form-group"><label>Empresa (opcional) <span class="field-tip" data-tip="Razón social o nombre comercial si compra a nombre de empresa.">?</span></label><input type="text" name="company_name" id="custCompany" class="form-control" placeholder="Nombre de empresa"></div>
-                <div class="form-group"><label>¿De dónde viene? <span class="field-tip" data-tip="Canal de origen del cliente (referido, redes, pasante, etc.) para seguimiento comercial.">?</span></label><select name="source" id="custSource" class="form-control"><option value="">Seleccionar</option><?php foreach($sourceOptions as $s): ?><option value="<?php echo $s; ?>"><?php echo $s; ?></option><?php endforeach; ?></select></div>
+                <div class="form-group"><label>¿De dónde viene? <span class="field-tip" data-tip="Canal de origen del cliente (referido, redes, pasante, etc.) para seguimiento comercial.">?</span></label><select name="source" id="custSource" class="form-control" data-custom-other="customer_source"><option value="">Seleccionar</option><?php foreach($sourceOptions as $s): ?><option value="<?php echo htmlspecialchars((string)$s['value']); ?>"><?php echo htmlspecialchars((string)$s['label']); ?></option><?php endforeach; ?></select></div>
                 <div class="form-group"><label>Email <span class="field-tip" data-tip="Correo para facturas, cotizaciones o contacto.">?</span></label><input type="email" name="email" id="custEmail" class="form-control"></div>
                 <div class="form-group"><label>Teléfono * <span class="field-tip" data-tip="Número de contacto principal. Campo obligatorio.">?</span></label><input type="text" name="phone" id="custPhone" class="form-control" required></div>
             </div>
@@ -144,5 +145,9 @@ function viewDetail(id) {
         document.getElementById('detailModal').style.display = 'flex';
     });
 }
-function esc(s) { return (s||'').replace(/</g,'<').replace(/>/g,'>'); }
+function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+        return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]);
+    });
+}
 </script>

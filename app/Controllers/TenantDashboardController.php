@@ -5,7 +5,9 @@ namespace SoftNova\Controllers;
 use SoftNova\Core\TenantController;
 use SoftNova\Core\TenantMiddleware;
 use SoftNova\Services\ReceivableService;
+use SoftNova\Services\PurchasingService;
 use SoftNova\Services\DashboardLayoutService;
+use SoftNova\Services\SupplyChainSchema;
 
 /**
  * Dashboard del tenant - panel principal del cliente
@@ -28,6 +30,10 @@ class TenantDashboardController extends TenantController
             $this->lookupBarcode($db);
             return;
         }
+        if ($action === 'save_custom_option' && $this->request->method() === 'POST') {
+            $this->saveCustomOption($db);
+            return;
+        }
         if ($action === 'saveLayout' && $this->request->method() === 'POST') {
             $this->saveLayout($db);
             return;
@@ -36,11 +42,13 @@ class TenantDashboardController extends TenantController
         $layoutService = new DashboardLayoutService($db);
         $userId = (int)($_SESSION['tenant_user_id'] ?? 0);
         $layout = $layoutService->getLayout($userId);
+        $canAccess = static fn(string $module): bool => TenantMiddleware::canAccess($module);
         
-        $visibleWidgets = $layoutService->resolveVisible(
-            $layout,
-            static fn(string $module): bool => TenantMiddleware::canAccess($module)
-        );
+        $boardWidgets = $layoutService->resolveBoard($layout, $canAccess);
+        $visibleWidgets = array_values(array_filter(
+            $boardWidgets,
+            static fn(array $w): bool => !empty($w['visible'])
+        ));
         
         $stats = [
             'total_products' => (int)$db->query("SELECT COUNT(*) as c FROM products")->fetch()['c'],
@@ -54,11 +62,16 @@ class TenantDashboardController extends TenantController
         $openReceivables = [];
         $recentlyPaidSales = [];
         $receivablesError = null;
+        $openPayables = [];
+        $payablesTotal = 0.0;
+        $payablesError = null;
         $lowStockProducts = [];
         
-        $needsRecent = $this->widgetVisible($visibleWidgets, 'recent_sales');
-        $needsRx = $this->widgetVisible($visibleWidgets, 'receivables');
-        $needsLowList = $this->widgetVisible($visibleWidgets, 'low_stock_list');
+        // Cargar datos de todos los widgets accesibles para poder mostrarlos sin recargar.
+        $needsRecent = $this->widgetInBoard($boardWidgets, 'recent_sales');
+        $needsRx = $this->widgetInBoard($boardWidgets, 'receivables');
+        $needsPay = $this->widgetInBoard($boardWidgets, 'payables');
+        $needsLowList = $this->widgetInBoard($boardWidgets, 'low_stock_list');
         
         if ($needsRecent) {
             $recentSales = $db->query("
@@ -83,6 +96,27 @@ class TenantDashboardController extends TenantController
                 error_log('Dashboard receivables: ' . $e->getMessage());
             }
         }
+
+        if ($needsPay) {
+            try {
+                SupplyChainSchema::ensure($db);
+                $purchasing = new PurchasingService($db);
+                $openPayables = $purchasing->payableOrders(8);
+                foreach ($openPayables as &$po) {
+                    $paid = (float)($po['paid_amount'] ?? 0);
+                    $credit = (float)($po['credit_amount'] ?? 0);
+                    $total = (float)($po['total'] ?? 0);
+                    $po['balance'] = round(max(0, $total - $paid - $credit), 2);
+                }
+                unset($po);
+                $payablesTotal = $purchasing->payableTotal();
+            } catch (\Throwable $e) {
+                $openPayables = [];
+                $payablesTotal = 0.0;
+                $payablesError = 'No se pudieron cargar las cuentas por pagar';
+                error_log('Dashboard payables: ' . $e->getMessage());
+            }
+        }
         
         if ($needsLowList) {
             $lowStockProducts = $db->query("
@@ -100,17 +134,31 @@ class TenantDashboardController extends TenantController
             'openReceivables' => $openReceivables,
             'recentlyPaidSales' => $recentlyPaidSales,
             'receivablesError' => $receivablesError,
+            'openPayables' => $openPayables,
+            'payablesTotal' => $payablesTotal,
+            'payablesError' => $payablesError,
             'lowStockProducts' => $lowStockProducts,
             'dashboardLayout' => $layout,
             'visibleWidgets' => $visibleWidgets,
+            'boardWidgets' => $boardWidgets,
             'widgetCatalog' => DashboardLayoutService::catalog(),
         ]));
     }
     
-    private function widgetVisible(array $widgets, string $id): bool
+    private function widgetInBoard(array $widgets, string $id): bool
     {
         foreach ($widgets as $w) {
             if (($w['id'] ?? '') === $id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function widgetVisible(array $widgets, string $id): bool
+    {
+        foreach ($widgets as $w) {
+            if (($w['id'] ?? '') === $id && !empty($w['visible'])) {
                 return true;
             }
         }
@@ -176,6 +224,36 @@ class TenantDashboardController extends TenantController
     /**
      * Lookup exacto de producto por código de barras / SKU (products.code).
      */
+    private function saveCustomOption(\PDO $db): void
+    {
+        $token = (string)(
+            $_POST['csrf_token']
+            ?? ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? '')
+            ?? ''
+        );
+        if (!\SoftNova\Core\Security::verifyCsrfToken($token)) {
+            $this->json(['success' => false, 'message' => 'Token de seguridad invalido o expirado']);
+            return;
+        }
+        $group = trim((string)$this->request->post('group', ''));
+        $label = trim((string)$this->request->post('label', ''));
+        try {
+            $svc = new \SoftNova\Services\CustomOptionService($db);
+            $opt = $svc->add($group, $label);
+            $this->json([
+                'success' => true,
+                'message' => $opt['created'] ? 'Opción guardada' : 'Opción ya existía',
+                'option' => [
+                    'value' => $opt['value'],
+                    'label' => $opt['label'],
+                    'created' => $opt['created'],
+                ],
+            ]);
+        } catch (\Throwable $e) {
+            $this->json(['success' => false, 'message' => $e->getMessage()]);
+        }
+    }
+
     private function lookupBarcode(\PDO $db): void
     {
         $code = trim((string)$this->request->get('code', ''));
@@ -186,16 +264,29 @@ class TenantDashboardController extends TenantController
 
         try {
             $stmt = $db->prepare(
-                "SELECT id, name, code, sale_price, purchase_price, stock, min_stock, product_type, status
+                "SELECT id, name, code, barcode, sale_price, purchase_price, stock, min_stock, product_type, status
                  FROM products
-                 WHERE status = 'active' AND code = ?
+                 WHERE status = 'active' AND (code = ? OR barcode = ?)
+                 ORDER BY CASE WHEN code = ? THEN 0 ELSE 1 END
                  LIMIT 1"
             );
-            $stmt->execute([$code]);
+            $stmt->execute([$code, $code, $code]);
             $row = $stmt->fetch(\PDO::FETCH_ASSOC);
         } catch (\Throwable $e) {
-            $this->json(['success' => false, 'message' => 'Error al buscar código', 'product' => null]);
-            return;
+            // Instalaciones sin columna barcode: fallback a SKU.
+            try {
+                $stmt = $db->prepare(
+                    "SELECT id, name, code, sale_price, purchase_price, stock, min_stock, product_type, status
+                     FROM products
+                     WHERE status = 'active' AND code = ?
+                     LIMIT 1"
+                );
+                $stmt->execute([$code]);
+                $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+            } catch (\Throwable $e2) {
+                $this->json(['success' => false, 'message' => 'Error al buscar código', 'product' => null]);
+                return;
+            }
         }
 
         if (!$row) {
@@ -209,6 +300,7 @@ class TenantDashboardController extends TenantController
                 'id' => (int)$row['id'],
                 'name' => (string)$row['name'],
                 'code' => (string)($row['code'] ?? ''),
+                'barcode' => (string)($row['barcode'] ?? ''),
                 'sale_price' => (float)$row['sale_price'],
                 'purchase_price' => (float)($row['purchase_price'] ?? 0),
                 'stock' => (int)$row['stock'],

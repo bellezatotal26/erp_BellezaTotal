@@ -120,4 +120,34 @@ class Security
         $plain = openssl_decrypt($cipher, 'aes-256-gcm', self::appKey(), OPENSSL_RAW_DATA, $iv, $tag);
         return $plain === false ? null : $plain;
     }
+
+    /** Prefijo de secretos cifrados en BD (passwords de tenant, etc.). */
+    public const SECRET_PREFIX = 'enc:v1:';
+
+    public static function isSealed(string $value): bool
+    {
+        return str_starts_with($value, self::SECRET_PREFIX);
+    }
+
+    /** Cifra un secreto para almacenarlo en BD. */
+    public static function sealSecret(string $plain): string
+    {
+        return self::SECRET_PREFIX . self::encrypt($plain);
+    }
+
+    /**
+     * Devuelve el texto plano. Acepta valores legados (sin cifrar) o sellados.
+     */
+    public static function revealSecret(string $value): string
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return '';
+        }
+        if (!self::isSealed($value)) {
+            return $value;
+        }
+        $decoded = self::decrypt(substr($value, strlen(self::SECRET_PREFIX)));
+        return $decoded ?? '';
+    }
 }

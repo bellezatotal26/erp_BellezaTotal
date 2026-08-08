@@ -57,9 +57,11 @@ class SaleService
     }
     
     /**
-     * Devolver stock y revertir caja al cancelar
+     * Devolver stock y revertir caja al cancelar.
+     * @param string $reasonLabel Motivo legible (obligatorio)
+     * @param string $reasonCode  Código interno opcional
      */
-    public function cancelSale(int $saleId): array
+    public function cancelSale(int $saleId, string $reasonLabel = '', string $reasonCode = ''): array
     {
         $sale = $this->query(
             "SELECT * FROM sales WHERE id = ? AND status IN ('completed', 'pending')",
@@ -68,6 +70,14 @@ class SaleService
         
         if (!$sale) {
             throw new \RuntimeException('Venta no encontrada o ya cancelada');
+        }
+
+        $reasonLabel = trim(preg_replace('/\s+/', ' ', $reasonLabel) ?? '');
+        if ($reasonLabel === '') {
+            throw new \InvalidArgumentException('Debe indicar el motivo de la eliminación');
+        }
+        if (mb_strlen($reasonLabel) > 180) {
+            $reasonLabel = mb_substr($reasonLabel, 0, 180);
         }
         
         $this->db->beginTransaction();
@@ -85,13 +95,28 @@ class SaleService
                     'Devolucion: ' . $sale['invoice_number']
                 );
             }
-            
-            $this->query(
-                "UPDATE sales SET status = 'cancelled',
-                    notes = CONCAT(IFNULL(notes, ''), ' | CANCELADO: ', ?)
-                 WHERE id = ?",
-                [date('Y-m-d H:i'), $saleId]
-            );
+
+            $noteSuffix = ' | CANCELADO: ' . date('Y-m-d H:i') . ' · Motivo: ' . $reasonLabel;
+            if ($reasonCode !== '') {
+                $noteSuffix .= ' [' . $reasonCode . ']';
+            }
+
+            // cancel_reason puede no existir aún en installs viejas; el schema lo crea al usar CustomOptionService.
+            try {
+                $this->query(
+                    "UPDATE sales SET status = 'cancelled', cancel_reason = ?,
+                        notes = CONCAT(IFNULL(notes, ''), ?)
+                     WHERE id = ?",
+                    [$reasonLabel, $noteSuffix, $saleId]
+                );
+            } catch (\Throwable $e) {
+                $this->query(
+                    "UPDATE sales SET status = 'cancelled',
+                        notes = CONCAT(IFNULL(notes, ''), ?)
+                     WHERE id = ?",
+                    [$noteSuffix, $saleId]
+                );
+            }
             
             $this->db->commit();
         } catch (\Exception $e) {
@@ -104,6 +129,7 @@ class SaleService
         return [
             'sale' => $sale,
             'reversed_cash' => $reversed,
+            'cancel_reason' => $reasonLabel,
         ];
     }
 }

@@ -44,9 +44,13 @@ function fmtT(float $a, array $c): string
                     <?php foreach ([
                         'purchase'=>'Compra',
                         'purchase_order'=>'Orden de compra',
+                        'purchase_credit_note'=>'Nota crédito compra',
                         'sale'=>'Venta',
                         'adjustment'=>'Ajuste',
+                        'opening'=>'Inventario inicial',
                         'return'=>'Devolución',
+                        'csv_import'=>'Importación CSV',
+                        'csv_export'=>'Exportación CSV',
                         'woocommerce'=>'WooCommerce',
                         'mercadolibre'=>'Mercado Libre',
                         'purchase_cancel'=>'Cancel. compra',
@@ -58,6 +62,18 @@ function fmtT(float $a, array $c): string
             <div class="form-group" style="margin:0;"><label>Desde</label><input type="date" name="from" class="form-control" value="<?php echo htmlspecialchars($filters['from']??''); ?>"></div>
             <div class="form-group" style="margin:0;"><label>Hasta</label><input type="date" name="to" class="form-control" value="<?php echo htmlspecialchars($filters['to']??''); ?>"></div>
             <button class="btn btn-primary" type="submit">Filtrar</button>
+            <?php
+            $tracePdfQ = http_build_query(array_filter([
+                'action' => 'traceability_pdf',
+                'q' => $filters['q'] ?? null,
+                'type' => $filters['type'] ?? null,
+                'reference_type' => $filters['reference_type'] ?? null,
+                'from' => $filters['from'] ?? null,
+                'to' => $filters['to'] ?? null,
+                'product_id' => $filters['product_id'] ?? null,
+            ], static fn($v) => $v !== null && $v !== ''));
+            ?>
+            <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/inventario') . '?' . $tracePdfQ; ?>" target="_blank" title="Descargar PDF detallado">Reporte PDF</a>
             <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/inventario'); ?>">Volver a inventario</a>
             <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/compras'); ?>">Compras</a>
         </form>
@@ -145,7 +161,7 @@ function fmtT(float $a, array $c): string
             <div class="table-container"><table>
                 <thead>
                 <tr>
-                    <th>Fecha ingreso</th><th>Producto</th><th>Canal</th><th>Tipo</th><th>Cant.</th>
+                    <th>Fecha ingreso</th><th>Producto</th><th>Ubicación</th><th>Canal</th><th>Tipo</th><th>Cant.</th>
                     <th>Costo u.</th><th>Total</th><th>Stock</th>
                     <th>Origen</th><th>Notas</th><th>Usuario</th><th>Editar fecha</th>
                 </tr>
@@ -154,6 +170,18 @@ function fmtT(float $a, array $c): string
                 <?php foreach ($movements as $m):
                     $dt = $m['movement_date'] ?? $m['created_at'];
                     $dateVal = $dt ? date('Y-m-d', strtotime($dt)) : date('Y-m-d');
+                    $refMap = [
+                        'csv_import' => 'Importación CSV',
+                        'csv_export' => 'Exportación CSV',
+                        'purchase_order' => 'Orden de compra',
+                        'purchase_credit_note' => 'Nota crédito compra',
+                        'opening' => 'Inventario inicial',
+                        'sale' => 'Venta',
+                        'return' => 'Devolución',
+                        'adjustment' => 'Ajuste',
+                        'purchase' => 'Compra',
+                    ];
+                    $refLabel = $refMap[$m['reference_type'] ?? ''] ?? ($m['reference_type'] ?: '—');
                 ?>
                     <tr>
                         <td><?php echo $dt ? date('d/m/Y H:i', strtotime($dt)) : '—'; ?></td>
@@ -162,7 +190,11 @@ function fmtT(float $a, array $c): string
                             <?php if (!empty($m['product_code'])): ?>
                                 <br><small><?php echo htmlspecialchars($m['product_code']); ?></small>
                             <?php endif; ?>
+                            <?php if (!empty($m['category_name'])): ?>
+                                <br><small style="color:var(--color-text-secondary);"><?php echo htmlspecialchars($m['category_name']); ?></small>
+                            <?php endif; ?>
                         </td>
+                        <td><?php echo htmlspecialchars($m['product_location'] ?? '—'); ?></td>
                         <td><?php echo htmlspecialchars(\SoftNova\Core\product_channel_label((string)($m['source_channel'] ?? 'manual'))); ?></td>
                         <td>
                             <?php
@@ -175,7 +207,7 @@ function fmtT(float $a, array $c): string
                         <td><?php echo fmtT((float)($m['total_cost'] ?? 0), $currency); ?></td>
                         <td><?php echo isset($m['stock_after']) && $m['stock_after'] !== null ? (int)$m['stock_after'] : '—'; ?></td>
                         <td>
-                            <?php echo htmlspecialchars((string)($m['reference_type'] ?? '—')); ?>
+                            <?php echo htmlspecialchars($refLabel); ?>
                             <?php if (!empty($m['reference_id'])): ?>
                                 #<?php echo (int)$m['reference_id']; ?>
                             <?php endif; ?>

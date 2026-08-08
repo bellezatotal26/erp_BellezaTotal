@@ -22,7 +22,7 @@ $suppliers = $suppliers ?? [];
                 <div style="display:flex;align-items:flex-start;gap:18px;">
                     <div style="width:90px;height:90px;border-radius:14px;overflow:hidden;flex-shrink:0;background:var(--bg-input);display:flex;align-items:center;justify-content:center;border:2px solid var(--color-border);box-shadow:0 2px 8px rgba(0,0,0,0.06);">
                         <?php if(!empty($s['image'])): ?>
-                            <img src="<?php echo htmlspecialchars($s['image']); ?>" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+                            <img src="<?php echo htmlspecialchars(\SoftNova\Core\media_url($s['image'])); ?>" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
                             <span style="display:none;font-size:36px;">🏢</span>
                         <?php else: ?>
                             <span style="font-size:36px;">🏢</span>

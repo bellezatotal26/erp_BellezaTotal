@@ -13,8 +13,12 @@ $currency = $currency ?? ['symbol' => '$', 'decimals' => 0];
 $canCreateSale = \SoftNova\Core\TenantMiddleware::canDo('create', 'ventas');
 $canDeleteSale = \SoftNova\Core\TenantMiddleware::canDo('delete', 'ventas');
 $canExportSale = \SoftNova\Core\TenantMiddleware::canDo('export', 'ventas');
-$filters = $filters ?? ['q'=>'','from'=>'','to'=>'','status'=>'','sort'=>'date','dir'=>'desc','query'=>[]];
+$filters = $filters ?? ['q'=>'','from'=>'','to'=>'','status'=>'','customer_id'=>'','payment_method'=>'','record_status'=>'active','sort'=>'date','dir'=>'desc','query'=>[]];
+$cancelReasons = $cancelReasons ?? [];
+$paymentMethodOptionsHtml = $paymentMethodOptionsHtml ?? \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true);
+$paymentMethodFilterHtml = $paymentMethodFilterHtml ?? '';
 $ventasBase = $viewInstance->route('app/ventas');
+$filterQuery = http_build_query($filters['query'] ?? []);
 $needBarcode = true;
 $pageScripts = ['ventas.js'];
 
@@ -37,7 +41,8 @@ function fmtV(float $a, array $c): string
         <button onclick="openSaleModal()" class="btn btn-primary neumorphic-btn" title="Nueva venta">Nueva Venta</button>
     <?php endif; ?>
     <?php if ($canExportSale): ?>
-        <a href="<?php echo $ventasBase; ?>?action=export" class="btn btn-secondary" title="Exportar CSV">Exportar CSV</a>
+        <a href="<?php echo $ventasBase; ?>?action=export<?php echo $filterQuery !== '' ? '&' . $filterQuery : ''; ?>" class="btn btn-secondary" title="Exportar CSV filtrado">Exportar CSV</a>
+        <a href="<?php echo $ventasBase; ?>?action=report_pdf<?php echo $filterQuery !== '' ? '&' . $filterQuery : ''; ?>" class="btn btn-secondary" target="_blank" title="Descargar PDF filtrado">Reporte PDF</a>
     <?php endif; ?>
 </div>
 
@@ -46,19 +51,48 @@ function fmtV(float $a, array $c): string
         <form method="GET" action="<?php echo $ventasBase; ?>" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;">
             <input type="hidden" name="sort" value="<?php echo htmlspecialchars($filters['sort']); ?>">
             <input type="hidden" name="dir" value="<?php echo htmlspecialchars($filters['dir']); ?>">
-            <div class="form-group" style="margin:0;min-width:220px;flex:1;">
+            <div class="form-group" style="margin:0;min-width:200px;flex:1;">
                 <label>Buscar</label>
                 <input class="form-control" type="search" name="q" value="<?php echo htmlspecialchars($filters['q']); ?>" placeholder="Factura, cliente o documento..." title="Buscar ventas">
+            </div>
+            <div class="form-group" style="margin:0;min-width:180px;">
+                <label>Cliente</label>
+                <select class="form-control" name="customer_id">
+                    <option value="">Todos</option>
+                    <?php foreach ($customers as $c):
+                        $clabel = trim(($c['first_name'] ?? $c['name']) . ' ' . ($c['last_name'] ?? ''));
+                        $cid = (string)(int)$c['id'];
+                    ?>
+                        <option value="<?php echo $cid; ?>" <?php echo ($filters['customer_id'] ?? '') === $cid ? 'selected' : ''; ?>>
+                            <?php echo htmlspecialchars($clabel !== '' ? $clabel : ('Cliente #' . $cid)); ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
             </div>
             <div class="form-group" style="margin:0;"><label>Desde</label><input class="form-control" type="date" name="from" value="<?php echo htmlspecialchars($filters['from']); ?>"></div>
             <div class="form-group" style="margin:0;"><label>Hasta</label><input class="form-control" type="date" name="to" value="<?php echo htmlspecialchars($filters['to']); ?>"></div>
             <div class="form-group" style="margin:0;min-width:150px;">
+                <label>Tipo de pago</label>
+                <select class="form-control" name="payment_method">
+                    <option value="">Todos</option>
+                    <?php echo $paymentMethodFilterHtml; ?>
+                </select>
+            </div>
+            <div class="form-group" style="margin:0;min-width:140px;">
                 <label>Estado pago</label>
                 <select class="form-control" name="status">
                     <option value="">Todos</option>
                     <option value="paid" <?php echo $filters['status']==='paid'?'selected':''; ?>>Pagado</option>
                     <option value="partial" <?php echo $filters['status']==='partial'?'selected':''; ?>>Parcial</option>
                     <option value="pending" <?php echo $filters['status']==='pending'?'selected':''; ?>>Pendiente</option>
+                </select>
+            </div>
+            <div class="form-group" style="margin:0;min-width:140px;">
+                <label>Registro</label>
+                <select class="form-control" name="record_status">
+                    <option value="active" <?php echo ($filters['record_status'] ?? 'active')==='active'?'selected':''; ?>>Activas</option>
+                    <option value="cancelled" <?php echo ($filters['record_status'] ?? '')==='cancelled'?'selected':''; ?>>Canceladas</option>
+                    <option value="all" <?php echo ($filters['record_status'] ?? '')==='all'?'selected':''; ?>>Todas</option>
                 </select>
             </div>
             <button class="btn btn-primary" type="submit">Filtrar</button>
@@ -117,11 +151,10 @@ function fmtV(float $a, array $c): string
                                 <button onclick="openPaymentModal(<?php echo $sale['id']; ?>,<?php echo $sale['total']; ?>,<?php echo ($sale['paid_amount'] ?? 0); ?>)" class="btn btn-sm btn-success" title="Registrar abono"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></button>
                             <?php endif; ?>
                             <?php if ($canDeleteSale && $sale['status'] !== 'cancelled'): ?>
-                                <form method="POST" action="<?php echo $ventasBase; ?>?action=cancel" style="display:inline;" data-ajax="true">
-                                    <?php echo \SoftNova\Core\csrf_field(); ?>
-                                    <input type="hidden" name="id" value="<?php echo (int)$sale['id']; ?>">
-                                    <button type="submit" data-confirm="Eliminar esta venta? Se cancelara, se devolvera el stock y se ajustara la caja." class="btn btn-sm btn-danger" title="Eliminar venta"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
-                                </form>
+                                <button type="button" class="btn btn-sm btn-danger" title="Eliminar venta"
+                                    onclick="openCancelSaleModal(<?php echo (int)$sale['id']; ?>, '<?php echo htmlspecialchars($sale['invoice_number'] ?? '', ENT_QUOTES); ?>')">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                                </button>
                             <?php endif; ?>
                         </td>
                     </tr>
@@ -231,8 +264,8 @@ function fmtV(float $a, array $c): string
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;">
                 <div class="form-group">
                     <label>Método de Pago <span class="field-tip" data-tip="Medio con el que se recibe el dinero (efectivo, tarjeta, transferencia u otro).">?</span></label>
-                    <select name="payment_method" class="form-control">
-                        <?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash'); ?>
+                    <select name="payment_method" class="form-control" data-custom-other="payment_method">
+                        <?php echo $paymentMethodOptionsHtml; ?>
                     </select>
                 </div>
                 <div class="form-group" id="initialPaymentGroup" style="display:none;">
@@ -285,7 +318,7 @@ function fmtV(float $a, array $c): string
             <input type="hidden" name="sale_id" id="paySaleId">
             <p id="payInfo" style="margin-bottom:10px;"></p>
             <div class="form-group"><label>Monto * <span class="field-tip" data-tip="Cantidad que el cliente abona ahora. No puede superar el saldo pendiente.">?</span></label><input type="number" name="amount" id="payAmount" class="form-control" step="0.01" min="0.01" required></div>
-            <div class="form-group"><label>Método <span class="field-tip" data-tip="Medio de pago de este abono.">?</span></label><select name="payment_method" class="form-control"><?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', false); ?></select></div>
+            <div class="form-group"><label>Método <span class="field-tip" data-tip="Medio de pago de este abono.">?</span></label><select name="payment_method" class="form-control" data-custom-other="payment_method"><?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?></select></div>
             <div class="form-group"><label>Notas <span class="field-tip" data-tip="Referencia del abono (número de transferencia, recibo, etc.).">?</span></label><input type="text" name="notes" class="form-control" placeholder="Abono"></div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('paymentModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-success">Registrar Abono</button></div>
         </form>
@@ -312,6 +345,39 @@ function fmtV(float $a, array $c): string
                 <button type="submit" class="btn btn-primary" style="width:100%;">Enviar por correo</button>
             </form>
         </div>
+    </div>
+</div>
+
+<!-- Modal cancelar venta -->
+<div id="cancelSaleModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:440px;">
+        <div class="modal-header">
+            <h3>Eliminar venta</h3>
+            <button type="button" class="modal-close" onclick="closeCancelSaleModal()">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $ventasBase; ?>?action=cancel" data-ajax="true" id="cancelSaleForm" onsubmit="return prepareCancelSale()">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="id" id="cancelSaleId" value="">
+            <input type="hidden" name="cancel_reason_other" id="cancelReasonOther" value="">
+            <div class="modal-body">
+                <p style="margin:0 0 12px;color:var(--color-text-secondary);">
+                    Se cancelará <strong id="cancelSaleInvoice"></strong>, se devolverá el stock y se ajustará la caja.
+                </p>
+                <div class="form-group">
+                    <label>Motivo de eliminación *</label>
+                    <select name="cancel_reason" id="cancelReasonSelect" class="form-control" required data-custom-other="sale_cancel_reason">
+                        <option value="">Seleccione un motivo...</option>
+                        <?php foreach ($cancelReasons as $opt): ?>
+                            <option value="<?php echo htmlspecialchars((string)$opt['value']); ?>"><?php echo htmlspecialchars((string)$opt['label']); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeCancelSaleModal()">Volver</button>
+                <button type="submit" class="btn btn-danger">Confirmar eliminación</button>
+            </div>
+        </form>
     </div>
 </div>
 

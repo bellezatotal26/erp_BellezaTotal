@@ -8,6 +8,8 @@ use SoftNova\Services\SaleService;
 use SoftNova\Services\CashService;
 use SoftNova\Services\ReceivableService;
 use SoftNova\Services\AccountingService;
+use SoftNova\Services\CustomOptionService;
+use SoftNova\Services\PaymentMethodCatalog;
 use SoftNova\Services\Integrations\IntegrationManager;
 
 class TenantVentasController extends TenantController
@@ -16,6 +18,7 @@ class TenantVentasController extends TenantController
     private CashService $cash;
     private ReceivableService $receivables;
     private AccountingService $accounting;
+    private CustomOptionService $customOptions;
     
     public function __construct()
     {
@@ -24,6 +27,7 @@ class TenantVentasController extends TenantController
         $this->cash = new CashService($this->db);
         $this->receivables = new ReceivableService($this->db);
         $this->accounting = new AccountingService($this->db);
+        $this->customOptions = new CustomOptionService($this->db);
     }
     
     public function index(): void
@@ -35,6 +39,11 @@ class TenantVentasController extends TenantController
         if ($action === 'create' && $this->request->method() === 'POST') {
             TenantMiddleware::authorize('ventas', 'create');
             $this->createSale();
+            return;
+        }
+        if ($action === 'sync_offline' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('ventas', 'create');
+            $this->syncOfflineBatch();
             return;
         }
         if ($action === 'detail' && $this->request->method() === 'GET') {
@@ -55,6 +64,11 @@ class TenantVentasController extends TenantController
             $this->invoicePdf();
             return;
         }
+        if ($action === 'report_pdf' && $this->request->method() === 'GET') {
+            TenantMiddleware::authorize('ventas', 'export');
+            $this->reportPdf();
+            return;
+        }
         if ($action === 'share' && $this->request->method() === 'GET') {
             $this->shareReceipt();
             return;
@@ -72,36 +86,10 @@ class TenantVentasController extends TenantController
 
         (new \SoftNova\Services\SalesDocumentService($this->db));
 
-        $filters = $this->listFilters([
-            'invoice' => 's.invoice_number',
-            'customer' => 'c.name',
-            'date' => 's.sale_date',
-            'total' => 's.total',
-            'paid' => 'paid_amount',
-            'method' => 's.payment_method',
-            'status' => 's.payment_status',
-        ], 'date', 'desc');
-
-        $where = ["s.status != 'cancelled'"];
-        $params = [];
-        if ($filters['q'] !== '') {
-            $where[] = '(s.invoice_number LIKE ? OR c.name LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ? OR c.document_number LIKE ?)';
-            $like = '%' . $filters['q'] . '%';
-            array_push($params, $like, $like, $like, $like, $like);
-        }
-        if ($filters['from'] !== '') {
-            $where[] = 'DATE(s.sale_date) >= ?';
-            $params[] = $filters['from'];
-        }
-        if ($filters['to'] !== '') {
-            $where[] = 'DATE(s.sale_date) <= ?';
-            $params[] = $filters['to'];
-        }
-        if (in_array($filters['status'], ['paid', 'partial', 'pending'], true)) {
-            $where[] = 's.payment_status = ?';
-            $params[] = $filters['status'];
-        }
-        $whereSql = implode(' AND ', $where);
+        $filters = $this->salesListFilters();
+        $built = $this->buildSalesWhere($filters);
+        $whereSql = $built['whereSql'];
+        $params = $built['params'];
 
         $total = (int)$this->query(
             "SELECT COUNT(*) as c
@@ -144,7 +132,8 @@ class TenantVentasController extends TenantController
         )->fetchAll();
         
         $customers = $this->query(
-            "SELECT id, name, first_name, last_name FROM customers WHERE status = 'active' ORDER BY name"
+            "SELECT id, name, first_name, last_name, document_number, document_type
+             FROM customers WHERE status = 'active' ORDER BY name"
         )->fetchAll();
         
         $this->view('tenant.ventas', $this->tenantViewData([
@@ -155,7 +144,130 @@ class TenantVentasController extends TenantController
             'customers' => $customers,
             'pagination' => $pagination,
             'filters' => $filters,
+            'cancelReasons' => $this->customOptions->options(CustomOptionService::GROUP_CANCEL_REASON),
+            'paymentMethodOptionsHtml' => PaymentMethodCatalog::optionsHtml('cash', true, $this->db),
+            'paymentMethodFilterHtml' => PaymentMethodCatalog::optionsHtml((string)($filters['payment_method'] ?? ''), false, $this->db),
         ]));
+    }
+
+    /**
+     * @return array{
+     *   q:string,from:string,to:string,status:string,customer_id:string,payment_method:string,
+     *   record_status:string,sort:string,dir:string,orderSql:string,query:array
+     * }
+     */
+    private function salesListFilters(): array
+    {
+        $base = $this->listFilters([
+            'invoice' => 's.invoice_number',
+            'customer' => 'c.name',
+            'date' => 's.sale_date',
+            'total' => 's.total',
+            'paid' => 'paid_amount',
+            'method' => 's.payment_method',
+            'status' => 's.payment_status',
+        ], 'date', 'desc');
+
+        $customerId = trim((string)$this->request->get('customer_id', ''));
+        if ($customerId !== '' && !ctype_digit($customerId)) {
+            $customerId = '';
+        }
+        $paymentMethod = strtolower(trim((string)$this->request->get('payment_method', '')));
+        if ($paymentMethod === '__other__' || $paymentMethod === 'other') {
+            $paymentMethod = '';
+        }
+        if ($paymentMethod !== '' && !preg_match('/^[a-z][a-z0-9_]{0,59}$/', $paymentMethod)) {
+            $paymentMethod = '';
+        }
+        $recordStatus = trim((string)$this->request->get('record_status', 'active'));
+        if (!in_array($recordStatus, ['active', 'cancelled', 'all'], true)) {
+            $recordStatus = 'active';
+        }
+
+        $base['customer_id'] = $customerId;
+        $base['payment_method'] = $paymentMethod;
+        $base['record_status'] = $recordStatus;
+        $base['query'] = array_filter([
+            'q' => $base['q'] !== '' ? $base['q'] : null,
+            'from' => $base['from'] !== '' ? $base['from'] : null,
+            'to' => $base['to'] !== '' ? $base['to'] : null,
+            'status' => $base['status'] !== '' ? $base['status'] : null,
+            'customer_id' => $customerId !== '' ? $customerId : null,
+            'payment_method' => $paymentMethod !== '' ? $paymentMethod : null,
+            'record_status' => $recordStatus !== 'active' ? $recordStatus : null,
+            'sort' => $base['sort'] !== 'date' ? $base['sort'] : null,
+            'dir' => ($base['sort'] !== 'date' || $base['dir'] !== 'desc') ? $base['dir'] : null,
+        ], static fn($v) => $v !== null && $v !== '');
+
+        return $base;
+    }
+
+    /** @return array{whereSql:string,params:list<mixed>} */
+    private function buildSalesWhere(array $filters): array
+    {
+        $where = [];
+        $params = [];
+
+        if (($filters['record_status'] ?? 'active') === 'cancelled') {
+            $where[] = "s.status = 'cancelled'";
+        } elseif (($filters['record_status'] ?? 'active') !== 'all') {
+            $where[] = "s.status != 'cancelled'";
+        }
+
+        if (($filters['q'] ?? '') !== '') {
+            $where[] = '(s.invoice_number LIKE ? OR c.name LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ? OR c.document_number LIKE ?)';
+            $like = '%' . $filters['q'] . '%';
+            array_push($params, $like, $like, $like, $like, $like);
+        }
+        if (($filters['from'] ?? '') !== '') {
+            $where[] = 'DATE(s.sale_date) >= ?';
+            $params[] = $filters['from'];
+        }
+        if (($filters['to'] ?? '') !== '') {
+            $where[] = 'DATE(s.sale_date) <= ?';
+            $params[] = $filters['to'];
+        }
+        if (in_array($filters['status'] ?? '', ['paid', 'partial', 'pending'], true)) {
+            $where[] = 's.payment_status = ?';
+            $params[] = $filters['status'];
+        }
+        if (($filters['customer_id'] ?? '') !== '') {
+            $where[] = 's.customer_id = ?';
+            $params[] = (int)$filters['customer_id'];
+        }
+        if (($filters['payment_method'] ?? '') !== '') {
+            $where[] = 's.payment_method = ?';
+            $params[] = $filters['payment_method'];
+        }
+
+        if ($where === []) {
+            $where[] = '1=1';
+        }
+
+        return ['whereSql' => implode(' AND ', $where), 'params' => $params];
+    }
+
+    /** @return list<array<string,mixed>> */
+    private function fetchFilteredSales(array $filters, int $limit = 5000): array
+    {
+        $built = $this->buildSalesWhere($filters);
+        $limit = max(1, min(10000, $limit));
+        return $this->query(
+            "SELECT s.*, COALESCE(c.name, 'General') as customer_name, u.name as user_name,
+                    COALESCE(p.paid_amount, 0) as paid_amount
+             FROM sales s
+             LEFT JOIN customers c ON s.customer_id = c.id
+             LEFT JOIN users u ON s.user_id = u.id
+             LEFT JOIN (
+                SELECT sale_id, COALESCE(SUM(amount), 0) as paid_amount
+                FROM sale_payments
+                GROUP BY sale_id
+             ) p ON p.sale_id = s.id
+             WHERE {$built['whereSql']}
+             ORDER BY {$filters['orderSql']}, s.id DESC
+             LIMIT {$limit}",
+            $built['params']
+        )->fetchAll();
     }
     
     public function detail(): void
@@ -184,14 +296,170 @@ class TenantVentasController extends TenantController
         $this->json(['sale' => $sale, 'items' => $items, 'payments' => $payments]);
     }
     
+    /**
+     * Sync por lotes de ventas capturadas offline.
+     * Respuesta por venta: ok | idempotent | conflict | retry.
+     * La contabilidad solo corre en servidor tras un commit exitoso.
+     */
+    private function syncOfflineBatch(): void
+    {
+        $body = $this->readJsonBody();
+        // CSRF desde JSON: php://input no llena $_POST.
+        if (!empty($body['csrf_token']) && empty($_POST['csrf_token'])) {
+            $_POST['csrf_token'] = (string)$body['csrf_token'];
+        }
+        if (!$this->validateCsrf()) {
+            $this->json([
+                'success' => false,
+                'message' => 'Token de seguridad inválido o expirado. Recargue Caja e intente de nuevo.',
+                'results' => [],
+                'summary' => ['ok' => 0, 'conflict' => 0, 'retry' => 0, 'idempotent' => 0],
+                'code' => 'csrf',
+            ], 419);
+            return;
+        }
+
+        $sales = $body['sales'] ?? $this->request->post('sales', []);
+        if (is_string($sales)) {
+            $decoded = json_decode($sales, true);
+            $sales = is_array($decoded) ? $decoded : [];
+        }
+        if (!is_array($sales) || $sales === []) {
+            $this->json([
+                'success' => false,
+                'message' => 'No hay ventas para sincronizar',
+                'results' => [],
+                'summary' => ['ok' => 0, 'conflict' => 0, 'retry' => 0, 'idempotent' => 0],
+            ]);
+            return;
+        }
+
+        // Límite defensivo para no saturar la petición.
+        $sales = array_slice(array_values($sales), 0, 50);
+        $userId = (int)($_SESSION['tenant_user_id'] ?? 0);
+        if ($userId <= 0) {
+            $this->json(['success' => false, 'message' => 'Sesión inválida', 'results' => []]);
+            return;
+        }
+
+        $settings = [
+            'invoice_prefix' => $this->getSetting('invoice_prefix', 'FAC-'),
+            'tax_rate' => $this->getSetting('tax_rate', '0'),
+        ];
+
+        try {
+            $sync = new \SoftNova\Services\OfflineSaleSyncService($this->db);
+            $out = $sync->syncBatch($sales, $userId, $settings);
+        } catch (\Throwable $e) {
+            error_log('sync_offline: ' . $e->getMessage());
+            $this->json([
+                'success' => false,
+                'message' => 'No se pudo sincronizar: ' . $e->getMessage(),
+                'results' => [],
+            ], 500);
+            return;
+        }
+
+        $summary = $out['summary'];
+        $accepted = (int)$summary['ok'] + (int)$summary['idempotent'];
+        $this->json([
+            'success' => true,
+            'message' => sprintf(
+                'Sync: %d ok, %d ya existían, %d conflictos, %d reintentar',
+                (int)$summary['ok'],
+                (int)$summary['idempotent'],
+                (int)$summary['conflict'],
+                (int)$summary['retry']
+            ),
+            'accepted' => $accepted,
+            'results' => $out['results'],
+            'summary' => $summary,
+            'accounting' => 'server_post_commit',
+        ]);
+    }
+
+    /** @return array<string,mixed> */
+    private function readJsonBody(): array
+    {
+        $raw = file_get_contents('php://input');
+        if ($raw === false || trim($raw) === '') {
+            return [];
+        }
+        $data = json_decode($raw, true);
+        return is_array($data) ? $data : [];
+    }
+
     private function createSale(): void
     {
         if (!$this->validateCsrfOrFail('/app/ventas')) {
             return;
         }
+
+        (new \SoftNova\Services\SalesDocumentService($this->db));
+
+        // Cola offline: motor unificado (idempotencia + contabilidad post-commit).
+        $clientUuid = trim((string)$this->request->post('client_sale_uuid', ''));
+        if ($clientUuid !== '' && preg_match('/^[A-Za-z0-9\-_]{8,64}$/', $clientUuid)) {
+            $notes = trim((string)$this->request->post('notes', ''));
+            $isOfflineSync = $this->request->post('offline_sync') === '1'
+                || str_contains($notes, 'Offline');
+            if ($isOfflineSync) {
+                $userId = (int)($_SESSION['tenant_user_id'] ?? 0);
+                $sync = new \SoftNova\Services\OfflineSaleSyncService($this->db);
+                $result = $sync->syncOne($_POST, $userId, [
+                    'invoice_prefix' => $this->getSetting('invoice_prefix', 'FAC-'),
+                    'tax_rate' => $this->getSetting('tax_rate', '0'),
+                ]);
+                $ok = in_array($result['status'] ?? '', ['ok', 'idempotent'], true);
+                $this->respond(
+                    $ok,
+                    (string)($result['message'] ?? ($ok ? 'Venta sincronizada' : 'No se pudo sincronizar')),
+                    '/app/ventas',
+                    [
+                        'sale_id' => $result['sale_id'] ?? null,
+                        'invoice_number' => $result['invoice_number'] ?? null,
+                        'client_sale_uuid' => $result['client_sale_uuid'] ?? $clientUuid,
+                        'sync_status' => $result['status'] ?? null,
+                        'code' => $result['code'] ?? null,
+                        'stock_conflicts' => $result['stock_conflicts'] ?? [],
+                        'idempotent' => ($result['status'] ?? '') === 'idempotent',
+                        'accounting_posted' => (bool)($result['accounting_posted'] ?? false),
+                    ]
+                );
+                return;
+            }
+
+            try {
+                $existing = $this->query(
+                    "SELECT id, invoice_number, total, payment_status
+                     FROM sales WHERE client_sale_uuid = ? LIMIT 1",
+                    [$clientUuid]
+                )->fetch();
+                if ($existing) {
+                    $this->respond(
+                        true,
+                        'Venta ya registrada: ' . $existing['invoice_number'],
+                        '/app/ventas',
+                        [
+                            'sale_id' => (int)$existing['id'],
+                            'invoice_number' => (string)$existing['invoice_number'],
+                            'idempotent' => true,
+                        ]
+                    );
+                    return;
+                }
+            } catch (\Throwable $e) {
+                // Columna aún no migrada: continuar con flujo normal.
+            }
+        }
         
         $customerId = $this->request->post('customer_id') ? (int)$this->request->post('customer_id') : null;
-        $paymentMethod = \SoftNova\Services\PaymentMethodCatalog::normalize($this->request->post('payment_method', 'cash'));
+        $rawPayMethod = strtolower(trim((string)$this->request->post('payment_method', 'cash')));
+        if ($rawPayMethod === '__other__' || $rawPayMethod === 'other') {
+            $this->respond(false, 'Seleccione un método de pago o cree uno con la opción Otro', '/app/ventas');
+            return;
+        }
+        $paymentMethod = PaymentMethodCatalog::normalize($rawPayMethod);
         $paymentType = $this->request->post('payment_type', 'full');
         $documentType = (string)$this->request->post('document_type', 'invoice');
         if (!isset(\SoftNova\Services\SalesDocumentService::documentTypes()[$documentType])) {
@@ -229,7 +497,6 @@ class TenantVentasController extends TenantController
             return;
         }
 
-        (new \SoftNova\Services\SalesDocumentService($this->db));
         $prefix = \SoftNova\Services\SalesDocumentService::prefixFor($documentType);
         if ($documentType === 'invoice') {
             $prefix = $this->getSetting('invoice_prefix', 'FAC-');
@@ -293,30 +560,59 @@ class TenantVentasController extends TenantController
         try {
             $this->db->beginTransaction();
             
-            $this->query(
-                "INSERT INTO sales
-                    (invoice_number, document_type, customer_id, user_id, sale_date, due_date, received_date,
-                     subtotal, tax, discount, total, payment_method, payment_terms, payment_status, notes, status)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    $invoiceNumber,
-                    $documentType,
-                    $customerId,
-                    $_SESSION['tenant_user_id'],
-                    $saleDate . ' ' . date('H:i:s'),
-                    $dueDate,
-                    $receivedDate !== '' ? $receivedDate : null,
-                    $subtotal,
-                    $tax,
-                    $discount,
-                    $total,
-                    $paymentMethod,
-                    $paymentTerms,
-                    $paymentStatus,
-                    $notes,
-                    $paymentStatus === 'paid' ? 'completed' : 'pending',
-                ]
-            );
+            try {
+                $this->query(
+                    "INSERT INTO sales
+                        (invoice_number, document_type, customer_id, user_id, sale_date, due_date, received_date,
+                         subtotal, tax, discount, total, payment_method, payment_terms, payment_status, notes,
+                         client_sale_uuid, status)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        $invoiceNumber,
+                        $documentType,
+                        $customerId,
+                        $_SESSION['tenant_user_id'],
+                        $saleDate . ' ' . date('H:i:s'),
+                        $dueDate,
+                        $receivedDate !== '' ? $receivedDate : null,
+                        $subtotal,
+                        $tax,
+                        $discount,
+                        $total,
+                        $paymentMethod,
+                        $paymentTerms,
+                        $paymentStatus,
+                        $notes,
+                        $clientUuid !== '' ? $clientUuid : null,
+                        $paymentStatus === 'paid' ? 'completed' : 'pending',
+                    ]
+                );
+            } catch (\PDOException $e) {
+                // Carrera: otro reintento offline insertó el mismo UUID entre el SELECT y el INSERT.
+                if ($clientUuid !== '' && str_contains(strtolower($e->getMessage()), 'duplicate')) {
+                    if ($this->db->inTransaction()) {
+                        $this->db->rollBack();
+                    }
+                    $dup = $this->query(
+                        "SELECT id, invoice_number FROM sales WHERE client_sale_uuid = ? LIMIT 1",
+                        [$clientUuid]
+                    )->fetch();
+                    if ($dup) {
+                        $this->respond(
+                            true,
+                            'Venta ya registrada: ' . $dup['invoice_number'],
+                            '/app/ventas',
+                            [
+                                'sale_id' => (int)$dup['id'],
+                                'invoice_number' => (string)$dup['invoice_number'],
+                                'idempotent' => true,
+                            ]
+                        );
+                        return;
+                    }
+                }
+                throw $e;
+            }
             $saleId = (int)$this->db->lastInsertId();
             
             foreach ($validItems as $vi) {
@@ -429,7 +725,11 @@ class TenantVentasController extends TenantController
                 error_log('audit createSale: ' . $e->getMessage());
             }
 
-            $this->respond(true, $msg . $einvoiceNote, '/app/ventas');
+            $this->respond(true, $msg . $einvoiceNote, '/app/ventas', [
+                'sale_id' => $saleId,
+                'invoice_number' => $invoiceNumber,
+                'client_sale_uuid' => $clientUuid !== '' ? $clientUuid : null,
+            ]);
         } catch (\Exception $e) {
             if ($this->db->inTransaction()) {
                 $this->db->rollBack();
@@ -551,6 +851,8 @@ class TenantVentasController extends TenantController
         }
         
         $id = (int)$this->request->post('id');
+        $reasonCode = trim((string)$this->request->post('cancel_reason', ''));
+        $reasonOther = trim((string)$this->request->post('cancel_reason_other', ''));
         $invoiceLabel = '#' . $id;
         try {
             $row = $this->query("SELECT invoice_number FROM sales WHERE id = ?", [$id])->fetch();
@@ -559,13 +861,27 @@ class TenantVentasController extends TenantController
             }
         } catch (\Throwable $e) {
         }
-        
+
         try {
-            $result = $this->sales->cancelSale($id);
+            if ($reasonCode === '' || $reasonCode === '__other__') {
+                if ($reasonOther === '') {
+                    throw new \InvalidArgumentException('Seleccione o escriba el motivo de la eliminación');
+                }
+                $added = $this->customOptions->add(CustomOptionService::GROUP_CANCEL_REASON, $reasonOther);
+                $reasonCode = $added['value'];
+                $reasonLabel = $added['label'];
+            } else {
+                $reasonLabel = $this->customOptions->label(CustomOptionService::GROUP_CANCEL_REASON, $reasonCode);
+                if ($reasonLabel === $reasonCode && $reasonOther !== '') {
+                    $reasonLabel = $reasonOther;
+                }
+            }
+
+            $result = $this->sales->cancelSale($id, $reasonLabel, $reasonCode);
             $this->receivables->cancelBySale($id);
             $msg = 'Venta eliminada. Stock devuelto.';
             try {
-                $this->accounting->reverseSaleCascade($id, 'Venta cancelada');
+                $this->accounting->reverseSaleCascade($id, 'Venta cancelada: ' . $reasonLabel);
             } catch (\Throwable $accountingError) {
                 error_log('Accounting sale reversal: ' . $accountingError->getMessage());
                 $msg .= ' La reversión contable quedó pendiente de revisión.';
@@ -583,14 +899,14 @@ class TenantVentasController extends TenantController
                 (new \SoftNova\Services\TenantAuditService($this->db))->log(
                     'cancel',
                     'ventas',
-                    'Venta cancelada: ' . $invoiceLabel,
+                    'Venta cancelada: ' . $invoiceLabel . ' · Motivo: ' . $reasonLabel,
                     'sale',
                     $id
                 );
                 \SoftNova\Services\TenantNotifyService::saleFailedOrCancelled(
                     $this->db,
                     'cancelled',
-                    'Cancelada: ' . $invoiceLabel,
+                    'Cancelada: ' . $invoiceLabel . ' (' . $reasonLabel . ')',
                     $id
                 );
             } catch (\Throwable $e) {
@@ -679,18 +995,34 @@ class TenantVentasController extends TenantController
         $this->respond($result['success'], $result['message'], '/app/ventas');
     }
     
+    private function reportPdf(): void
+    {
+        try {
+            $filters = $this->salesListFilters();
+            $sales = $this->fetchFilteredSales($filters, 5000);
+            $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
+            $content = $pdf->generateSalesListReport($sales, $filters, $this->db);
+            $pdf->download($content, 'reporte_ventas_' . date('Ymd_His') . '.pdf');
+        } catch (\Throwable $e) {
+            error_log('reportPdf ventas: ' . $e->getMessage());
+            http_response_code(500);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo "No se pudo generar el PDF.\n" . $e->getMessage();
+            exit;
+        }
+    }
+
     private function exportSales(): void
     {
-        $rows = $this->query(
-            "SELECT s.invoice_number, COALESCE(c.name, 'General') as customer_name, s.sale_date,
-                    s.subtotal, s.tax, s.total, s.payment_method, s.payment_status, s.status
-             FROM sales s
-             LEFT JOIN customers c ON s.customer_id = c.id
-             ORDER BY s.created_at DESC"
-        )->fetchAll();
+        $filters = $this->salesListFilters();
+        $rows = $this->fetchFilteredSales($filters, 10000);
         
         $csvRows = [];
         foreach ($rows as $r) {
+            $payLabel = PaymentMethodCatalog::label((string)$r['payment_method'], $this->db);
+            $statusLabel = (($r['status'] ?? '') === 'cancelled')
+                ? 'Cancelado'
+                : ($r['payment_status'] === 'paid' ? 'Pagado' : ($r['payment_status'] === 'partial' ? 'Parcial' : 'Pendiente'));
             $csvRows[] = [
                 $r['invoice_number'],
                 $r['customer_name'],
@@ -698,15 +1030,16 @@ class TenantVentasController extends TenantController
                 $r['subtotal'],
                 $r['tax'],
                 $r['total'],
-                $r['payment_method'],
+                $payLabel,
                 $r['payment_status'],
-                $r['status'],
+                $statusLabel,
+                $r['cancel_reason'] ?? '',
             ];
         }
         
         $this->exportCsv(
             'ventas_' . date('Ymd_His') . '.csv',
-            ['Factura', 'Cliente', 'Fecha', 'Subtotal', 'Impuesto', 'Total', 'Metodo', 'Pago', 'Estado'],
+            ['Factura', 'Cliente', 'Fecha', 'Subtotal', 'Impuesto', 'Total', 'Metodo', 'Pago', 'Estado', 'Motivo cancelacion'],
             $csvRows
         );
     }

@@ -399,6 +399,119 @@ class AiService
             . "\nContexto del negocio (JSON):\n" . $json;
     }
     
+    /**
+     * Extrae la cabecera y las líneas de una factura de compra en texto plano.
+     * Devuelve null si la IA no está configurada o la respuesta no es utilizable,
+     * para que el flujo continúe con el análisis heurístico.
+     *
+     * @return array{invoice_number?:string,invoice_date?:string,due_date?:string,supplier_name?:string,subtotal?:float,tax_total?:float,total?:float,items:list<array<string,mixed>>}|null
+     */
+    public function extractInvoiceData(string $rawText): ?array
+    {
+        $rawText = trim($rawText);
+        if ($rawText === '' || !$this->isConfigured()) {
+            return null;
+        }
+        // Recorta para no exceder el contexto: las facturas útiles caben de sobra.
+        $rawText = mb_substr($rawText, 0, 12000);
+
+        $instruccion = <<<'PROMPT'
+Eres un extractor de datos de facturas de compra. Recibirás el texto de una factura
+y devolverás EXCLUSIVAMENTE un objeto JSON válido, sin explicaciones ni bloques de código.
+
+Estructura exacta:
+{
+  "invoice_number": "string o vacio",
+  "invoice_date": "YYYY-MM-DD o vacio",
+  "due_date": "YYYY-MM-DD o vacio",
+  "supplier_name": "string o vacio",
+  "subtotal": 0,
+  "tax_total": 0,
+  "total": 0,
+  "items": [
+    {
+      "supplier_sku": "codigo del proveedor o vacio",
+      "description": "nombre del producto",
+      "quantity": 0,
+      "unit_cost": 0,
+      "tax_rate": 0,
+      "discount_pct": 0,
+      "line_total": 0,
+      "lot_code": "codigo de lote o vacio",
+      "expiry_date": "YYYY-MM-DD o vacio"
+    }
+  ]
+}
+
+Reglas: usa punto decimal; no inventes datos ausentes (deja vacío o 0);
+si el texto no es una factura devuelve {"items": []}.
+PROMPT;
+
+        try {
+            $baseUrl = rtrim((string)($this->config['base_url'] ?? 'https://openrouter.ai/api/v1'), '/');
+            $response = $this->httpPostJson(
+                $baseUrl . '/chat/completions',
+                [
+                    'model' => (string)($this->config['model'] ?? 'nvidia/nemotron-3-ultra-550b-a55b:free'),
+                    'messages' => [
+                        ['role' => 'system', 'content' => $instruccion],
+                        ['role' => 'user', 'content' => $rawText],
+                    ],
+                    'temperature' => 0,
+                    'max_tokens' => 3000,
+                ],
+                [
+                    'Content-Type: application/json',
+                    'Authorization: Bearer ' . (string)$this->config['api_key'],
+                    'HTTP-Referer: ' . ($this->config['site_url'] ?? 'http://localhost'),
+                    'X-Title: ' . ($this->config['site_name'] ?? 'Seri ERP'),
+                ],
+                (int)($this->config['timeout'] ?? 60)
+            );
+        } catch (\Throwable $e) {
+            error_log('AiService extractInvoiceData: ' . $this->safeError($e->getMessage()));
+            return null;
+        }
+
+        if (isset($response['error'])) {
+            return null;
+        }
+
+        $content = $response['choices'][0]['message']['content'] ?? '';
+        if (!is_string($content) || trim($content) === '') {
+            return null;
+        }
+
+        return $this->decodeJsonPayload($content);
+    }
+
+    /**
+     * Aísla el objeto JSON de una respuesta que puede venir con texto alrededor.
+     *
+     * @return array<string,mixed>|null
+     */
+    private function decodeJsonPayload(string $content): ?array
+    {
+        $content = trim($content);
+        $content = preg_replace('/^```(?:json)?|```$/mi', '', $content) ?? $content;
+
+        $start = strpos($content, '{');
+        $end = strrpos($content, '}');
+        if ($start === false || $end === false || $end <= $start) {
+            return null;
+        }
+
+        $decoded = json_decode(substr($content, $start, $end - $start + 1), true);
+        if (!is_array($decoded)) {
+            return null;
+        }
+        if (!isset($decoded['items']) || !is_array($decoded['items'])) {
+            $decoded['items'] = [];
+        }
+
+        return $decoded;
+    }
+
     private function httpPostJson(string $url, array $payload, array $headers, int $timeout): array
     {
         $body = json_encode($payload, JSON_UNESCAPED_UNICODE);

@@ -4,7 +4,11 @@ namespace SoftNova\Controllers;
 
 use SoftNova\Core\TenantController;
 use SoftNova\Core\TenantMiddleware;
+use SoftNova\Services\AccountingService;
+use SoftNova\Services\LotService;
+use SoftNova\Services\ProductSupplierService;
 use SoftNova\Services\StockService;
+use SoftNova\Services\SupplyChainSchema;
 use SoftNova\Services\TenantOpsSchema;
 use SoftNova\Services\Integrations\CatalogSyncService;
 
@@ -25,6 +29,7 @@ class TenantInventarioController extends TenantController
         TenantMiddleware::authorize('inventario');
         $this->ensureQuotesSchema();
         TenantOpsSchema::ensure($this->db);
+        SupplyChainSchema::ensure($this->db);
         $this->stock = new StockService($this->db);
     }
     
@@ -65,6 +70,34 @@ class TenantInventarioController extends TenantController
             $this->traceability();
             return;
         }
+        if ($action === 'vencimientos') {
+            $this->expiryPanel();
+            return;
+        }
+        if ($action === 'lot_adjust' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('inventario', 'edit');
+            $this->lotAction('adjust');
+            return;
+        }
+        if ($action === 'lot_block' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('inventario', 'edit');
+            $this->lotAction('block');
+            return;
+        }
+        if ($action === 'supplier_link' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('inventario', 'edit');
+            $this->supplierLink();
+            return;
+        }
+        if ($action === 'supplier_unlink' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('inventario', 'edit');
+            $this->supplierUnlink();
+            return;
+        }
+        if ($action === 'product_suppliers' && $this->request->method() === 'GET') {
+            $this->productSuppliers();
+            return;
+        }
         if ($action === 'import_catalog' && $this->request->method() === 'POST') {
             TenantMiddleware::authorize('inventario', 'create');
             $this->importCatalog();
@@ -80,6 +113,26 @@ class TenantInventarioController extends TenantController
             $this->importCsv();
             return;
         }
+        if ($action === 'create_category' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('inventario', 'create');
+            $this->createCategory();
+            return;
+        }
+        if ($action === 'delete_category' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('inventario', 'delete');
+            $this->deleteCategory();
+            return;
+        }
+        if ($action === 'category_report' && $this->request->method() === 'GET') {
+            TenantMiddleware::authorize('inventario', 'export');
+            $this->categoryReport();
+            return;
+        }
+        if ($action === 'traceability_pdf' && $this->request->method() === 'GET') {
+            TenantMiddleware::authorize('inventario', 'export');
+            $this->traceabilityPdf();
+            return;
+        }
         
         $filters = $this->listFilters([
             'name' => 'p.name',
@@ -89,12 +142,14 @@ class TenantInventarioController extends TenantController
             'cost' => 'p.purchase_price',
             'stock' => 'p.stock',
             'created' => 'p.created_at',
+            'location' => 'p.location',
         ], 'name', 'asc');
 
         $typeFilter = $this->request->get('type', '');
         $categoryFilter = (int)$this->request->get('category_id', 0);
         $stockFilter = (string)$this->request->get('stock_state', '');
         $channelFilter = (string)$this->request->get('channel', '');
+        $locationFilter = trim((string)$this->request->get('location', ''));
 
         $where = ["p.status = 'active'"];
         $params = [];
@@ -115,10 +170,14 @@ class TenantInventarioController extends TenantController
             $where[] = "COALESCE(p.source_channel, 'manual') = ?";
             $params[] = $channelFilter;
         }
+        if ($locationFilter !== '') {
+            $where[] = "p.location = ?";
+            $params[] = $locationFilter;
+        }
         if ($filters['q'] !== '') {
-            $where[] = "(p.name LIKE ? OR p.code LIKE ? OR p.description LIKE ? OR COALESCE(p.external_id,'') LIKE ?)";
+            $where[] = "(p.name LIKE ? OR p.code LIKE ? OR COALESCE(p.barcode,'') LIKE ? OR p.description LIKE ? OR COALESCE(p.external_id,'') LIKE ? OR COALESCE(p.location,'') LIKE ?)";
             $like = '%' . $filters['q'] . '%';
-            array_push($params, $like, $like, $like, $like);
+            array_push($params, $like, $like, $like, $like, $like, $like);
         }
         $whereSql = 'WHERE ' . implode(' AND ', $where);
 
@@ -162,6 +221,7 @@ class TenantInventarioController extends TenantController
             'category_id' => $categoryFilter > 0 ? $categoryFilter : null,
             'stock_state' => in_array($stockFilter, ['low', 'out'], true) ? $stockFilter : null,
             'channel' => $channelFilter !== '' ? $channelFilter : null,
+            'location' => $locationFilter !== '' ? $locationFilter : null,
         ], static fn($v) => $v !== null && $v !== '');
         $filters['query'] = array_merge($filters['query'], $extraQuery);
 
@@ -172,7 +232,38 @@ class TenantInventarioController extends TenantController
             $catalogStatuses = [];
         }
 
+        $expirySummary = ['expired_lots' => 0, 'expiring_lots' => 0, 'expired_value' => 0.0, 'expiring_value' => 0.0];
+        try {
+            $expirySummary = (new LotService($this->db))->expirySummary();
+        } catch (\Throwable $e) {
+            // Instalación sin migrar aún: el panel de vencimientos queda en cero.
+        }
+
+        $suppliersCatalog = [];
+        try {
+            $suppliersCatalog = $this->query(
+                "SELECT id, name FROM suppliers WHERE status = 'active' ORDER BY name"
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $suppliersCatalog = [];
+        }
+
+        $locationOptions = [];
+        try {
+            $locationOptions = (new \SoftNova\Services\CustomOptionService($this->db))
+                ->options(\SoftNova\Services\CustomOptionService::GROUP_PRODUCT_LOCATION, true);
+        } catch (\Throwable $e) {
+            $locationOptions = [
+                ['value' => 'Bodega', 'label' => 'Bodega'],
+                ['value' => 'Almacén 1', 'label' => 'Almacén 1'],
+                ['value' => 'Local 2', 'label' => 'Local 2'],
+                ['value' => '__other__', 'label' => 'Otro'],
+            ];
+        }
+
         $this->view('tenant.inventario', $this->tenantViewData([
+            'expirySummary' => $expirySummary,
+            'suppliersCatalog' => $suppliersCatalog,
             'products' => $products,
             'categories' => $categories,
             'lowStock' => $lowStock,
@@ -182,6 +273,8 @@ class TenantInventarioController extends TenantController
             'categoryFilter' => $categoryFilter,
             'stockFilter' => $stockFilter,
             'channelFilter' => $channelFilter,
+            'locationFilter' => $locationFilter,
+            'locationOptions' => $locationOptions,
             'filters' => $filters,
             'pagination' => $pagination,
             'catalogStatuses' => $catalogStatuses,
@@ -229,13 +322,141 @@ class TenantInventarioController extends TenantController
             [$id]
         )->fetchAll();
         
+        $lots = [];
+        if (!empty($product['track_lots'])) {
+            try {
+                $lots = (new LotService($this->db))->lotsForProduct($id);
+            } catch (\Throwable $e) {
+                $lots = [];
+            }
+        }
+
+        $productSuppliers = [];
+        try {
+            $productSuppliers = (new ProductSupplierService($this->db))->suppliersFor($id);
+        } catch (\Throwable $e) {
+            $productSuppliers = [];
+        }
+
         $this->json([
             'product' => $product,
             'movements' => $movements,
             'lastSales' => $lastSales,
             'purchases' => $purchases,
+            'lots' => $lots,
+            'suppliers' => $productSuppliers,
             'channel_label' => \SoftNova\Core\product_channel_label((string)($product['source_channel'] ?? 'manual')),
         ]);
+    }
+
+    /** Ajuste manual o bloqueo de un lote (mermas, roturas, cuarentena). */
+    private function lotAction(string $mode): void
+    {
+        if (!$this->validateCsrfOrFail('/app/inventario?action=vencimientos')) {
+            return;
+        }
+        $lotId = (int)$this->request->post('lot_id');
+        if ($lotId <= 0) {
+            $this->respond(false, 'Lote no válido', '/app/inventario?action=vencimientos');
+            return;
+        }
+
+        try {
+            $lots = new LotService($this->db);
+            $notes = substr(trim((string)$this->request->post('notes', '')), 0, 255);
+
+            if ($mode === 'block') {
+                $ok = $lots->blockLot($lotId, $notes);
+                $this->respond($ok, $ok ? 'Lote bloqueado: no se venderá' : 'Lote no encontrado', '/app/inventario?action=vencimientos');
+                return;
+            }
+
+            $ok = $lots->adjustLot($lotId, (int)$this->request->post('quantity', 0), $notes);
+            $this->respond($ok, $ok ? 'Lote ajustado' : 'Lote no encontrado', '/app/inventario?action=vencimientos');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/inventario?action=vencimientos');
+        }
+    }
+
+    /** Proveedores de un producto con su código y costo, para el modal de detalle. */
+    private function productSuppliers(): void
+    {
+        $productId = (int)$this->request->get('id', 0);
+        if ($productId <= 0) {
+            $this->json(['success' => false, 'message' => 'Producto no válido']);
+            return;
+        }
+
+        try {
+            $service = new ProductSupplierService($this->db);
+            $this->json([
+                'success' => true,
+                'suppliers' => $service->suppliersFor($productId),
+                'catalog' => $this->query(
+                    "SELECT id, name FROM suppliers WHERE status = 'active' ORDER BY name"
+                )->fetchAll(),
+            ]);
+        } catch (\Throwable $e) {
+            $this->json(['success' => false, 'message' => $e->getMessage()]);
+        }
+    }
+
+    private function supplierLink(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/inventario')) {
+            return;
+        }
+        $productId = (int)$this->request->post('product_id');
+        $supplierId = (int)$this->request->post('supplier_id');
+        if ($productId <= 0 || $supplierId <= 0) {
+            $this->respond(false, 'Seleccione producto y proveedor', '/app/inventario');
+            return;
+        }
+
+        try {
+            (new ProductSupplierService($this->db))->link($productId, $supplierId, [
+                'supplier_sku' => (string)$this->request->post('supplier_sku', ''),
+                'supplier_product_name' => (string)$this->request->post('supplier_product_name', ''),
+                'last_cost' => (float)$this->request->post('last_cost', 0),
+                'lead_time_days' => (int)$this->request->post('lead_time_days', 0),
+                'min_order_qty' => (int)$this->request->post('min_order_qty', 1),
+                'is_primary' => (string)$this->request->post('is_primary', '') !== '',
+                'notes' => (string)$this->request->post('notes', ''),
+            ]);
+            $this->respond(true, 'Proveedor vinculado al producto', '/app/inventario');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/inventario');
+        }
+    }
+
+    private function supplierUnlink(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/inventario')) {
+            return;
+        }
+        try {
+            (new ProductSupplierService($this->db))->unlink(
+                (int)$this->request->post('product_id'),
+                (int)$this->request->post('supplier_id')
+            );
+            $this->respond(true, 'Proveedor desvinculado', '/app/inventario');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/inventario');
+        }
+    }
+
+    /** Panel de control de vencimientos: lotes vencidos, por vencer y descuadres. */
+    private function expiryPanel(): void
+    {
+        $days = (int)$this->request->get('days', 0);
+        $lots = new LotService($this->db);
+
+        $this->view('tenant.vencimientos', $this->tenantViewData([
+            'summary' => $lots->expirySummary(),
+            'lots' => $lots->expiringLots($days > 0 ? $days : null, 200),
+            'mismatches' => $lots->lotStockMismatches(30),
+            'daysFilter' => $days,
+        ]));
     }
 
     private function editMovementDate(): void
@@ -330,14 +551,27 @@ class TenantInventarioController extends TenantController
         if ($code === '') {
             $code = 'SKU-' . strtoupper(substr(bin2hex(random_bytes(3)), 0, 6));
         }
+        $barcode = $this->normalizeBarcodeInput((string)$this->request->post('barcode', ''));
+        if ($barcode === false) {
+            $this->respond(false, 'Código de barras EAN inválido (máx. 64 caracteres).', '/app/inventario');
+            return;
+        }
         
+        $lotInput = $this->lotInput();
+        $trackLots = $productType === 'product'
+            && ($lotInput['track_lots'] || $lotInput['expiry_date'] !== null);
+        $location = $this->normalizeLocationInput((string)$this->request->post('location', ''));
+
+        SupplyChainSchema::ensure($this->db);
+
         $this->query(
             "INSERT INTO products
-                (code, name, product_type, description, category_id, purchase_price, sale_price,
-                 stock, min_stock, unit, image, created_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (code, barcode, name, product_type, description, category_id, purchase_price, sale_price,
+                 stock, min_stock, unit, image, track_lots, expiry_alert_days, max_stock, location, created_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 $code,
+                $barcode !== '' ? $barcode : null,
                 $name,
                 $productType,
                 $this->request->post('description'),
@@ -348,6 +582,10 @@ class TenantInventarioController extends TenantController
                 $this->request->post('min_stock', 5),
                 $this->request->post('unit', 'UNIDAD'),
                 $image,
+                $trackLots ? 1 : 0,
+                $lotInput['alert_days'],
+                $this->maxStockInput(),
+                $location,
                 $_SESSION['tenant_user_id'],
             ]
         );
@@ -355,7 +593,24 @@ class TenantInventarioController extends TenantController
         $newId = (int)$this->db->lastInsertId();
         
         if ($stock > 0 && $productType === 'product') {
-            $this->stock->addMovement($newId, 'in', $stock, 'adjustment', null, 'Stock inicial (ajuste; use Compras para proveedor)');
+            $unitCost = (float)$this->request->post('purchase_price', 0);
+            $movementId = $this->stock->addMovement(
+                $newId,
+                'in',
+                $stock,
+                'opening',
+                null,
+                'Stock inicial (use Compras para entradas con proveedor)',
+                null,
+                $unitCost,
+                $stock,
+                null,
+                'equity'
+            );
+            $this->postStockAccounting($movementId);
+            if ($trackLots) {
+                $this->registerLot($newId, $stock, $unitCost, $movementId, $lotInput);
+            }
         }
         
         $this->respond(true, ($productType === 'service' ? 'Servicio' : 'Producto') . ' creado: ' . $name, '/app/inventario');
@@ -394,11 +649,21 @@ class TenantInventarioController extends TenantController
             $this->respond(false, 'Código / SKU inválido. Use texto (no notación científica) y máximo 255 caracteres.', '/app/inventario');
             return;
         }
+        $barcode = $this->normalizeBarcodeInput((string)$this->request->post('barcode', ''));
+        if ($barcode === false) {
+            $this->respond(false, 'Código de barras EAN inválido (máx. 64 caracteres).', '/app/inventario');
+            return;
+        }
         
-        $sql = "UPDATE products SET code = ?, name = ?, product_type = ?, description = ?, category_id = ?,
-                purchase_price = ?, sale_price = ?, stock = ?, min_stock = ?, unit = ?, status = ?";
+        $lotInput = $this->lotInput();
+        $location = $this->normalizeLocationInput((string)$this->request->post('location', ''));
+        SupplyChainSchema::ensure($this->db);
+        $sql = "UPDATE products SET code = ?, barcode = ?, name = ?, product_type = ?, description = ?, category_id = ?,
+                purchase_price = ?, sale_price = ?, stock = ?, min_stock = ?, unit = ?, status = ?,
+                track_lots = ?, expiry_alert_days = ?, max_stock = ?, location = ?";
         $params = [
             $code,
+            $barcode !== '' ? $barcode : null,
             $name,
             $productType,
             $this->request->post('description'),
@@ -409,6 +674,10 @@ class TenantInventarioController extends TenantController
             $this->request->post('min_stock', 5),
             $this->request->post('unit', 'UNIDAD'),
             $this->request->post('status', 'active'),
+            ($productType === 'product' && $lotInput['track_lots']) ? 1 : 0,
+            $lotInput['alert_days'],
+            $this->maxStockInput(),
+            $location,
         ];
         
         if ($image) {
@@ -422,14 +691,20 @@ class TenantInventarioController extends TenantController
         $oldStock = (int)$oldProduct['stock'];
         if ($newStock !== $oldStock && $productType === 'product') {
             $diff = $newStock - $oldStock;
-            $this->stock->addMovement(
+            $movementId = $this->stock->addMovement(
                 $id,
                 $diff > 0 ? 'in' : 'out',
                 abs($diff),
                 'adjustment',
                 null,
-                'Ajuste manual de stock'
+                $diff > 0 ? 'Ajuste (+): manual de stock' : 'Ajuste (−): manual de stock',
+                null,
+                (float)$this->request->post('purchase_price', $oldProduct['purchase_price'] ?? 0),
+                $newStock,
+                null,
+                $diff > 0 ? 'equity' : 'loss'
             );
+            $this->postStockAccounting($movementId);
         }
         
         $this->respond(true, 'Actualizado', '/app/inventario');
@@ -454,7 +729,8 @@ class TenantInventarioController extends TenantController
             return;
         }
         
-        $this->stock->increase(
+        $lotInput = $this->lotInput();
+        $movementId = $this->stock->increase(
             $id,
             $qty,
             'adjustment',
@@ -463,11 +739,91 @@ class TenantInventarioController extends TenantController
             'in',
             null,
             null,
-            null,
+            'equity',
             false,
-            $movementDate
+            $movementDate,
+            [
+                'lot_code' => $lotInput['lot_code'],
+                'expiry_date' => $lotInput['expiry_date'],
+                'alert_days' => $lotInput['alert_days'],
+            ]
         );
-        $this->respond(true, "Stock aumentado en {$qty} unidades", '/app/inventario');
+        $this->postStockAccounting($movementId);
+
+        $mensaje = "Stock aumentado en {$qty} unidades";
+        if ($lotInput['expiry_date'] !== null) {
+            $mensaje .= ' con vencimiento ' . $lotInput['expiry_date'];
+        }
+        $this->respond(true, $mensaje, '/app/inventario');
+    }
+
+    /**
+     * Datos de lote enviados por el formulario de producto o de entrada de stock.
+     *
+     * @return array{track_lots:bool,lot_code:string,expiry_date:?string,alert_days:int}
+     */
+    private function lotInput(): array
+    {
+        $expiry = trim((string)$this->request->post('expiry_date', ''));
+        $dt = $expiry !== '' ? \DateTimeImmutable::createFromFormat('Y-m-d', $expiry) : null;
+
+        return [
+            'track_lots' => (string)$this->request->post('track_lots', '') !== '',
+            'lot_code' => substr(trim((string)$this->request->post('lot_code', '')), 0, 60),
+            'expiry_date' => ($dt && $dt->format('Y-m-d') === $expiry) ? $expiry : null,
+            'alert_days' => max(0, min(3650, (int)$this->request->post('expiry_alert_days', 30))),
+        ];
+    }
+
+    /** Stock máximo sugerido para las órdenes de reposición. */
+    private function maxStockInput(): ?int
+    {
+        $raw = trim((string)$this->request->post('max_stock', ''));
+        if ($raw === '') {
+            return null;
+        }
+        return max(0, (int)$raw);
+    }
+
+    /**
+     * @param array{lot_code:string,expiry_date:?string,alert_days:int} $lotInput
+     */
+    private function registerLot(int $productId, int $qty, float $unitCost, int $movementId, array $lotInput): void
+    {
+        try {
+            $lots = new LotService($this->db);
+            $lotId = $lots->registerEntry($productId, $qty, $unitCost, [
+                'lot_code' => $lotInput['lot_code'],
+                'expiry_date' => $lotInput['expiry_date'],
+                'notes' => 'Registrado desde inventario',
+            ]);
+            if ($lotId > 0 && $movementId > 0) {
+                $this->query(
+                    "INSERT INTO stock_movement_lots
+                        (movement_id, lot_id, lot_code, expiry_date, quantity, unit_cost)
+                     SELECT ?, id, lot_code, expiry_date, ?, ? FROM product_lots WHERE id = ?",
+                    [$movementId, $qty, round($unitCost, 2), $lotId]
+                );
+            }
+        } catch (\Throwable $e) {
+            error_log('Registro de lote producto ' . $productId . ': ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Lleva el movimiento de inventario al libro contable.
+     * Un fallo contable no debe revertir el movimiento de bodega.
+     */
+    private function postStockAccounting(int $movementId): void
+    {
+        if ($movementId <= 0) {
+            return;
+        }
+        try {
+            (new AccountingService($this->db))->postStockMovement($movementId);
+        } catch (\Throwable $e) {
+            error_log('Contabilidad movimiento inventario ' . $movementId . ': ' . $e->getMessage());
+        }
     }
     
     private function delete(): void
@@ -526,8 +882,8 @@ class TenantInventarioController extends TenantController
             return false;
         }
         
-        $baseUrl = \SoftNova\Core\config('app.url', 'http://localhost/SoftNova/public');
-        return rtrim($baseUrl, '/') . '/uploads/products/' . $filename;
+        // Ruta relativa: se sirve vía /app/media (autenticado)
+        return 'uploads/products/' . $filename;
     }
     
     private function exportProducts(): void
@@ -540,11 +896,13 @@ class TenantInventarioController extends TenantController
             'cost' => 'p.purchase_price',
             'stock' => 'p.stock',
             'created' => 'p.created_at',
+            'location' => 'p.location',
         ], 'name', 'asc');
 
         $typeFilter = $this->request->get('type', '');
         $categoryFilter = (int)$this->request->get('category_id', 0);
         $stockFilter = (string)$this->request->get('stock_state', '');
+        $locationFilter = trim((string)$this->request->get('location', ''));
 
         $where = ["p.status = 'active'"];
         $params = [];
@@ -561,16 +919,20 @@ class TenantInventarioController extends TenantController
         } elseif ($stockFilter === 'out') {
             $where[] = "p.product_type = 'product' AND p.stock <= 0";
         }
+        if ($locationFilter !== '') {
+            $where[] = "p.location = ?";
+            $params[] = $locationFilter;
+        }
         if ($filters['q'] !== '') {
-            $where[] = "(p.name LIKE ? OR p.code LIKE ? OR p.description LIKE ?)";
+            $where[] = "(p.name LIKE ? OR p.code LIKE ? OR COALESCE(p.barcode,'') LIKE ? OR p.description LIKE ? OR COALESCE(p.location,'') LIKE ?)";
             $like = '%' . $filters['q'] . '%';
-            array_push($params, $like, $like, $like);
+            array_push($params, $like, $like, $like, $like, $like);
         }
         $whereSql = 'WHERE ' . implode(' AND ', $where);
 
         $rows = $this->query(
-            "SELECT p.code, p.name, p.product_type, c.name as category_name, p.purchase_price,
-                    p.sale_price, p.stock, p.min_stock, p.unit, p.status
+            "SELECT p.id, p.code, p.barcode, p.name, p.product_type, c.name as category_name, p.purchase_price,
+                    p.sale_price, p.stock, p.min_stock, p.unit, p.status, p.location
              FROM products p
              LEFT JOIN categories c ON p.category_id = c.id
              {$whereSql}
@@ -579,14 +941,20 @@ class TenantInventarioController extends TenantController
         )->fetchAll();
         
         $csvRows = [];
+        $userId = (int)($_SESSION['tenant_user_id'] ?? 0);
         foreach ($rows as $r) {
             // Prefijo tab: Excel no convierte EAN/SKU largos a notación científica
             $sku = (string)($r['code'] ?? '');
             if ($sku !== '' && preg_match('/^\d{11,}$/', $sku)) {
                 $sku = "\t" . $sku;
             }
+            $ean = (string)($r['barcode'] ?? '');
+            if ($ean !== '' && preg_match('/^\d{11,}$/', $ean)) {
+                $ean = "\t" . $ean;
+            }
             $csvRows[] = [
                 $sku,
+                $ean,
                 $r['name'],
                 $r['product_type'],
                 $r['category_name'],
@@ -596,14 +964,220 @@ class TenantInventarioController extends TenantController
                 $r['min_stock'],
                 $r['unit'],
                 $r['status'],
+                $r['location'] ?? '',
             ];
+
+            // Huella en trazabilidad: exportación CSV (sin alterar stock).
+            try {
+                $this->stock->addMovement(
+                    (int)$r['id'],
+                    'adjustment',
+                    0,
+                    'csv_export',
+                    null,
+                    'Exportación CSV de catálogo',
+                    $userId ?: null,
+                    (float)($r['purchase_price'] ?? 0),
+                    (int)($r['stock'] ?? 0),
+                    null,
+                    null
+                );
+            } catch (\Throwable $e) {
+                // No bloquear la descarga si falla el registro de auditoría.
+            }
         }
         
         $this->exportCsv(
             'inventario_' . date('Ymd_His') . '.csv',
-            ['SKU', 'Nombre', 'Tipo', 'Categoria', 'Costo', 'Precio', 'Stock', 'Min', 'Unidad', 'Estado'],
+            ['SKU', 'EAN', 'Nombre', 'Tipo', 'Categoria', 'Costo', 'Precio', 'Stock', 'Min', 'Unidad', 'Estado', 'Ubicacion'],
             $csvRows
         );
+    }
+
+    private function createCategory(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/inventario')) {
+            return;
+        }
+        $name = trim(preg_replace('/\s+/', ' ', (string)$this->request->post('name', '')) ?? '');
+        if ($name === '' || mb_strlen($name) < 2) {
+            $this->respond(false, 'Escriba un nombre de categoría válido', '/app/inventario');
+            return;
+        }
+        if (mb_strlen($name) > 100) {
+            $name = mb_substr($name, 0, 100);
+        }
+        $description = trim((string)$this->request->post('description', ''));
+        try {
+            $exists = $this->query(
+                "SELECT id, status FROM categories WHERE LOWER(name) = LOWER(?) LIMIT 1",
+                [$name]
+            )->fetch();
+            if ($exists) {
+                if (($exists['status'] ?? '') !== 'active') {
+                    $this->query(
+                        "UPDATE categories SET status = 'active', description = COALESCE(NULLIF(?, ''), description) WHERE id = ?",
+                        [$description, (int)$exists['id']]
+                    );
+                    $this->respond(true, 'Categoría reactivada: ' . $name, '/app/inventario');
+                    return;
+                }
+                $this->respond(false, 'Ya existe la categoría: ' . $name, '/app/inventario');
+                return;
+            }
+            $this->query(
+                "INSERT INTO categories (name, description, status) VALUES (?, ?, 'active')",
+                [$name, $description !== '' ? $description : null]
+            );
+            $this->respond(true, 'Categoría creada: ' . $name, '/app/inventario');
+        } catch (\Throwable $e) {
+            $this->respond(false, 'No se pudo crear la categoría: ' . $e->getMessage(), '/app/inventario');
+        }
+    }
+
+    private function deleteCategory(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/inventario')) {
+            return;
+        }
+        $id = (int)$this->request->post('id', 0);
+        if ($id <= 0) {
+            $this->respond(false, 'Categoría no válida', '/app/inventario');
+            return;
+        }
+        try {
+            $cat = $this->query("SELECT id, name FROM categories WHERE id = ?", [$id])->fetch();
+            if (!$cat) {
+                $this->respond(false, 'Categoría no encontrada', '/app/inventario');
+                return;
+            }
+            $used = (int)$this->query(
+                "SELECT COUNT(*) FROM products WHERE category_id = ? AND status = 'active'",
+                [$id]
+            )->fetchColumn();
+            // Soft-delete: productos quedan sin categoría (FK ON DELETE SET NULL) o se desasocian.
+            $this->query("UPDATE products SET category_id = NULL WHERE category_id = ?", [$id]);
+            $this->query("UPDATE categories SET status = 'inactive' WHERE id = ?", [$id]);
+            $msg = 'Categoría eliminada: ' . $cat['name'];
+            if ($used > 0) {
+                $msg .= " ({$used} producto(s) quedaron sin categoría)";
+            }
+            $this->respond(true, $msg, '/app/inventario');
+        } catch (\Throwable $e) {
+            $this->respond(false, 'No se pudo eliminar: ' . $e->getMessage(), '/app/inventario');
+        }
+    }
+
+    private function categoryReport(): void
+    {
+        try {
+            $categoryId = (int)$this->request->get('category_id', 0);
+            $format = strtolower((string)$this->request->get('format', 'pdf'));
+            $where = ["p.status = 'active'", "p.product_type = 'product'"];
+            $params = [];
+            if ($categoryId > 0) {
+                $where[] = 'p.category_id = ?';
+                $params[] = $categoryId;
+            }
+            $whereSql = implode(' AND ', $where);
+            $rows = $this->query(
+                "SELECT COALESCE(c.name, 'Sin categoría') as category_name,
+                        p.code, p.name, p.location, p.stock, p.min_stock, p.purchase_price, p.sale_price,
+                        (p.stock * p.purchase_price) as stock_value
+                 FROM products p
+                 LEFT JOIN categories c ON c.id = p.category_id
+                 WHERE {$whereSql}
+                 ORDER BY category_name ASC, p.name ASC",
+                $params
+            )->fetchAll();
+
+            if ($format === 'csv') {
+                $csvRows = [];
+                foreach ($rows as $r) {
+                    $csvRows[] = [
+                        $r['category_name'],
+                        $r['code'],
+                        $r['name'],
+                        $r['location'] ?? '',
+                        $r['stock'],
+                        $r['min_stock'],
+                        $r['purchase_price'],
+                        $r['sale_price'],
+                        $r['stock_value'],
+                    ];
+                }
+                $this->exportCsv(
+                    'inventario_por_categoria_' . date('Ymd_His') . '.csv',
+                    ['Categoria', 'SKU', 'Producto', 'Ubicacion', 'Stock', 'Min', 'Costo', 'Precio', 'Valor stock'],
+                    $csvRows
+                );
+                return;
+            }
+
+            $summary = $this->query(
+                "SELECT COALESCE(c.name, 'Sin categoría') as category_name,
+                        COUNT(*) as products,
+                        COALESCE(SUM(p.stock), 0) as units,
+                        COALESCE(SUM(p.stock * p.purchase_price), 0) as value
+                 FROM products p
+                 LEFT JOIN categories c ON c.id = p.category_id
+                 WHERE {$whereSql}
+                 GROUP BY COALESCE(c.name, 'Sin categoría')
+                 ORDER BY category_name",
+                $params
+            )->fetchAll();
+
+            $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
+            $content = $pdf->generateInventoryByCategoryReport($summary, $rows, [
+                'category_id' => $categoryId,
+            ]);
+            $pdf->download($content, 'inventario_categoria_' . date('Ymd_His') . '.pdf');
+        } catch (\Throwable $e) {
+            error_log('categoryReport: ' . $e->getMessage());
+            http_response_code(500);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo "No se pudo generar el reporte.\n" . $e->getMessage();
+            exit;
+        }
+    }
+
+    private function traceabilityPdf(): void
+    {
+        try {
+            $filters = [
+                'q' => trim((string)$this->request->get('q', '')),
+                'type' => trim((string)$this->request->get('type', '')),
+                'reference_type' => trim((string)$this->request->get('reference_type', '')),
+                'from' => trim((string)$this->request->get('from', '')),
+                'to' => trim((string)$this->request->get('to', '')),
+                'product_id' => (int)$this->request->get('product_id', 0) ?: null,
+                'location' => trim((string)$this->request->get('location', '')),
+                'category_id' => (int)$this->request->get('category_id', 0) ?: null,
+            ];
+            $result = $this->stock->listMovements($filters, 5000, 0);
+            $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
+            $content = $pdf->generateTraceabilityReport($result['rows'] ?? [], $filters);
+            $pdf->download($content, 'trazabilidad_' . date('Ymd_His') . '.pdf');
+        } catch (\Throwable $e) {
+            error_log('traceabilityPdf: ' . $e->getMessage());
+            http_response_code(500);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo "No se pudo generar el PDF de trazabilidad.\n" . $e->getMessage();
+            exit;
+        }
+    }
+
+    /** @return string|null */
+    private function normalizeLocationInput(string $raw): ?string
+    {
+        $location = trim(preg_replace('/\s+/', ' ', $raw) ?? '');
+        if ($location === '' || $location === '__other__' || mb_strtolower($location) === 'otro') {
+            return null;
+        }
+        if (mb_strlen($location) > 120) {
+            $location = mb_substr($location, 0, 120);
+        }
+        return $location;
     }
 
     /**
@@ -699,6 +1273,19 @@ class TenantInventarioController extends TenantController
             $code = $m[1];
         }
         if (mb_strlen($code, 'UTF-8') > 255) {
+            return false;
+        }
+        return $code;
+    }
+
+    /** @return string|false */
+    private function normalizeBarcodeInput(string $raw): string|false
+    {
+        $code = $this->normalizeProductCodeInput($raw);
+        if ($code === false) {
+            return false;
+        }
+        if (mb_strlen($code, 'UTF-8') > 64) {
             return false;
         }
         return $code;

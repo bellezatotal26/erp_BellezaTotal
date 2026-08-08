@@ -146,8 +146,8 @@ $operationalCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '')
                     </div>
                     <div class="form-group">
                         <label>Medio de pago</label>
-                        <select name="payment_method" class="form-control">
-                            <?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash'); ?>
+                        <select name="payment_method" class="form-control" data-custom-other="payment_method">
+                            <?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?>
                         </select>
                     </div>
                 </div>

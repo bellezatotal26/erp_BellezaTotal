@@ -8,14 +8,18 @@ namespace SoftNova\Services;
  */
 class TenantOpsSchema
 {
+    /** @var \WeakMap<\PDO, bool>|null Evita reentradas en el mismo PDO sin romper FPM al reciclar IDs. */
+    private static ?\WeakMap $done = null;
+
     public static function ensure(\PDO $db): void
     {
-        static $done = [];
-        $oid = spl_object_id($db);
-        if (isset($done[$oid])) {
+        self::$done ??= new \WeakMap();
+        if (isset(self::$done[$db])) {
+            // Re-aplicar columnas de nómina (barato) por si el código se desplegó mid-worker.
+            self::ensurePayrollSchema($db);
             return;
         }
-        $done[$oid] = true;
+        self::$done[$db] = true;
 
         $db->exec(
             "CREATE TABLE IF NOT EXISTS purchases (
@@ -110,6 +114,56 @@ class TenantOpsSchema
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
         );
 
+        // Migración: instalaciones viejas pueden tener `employees` incompleta.
+        foreach ([
+            ['employees', 'document_type', "VARCHAR(20) NOT NULL DEFAULT 'CC'"],
+            ['employees', 'document_number', "VARCHAR(40) NOT NULL DEFAULT ''"],
+            ['employees', 'first_name', "VARCHAR(120) NOT NULL DEFAULT ''"],
+            ['employees', 'last_name', "VARCHAR(120) NOT NULL DEFAULT ''"],
+            ['employees', 'email', 'VARCHAR(180) NULL'],
+            ['employees', 'phone', 'VARCHAR(40) NULL'],
+            ['employees', 'position_title', 'VARCHAR(120) NULL'],
+            ['employees', 'hire_date', 'DATE NULL'],
+            ['employees', 'salary', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00'],
+            ['employees', 'contract_type', "VARCHAR(40) NOT NULL DEFAULT 'indefinido'"],
+            ['employees', 'payment_method', "VARCHAR(50) NOT NULL DEFAULT 'transfer'"],
+            ['employees', 'bank_account', 'VARCHAR(80) NULL'],
+            ['employees', 'has_transport_aid', 'TINYINT(1) NOT NULL DEFAULT 1'],
+            ['employees', 'status', "ENUM('active','inactive') NOT NULL DEFAULT 'active'"],
+            ['employees', 'notes', 'TEXT NULL'],
+        ] as [$table, $col, $def]) {
+            self::addColumnIfMissing($db, $table, $col, $def);
+        }
+
+        // Verificación explícita: sin last_name el módulo de nómina falla al ordenar.
+        try {
+            $hasLast = $db->query("SHOW COLUMNS FROM `employees` LIKE 'last_name'")->fetch();
+            if (!$hasLast) {
+                $db->exec("ALTER TABLE `employees` ADD COLUMN `last_name` VARCHAR(120) NOT NULL DEFAULT ''");
+            }
+            $hasFirst = $db->query("SHOW COLUMNS FROM `employees` LIKE 'first_name'")->fetch();
+            if (!$hasFirst) {
+                $db->exec("ALTER TABLE `employees` ADD COLUMN `first_name` VARCHAR(120) NOT NULL DEFAULT ''");
+            }
+        } catch (\Throwable $e) {
+            error_log('Payroll schema employees names: ' . $e->getMessage());
+        }
+
+        // Legacy: si existe `name` y first_name está vacío, copiar.
+        try {
+            $hasName = $db->query("SHOW COLUMNS FROM `employees` LIKE 'name'")->fetch();
+            if ($hasName) {
+                $db->exec(
+                    "UPDATE employees
+                     SET first_name = TRIM(SUBSTRING_INDEX(name, ' ', 1)),
+                         last_name = TRIM(SUBSTRING(name, LENGTH(SUBSTRING_INDEX(name, ' ', 1)) + 1))
+                     WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''"
+                );
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
         $db->exec(
             "CREATE TABLE IF NOT EXISTS payroll_runs (
                 id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -193,9 +247,16 @@ class TenantOpsSchema
             if ($stmt && $stmt->fetch()) {
                 return;
             }
-            $db->exec("ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$definition}");
+            try {
+                $db->exec("ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$definition}");
+            } catch (\Throwable $e) {
+                // Si falla por AFTER/columna ancla, reintentar sin posición.
+                $bare = preg_replace('/\s+AFTER\s+`.+?`/i', '', $definition) ?? $definition;
+                $bare = preg_replace('/\s+AFTER\s+\w+/i', '', $bare) ?? $bare;
+                $db->exec("ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$bare}");
+            }
         } catch (\Throwable $e) {
-            // silencioso
+            error_log("TenantOpsSchema ADD {$table}.{$column}: " . $e->getMessage());
         }
     }
 

@@ -77,11 +77,25 @@ class TenantAuthController extends Controller
         
         // Verificar que la BD del tenant existe y sincronizar usuario
         try {
+            $dbPassStored = (string)($user['database_password'] ?? '');
+            $dbPassPlain = \SoftNova\Core\Security::revealSecret($dbPassStored);
+            // Migración lazy: cifrar passwords legados en claro.
+            if ($dbPassPlain !== '' && !\SoftNova\Core\Security::isSealed($dbPassStored)) {
+                try {
+                    $masterDb->query(
+                        "UPDATE tenants SET database_password = ? WHERE id = ?",
+                        [\SoftNova\Core\Security::sealSecret($dbPassPlain), (int)$user['tenant_id']]
+                    );
+                } catch (\Throwable $e) {
+                    error_log('tenant password seal: ' . $e->getMessage());
+                }
+            }
+
             $tenantDb = TenantDatabase::getInstance();
             $tenantConn = $tenantDb->getTenantConnection(
                 $user['database_name'],
                 $user['database_user'],
-                $user['database_password']
+                $dbPassPlain
             );
             
             // Sincronizar usuario en la BD del tenant (para FKs de cash_sessions, sales, etc.)

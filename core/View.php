@@ -52,7 +52,7 @@ class View
                     // Vars definidas en la vista (pageScripts, needBarcode, etc.)
                     // deben llegar al layout junto con $data del controlador.
                     $viewExtras = [];
-                    foreach (['pageScripts', 'needBarcode', 'pageTitle', 'title'] as $extraKey) {
+                    foreach (['pageScripts', 'needBarcode', 'pageTitle', 'title', 'pageTopStatsHtml'] as $extraKey) {
                         if (isset($$extraKey)) {
                             $viewExtras[$extraKey] = $$extraKey;
                         }

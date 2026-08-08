@@ -118,6 +118,9 @@ function handleAjaxSubmit(form) {
     if (form.dataset.prepare === 'saleItems' && typeof prepareSaleItems === 'function') {
         if (prepareSaleItems() === false) return;
     }
+    if (form.id === 'cancelSaleForm' && typeof prepareCancelSale === 'function') {
+        if (prepareCancelSale() === false) return;
+    }
     if (form.dataset.prepare === 'quoteItems' && typeof prepareQuoteItems === 'function') {
         if (prepareQuoteItems() === false) return;
     }
@@ -192,8 +195,10 @@ function handleAjaxSubmit(form) {
                         a.remove();
                     }, 400);
                 } catch (e) {
-                    window.location.href = data.pdf_url;
-                    return;
+                    // Abrir PDF en pestaña nueva; no abortar redirect (ej. share_close de caja).
+                    try {
+                        window.open(data.pdf_url, '_blank', 'noopener');
+                    } catch (e2) {}
                 }
             }
             if (data.redirect) {
@@ -372,6 +377,62 @@ function showAlert(message, type) {
     toast.innerHTML = '<strong style="opacity:0.9;">' + (labels[type] || 'Info') + '</strong><span>' + esc(message || '') + '</span>';
     container.appendChild(toast);
     setTimeout(function() { toast.remove(); }, 5000);
+}
+
+/**
+ * Intenta compartir un PDF con la app nativa (móvil → WhatsApp app).
+ * En escritorio cae a wa.me (abre WhatsApp Web/Desktop): el navegador
+ * no puede enviar archivos a WhatsApp en silencio sin API Business.
+ *
+ * @param {{pdfUrl:string, text?:string, waLink?:string, title?:string, filename?:string}} opts
+ * @returns {Promise<boolean>}
+ */
+function sharePdfToWhatsApp(opts) {
+    opts = opts || {};
+    var pdfUrl = opts.pdfUrl || '';
+    var waLink = opts.waLink || '';
+    var text = opts.text || '';
+    var title = opts.title || 'Documento';
+    var filename = opts.filename || 'documento.pdf';
+
+    function openWaFallback() {
+        if (waLink) {
+            window.open(waLink, '_blank', 'noopener');
+            return true;
+        }
+        if (text) {
+            window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank', 'noopener');
+            return true;
+        }
+        if (pdfUrl) {
+            window.open(pdfUrl, '_blank', 'noopener');
+            return true;
+        }
+        return false;
+    }
+
+    if (!pdfUrl || !navigator.share || !navigator.canShare) {
+        return Promise.resolve(openWaFallback());
+    }
+
+    return fetch(pdfUrl, { credentials: 'same-origin' })
+        .then(function(r) {
+            if (!r.ok) throw new Error('PDF no disponible');
+            return r.blob();
+        })
+        .then(function(blob) {
+            var file = new File([blob], filename, { type: 'application/pdf' });
+            var payload = { title: title, text: text || title, files: [file] };
+            if (!navigator.canShare(payload)) {
+                openWaFallback();
+                return false;
+            }
+            return navigator.share(payload).then(function() { return true; });
+        })
+        .catch(function() {
+            openWaFallback();
+            return false;
+        });
 }
 
 function showConfirmModal(message, callback) {
@@ -601,4 +662,136 @@ document.addEventListener('DOMContentLoaded', function() {
     if (typeof initCustomerCombobox === 'function') {
         initCustomerCombobox();
     }
+    if (window.SoftNovaCustomSelect) {
+        SoftNovaCustomSelect.bindAll();
+    }
 });
+
+/**
+ * Desplegables con opción "Otro": pide valor, lo guarda permanente y lo selecciona.
+ * Uso: <select data-custom-other="payment_method">…<option value="__other__">Otro</option>
+ * Grupos: payment_method | customer_source | sale_cancel_reason | discount_percent
+ */
+window.SoftNovaCustomSelect = {
+    otherValues: { __other__: true, other: true, Otro: true },
+
+    isOther: function(v) {
+        return !!this.otherValues[String(v || '')];
+    },
+
+    csrf: function() {
+        return (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+    },
+
+    url: function() {
+        return (document.querySelector('meta[name="custom-option-url"]') || {}).content || '';
+    },
+
+    promptLabel: function(group) {
+        if (group === 'discount_percent') return 'Ingrese el porcentaje de descuento (ej. 12):';
+        if (group === 'payment_method') return 'Nombre del nuevo medio de pago:';
+        if (group === 'customer_source') return '¿De dónde viene el cliente? Escriba el origen:';
+        if (group === 'sale_cancel_reason') return 'Escriba el motivo de eliminación:';
+        if (group === 'product_location') return 'Nombre de la nueva ubicación (bodega, local, etc.):';
+        return 'Escriba la nueva opción:';
+    },
+
+    save: function(group, label) {
+        var self = this;
+        var endpoint = this.url();
+        if (!endpoint) {
+            return Promise.reject(new Error('URL de opciones no configurada'));
+        }
+        var fd = new FormData();
+        fd.append('csrf_token', this.csrf());
+        fd.append('group', group);
+        fd.append('label', label);
+        return fetch(endpoint, { method: 'POST', body: fd, credentials: 'same-origin' })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (!data || !data.success || !data.option) {
+                    throw new Error((data && data.message) || 'No se pudo guardar la opción');
+                }
+                return data.option;
+            });
+    },
+
+    upsertOption: function(select, value, label) {
+        var found = null;
+        Array.prototype.forEach.call(select.options, function(opt) {
+            if (opt.value === value) found = opt;
+        });
+        if (found) {
+            found.textContent = label;
+            found.selected = true;
+            return;
+        }
+        var otherOpt = null;
+        Array.prototype.forEach.call(select.options, function(opt) {
+            if (SoftNovaCustomSelect.isOther(opt.value)) otherOpt = opt;
+        });
+        var opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = label;
+        if (otherOpt) {
+            select.insertBefore(opt, otherOpt);
+        } else {
+            select.appendChild(opt);
+        }
+        select.value = value;
+    },
+
+    handleChange: function(select, prevValue) {
+        var group = select.getAttribute('data-custom-other');
+        if (!group || !this.isOther(select.value)) {
+            return;
+        }
+        var self = this;
+        var label = window.prompt(this.promptLabel(group), '');
+        if (label === null) {
+            select.value = prevValue || '';
+            return;
+        }
+        label = String(label).trim();
+        if (!label) {
+            select.value = prevValue || '';
+            if (typeof showAlert === 'function') showAlert('Debe escribir una opción', 'warning');
+            return;
+        }
+        select.disabled = true;
+        this.save(group, label).then(function(opt) {
+            self.upsertOption(select, opt.value, opt.label);
+            select.disabled = false;
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+            if (typeof showAlert === 'function') {
+                showAlert(opt.created === false ? 'Opción seleccionada' : 'Opción añadida permanentemente', 'success');
+            }
+        }).catch(function(err) {
+            select.value = prevValue || '';
+            select.disabled = false;
+            if (typeof showAlert === 'function') showAlert(err.message || 'Error', 'error');
+        });
+    },
+
+    bind: function(select) {
+        if (!select || select.dataset.customOtherBound === '1') return;
+        select.dataset.customOtherBound = '1';
+        var prev = select.value;
+        select.addEventListener('focus', function() {
+            prev = select.value;
+        });
+        select.addEventListener('change', function() {
+            SoftNovaCustomSelect.handleChange(select, prev);
+            if (!SoftNovaCustomSelect.isOther(select.value)) {
+                prev = select.value;
+            }
+        });
+    },
+
+    bindAll: function(root) {
+        var scope = root || document;
+        scope.querySelectorAll('select[data-custom-other]').forEach(function(sel) {
+            SoftNovaCustomSelect.bind(sel);
+        });
+    }
+};

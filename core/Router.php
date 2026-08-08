@@ -187,6 +187,9 @@ class Router
         $this->post('/app/contabilidad', 'TenantContabilidadController', 'index');
         $this->get('/app/nomina', 'TenantNominaController', 'index');
         $this->post('/app/nomina', 'TenantNominaController', 'index');
+
+        // Archivos protegidos (uploads)
+        $this->get('/app/media', 'TenantMediaController', 'serve');
         
         // API v1
         $this->get('/api/v1/ping', 'ApiController', 'ping');

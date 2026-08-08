@@ -9,6 +9,9 @@ $recentSales = $recentSales ?? [];
 $openReceivables = $openReceivables ?? [];
 $recentlyPaidSales = $recentlyPaidSales ?? [];
 $receivablesError = $receivablesError ?? null;
+$openPayables = $openPayables ?? [];
+$payablesTotal = $payablesTotal ?? 0.0;
+$payablesError = $payablesError ?? null;
 $lowStockProducts = $lowStockProducts ?? [];
 $visibleWidgets = $visibleWidgets ?? [];
 $dashboardLayout = $dashboardLayout ?? [];
@@ -27,10 +30,10 @@ function formatCurrencyDashboard(?float $amount): string {
 }
 
 /** @return array<int, array> */
-function dashboardWidgetsByColumn(array $visibleWidgets): array
+function dashboardWidgetsByColumn(array $widgets): array
 {
     $cols = [0 => [], 1 => []];
-    foreach ($visibleWidgets as $w) {
+    foreach ($widgets as $w) {
         $col = (int)($w['column'] ?? 0);
         if ($col < 0 || $col > 1) {
             $col = 0;
@@ -40,7 +43,8 @@ function dashboardWidgetsByColumn(array $visibleWidgets): array
     return $cols;
 }
 
-$cols = dashboardWidgetsByColumn($visibleWidgets);
+$boardWidgets = $boardWidgets ?? $visibleWidgets;
+$cols = dashboardWidgetsByColumn($boardWidgets);
 $saveUrl = $viewInstance->route('app/dashboard') . '?action=saveLayout';
 $csrf = \SoftNova\Core\csrf_token();
 ?>
@@ -96,17 +100,27 @@ $csrf = \SoftNova\Core\csrf_token();
      data-csrf="<?php echo htmlspecialchars($csrf); ?>">
     <?php for ($col = 0; $col < 2; $col++): ?>
         <div class="dashboard-column" data-column="<?php echo $col; ?>">
-            <?php if (empty($cols[$col])): ?>
+            <?php
+            $colHasVisible = false;
+            foreach ($cols[$col] as $cw) {
+                if (!empty($cw['visible'])) {
+                    $colHasVisible = true;
+                    break;
+                }
+            }
+            ?>
+            <?php if (!$colHasVisible): ?>
                 <div class="dashboard-drop-placeholder">Arrastra aqui las cajas</div>
             <?php endif; ?>
             <?php foreach ($cols[$col] as $w): ?>
                 <?php
                 $wid = $w['id'];
                 $title = $w['title'] ?? $wid;
+                $isVisible = !empty($w['visible']);
                 ?>
-                <section class="dashboard-box neumorphic" draggable="true" data-widget-id="<?php echo htmlspecialchars($wid); ?>">
+                <section class="dashboard-box neumorphic<?php echo $isVisible ? '' : ' is-screen-hidden'; ?>" data-widget-id="<?php echo htmlspecialchars($wid); ?>">
                     <header class="dashboard-box-header">
-                        <span class="dashboard-box-handle" title="Arrastrar">⠿</span>
+                        <span class="dashboard-box-handle" title="Arrastrar" aria-grabbed="false">⠿</span>
                         <h3><?php echo htmlspecialchars($title); ?></h3>
                         <div class="dashboard-box-tools">
                             <button type="button" class="dash-move-btn" data-dir="-1" title="Subir">▲</button>
@@ -121,7 +135,6 @@ $csrf = \SoftNova\Core\csrf_token();
                                 'kpi_products' => ['value' => number_format($stats['total_products'] ?? 0), 'url' => $viewInstance->route('app/inventario'), 'color' => null],
                                 'kpi_customers' => ['value' => number_format($stats['total_customers'] ?? 0), 'url' => $viewInstance->route('app/clientes'), 'color' => null],
                                 'kpi_today_sales' => ['value' => formatCurrencyDashboard($stats['today_sales'] ?? 0), 'url' => $viewInstance->route('app/ventas'), 'color' => '#10B981'],
-                                'kpi_low_stock' => ['value' => number_format($stats['low_stock'] ?? 0), 'url' => $viewInstance->route('app/inventario'), 'color' => (($stats['low_stock'] ?? 0) > 0) ? '#DC2626' : '#10B981'],
                                 'kpi_total_sales' => ['value' => number_format($stats['total_sales'] ?? 0), 'url' => $viewInstance->route('app/ventas'), 'color' => null],
                             ];
                             $k = $kpiMap[$wid] ?? null;
@@ -196,6 +209,61 @@ $csrf = \SoftNova\Core\csrf_token();
                             </div>
                             <div style="margin-top:10px;">
                                 <a href="<?php echo $viewInstance->route('app/ventas'); ?>" class="btn btn-sm btn-secondary">Ver ventas</a>
+                            </div>
+                            <?php endif; ?>
+                        <?php elseif ($wid === 'payables'): ?>
+                            <?php if (!empty($payablesError)): ?>
+                                <p class="dashboard-empty" style="color:#DC2626;"><?php echo htmlspecialchars($payablesError); ?></p>
+                            <?php else: ?>
+                            <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--color-border);">
+                                <span style="font-size:13px;color:var(--color-text-secondary);">Total por pagar</span>
+                                <strong style="font-size:20px;color:#B45309;"><?php echo formatCurrencyDashboard((float)$payablesTotal); ?></strong>
+                            </div>
+                            <div style="margin-bottom:8px;">
+                                <h4 style="margin:0 0 8px;font-size:13px;color:var(--color-text-secondary);">Pendientes a proveedores</h4>
+                                <?php if (empty($openPayables)): ?>
+                                    <p class="dashboard-empty">No hay saldos por pagar</p>
+                                <?php else: ?>
+                                    <div class="table-container">
+                                        <table>
+                                            <thead><tr><th>Orden</th><th>Proveedor</th><th>Vence</th><th>Saldo</th><th>Estado</th></tr></thead>
+                                            <tbody>
+                                            <?php foreach ($openPayables as $po):
+                                                $bal = (float)($po['balance'] ?? 0);
+                                                $overdue = (int)($po['days_overdue'] ?? 0) > 0;
+                                                $status = (string)($po['payment_status'] ?? 'pending');
+                                            ?>
+                                                <tr>
+                                                    <td>
+                                                        <a href="<?php echo $viewInstance->route('app/compras'); ?>">
+                                                            <?php echo htmlspecialchars($po['order_number'] ?? ('#' . (int)($po['id'] ?? 0))); ?>
+                                                        </a>
+                                                        <?php if (!empty($po['invoice_number'])): ?>
+                                                            <br><small><?php echo htmlspecialchars((string)$po['invoice_number']); ?></small>
+                                                        <?php endif; ?>
+                                                    </td>
+                                                    <td><?php echo htmlspecialchars($po['supplier_name'] ?? 'Proveedor'); ?></td>
+                                                    <td>
+                                                        <?php echo !empty($po['due_date']) ? date('d/m/Y', strtotime((string)$po['due_date'])) : '-'; ?>
+                                                        <?php if ($overdue): ?>
+                                                            <br><span class="badge badge-danger">Vencida</span>
+                                                        <?php endif; ?>
+                                                    </td>
+                                                    <td style="color:#B45309;font-weight:600;"><?php echo formatCurrencyDashboard($bal); ?></td>
+                                                    <td>
+                                                        <span class="badge <?php echo $status === 'partial' ? 'badge-warning' : 'badge-info'; ?>">
+                                                            <?php echo $status === 'partial' ? 'Parcial' : 'Pendiente'; ?>
+                                                        </span>
+                                                    </td>
+                                                </tr>
+                                            <?php endforeach; ?>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                <?php endif; ?>
+                            </div>
+                            <div style="margin-top:10px;">
+                                <a href="<?php echo $viewInstance->route('app/compras'); ?>" class="btn btn-sm btn-secondary">Ver compras</a>
                             </div>
                             <?php endif; ?>
                         <?php elseif ($wid === 'recent_sales'): ?>
@@ -278,7 +346,6 @@ $csrf = \SoftNova\Core\csrf_token();
     var csrf = board.getAttribute('data-csrf');
     var saveTimer = null;
     var pendingReload = false;
-    var dragged = null;
 
     var toggleBtn = document.getElementById('screenOptionsToggle');
     var panel = document.getElementById('screenOptionsPanel');
@@ -343,7 +410,7 @@ $csrf = \SoftNova\Core\csrf_token();
 
     function refreshPlaceholders() {
         document.querySelectorAll('.dashboard-column').forEach(function(col) {
-            var hasBox = !!col.querySelector('.dashboard-box');
+            var hasBox = !!col.querySelector('.dashboard-box:not(.is-screen-hidden)');
             var ph = col.querySelector('.dashboard-drop-placeholder');
             if (!hasBox && !ph) {
                 var div = document.createElement('div');
@@ -354,6 +421,13 @@ $csrf = \SoftNova\Core\csrf_token();
                 ph.remove();
             }
         });
+    }
+
+    function toggleWidgetVisibility(widgetId, visible) {
+        var box = board.querySelector('.dashboard-box[data-widget-id="' + widgetId + '"]');
+        if (!box) return;
+        box.classList.toggle('is-screen-hidden', !visible);
+        refreshPlaceholders();
     }
 
     function saveLayout(reloadAfter) {
@@ -376,8 +450,8 @@ $csrf = \SoftNova\Core\csrf_token();
                 if (typeof showAlert === 'function') showAlert(d.message || 'No se pudo guardar', 'error');
                 return;
             }
-            if (typeof showAlert === 'function') showAlert(d.message || 'Guardado', 'success');
             if (reloadAfter) {
+                if (typeof showAlert === 'function') showAlert(d.message || 'Guardado', 'success');
                 setTimeout(function() { window.location.reload(); }, 450);
             }
         })
@@ -396,14 +470,15 @@ $csrf = \SoftNova\Core\csrf_token();
         }, 250);
     }
 
-    // Checkboxes: mostrar/ocultar + guardar + recargar
+    // Checkboxes: mostrar/ocultar al instante, guardar sin recargar
     document.querySelectorAll('.dash-screen-check').forEach(function(cb) {
         cb.addEventListener('change', function() {
-            scheduleSave(true);
+            toggleWidgetVisibility(cb.getAttribute('data-widget-id'), cb.checked);
+            scheduleSave(false);
         });
     });
 
-    // Collapse
+    // Collapse + botones subir/bajar
     board.addEventListener('click', function(e) {
         var collapse = e.target.closest('.dash-collapse-btn');
         if (collapse) {
@@ -426,56 +501,129 @@ $csrf = \SoftNova\Core\csrf_token();
         }
     });
 
-    // Drag & drop
-    board.addEventListener('dragstart', function(e) {
-        var box = e.target.closest('.dashboard-box');
+    // Arrastre fluido con pointer (se ve la caja mientras se mueve)
+    var dragState = null;
+
+    function startPointerDrag(e) {
+        var handle = e.target.closest('.dashboard-box-handle');
+        if (!handle || e.button !== 0) return;
+        var box = handle.closest('.dashboard-box');
         if (!box) return;
-        dragged = box;
-        box.classList.add('is-dragging');
-        e.dataTransfer.effectAllowed = 'move';
-        try { e.dataTransfer.setData('text/plain', box.getAttribute('data-widget-id')); } catch (err) {}
-    });
-
-    board.addEventListener('dragend', function() {
-        if (dragged) dragged.classList.remove('is-dragging');
-        dragged = null;
-        document.querySelectorAll('.dashboard-column').forEach(function(c) { c.classList.remove('is-drop-target'); });
-        refreshPlaceholders();
-        scheduleSave(false);
-    });
-
-    board.addEventListener('dragover', function(e) {
         e.preventDefault();
-        var col = e.target.closest('.dashboard-column');
-        if (!col || !dragged) return;
-        document.querySelectorAll('.dashboard-column').forEach(function(c) { c.classList.remove('is-drop-target'); });
-        col.classList.add('is-drop-target');
 
-        var after = getDragAfterElement(col, e.clientY);
+        var rect = box.getBoundingClientRect();
+        var placeholder = document.createElement('div');
+        placeholder.className = 'dashboard-drag-placeholder';
+        placeholder.style.height = rect.height + 'px';
+
+        var ghost = box.cloneNode(true);
+        ghost.classList.add('dashboard-drag-ghost');
+        ghost.style.width = rect.width + 'px';
+        ghost.style.height = rect.height + 'px';
+        ghost.style.left = rect.left + 'px';
+        ghost.style.top = rect.top + 'px';
+        document.body.appendChild(ghost);
+
+        box.classList.add('is-dragging-source');
+        box.parentNode.insertBefore(placeholder, box);
+
+        dragState = {
+            box: box,
+            placeholder: placeholder,
+            ghost: ghost,
+            offsetX: e.clientX - rect.left,
+            offsetY: e.clientY - rect.top,
+            pointerId: e.pointerId
+        };
+
+        handle.setAttribute('aria-grabbed', 'true');
+        board.classList.add('is-reordering');
+        try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+
+    function movePointerDrag(e) {
+        if (!dragState) return;
+        e.preventDefault();
+        var x = e.clientX - dragState.offsetX;
+        var y = e.clientY - dragState.offsetY;
+        dragState.ghost.style.transform = 'translate(' + (x - parseFloat(dragState.ghost.style.left)) + 'px, ' + (y - parseFloat(dragState.ghost.style.top)) + 'px)';
+        // Posición absoluta directa (más fluido)
+        dragState.ghost.style.left = x + 'px';
+        dragState.ghost.style.top = y + 'px';
+        dragState.ghost.style.transform = 'none';
+
+        var el = document.elementFromPoint(e.clientX, e.clientY);
+        var col = el ? el.closest('.dashboard-column') : null;
+        if (!col) {
+            // Buscar columna más cercana por X
+            var cols = board.querySelectorAll('.dashboard-column');
+            var best = null;
+            var bestDist = Infinity;
+            cols.forEach(function(c) {
+                var r = c.getBoundingClientRect();
+                var cx = r.left + r.width / 2;
+                var d = Math.abs(e.clientX - cx);
+                if (d < bestDist) { bestDist = d; best = c; }
+            });
+            col = best;
+        }
+        if (!col) return;
+
+        document.querySelectorAll('.dashboard-column').forEach(function(c) {
+            c.classList.toggle('is-drop-target', c === col);
+        });
+
+        var after = getDragAfterElement(col, e.clientY, dragState.placeholder);
         if (after == null) {
-            col.appendChild(dragged);
+            col.appendChild(dragState.placeholder);
         } else {
-            col.insertBefore(dragged, after);
+            col.insertBefore(dragState.placeholder, after);
         }
         var ph = col.querySelector('.dashboard-drop-placeholder');
         if (ph) ph.remove();
-    });
+    }
 
-    board.addEventListener('drop', function(e) {
-        e.preventDefault();
+    function endPointerDrag(e) {
+        if (!dragState) return;
+        var box = dragState.box;
+        var placeholder = dragState.placeholder;
+        var ghost = dragState.ghost;
+        var handle = box.querySelector('.dashboard-box-handle');
+
+        if (placeholder && placeholder.parentNode) {
+            placeholder.parentNode.insertBefore(box, placeholder);
+            placeholder.remove();
+        }
+        box.classList.remove('is-dragging-source');
+        if (ghost && ghost.parentNode) ghost.remove();
+        if (handle) {
+            handle.setAttribute('aria-grabbed', 'false');
+            try { handle.releasePointerCapture(dragState.pointerId); } catch (err) {}
+        }
+        dragState = null;
+        board.classList.remove('is-reordering');
+        document.querySelectorAll('.dashboard-column').forEach(function(c) { c.classList.remove('is-drop-target'); });
         refreshPlaceholders();
-    });
+        scheduleSave(false);
+    }
 
-    function getDragAfterElement(container, y) {
-        var els = [].slice.call(container.querySelectorAll('.dashboard-box:not(.is-dragging)'));
+    board.addEventListener('pointerdown', startPointerDrag);
+    board.addEventListener('pointermove', movePointerDrag);
+    board.addEventListener('pointerup', endPointerDrag);
+    board.addEventListener('pointercancel', endPointerDrag);
+
+    function getDragAfterElement(container, y, placeholder) {
+        var els = [].slice.call(container.querySelectorAll('.dashboard-box:not(.is-dragging-source)'));
         var closest = { offset: Number.NEGATIVE_INFINITY, element: null };
         els.forEach(function(child) {
+            if (child === placeholder) return;
             var box = child.getBoundingClientRect();
             var offset = y - box.top - box.height / 2;
             if (offset < 0 && offset > closest.offset) {
                 closest = { offset: offset, element: child };
             }
         });
+        // También considerar el placeholder si ya está en otra posición
         return closest.element;
     }
 

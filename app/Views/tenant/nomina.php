@@ -16,9 +16,11 @@ $base = $viewInstance->route('app/nomina');
 $canCreate = \SoftNova\Core\TenantMiddleware::canDo('create', 'nomina');
 $canEdit = \SoftNova\Core\TenantMiddleware::canDo('edit', 'nomina');
 
-function fmtN(float $a, array $c): string
-{
-    return $c['symbol'] . ' ' . number_format($a, $c['decimals'], $c['decimal'] ?? ',', $c['thousands'] ?? '.');
+if (!function_exists('fmtN')) {
+    function fmtN(float $a, array $c): string
+    {
+        return $c['symbol'] . ' ' . number_format($a, $c['decimals'], $c['decimal'] ?? ',', $c['thousands'] ?? '.');
+    }
 }
 ?>
 <?php echo flashMessage(); ?>

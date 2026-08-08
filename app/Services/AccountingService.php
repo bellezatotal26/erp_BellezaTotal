@@ -23,10 +23,13 @@ class AccountingService
         return $stmt;
     }
 
+    /** @var \WeakMap<\PDO, bool>|null */
+    private static ?\WeakMap $schemaDone = null;
+
     public function ensureSchema(): void
     {
-        static $done = false;
-        if ($done) {
+        self::$schemaDone ??= new \WeakMap();
+        if (isset(self::$schemaDone[$this->db])) {
             return;
         }
 
@@ -130,16 +133,19 @@ class AccountingService
             // silencioso: tabla puede no existir en instalaciones nuevas
         }
 
-        $done = true;
+        self::$schemaDone[$this->db] = true;
     }
+
+    /** @var \WeakMap<\PDO, bool>|null */
+    private static ?\WeakMap $seedDone = null;
 
     private function seedChartOfAccounts(): void
     {
-        static $seeded = [];
-        $connKey = spl_object_id($this->db);
-        if (isset($seeded[$connKey])) {
+        self::$seedDone ??= new \WeakMap();
+        if (isset(self::$seedDone[$this->db])) {
             return;
         }
+        self::$seedDone[$this->db] = true;
 
         $accounts = [
             ['110505', 'Caja general', 'asset', 'debit', 1],
@@ -154,10 +160,13 @@ class AccountingService
             ['360505', 'Utilidad del ejercicio', 'equity', 'credit', 1],
             ['413501', 'Ingresos por ventas', 'revenue', 'credit', 1],
             ['417501', 'Devoluciones en ventas', 'revenue', 'debit', 1],
+            ['421040', 'Descuentos en compras', 'revenue', 'credit', 1],
+            ['429595', 'Otros ingresos no operacionales', 'revenue', 'credit', 1],
             ['510505', 'Gastos generales', 'expense', 'debit', 1],
             ['513505', 'Servicios', 'expense', 'debit', 1],
             ['519595', 'Otros gastos operacionales', 'expense', 'debit', 1],
             ['530505', 'Gastos financieros y comisiones', 'expense', 'debit', 1],
+            ['539595', 'Otros gastos no operacionales', 'expense', 'debit', 1],
             ['613501', 'Costo de ventas', 'expense', 'debit', 1],
         ];
 
@@ -185,6 +194,14 @@ class AccountingService
             'fixed_expense_account' => '510505',
             'financial_expense_account' => '530505',
             'cost_of_sales_account' => '613501',
+            'inventory_adjustment_account' => '519595',
+            'inventory_loss_account' => '519595',
+            'opening_inventory_equity_account' => '310505',
+            'purchase_discount_account' => '421040',
+            'cash_shortage_account' => '539595',
+            'cash_overage_account' => '429595',
+            'cash_manual_income_account' => '429595',
+            'cash_manual_expense_account' => '519595',
         ];
         $stmt = $this->db->prepare(
             "INSERT IGNORE INTO accounting_settings (setting_key, setting_value) VALUES (?, ?)"
@@ -192,8 +209,6 @@ class AccountingService
         foreach ($settings as $settingKey => $value) {
             $stmt->execute([$settingKey, $value]);
         }
-
-        $seeded[$connKey] = true;
     }
 
     /**
@@ -210,7 +225,12 @@ class AccountingService
             '111005' => 'Bancos y medios electrónicos',
             '143501' => 'Inventarios de mercancías',
             '220505' => 'Proveedores nacionales',
+            '310505' => 'Capital social',
+            '421040' => 'Descuentos en compras',
+            '429595' => 'Otros ingresos no operacionales',
+            '519595' => 'Otros gastos operacionales',
             '530505' => 'Gastos financieros y comisiones',
+            '539595' => 'Otros gastos no operacionales',
             '613501' => 'Costo de ventas',
         ];
         $missing = [];
@@ -225,6 +245,8 @@ class AccountingService
                 $type = match (true) {
                     str_starts_with($code, '1') => 'asset',
                     str_starts_with($code, '2') => 'liability',
+                    str_starts_with($code, '3') => 'equity',
+                    str_starts_with($code, '4') => 'revenue',
                     str_starts_with($code, '5'), str_starts_with($code, '6') => 'expense',
                     default => 'expense',
                 };
@@ -245,6 +267,11 @@ class AccountingService
             'dataphone_commission_rate' => '2.5',
             'card_commission_rate' => '2.8',
             'purchase_credit_policy' => 'cxp', // cxp = pendiente/parcial → Proveedores 220505
+            'inventory_adjustment_account' => '519595',
+            'opening_inventory_equity_account' => '310505',
+            'purchase_discount_account' => '421040',
+            'cash_shortage_account' => '539595',
+            'cash_overage_account' => '429595',
         ];
         foreach ($settingsMap as $key => $value) {
             $this->query(
@@ -255,8 +282,10 @@ class AccountingService
 
         $notes = [
             'Compras pagadas: crédito a caja/banco según medio de pago.',
-            'Compras pendientes o parciales: crédito a CxP proveedores (220505). El saldo parcial se liquida fuera del asiento inicial.',
+            'Compras pendientes o parciales: crédito a CxP proveedores (220505); los abonos posteriores la liquidan desde Compras.',
             'Comisiones datáfono/tarjeta: gasto a 530505 (financial_expense_account).',
+            'Ajustes y mermas de inventario: gasto a 519595; el inventario inicial se acredita a 310505.',
+            'Arqueo de caja: faltantes a 539595 y sobrantes a 429595.',
         ];
 
         return [
@@ -1074,11 +1103,22 @@ class AccountingService
      * de modo que la UI pueda invocar el proceso nuevamente.
      *
      * @param int $limit Máximo de operaciones a procesar por invocación (0 = sin límite).
-     * @return array{sales:int,expenses:int,payments:int,errors:int,remaining:int,done:bool}
+     * @return array{sales:int,expenses:int,payments:int,purchases:int,stock:int,supplier_payments:int,cash:int,errors:int,remaining:int,done:bool}
      */
     public function syncExistingOperations(int $limit = 200): array
     {
-        $result = ['sales' => 0, 'expenses' => 0, 'payments' => 0, 'errors' => 0, 'remaining' => 0, 'done' => true];
+        $result = [
+            'sales' => 0,
+            'expenses' => 0,
+            'payments' => 0,
+            'purchases' => 0,
+            'stock' => 0,
+            'supplier_payments' => 0,
+            'cash' => 0,
+            'errors' => 0,
+            'remaining' => 0,
+            'done' => true,
+        ];
         $limit = max(0, $limit);
         $budget = $limit > 0 ? $limit : PHP_INT_MAX;
         $limitSql = $limit > 0 ? ' LIMIT ' . ((int)$limit + 1) : '';
@@ -1160,9 +1200,86 @@ class AccountingService
             }
         }
 
+        foreach ($this->historicalSyncSources() as $key => $source) {
+            if ($budget <= 0) {
+                break;
+            }
+            $rows = [];
+            try {
+                $rows = $this->query(
+                    $source['sql'] . ' LIMIT ' . ((int)$budget + 1)
+                )->fetchAll();
+            } catch (\Throwable $e) {
+                // Tabla ausente en instalaciones parciales: se omite el origen.
+                continue;
+            }
+            foreach ($rows as $row) {
+                if ($budget <= 0) {
+                    break;
+                }
+                try {
+                    if ($source['post']((int)$row['id']) !== null) {
+                        $result[$key]++;
+                    }
+                } catch (\Throwable $e) {
+                    $result['errors']++;
+                    error_log('Accounting sync ' . $key . ' ' . $row['id'] . ': ' . $e->getMessage());
+                }
+                $budget--;
+            }
+        }
+
         $result['remaining'] = $this->pendingSyncCount();
         $result['done'] = $result['remaining'] === 0;
         return $result;
+    }
+
+    /**
+     * Orígenes históricos contabilizables además de ventas, abonos y gastos.
+     * Cada consulta devuelve solo los registros que aún no tienen comprobante.
+     *
+     * @return array<string,array{sql:string,post:callable(int):?int}>
+     */
+    private function historicalSyncSources(): array
+    {
+        return [
+            'purchases' => [
+                'sql' => "SELECT o.id
+                          FROM purchase_orders o
+                          LEFT JOIN accounting_entries e
+                            ON e.source_type = 'purchase_order' AND e.source_id = o.id
+                               AND e.source_event = 'received'
+                          WHERE o.status = 'received' AND o.accounting_entry_id IS NULL AND e.id IS NULL
+                          ORDER BY o.id",
+                'post' => fn(int $id): ?int => $this->postPurchaseOrder($id),
+            ],
+            'stock' => [
+                'sql' => "SELECT sm.id
+                          FROM stock_movements sm
+                          JOIN products p ON p.id = sm.product_id
+                               AND COALESCE(p.product_type, 'product') = 'product'
+                          WHERE sm.accounting_entry_id IS NULL
+                            AND COALESCE(sm.total_cost, 0) > 0
+                            AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'purchase_order', 'purchase_credit_note')
+                          ORDER BY sm.id",
+                'post' => fn(int $id): ?int => $this->postStockMovement($id),
+            ],
+            'supplier_payments' => [
+                'sql' => "SELECT sp.id
+                          FROM supplier_payments sp
+                          WHERE sp.accounting_entry_id IS NULL AND sp.status = 'applied'
+                          ORDER BY sp.id",
+                'post' => fn(int $id): ?int => $this->postSupplierPayment($id),
+            ],
+            'cash' => [
+                'sql' => "SELECT cm.id
+                          FROM cash_movements cm
+                          WHERE cm.accounting_entry_id IS NULL
+                            AND COALESCE(cm.reference_type, 'manual') IN ('manual', '')
+                          ORDER BY cm.id",
+                'post' => fn(int $id): ?int => $this->postCashMovement($id),
+            ],
+        ];
     }
 
     /** Cuenta operaciones históricas aún sin asiento contable. */
@@ -1189,7 +1306,19 @@ class AccountingService
                ON e.source_type = 'expense' AND e.source_id = x.id AND e.source_event = 'created'
              WHERE e.id IS NULL"
         )->fetchColumn();
-        return $pendingSales + $pendingPayments + $pendingExpenses;
+
+        $pendingOthers = 0;
+        foreach ($this->historicalSyncSources() as $source) {
+            try {
+                $pendingOthers += (int)$this->query(
+                    'SELECT COUNT(*) FROM (' . $source['sql'] . ') pending'
+                )->fetchColumn();
+            } catch (\Throwable $e) {
+                // Origen no disponible en esta instalación.
+            }
+        }
+
+        return $pendingSales + $pendingPayments + $pendingExpenses + $pendingOthers;
     }
 
     public function reverseSource(string $sourceType, int $sourceId, string $reason): ?int
@@ -1535,7 +1664,7 @@ class AccountingService
 
         if ($discount > 0.009) {
             $lines[] = $this->line(
-                '421040',
+                $this->setting('purchase_discount_account', '421040'),
                 0,
                 $discount,
                 'Descuento pronto pago / aliado ' . $label,
@@ -1579,6 +1708,134 @@ class AccountingService
     }
 
     /**
+     * Contabiliza una nota de crédito de compra (devolución o ajuste comercial).
+     * Invierte parcialmente la OC: reduce CxP (o caja/banco) y saca inventario / descuento.
+     */
+    public function postPurchaseCreditNote(int $creditNoteId): ?int
+    {
+        $purchasing = new PurchasingService($this->db);
+        $note = $this->query(
+            "SELECT cn.*, po.order_number, po.payment_mode, po.supplier_id po_supplier_id,
+                    s.name supplier_name
+             FROM purchase_credit_notes cn
+             JOIN purchase_orders po ON po.id = cn.purchase_order_id
+             LEFT JOIN suppliers s ON s.id = COALESCE(cn.supplier_id, po.supplier_id)
+             WHERE cn.id = ?",
+            [$creditNoteId]
+        )->fetch();
+        if (!$note || ($note['status'] ?? '') !== 'posted') {
+            throw new \RuntimeException('Nota de crédito no encontrada');
+        }
+        if (!empty($note['accounting_entry_id'])) {
+            return (int)$note['accounting_entry_id'];
+        }
+
+        $subtotal = round((float)$note['subtotal'], 2);
+        $tax = round((float)$note['tax'], 2);
+        $total = round((float)$note['total'], 2);
+        if ($total <= 0) {
+            throw new \RuntimeException('La nota de crédito no tiene total contable');
+        }
+
+        $date = date('Y-m-d', strtotime((string)$note['credit_date']));
+        $paymentMode = (string)($note['payment_mode'] ?? 'payable');
+        $debitCode = match ($paymentMode) {
+            'cash' => $this->setting('cash_account', '110505'),
+            'transfer', 'card' => $this->setting('bank_account', '111005'),
+            default => $this->setting('payable_account', '220505'),
+        };
+        $debitLabel = match ($paymentMode) {
+            'cash' => 'Devolución/crédito compra en efectivo',
+            'transfer', 'card' => 'Devolución/crédito compra transferencia',
+            default => 'Nota crédito proveedor (reduce CxP)',
+        };
+
+        $label = 'NCC ' . $note['credit_number'] . ' / OC ' . $note['order_number'];
+        $affectsStock = (int)($note['affects_stock'] ?? 1) === 1;
+        $lines = [];
+
+        // Débito: reduce lo que se debe al proveedor (o recupera caja si se pagó de contado).
+        $lines[] = $this->line(
+            $debitCode,
+            $total,
+            0,
+            $debitLabel . ' ' . $label,
+            'supplier',
+            $note['supplier_id'] ?? $note['po_supplier_id'] ?? null,
+            $note['supplier_name'] ?? null
+        );
+
+        if ($affectsStock) {
+            if ($subtotal > 0) {
+                $lines[] = $this->line(
+                    $this->setting('inventory_account', '143501'),
+                    0,
+                    $subtotal,
+                    'Salida mercancía ' . $label
+                );
+            }
+        } else {
+            if ($subtotal > 0) {
+                $lines[] = $this->line(
+                    $this->setting('purchase_discount_account', '421040'),
+                    0,
+                    $subtotal,
+                    'Descuento/ajuste comercial ' . $label,
+                    'supplier',
+                    $note['supplier_id'] ?? $note['po_supplier_id'] ?? null,
+                    $note['supplier_name'] ?? null
+                );
+            }
+        }
+
+        if ($tax > 0) {
+            $lines[] = $this->line(
+                $this->setting('vat_deductible_account', '240802'),
+                0,
+                $tax,
+                'Reverso IVA descontable ' . $label,
+                'supplier',
+                $note['supplier_id'] ?? $note['po_supplier_id'] ?? null,
+                $note['supplier_name'] ?? null
+            );
+        }
+
+        // Si solo hay total (sin subtotal/tax desglosado), acreditar inventario/descuento por el total.
+        if (count($lines) === 1) {
+            $lines[] = $this->line(
+                $affectsStock
+                    ? $this->setting('inventory_account', '143501')
+                    : $this->setting('purchase_discount_account', '421040'),
+                0,
+                $total,
+                ($affectsStock ? 'Salida mercancía ' : 'Ajuste comercial ') . $label
+            );
+        }
+
+        $entryId = $this->postEntry(
+            $date,
+            'Nota crédito compra ' . $label,
+            $lines,
+            'purchase_credit_note',
+            $creditNoteId,
+            'posted'
+        );
+
+        $this->query(
+            "UPDATE purchase_credit_notes SET accounting_entry_id = ? WHERE id = ?",
+            [$entryId, $creditNoteId]
+        );
+        $this->query(
+            "UPDATE stock_movements
+             SET accounting_entry_id = ?
+             WHERE reference_type = 'purchase_credit_note' AND reference_id = ?",
+            [$entryId, $creditNoteId]
+        );
+
+        return $entryId;
+    }
+
+    /**
      * Contabiliza un movimiento de inventario (compra, apertura o ajuste).
      * Las salidas por venta/devolución se omiten: ya van en postSale / reverseSale.
      */
@@ -1605,8 +1862,8 @@ class AccountingService
         }
 
         $referenceType = (string)($movement['reference_type'] ?? '');
-        if (in_array($referenceType, ['sale', 'return', 'purchase_order'], true)) {
-            // sale/return: asiento de venta. purchase_order: asiento de la OC (con IVA).
+        if (in_array($referenceType, ['sale', 'return', 'purchase_order', 'purchase_credit_note'], true)) {
+            // sale/return: asiento de venta. purchase_order / NCC: asiento propio con IVA.
             return null;
         }
 
@@ -1702,15 +1959,307 @@ class AccountingService
     }
 
     /**
-     * Crea comprobantes para operaciones anteriores a la activación del módulo.
-     * En gastos históricos se presume que el método registrado fue pagado.
+     * Conciliación entre los submayores operativos y el libro contable.
+     * Un descuadre indica operaciones sin asiento o asientos manuales sueltos.
      *
-     * Procesa por lotes para no agotar el tiempo de ejecución con históricos grandes.
-     * Devuelve 'remaining' > 0 cuando aún quedan operaciones por sincronizar,
-     * de modo que la UI pueda invocar el proceso nuevamente.
-     *
-     * @param int $limit Máximo de operaciones a procesar por invocación (0 = sin límite).
-     * @return array{sales:int,expenses:int,payments:int,stock:int,errors:int,remaining:int,done:bool}
+     * @return list<array{label:string,account:string,operational:float,accounting:float,gap:float,hint:string}>
      */
+    public function subledgerReconciliation(): array
+    {
+        $rows = [];
 
+        $rows[] = $this->reconcileLine(
+            'Cartera de clientes',
+            $this->setting('receivable_account', '130505'),
+            "SELECT COALESCE(SUM(balance), 0) FROM receivables WHERE status != 'paid'",
+            'Revise ventas a crédito sin asiento o abonos no registrados.'
+        );
+
+        $rows[] = $this->reconcileLine(
+            'Proveedores por pagar',
+            $this->setting('payable_account', '220505'),
+            "SELECT COALESCE(SUM(po.total - COALESCE((
+                        SELECT SUM(sp.amount) FROM supplier_payments sp
+                        WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                   ), 0) - COALESCE((
+                        SELECT SUM(cn.total) FROM purchase_credit_notes cn
+                        WHERE cn.purchase_order_id = po.id AND cn.status = 'posted'
+                   ), 0)), 0)
+             FROM purchase_orders po
+             WHERE po.status = 'received' AND COALESCE(po.payment_mode, 'payable') = 'payable'",
+            'Revise órdenes recibidas sin contabilizar, abonos o notas de crédito sin asiento.'
+        );
+
+        $rows[] = $this->reconcileLine(
+            'Inventario valorizado',
+            $this->setting('inventory_account', '143501'),
+            "SELECT COALESCE(SUM(stock * purchase_price), 0)
+             FROM products
+             WHERE COALESCE(product_type, 'product') = 'product' AND status = 'active'",
+            'El costo promedio cambia con cada compra; una brecha pequeña es normal.'
+        );
+
+        return array_values(array_filter($rows));
+    }
+
+    /**
+     * @return array{label:string,account:string,operational:float,accounting:float,gap:float,hint:string}|null
+     */
+    private function reconcileLine(string $label, string $accountCode, string $operationalSql, string $hint): ?array
+    {
+        try {
+            $operational = round((float)$this->query($operationalSql)->fetchColumn(), 2);
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        try {
+            $balance = $this->query(
+                "SELECT COALESCE(SUM(l.debit), 0) - COALESCE(SUM(l.credit), 0) net
+                 FROM accounting_lines l
+                 JOIN accounting_accounts a ON a.id = l.account_id
+                 JOIN accounting_entries e ON e.id = l.entry_id
+                 WHERE a.code = ? AND e.status = 'posted'",
+                [$accountCode]
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        // Los pasivos tienen naturaleza crédito: se presentan en positivo.
+        $accounting = round((float)$balance, 2);
+        if (str_starts_with($accountCode, '2')) {
+            $accounting = -$accounting;
+        }
+
+        return [
+            'label' => $label,
+            'account' => $accountCode,
+            'operational' => $operational,
+            'accounting' => $accounting,
+            'gap' => round($operational - $accounting, 2),
+            'hint' => $hint,
+        ];
+    }
+
+    /**
+     * Abono a proveedor: liquida la cuenta por pagar contra caja o banco.
+     */
+    public function postSupplierPayment(int $paymentId): ?int
+    {
+        $payment = $this->query(
+            "SELECT sp.*, s.name supplier_name,
+                    po.order_number, po.invoice_number
+             FROM supplier_payments sp
+             LEFT JOIN suppliers s ON s.id = sp.supplier_id
+             LEFT JOIN purchase_orders po ON po.id = sp.purchase_order_id
+             WHERE sp.id = ?",
+            [$paymentId]
+        )->fetch();
+
+        if (!$payment) {
+            throw new \RuntimeException('Abono a proveedor no encontrado');
+        }
+        if (($payment['status'] ?? 'applied') === 'cancelled') {
+            return null;
+        }
+        if (!empty($payment['accounting_entry_id'])) {
+            return (int)$payment['accounting_entry_id'];
+        }
+
+        $amount = round((float)$payment['amount'], 2);
+        if ($amount <= 0) {
+            return null;
+        }
+
+        $date = date('Y-m-d', strtotime((string)$payment['payment_date']));
+        $method = (string)($payment['payment_method'] ?? 'cash');
+        $supplierName = (string)($payment['supplier_name'] ?? 'Proveedor');
+
+        $label = $supplierName;
+        if (!empty($payment['order_number'])) {
+            $label .= ' / OC ' . $payment['order_number'];
+        }
+        if (!empty($payment['invoice_number'])) {
+            $label .= ' / Factura ' . $payment['invoice_number'];
+        }
+
+        $lines = [
+            $this->line(
+                $this->setting('payable_account', '220505'),
+                $amount,
+                0,
+                'Abono cuenta por pagar ' . $label,
+                'supplier',
+                $payment['supplier_id'] ?? null,
+                $supplierName
+            ),
+            $this->line(
+                $this->paymentAccount($method),
+                0,
+                $amount,
+                'Pago a proveedor ' . $label,
+                'supplier',
+                $payment['supplier_id'] ?? null,
+                $supplierName
+            ),
+        ];
+
+        $entryId = $this->postEntry(
+            $date,
+            'Abono a proveedor ' . $label,
+            $lines,
+            'supplier_payment',
+            $paymentId,
+            'created'
+        );
+
+        $this->query(
+            "UPDATE supplier_payments SET accounting_entry_id = ? WHERE id = ?",
+            [$entryId, $paymentId]
+        );
+
+        return $entryId;
+    }
+
+    /**
+     * Movimiento manual de caja (no ligado a venta ni gasto).
+     * Los movimientos con origen en otro módulo ya tienen su propio asiento.
+     */
+    public function postCashMovement(int $movementId): ?int
+    {
+        $movement = $this->query(
+            "SELECT * FROM cash_movements WHERE id = ?",
+            [$movementId]
+        )->fetch();
+
+        if (!$movement) {
+            throw new \RuntimeException('Movimiento de caja no encontrado');
+        }
+        if (!empty($movement['accounting_entry_id'])) {
+            return (int)$movement['accounting_entry_id'];
+        }
+
+        $reference = (string)($movement['reference_type'] ?? '');
+        if (!in_array($reference, ['manual', ''], true)) {
+            return null;
+        }
+
+        $amount = round((float)$movement['amount'], 2);
+        if ($amount <= 0) {
+            return null;
+        }
+
+        $date = date('Y-m-d', strtotime((string)$movement['created_at']));
+        $cash = $this->setting('cash_account', '110505');
+        $description = trim((string)($movement['description'] ?? '')) ?: 'Movimiento manual de caja';
+        $isIncome = (string)$movement['type'] === 'income';
+
+        $lines = $isIncome
+            ? [
+                $this->line($cash, $amount, 0, 'Ingreso a caja: ' . $description),
+                $this->line(
+                    $this->setting('cash_manual_income_account', '429595'),
+                    0,
+                    $amount,
+                    'Otros ingresos: ' . $description
+                ),
+            ]
+            : [
+                $this->line(
+                    $this->setting('cash_manual_expense_account', '519595'),
+                    $amount,
+                    0,
+                    'Otros gastos: ' . $description
+                ),
+                $this->line($cash, 0, $amount, 'Salida de caja: ' . $description),
+            ];
+
+        $entryId = $this->postEntry(
+            $date,
+            ($isIncome ? 'Ingreso manual de caja: ' : 'Egreso manual de caja: ') . $description,
+            $lines,
+            'cash_movement',
+            $movementId,
+            'created'
+        );
+
+        $this->query(
+            "UPDATE cash_movements SET accounting_entry_id = ? WHERE id = ?",
+            [$entryId, $movementId]
+        );
+
+        return $entryId;
+    }
+
+    /**
+     * Arqueo de caja: registra únicamente el faltante o sobrante del cierre.
+     * El efectivo en sí ya entró al libro por la venta o el gasto que lo originó.
+     */
+    public function postCashSessionClosing(int $sessionId): ?int
+    {
+        $session = $this->query(
+            "SELECT * FROM cash_sessions WHERE id = ?",
+            [$sessionId]
+        )->fetch();
+
+        if (!$session) {
+            throw new \RuntimeException('Sesión de caja no encontrada');
+        }
+        if (($session['status'] ?? '') !== 'closed') {
+            throw new \RuntimeException('La caja debe estar cerrada para contabilizar el arqueo');
+        }
+        if (!empty($session['closing_entry_id'])) {
+            return (int)$session['closing_entry_id'];
+        }
+
+        $difference = round((float)($session['difference_amount'] ?? 0), 2);
+        if (abs($difference) < 0.01) {
+            return null;
+        }
+
+        $date = !empty($session['closing_date'])
+            ? date('Y-m-d', strtotime((string)$session['closing_date']))
+            : date('Y-m-d');
+        $cash = $this->setting('cash_account', '110505');
+        $amount = abs($difference);
+        $label = 'arqueo caja #' . $sessionId . ' del ' . date('d/m/Y', strtotime($date));
+
+        // difference_amount = contado − esperado: negativo es faltante.
+        $lines = $difference < 0
+            ? [
+                $this->line(
+                    $this->setting('cash_shortage_account', '539595'),
+                    $amount,
+                    0,
+                    'Faltante de ' . $label
+                ),
+                $this->line($cash, 0, $amount, 'Ajuste por faltante de caja'),
+            ]
+            : [
+                $this->line($cash, $amount, 0, 'Ajuste por sobrante de caja'),
+                $this->line(
+                    $this->setting('cash_overage_account', '429595'),
+                    0,
+                    $amount,
+                    'Sobrante de ' . $label
+                ),
+            ];
+
+        $entryId = $this->postEntry(
+            $date,
+            ($difference < 0 ? 'Faltante de ' : 'Sobrante de ') . $label,
+            $lines,
+            'cash_session',
+            $sessionId,
+            'closing'
+        );
+
+        $this->query(
+            "UPDATE cash_sessions SET closing_entry_id = ? WHERE id = ?",
+            [$entryId, $sessionId]
+        );
+
+        return $entryId;
+    }
 }

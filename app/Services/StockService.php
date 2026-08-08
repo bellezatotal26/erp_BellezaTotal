@@ -9,11 +9,21 @@ namespace SoftNova\Services;
 class StockService
 {
     private \PDO $db;
+    private ?LotService $lots = null;
 
     public function __construct(\PDO $db)
     {
         $this->db = $db;
         $this->ensureSchema();
+    }
+
+    /** Servicio de lotes creado bajo demanda: la mayoría de productos no los usan. */
+    public function lots(): LotService
+    {
+        if ($this->lots === null) {
+            $this->lots = new LotService($this->db);
+        }
+        return $this->lots;
     }
 
     private function query(string $sql, array $params = []): \PDOStatement
@@ -245,7 +255,7 @@ class StockService
         }
 
         $after = (int)$product['stock'] - $quantity;
-        return $this->addMovement(
+        $movementId = $this->addMovement(
             $productId,
             'out',
             $quantity,
@@ -256,6 +266,38 @@ class StockService
             $cost,
             $after
         );
+
+        $this->consumeLots($productId, $quantity, $movementId);
+
+        return $movementId;
+    }
+
+    /**
+     * Descarga FEFO del submayor de lotes. Nunca interrumpe la salida de stock:
+     * si los lotes están descuadrados se registra la traza parcial y se avisa por log.
+     */
+    private function consumeLots(int $productId, int $quantity, int $movementId): void
+    {
+        if ($movementId <= 0 || $quantity <= 0) {
+            return;
+        }
+        try {
+            $lots = $this->lots();
+            if (!$lots->tracksLots($productId)) {
+                return;
+            }
+            $result = $lots->consumeFefo($productId, $quantity, $movementId);
+            if ($result['pending'] > 0) {
+                error_log(sprintf(
+                    'Lotes insuficientes en producto %d: faltan %d unidades por trazar (movimiento %d)',
+                    $productId,
+                    $result['pending'],
+                    $movementId
+                ));
+            }
+        } catch (\Throwable $e) {
+            error_log('Consumo FEFO producto ' . $productId . ': ' . $e->getMessage());
+        }
     }
 
     /**
@@ -273,7 +315,8 @@ class StockService
         ?int $supplierId = null,
         ?string $paymentMode = null,
         bool $updatePurchasePrice = false,
-        ?string $movementDate = null
+        ?string $movementDate = null,
+        ?array $lot = null
     ): int {
         if ($quantity <= 0) {
             return 0;
@@ -310,7 +353,7 @@ class StockService
         }
 
         $after = $oldStock + $quantity;
-        return $this->addMovement(
+        $movementId = $this->addMovement(
             $productId,
             $movementType,
             $quantity,
@@ -324,6 +367,107 @@ class StockService
             $paymentMode,
             $movementDate
         );
+
+        $this->registerLotEntry(
+            $productId,
+            $quantity,
+            $cost,
+            $movementId,
+            $lot,
+            $supplierId,
+            $movementDate,
+            $referenceType,
+            $referenceId
+        );
+
+        return $movementId;
+    }
+
+    /**
+     * Alimenta el submayor de lotes en las entradas. Se crea lote incluso sin
+     * fecha de vencimiento para que el saldo por lotes siga cuadrando con el stock.
+     */
+    private function registerLotEntry(
+        int $productId,
+        int $quantity,
+        float $cost,
+        int $movementId,
+        ?array $lot,
+        ?int $supplierId,
+        ?string $movementDate,
+        string $referenceType = '',
+        ?int $referenceId = null
+    ): void {
+        if ($movementId <= 0 || $quantity <= 0) {
+            return;
+        }
+        try {
+            $lots = $this->lots();
+            $hasLotData = !empty($lot['lot_code']) || !empty($lot['expiry_date']);
+            if (!$hasLotData && !$lots->tracksLots($productId)) {
+                return;
+            }
+
+            // Una devolución vuelve a su lote original; crear uno nuevo duplicaría remesas.
+            if ($referenceType === 'return' && !$hasLotData
+                && $this->restoreReturnedLots($productId, $quantity, $referenceId)) {
+                return;
+            }
+
+            // Una fecha de vencimiento en la entrada activa el control de lotes.
+            if ($hasLotData && !$lots->tracksLots($productId)) {
+                $lots->configureProduct($productId, true, (int)($lot['alert_days'] ?? 30));
+            }
+
+            $lotId = $lots->registerEntry($productId, $quantity, $cost, [
+                'lot_code' => (string)($lot['lot_code'] ?? ''),
+                'expiry_date' => $lot['expiry_date'] ?? null,
+                'supplier_id' => $lot['supplier_id'] ?? $supplierId,
+                'purchase_order_id' => $lot['purchase_order_id'] ?? null,
+                'received_date' => $movementDate,
+                'notes' => (string)($lot['notes'] ?? ''),
+            ]);
+
+            if ($lotId > 0) {
+                $this->query(
+                    "INSERT INTO stock_movement_lots
+                        (movement_id, lot_id, lot_code, expiry_date, quantity, unit_cost)
+                     SELECT ?, id, lot_code, expiry_date, ?, ? FROM product_lots WHERE id = ?",
+                    [$movementId, $quantity, round($cost, 2), $lotId]
+                );
+            }
+        } catch (\Throwable $e) {
+            error_log('Registro de lote producto ' . $productId . ': ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Reingresa las unidades a los lotes de los que salieron en la venta anulada.
+     *
+     * @return bool true si la devolución quedó completamente trazada
+     */
+    private function restoreReturnedLots(int $productId, int $quantity, ?int $saleId): bool
+    {
+        if ($saleId === null || $saleId <= 0) {
+            return false;
+        }
+
+        $movements = $this->query(
+            "SELECT id FROM stock_movements
+             WHERE product_id = ? AND reference_type = 'sale' AND reference_id = ? AND type = 'out'
+             ORDER BY id DESC",
+            [$productId, $saleId]
+        )->fetchAll();
+
+        $restored = 0;
+        foreach ($movements as $movement) {
+            if ($restored >= $quantity) {
+                break;
+            }
+            $restored += $this->lots()->restoreFromMovement((int)$movement['id']);
+        }
+
+        return $restored >= $quantity;
     }
 
     /**
@@ -551,7 +695,7 @@ class StockService
              JOIN products p ON p.id = sm.product_id AND COALESCE(p.product_type, 'product') = 'product'
              WHERE sm.accounting_entry_id IS NULL
                AND COALESCE(sm.total_cost, 0) > 0
-               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'purchase_order')
+               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'purchase_order', 'purchase_credit_note')
                AND (
                     sm.type = 'in'
                     OR sm.type = 'adjustment'
@@ -570,7 +714,7 @@ class StockService
              JOIN products p ON p.id = sm.product_id AND COALESCE(p.product_type, 'product') = 'product'
              WHERE sm.accounting_entry_id IS NULL
                AND COALESCE(sm.total_cost, 0) > 0
-               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'purchase_order')
+               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'purchase_order', 'purchase_credit_note')
                AND (
                     sm.type = 'in'
                     OR sm.type = 'adjustment'
@@ -614,6 +758,14 @@ class StockService
             $where[] = 'DATE(COALESCE(sm.movement_date, sm.created_at)) <= ?';
             $params[] = $filters['to'];
         }
+        if (!empty($filters['location'])) {
+            $where[] = 'p.location = ?';
+            $params[] = $filters['location'];
+        }
+        if (!empty($filters['category_id'])) {
+            $where[] = 'p.category_id = ?';
+            $params[] = (int)$filters['category_id'];
+        }
         $whereSql = implode(' AND ', $where);
 
         $total = (int)$this->query(
@@ -623,13 +775,14 @@ class StockService
             $params
         )->fetchColumn();
 
-        $limit = max(1, min(200, $limit));
+        $limit = max(1, min(5000, $limit));
         $offset = max(0, $offset);
         $rows = $this->query(
-            "SELECT sm.*, p.name product_name, p.code product_code, p.source_channel,
-                    u.name user_name
+            "SELECT sm.*, p.name product_name, p.code product_code, p.source_channel, p.location product_location,
+                    c.name category_name, u.name user_name
              FROM stock_movements sm
              LEFT JOIN products p ON p.id = sm.product_id
+             LEFT JOIN categories c ON c.id = p.category_id
              LEFT JOIN users u ON u.id = sm.user_id
              WHERE {$whereSql}
              ORDER BY COALESCE(sm.movement_date, sm.created_at) DESC, sm.id DESC

@@ -269,6 +269,7 @@ class LicenciasController extends Controller
         $databaseName = 'softnova_' . $companySlug . '_' . time();
         $databaseUser = 'tn_' . bin2hex(random_bytes(6));
         $databasePassword = bin2hex(random_bytes(16));
+        $databasePasswordSealed = \SoftNova\Core\Security::sealSecret($databasePassword);
         
         try {
             $this->db->query(
@@ -279,7 +280,7 @@ class LicenciasController extends Controller
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'localhost', 3306, ?, ?, ?, ?, ?, 'active', NOW())",
                 [
                     $name, $razon ?: null, $docTipo, $docNum, $email, $phone, $address ?: null,
-                    $databaseName, $databaseUser, $databasePassword,
+                    $databaseName, $databaseUser, $databasePasswordSealed,
                     $planId, $startDate, $endDate,
                 ]
             );

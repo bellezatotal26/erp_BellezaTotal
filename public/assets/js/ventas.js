@@ -3,6 +3,41 @@ var saleItems = [];
 var curSym = document.querySelector('meta[name="currency-symbol"]')?.content || '$';
 var curDec = parseInt(document.querySelector('meta[name="currency-decimals"]')?.content || '0');
 
+function openCancelSaleModal(id, invoice) {
+    var modal = document.getElementById('cancelSaleModal');
+    var idEl = document.getElementById('cancelSaleId');
+    var invEl = document.getElementById('cancelSaleInvoice');
+    var sel = document.getElementById('cancelReasonSelect');
+    var other = document.getElementById('cancelReasonOther');
+    if (!modal || !idEl) return;
+    idEl.value = String(id);
+    if (invEl) invEl.textContent = invoice || ('#' + id);
+    if (sel) sel.value = '';
+    if (other) other.value = '';
+    modal.style.display = 'flex';
+    if (window.SoftNovaCustomSelect && sel) SoftNovaCustomSelect.bind(sel);
+}
+
+function closeCancelSaleModal() {
+    var modal = document.getElementById('cancelSaleModal');
+    if (modal) modal.style.display = 'none';
+}
+
+function prepareCancelSale() {
+    var sel = document.getElementById('cancelReasonSelect');
+    var other = document.getElementById('cancelReasonOther');
+    if (!sel || !sel.value) {
+        if (typeof showAlert === 'function') showAlert('Seleccione el motivo de eliminación', 'warning');
+        return false;
+    }
+    if (window.SoftNovaCustomSelect && SoftNovaCustomSelect.isOther(sel.value)) {
+        if (typeof showAlert === 'function') showAlert('Complete la opción "Otro" o elija un motivo de la lista', 'warning');
+        return false;
+    }
+    if (other) other.value = '';
+    return true;
+}
+
 function toggleCredit() {
     var s = document.getElementById('paymentType').value === 'credit';
     document.getElementById('initialPaymentGroup').style.display = s ? 'block' : 'none';
@@ -60,7 +95,8 @@ function addProduct(ev) {
     renderItems();
     updateStockHint();
     var remaining = stock - (ex ? ex.quantity : qty);
-    showAlert(name + ' agregado. Restante en bodega: ' + remaining, 'success');
+    var level = remaining <= 0 ? 'error' : (remaining <= 5 ? 'warning' : 'info');
+    showAlert(name + ' agregado. Restante en bodega: ' + remaining, level);
     if (typeof animateAddToCart === 'function') {
         var fromEl = (ev && ev.target) ? ev.target : document.getElementById('addProductBtn');
         animateAddToCart(fromEl && fromEl.closest ? (fromEl.closest('.btn') || fromEl) : fromEl);
