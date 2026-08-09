@@ -152,6 +152,9 @@
         if (typeof togglePosCredit === 'function') togglePosCredit();
         renderCart();
         elPayBar.hidden = true;
+        if (elMixedPay) elMixedPay.checked = false;
+        if (elMixedRows) elMixedRows.innerHTML = '';
+        syncMixedVisibility();
         if (elSearch) {
             elSearch.value = '';
             elSearch.focus();
@@ -196,7 +199,8 @@
                 code: target.getAttribute('data-code') || '',
                 sale_price: parseFloat(target.getAttribute('data-price') || '0'),
                 stock: parseInt(target.getAttribute('data-stock') || '0', 10),
-                product_type: 'product'
+                product_type: target.getAttribute('data-type') || 'product',
+                is_open_item: target.getAttribute('data-open-item') === '1' ? 1 : 0
             });
         });
         if (list.length) Offline.upsertProducts(list);
@@ -256,10 +260,20 @@
     var elClock = document.getElementById('posClock');
     var elClear = document.getElementById('posSearchClear');
     var elDiscount = document.getElementById('posDiscountPercent');
+    var elDelivery = document.getElementById('posDeliveryTotal') || document.getElementById('posDeliveryFee');
+    var elDeliveryClient = document.getElementById('posDeliveryClient');
+    var elDeliveryCompany = document.getElementById('posDeliveryCompany');
+    var elDeliverySplit = document.getElementById('posDeliverySplit');
     var elSubLine = document.getElementById('posSubtotalLine');
     var elDiscLine = document.getElementById('posDiscountLine');
+    var elDeliveryLine = document.getElementById('posDeliveryLine');
+    var elDeliveryCompanyLine = document.getElementById('posDeliveryCompanyLine');
     var elSubtotal = document.getElementById('posSubtotal');
     var elDiscAmt = document.getElementById('posDiscountAmt');
+    var elDeliveryAmt = document.getElementById('posDeliveryAmt');
+    var elDeliveryCompanyAmt = document.getElementById('posDeliveryCompanyAmt');
+    var deliverySplitManual = false;
+    var deliverySplitSyncing = false;
 
     var elInvoice = document.getElementById('posInvoicePreview');
     var elPayType = document.getElementById('posPaymentType');
@@ -273,6 +287,12 @@
     var elCashBlock = document.getElementById('posCashChangeBlock');
     var elCashReceived = document.getElementById('posCashReceived');
     var elCashChange = document.getElementById('posCashChange');
+    var elMixedPay = document.getElementById('posMixedPay');
+    var elMixedWrap = document.getElementById('posMixedPayWrap');
+    var elSinglePayWrap = document.getElementById('posSinglePayWrap');
+    var elMixedRows = document.getElementById('posMixedRows');
+    var elMixedSummary = document.getElementById('posMixedSummary');
+    var elMixedAdd = document.getElementById('posMixedAdd');
     var cartTotal = 0;
 
     // Estado del carrito POS (obligatorio en strict mode)
@@ -314,17 +334,338 @@
         return isNaN(n) ? 0 : n;
     }
 
+    function roundMoney(n) {
+        return Math.round((Number(n) || 0) * 100) / 100;
+    }
+
+    function deliveryTotalFee() {
+        var fee = elDelivery ? parseMoneyInput(elDelivery.value) : 0;
+        if (isNaN(fee) || fee < 0) fee = 0;
+        return roundMoney(fee);
+    }
+
+    /** Aporte empresa → gasto Transporte (no entra al total de la venta). */
+    function deliveryCompanyFee() {
+        if (elDeliveryCompany) {
+            var company = parseMoneyInput(elDeliveryCompany.value);
+            if (isNaN(company) || company < 0) company = 0;
+            return roundMoney(Math.min(company, deliveryTotalFee()));
+        }
+        return 0;
+    }
+
+    /** Parte del cliente (total − empresa). */
+    function deliveryClientFee() {
+        if (elDeliveryClient) {
+            var client = parseMoneyInput(elDeliveryClient.value);
+            if (isNaN(client) || client < 0) client = 0;
+            return roundMoney(Math.min(client, deliveryTotalFee()));
+        }
+        return roundMoney(Math.max(0, deliveryTotalFee() - deliveryCompanyFee()));
+    }
+
+    /** Solo la parte del cliente entra al total de la venta. */
+    function deliveryFee() {
+        return deliveryClientFee();
+    }
+
+    function suggestDeliverySplit(total) {
+        total = roundMoney(total);
+        var client = roundMoney(total / 2);
+        var company = roundMoney(total - client);
+        if (elDeliveryClient) elDeliveryClient.value = String(client);
+        if (elDeliveryCompany) elDeliveryCompany.value = String(company);
+    }
+
+    function syncDeliverySplitVisibility() {
+        var total = deliveryTotalFee();
+        if (elDeliverySplit) {
+            elDeliverySplit.style.display = total > 0.009 ? 'flex' : 'none';
+        }
+        if (total <= 0.009) {
+            deliverySplitManual = false;
+            if (elDeliveryClient) elDeliveryClient.value = '0';
+            if (elDeliveryCompany) elDeliveryCompany.value = '0';
+        } else if (!deliverySplitManual) {
+            suggestDeliverySplit(total);
+        }
+    }
+
+    function onDeliveryTotalChanged() {
+        if (deliverySplitSyncing) return;
+        deliverySplitManual = false;
+        syncDeliverySplitVisibility();
+        renderCart();
+    }
+
+    function onDeliveryClientChanged() {
+        if (deliverySplitSyncing) return;
+        deliverySplitManual = true;
+        var total = deliveryTotalFee();
+        var client = elDeliveryClient ? parseMoneyInput(elDeliveryClient.value) : 0;
+        if (isNaN(client) || client < 0) client = 0;
+        if (client > total) {
+            client = total;
+            deliverySplitSyncing = true;
+            if (elDeliveryClient) elDeliveryClient.value = String(client);
+            deliverySplitSyncing = false;
+        }
+        var company = roundMoney(Math.max(0, total - client));
+        deliverySplitSyncing = true;
+        if (elDeliveryCompany) elDeliveryCompany.value = String(company);
+        deliverySplitSyncing = false;
+        syncDeliverySplitVisibility();
+        renderCart();
+    }
+
+    function onDeliveryCompanyChanged() {
+        if (deliverySplitSyncing) return;
+        deliverySplitManual = true;
+        var total = deliveryTotalFee();
+        var company = deliveryCompanyFee();
+        if (company > total) {
+            deliverySplitSyncing = true;
+            if (elDelivery) elDelivery.value = String(company);
+            deliverySplitSyncing = false;
+            total = company;
+        }
+        var client = roundMoney(Math.max(0, total - company));
+        deliverySplitSyncing = true;
+        if (elDeliveryClient) elDeliveryClient.value = String(client);
+        deliverySplitSyncing = false;
+        syncDeliverySplitVisibility();
+        renderCart();
+    }
+
+    function taxRatePct() {
+        var r = Number(window.cajaTaxRate || 0);
+        return isNaN(r) || r < 0 ? 0 : r;
+    }
+
+    function taxAmountOn(baseAfterDiscount) {
+        var rate = taxRatePct();
+        if (rate <= 0) return 0;
+        return roundMoney((Number(baseAfterDiscount) || 0) * (rate / 100));
+    }
+
     function currentCartTotal() {
         if (items && items.length) {
             var sub = 0;
             items.forEach(function (it) { sub += Number(it.subtotal) || 0; });
             var pct = discountPercent();
-            return Math.max(0, sub - (sub * (pct / 100)));
+            var afterDisc = Math.max(0, sub - (sub * (pct / 100)));
+            return afterDisc + taxAmountOn(afterDisc) + creditSurchargeAmount(afterDisc) + deliveryFee();
         }
         return Number(cartTotal) || 0;
     }
 
+    function creditTermsDays() {
+        if (!elPayType || elPayType.value !== 'credit') return 0;
+        var t = (elPayTerms && elPayTerms.value) || 'net_30';
+        if (t === 'net_15') return 15;
+        if (t === 'net_30') return 30;
+        if (t === 'net_60') return 60;
+        if (t === 'net_90') return 90;
+        if (t === 'net_120') return 120;
+        return 30;
+    }
+
+    function creditSurchargeRate() {
+        var rate = Number(window.cajaCreditSurchargeRate || 0);
+        return isNaN(rate) || rate < 0 ? 0 : rate;
+    }
+
+    function creditSurchargeAmount(baseAfterDiscount) {
+        var days = creditTermsDays();
+        var threshold = Number(window.cajaCreditSurchargeDays || 60);
+        if (isNaN(threshold) || threshold < 1) threshold = 60;
+        if (days <= threshold) return 0;
+        var rate = creditSurchargeRate();
+        if (rate <= 0) return 0;
+        return roundMoney((Number(baseAfterDiscount) || 0) * (rate / 100));
+    }
+
+    function isWholesaleMode() {
+        var el = document.getElementById('posWholesaleMode');
+        return !!(el && el.checked);
+    }
+
+    function priceForProduct(p) {
+        var retail = parseFloat(p.sale_price) || 0;
+        var wholesale = parseFloat(p.wholesale_price) || 0;
+        if (isWholesaleMode() && wholesale > 0.009) return wholesale;
+        return retail;
+    }
+
+    function isMixedMode() {
+        return !!(elMixedPay && elMixedPay.checked);
+    }
+
+    function methodOptionsHtml(selected) {
+        var tpl = document.getElementById('posPayMethodOptionsTpl');
+        var html = tpl ? tpl.innerHTML : '<option value="cash">Efectivo</option><option value="dataphone">Datáfono</option><option value="transfer">Transferencia</option>';
+        if (!selected) return html;
+        // Marca selected sin romper HTML de opciones.
+        return html.replace(
+            new RegExp('value="' + selected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '"', 'i'),
+            'value="' + selected + '" selected'
+        );
+    }
+
+    function amountToCollect() {
+        var payType = (elPayType && elPayType.value) || 'full';
+        var total = currentCartTotal();
+        if (payType === 'credit') {
+            var init = parseMoneyInput(elInitialPay ? elInitialPay.value : 0);
+            if (init < 0) init = 0;
+            return Math.min(init, total);
+        }
+        return total;
+    }
+
+    function collectMixedSplits() {
+        if (!elMixedRows) return [];
+        var rows = [];
+        elMixedRows.querySelectorAll('.pos-mixed-row').forEach(function (row) {
+            var sel = row.querySelector('.pos-mixed-method');
+            var amt = row.querySelector('.pos-mixed-amount');
+            var method = sel ? String(sel.value || '') : '';
+            var amount = parseMoneyInput(amt ? amt.value : 0);
+            if (!method || amount <= 0) return;
+            rows.push({ method: method, amount: Math.round(amount * 100) / 100 });
+        });
+        return rows;
+    }
+
+    function mixedCashPortion() {
+        var sum = 0;
+        collectMixedSplits().forEach(function (s) {
+            if (s.method === 'cash') sum += s.amount;
+        });
+        return Math.round(sum * 100) / 100;
+    }
+
+    function mixedAssignedTotal() {
+        var sum = 0;
+        collectMixedSplits().forEach(function (s) { sum += s.amount; });
+        return Math.round(sum * 100) / 100;
+    }
+
+    function updateMixedSummary() {
+        if (!elMixedSummary) return;
+        var need = amountToCollect();
+        var assigned = mixedAssignedTotal();
+        var left = Math.round((need - assigned) * 100) / 100;
+        elMixedSummary.classList.remove('is-ok', 'is-bad');
+        if (Math.abs(left) <= 0.02) {
+            elMixedSummary.classList.add('is-ok');
+            elMixedSummary.textContent = 'Completo · ' + money(assigned) + ' de ' + money(need);
+        } else if (left > 0) {
+            elMixedSummary.classList.add('is-bad');
+            elMixedSummary.textContent = 'Faltan ' + money(left) + ' · Asignado ' + money(assigned) + ' / ' + money(need);
+        } else {
+            elMixedSummary.classList.add('is-bad');
+            elMixedSummary.textContent = 'Sobra ' + money(Math.abs(left)) + ' · Asignado ' + money(assigned) + ' / ' + money(need);
+        }
+    }
+
+    var mixedAmountSyncing = false;
+
+    /** Como la división de domicilio: al editar un monto, el otro queda con el restante. */
+    function syncMixedRemainder(changedInput) {
+        if (mixedAmountSyncing || !elMixedRows || !isMixedMode()) return;
+        var inputs = elMixedRows.querySelectorAll('.pos-mixed-amount');
+        if (inputs.length < 2) {
+            updateMixedSummary();
+            return;
+        }
+        var need = amountToCollect();
+        mixedAmountSyncing = true;
+        if (inputs.length === 2) {
+            var edited = (changedInput === inputs[1]) ? inputs[1] : inputs[0];
+            var other = edited === inputs[0] ? inputs[1] : inputs[0];
+            var val = parseMoneyInput(edited.value);
+            if (isNaN(val) || val < 0) val = 0;
+            if (val > need) val = need;
+            var rest = roundMoney(Math.max(0, need - val));
+            if (Math.abs(parseMoneyInput(edited.value) - val) > 0.001) edited.value = String(val);
+            other.value = String(rest);
+        } else {
+            var last = inputs[inputs.length - 1];
+            var sum = 0;
+            var i;
+            if (changedInput !== last) {
+                for (i = 0; i < inputs.length - 1; i++) {
+                    sum += parseMoneyInput(inputs[i].value);
+                }
+                last.value = String(roundMoney(Math.max(0, need - sum)));
+            } else {
+                for (i = 1; i < inputs.length; i++) {
+                    sum += parseMoneyInput(inputs[i].value);
+                }
+                inputs[0].value = String(roundMoney(Math.max(0, need - sum)));
+            }
+        }
+        mixedAmountSyncing = false;
+        updateMixedSummary();
+        syncCashChangeVisibility();
+    }
+
+    function addMixedRow(method, amount) {
+        if (!elMixedRows) return;
+        method = method || 'cash';
+        var row = document.createElement('div');
+        row.className = 'pos-mixed-row';
+        row.innerHTML =
+            '<div class="form-group pos-mixed-method-wrap" style="flex:1;min-width:150px;">' +
+            '<label style="font-size:12px;">Método</label>' +
+            '<select class="form-control pos-mixed-method">' + methodOptionsHtml(method) + '</select>' +
+            '</div>' +
+            '<div class="form-group">' +
+            '<label style="font-size:12px;">Monto</label>' +
+            '<input type="number" class="form-control pos-mixed-amount" min="0" step="0.01" value="' + (amount != null ? amount : '') + '" placeholder="0">' +
+            '</div>' +
+            '<button type="button" class="btn btn-sm btn-danger pos-mixed-remove" title="Quitar">&times;</button>';
+        elMixedRows.appendChild(row);
+        var sel = row.querySelector('.pos-mixed-method');
+        if (sel) sel.value = method;
+        updateMixedSummary();
+        syncCashChangeVisibility();
+    }
+
+    function seedMixedRows() {
+        if (!elMixedRows) return;
+        elMixedRows.innerHTML = '';
+        var need = amountToCollect();
+        var half = Math.round((need / 2) * 100) / 100;
+        var rest = Math.round((need - half) * 100) / 100;
+        addMixedRow('cash', half > 0 ? half : '');
+        addMixedRow('dataphone', rest > 0 ? rest : '');
+        updateMixedSummary();
+    }
+
+    function syncMixedVisibility() {
+        elMixedPay = document.getElementById('posMixedPay') || elMixedPay;
+        elMixedWrap = document.getElementById('posMixedPayWrap') || elMixedWrap;
+        elSinglePayWrap = document.getElementById('posSinglePayWrap') || elSinglePayWrap;
+        elMixedRows = document.getElementById('posMixedRows') || elMixedRows;
+        var on = isMixedMode();
+        if (elMixedWrap) {
+            elMixedWrap.hidden = !on;
+            elMixedWrap.style.display = on ? 'block' : 'none';
+        }
+        if (elSinglePayWrap) elSinglePayWrap.style.display = on ? 'none' : '';
+        if (on && elMixedRows && !elMixedRows.children.length) {
+            seedMixedRows();
+        }
+        syncCashChangeVisibility();
+        updateMixedSummary();
+    }
+
     function isCashPayment() {
+        if (isMixedMode()) {
+            return mixedCashPortion() > 0.009;
+        }
         var m = elPayMethod ? String(elPayMethod.value || 'cash') : 'cash';
         return m === 'cash';
     }
@@ -351,19 +692,38 @@
             return;
         }
 
-        var total = currentCartTotal();
-        cartTotal = total;
+        var cashDue = isMixedMode() ? mixedCashPortion() : currentCartTotal();
+        // En crédito con un solo método, el billete se valida contra el abono si aplica.
+        if (!isMixedMode()) {
+            var payType = (elPayType && elPayType.value) || 'full';
+            if (payType === 'credit') {
+                cashDue = amountToCollect();
+            }
+        }
+        cartTotal = currentCartTotal();
         var received = parseMoneyInput(elCashReceived ? elCashReceived.value : 0);
         if (received < 0) received = 0;
-        var change = received - total;
+        var change = received - cashDue;
 
         elCashChange.classList.toggle('is-negative', received > 0 && change < 0);
         elCashChange.classList.toggle('is-ready', received > 0 && change >= 0);
-
         if (received > 0 && change < 0) {
             elCashChange.textContent = 'Faltan ' + money(Math.abs(change));
         } else {
             elCashChange.textContent = money(Math.max(0, change));
+        }
+        if (isMixedMode() && cashDue > 0) {
+            elCashChange.title = 'Vueltas sobre la parte en efectivo (' + money(cashDue) + ')';
+        } else {
+            elCashChange.title = '';
+        }
+        if (isMixedMode() && elMixedRows) {
+            var firstMixedAmt = elMixedRows.querySelector('.pos-mixed-amount');
+            if (firstMixedAmt && elMixedRows.querySelectorAll('.pos-mixed-amount').length >= 2) {
+                syncMixedRemainder(firstMixedAmt);
+            } else {
+                updateMixedSummary();
+            }
         }
     }
 
@@ -414,15 +774,37 @@
         if (elDiscountPreset) elDiscountPreset.value = '0';
         if (elDiscount) elDiscount.value = '0';
         if (elDiscountOtherWrap) elDiscountOtherWrap.style.display = 'none';
+        deliverySplitManual = false;
+        if (elDelivery) elDelivery.value = '0';
+        if (elDeliveryClient) elDeliveryClient.value = '0';
+        if (elDeliveryCompany) elDeliveryCompany.value = '0';
+        if (elDeliverySplit) elDeliverySplit.style.display = 'none';
     }
 
     function togglePosCredit() {
         var credit = elPayType && elPayType.value === 'credit';
         if (elTermsGroup) elTermsGroup.style.display = credit ? '' : 'none';
         if (elInitialGroup) elInitialGroup.style.display = credit ? '' : 'none';
+        renderCart();
     }
     if (elPayType) elPayType.addEventListener('change', togglePosCredit);
+    if (elPayTerms) elPayTerms.addEventListener('change', function () { renderCart(); });
     togglePosCredit();
+    var elWholesale = document.getElementById('posWholesaleMode');
+    if (elWholesale) {
+        elWholesale.addEventListener('change', function () {
+            // Recalcular precios de ítems ya en carrito según modo.
+            items.forEach(function (it) {
+                var retail = Number(it.retail_price != null ? it.retail_price : it.unit_price) || 0;
+                var wholesale = Number(it.wholesale_price) || 0;
+                it.retail_price = retail;
+                var next = (elWholesale.checked && wholesale > 0.009) ? wholesale : retail;
+                it.unit_price = next;
+                it.subtotal = roundMoney(next * (Number(it.quantity) || 0));
+            });
+            renderCart();
+        });
+    }
     if (elPayMethod) elPayMethod.addEventListener('change', syncCashChangeVisibility);
     // Listeners robustos (input / enter / blur) + delegación
     document.addEventListener('input', function (e) {
@@ -436,11 +818,66 @@
             updateCashChange();
         }
     });
+    if (elMixedPay) {
+        elMixedPay.addEventListener('change', syncMixedVisibility);
+        elMixedPay.addEventListener('click', function () {
+            setTimeout(syncMixedVisibility, 0);
+        });
+    }
     document.addEventListener('change', function (e) {
         if (e.target && e.target.id === 'posCashReceived') updateCashChange();
         if (e.target && e.target.id === 'posPayMethod') syncCashChangeVisibility();
+        if (e.target && e.target.id === 'posMixedPay') syncMixedVisibility();
+        if (e.target && e.target.classList.contains('pos-mixed-method')) {
+            updateMixedSummary();
+            syncCashChangeVisibility();
+        }
+        if (e.target && e.target.classList.contains('pos-mixed-amount')) {
+            syncMixedRemainder(e.target);
+        }
+        if (e.target && (e.target.id === 'posPaymentType' || e.target.id === 'posInitialPayment')) {
+            if (isMixedMode() && elMixedRows) {
+                var firstAmt = elMixedRows.querySelector('.pos-mixed-amount');
+                if (firstAmt) syncMixedRemainder(firstAmt);
+                else updateMixedSummary();
+            } else {
+                updateMixedSummary();
+            }
+            updateCashChange();
+        }
     });
+    document.addEventListener('input', function (e) {
+        if (e.target && e.target.classList.contains('pos-mixed-amount')) {
+            syncMixedRemainder(e.target);
+        }
+    });
+    if (elMixedAdd) {
+        elMixedAdd.addEventListener('click', function () {
+            var left = Math.round((amountToCollect() - mixedAssignedTotal()) * 100) / 100;
+            addMixedRow('dataphone', left > 0 ? left : '');
+            var lastAmt = elMixedRows && elMixedRows.querySelector('.pos-mixed-row:last-child .pos-mixed-amount');
+            if (lastAmt) lastAmt.focus();
+        });
+    }
+    if (elMixedRows) {
+        elMixedRows.addEventListener('click', function (e) {
+            var btn = e.target.closest('.pos-mixed-remove');
+            if (!btn) return;
+            var row = btn.closest('.pos-mixed-row');
+            if (row && elMixedRows.querySelectorAll('.pos-mixed-row').length > 1) {
+                row.remove();
+                var firstAmt = elMixedRows.querySelector('.pos-mixed-amount');
+                if (firstAmt && elMixedRows.querySelectorAll('.pos-mixed-amount').length >= 2) {
+                    syncMixedRemainder(firstAmt);
+                } else {
+                    updateMixedSummary();
+                    syncCashChangeVisibility();
+                }
+            }
+        });
+    }
     syncCashChangeVisibility();
+    syncMixedVisibility();
 
     function initPosCustomerCombobox() {
         var input = document.getElementById('posCustomerSearch');
@@ -514,34 +951,161 @@
         qty = qty || 1;
         var stock = parseInt(p.stock, 10);
         if (isNaN(stock)) stock = 0;
-        var inCart = cartQty(p.id);
-        if (inCart + qty > stock) {
-            if (typeof showAlert === 'function') showAlert('Stock insuficiente. Disponible: ' + stock, 'error');
+        var isService = (p.product_type || p.type || '') === 'service';
+        var openItem = typeof isOpenItemProduct === 'function' ? isOpenItemProduct(p) : false;
+
+        // Comodín: siempre línea nueva con nombre/precio capturados.
+        if (openItem) {
+            if (typeof requestOpenItemDetails !== 'function') {
+                if (typeof showAlert === 'function') showAlert('Actualice app.js para vender el comodín', 'error');
+                return false;
+            }
+            requestOpenItemDetails(function (customName, customPrice) {
+                items.push({
+                    product_id: p.id,
+                    product_name: customName,
+                    code: p.code || 'COMODIN',
+                    quantity: qty,
+                    unit_price: customPrice,
+                    retail_price: customPrice,
+                    wholesale_price: customPrice,
+                    subtotal: customPrice * qty,
+                    stock: 0,
+                    product_type: 'service',
+                    is_open_item: true,
+                    stock_oversell_reason: '',
+                    stock_oversell_note: ''
+                });
+                renderCart();
+                if (typeof showAlert === 'function') {
+                    showAlert(customName + ' agregado (comodín · sin stock)', 'info');
+                }
+            });
             return false;
         }
-        var existing = items.find(function (i) { return String(i.product_id) === String(p.id); });
-        if (existing) {
-            existing.quantity += qty;
-            existing.subtotal = existing.quantity * existing.unit_price;
-            existing.stock = stock;
-        } else {
-            items.push({
-                product_id: p.id,
-                product_name: p.name,
-                code: p.code || '',
-                quantity: qty,
-                unit_price: parseFloat(p.sale_price) || 0,
-                subtotal: (parseFloat(p.sale_price) || 0) * qty,
-                stock: stock
+
+        var inCart = cartQty(p.id);
+        var nextQty = inCart + qty;
+
+        function commit(reason, note) {
+            var retail = parseFloat(p.sale_price) || 0;
+            var wholesale = parseFloat(p.wholesale_price) || 0;
+            var unit = priceForProduct(p);
+            var existing = items.find(function (i) {
+                return String(i.product_id) === String(p.id) && !i.is_open_item;
             });
+            if (existing) {
+                existing.quantity += qty;
+                existing.subtotal = existing.quantity * existing.unit_price;
+                existing.stock = stock;
+                existing.retail_price = retail;
+                existing.wholesale_price = wholesale;
+                if (reason) {
+                    existing.stock_oversell_reason = reason;
+                    existing.stock_oversell_note = note || '';
+                }
+            } else {
+                items.push({
+                    product_id: p.id,
+                    product_name: p.name,
+                    code: p.code || '',
+                    quantity: qty,
+                    unit_price: unit,
+                    retail_price: retail,
+                    wholesale_price: wholesale,
+                    subtotal: unit * qty,
+                    stock: stock,
+                    product_type: p.product_type || p.type || 'product',
+                    stock_oversell_reason: reason || '',
+                    stock_oversell_note: note || ''
+                });
+            }
+            renderCart();
+            var remaining = stock - cartQty(p.id);
+            if (typeof showAlert === 'function') {
+                var level = remaining < 0 ? 'warning' : (remaining <= 0 ? 'error' : (remaining <= 5 ? 'warning' : 'info'));
+                var msg = (p.name || 'Producto') + ' agregado. Restante en bodega: ' + remaining;
+                if (reason) msg += ' · Sin stock (' + oversellLabel(reason) + ')';
+                showAlert(msg, level);
+            }
+            return true;
         }
-        renderCart();
-        var remaining = stock - cartQty(p.id);
-        if (typeof showAlert === 'function') {
-            var level = remaining <= 0 ? 'error' : (remaining <= 5 ? 'warning' : 'info');
-            showAlert((p.name || 'Producto') + ' agregado. Restante en bodega: ' + remaining, level);
+
+        if (!isService && nextQty > Math.max(0, stock)) {
+            requestOversellReason(p.name || 'Producto', stock, nextQty, function (reason, note) {
+                commit(reason, note);
+            });
+            return false;
         }
-        return true;
+        return commit('', '');
+    }
+
+    function oversellLabel(code) {
+        var map = { cambio: 'Cambio', prestamo: 'Préstamo', venta_pendiente: 'Venta pendiente', otro: 'Otro' };
+        return map[code] || code;
+    }
+
+    var oversellPending = null;
+
+    function requestOversellReason(productName, available, requested, onOk) {
+        var modal = document.getElementById('oversellModal');
+        var info = document.getElementById('oversellInfo');
+        var sel = document.getElementById('oversellReason');
+        var note = document.getElementById('oversellNote');
+        var noteGroup = document.getElementById('oversellNoteGroup');
+        var btn = document.getElementById('oversellConfirmBtn');
+        if (!modal || !sel || !btn) {
+            // Fallback si el modal no cargó (cache vieja / deploy parcial).
+            var reason = window.prompt(
+                (productName || 'Producto') + ' sin stock (disp. ' + available + '). Motivo: cambio / prestamo / venta_pendiente / otro',
+                'prestamo'
+            );
+            if (!reason) return;
+            reason = String(reason).toLowerCase().trim().replace(/\s+/g, '_');
+            var map = { cambio:1, prestamo:1, venta_pendiente:1, otro:1 };
+            if (!map[reason]) reason = 'otro';
+            var detail = '';
+            if (reason === 'otro') {
+                detail = window.prompt('Detalle del motivo', '') || '';
+                if (!String(detail).trim()) {
+                    if (typeof showAlert === 'function') showAlert('Debe indicar el detalle', 'error');
+                    return;
+                }
+            }
+            if (typeof onOk === 'function') onOk(reason, detail);
+            return;
+        }
+        oversellPending = onOk;
+        if (info) {
+            info.textContent = (productName || 'Producto') + ': disponible ' + available + ', se venden ' + requested
+                + '. Indique por qué se entrega sin inventario.';
+        }
+        sel.value = '';
+        if (note) note.value = '';
+        if (noteGroup) noteGroup.style.display = 'none';
+        modal.style.display = 'flex';
+        if (!sel._oversellBound) {
+            sel.addEventListener('change', function () {
+                if (noteGroup) noteGroup.style.display = sel.value === 'otro' ? '' : 'none';
+            });
+            btn.addEventListener('click', function () {
+                var reason = sel.value;
+                var detail = note ? String(note.value || '').trim() : '';
+                if (!reason) {
+                    if (typeof showAlert === 'function') showAlert('Seleccione un motivo', 'error');
+                    return;
+                }
+                if (reason === 'otro' && detail === '') {
+                    if (typeof showAlert === 'function') showAlert('Escriba el detalle del motivo Otro', 'error');
+                    return;
+                }
+                modal.style.display = 'none';
+                var cb = oversellPending;
+                oversellPending = null;
+                if (typeof cb === 'function') cb(reason, detail);
+            });
+            sel._oversellBound = true;
+        }
     }
 
     function bumpQty(idx, delta) {
@@ -550,19 +1114,37 @@
         var next = row.quantity + delta;
         if (next <= 0) {
             items.splice(idx, 1);
-        } else if (next > row.stock) {
-            if (typeof showAlert === 'function') showAlert('Stock insuficiente. Disponible: ' + row.stock, 'error');
+            renderCart();
             return;
-        } else {
-            row.quantity = next;
+        }
+        var isService = (row.product_type || '') === 'service';
+        var stockCap = Math.max(0, parseInt(row.stock, 10) || 0);
+
+        function applyQty(q, reason, note) {
+            row.quantity = q;
             row.subtotal = row.quantity * row.unit_price;
+            if (reason) {
+                row.stock_oversell_reason = reason;
+                row.stock_oversell_note = note || '';
+            } else if (q <= stockCap) {
+                row.stock_oversell_reason = '';
+                row.stock_oversell_note = '';
+            }
             if (delta > 0 && typeof showAlert === 'function') {
-                var remaining = row.stock - row.quantity;
-                var level = remaining <= 0 ? 'error' : (remaining <= 5 ? 'warning' : 'info');
+                var remaining = (row.stock || 0) - row.quantity;
+                var level = remaining < 0 ? 'warning' : (remaining <= 0 ? 'error' : (remaining <= 5 ? 'warning' : 'info'));
                 showAlert(row.product_name + ' · Restante en bodega: ' + remaining, level);
             }
+            renderCart();
         }
-        renderCart();
+
+        if (!isService && next > stockCap && !row.stock_oversell_reason) {
+            requestOversellReason(row.product_name, row.stock || 0, next, function (reason, note) {
+                applyQty(next, reason, note);
+            });
+            return;
+        }
+        applyQty(next, row.stock_oversell_reason || '', row.stock_oversell_note || '');
     }
 
     function setQty(idx, value) {
@@ -570,17 +1152,34 @@
         if (!row) return;
         var q = parseInt(value, 10);
         if (isNaN(q) || q < 1) q = 1;
-        if (q > row.stock) {
-            q = row.stock;
-            if (typeof showAlert === 'function') showAlert('Stock máximo: ' + row.stock, 'error');
+        var isService = (row.product_type || '') === 'service' || !!row.is_open_item;
+        if (!isService && q > Math.max(0, row.stock || 0) && !row.stock_oversell_reason) {
+            requestOversellReason(row.product_name, row.stock || 0, q, function (reason, note) {
+                row.quantity = q;
+                row.subtotal = row.quantity * row.unit_price;
+                row.stock_oversell_reason = reason;
+                row.stock_oversell_note = note || '';
+                renderCart();
+            });
+            return;
         }
         row.quantity = q;
         row.subtotal = row.quantity * row.unit_price;
-        if (typeof showAlert === 'function') {
-            var remaining = row.stock - row.quantity;
-            var level = remaining <= 0 ? 'error' : (remaining <= 5 ? 'warning' : 'info');
+        if (!row.is_open_item && typeof showAlert === 'function') {
+            var remaining = (row.stock || 0) - row.quantity;
+            var level = remaining < 0 ? 'warning' : (remaining <= 0 ? 'error' : (remaining <= 5 ? 'warning' : 'info'));
             showAlert(row.product_name + ' · Restante en bodega: ' + remaining, level);
         }
+        renderCart();
+    }
+
+    function setUnitPrice(idx, value) {
+        var row = items[idx];
+        if (!row) return;
+        var price = parseFloat(String(value).replace(',', '.'));
+        if (isNaN(price) || price < 0) price = 0;
+        row.unit_price = Math.round(price * 100) / 100;
+        row.subtotal = row.quantity * row.unit_price;
         renderCart();
     }
 
@@ -597,14 +1196,27 @@
                 subtotal += it.subtotal;
                 count += it.quantity;
                 var remaining = (parseInt(it.stock, 10) || 0) - it.quantity;
-                var remColor = remaining <= 0 ? '#DC2626' : (remaining <= 5 ? '#B45309' : '#059669');
-                var label = (it.code ? it.code + ' — ' : '') + it.product_name +
-                    ' · Und ' + money(it.unit_price) + ' · Total ' + money(it.subtotal);
+                var remColor = remaining < 0 ? '#B45309' : (remaining <= 0 ? '#DC2626' : (remaining <= 5 ? '#B45309' : '#059669'));
+                var name = it.is_open_item
+                    ? it.product_name
+                    : ((it.code ? it.code + ' — ' : '') + it.product_name);
+                var oversellBadge = it.stock_oversell_reason
+                    ? ' <span class="badge badge-warning" title="' + esc(it.stock_oversell_note || '') + '">Sin stock · ' + esc(oversellLabel(it.stock_oversell_reason)) + '</span>'
+                    : '';
+                if (it.is_open_item) {
+                    oversellBadge += ' <span class="badge badge-info">Comodín</span>';
+                }
+                var stockHint = it.is_open_item
+                    ? '<span style="color:var(--color-text-secondary);">Sin inventario</span>'
+                    : '<span style="color:' + remColor + ';font-weight:600;">Restan ' + remaining + ' / ' + (it.stock || 0) + '</span>';
                 var tr = document.createElement('tr');
                 tr.innerHTML =
                     '<td><input type="number" min="1" class="pos-qty" data-idx="' + idx + '" value="' + it.quantity + '"></td>' +
-                    '<td><div class="pos-prod-label">' + esc(label) +
-                    ' <span style="color:' + remColor + ';font-weight:600;">Restan ' + remaining + ' / ' + (it.stock || 0) + '</span></div></td>' +
+                    '<td><div class="pos-prod-label">' + esc(name) + oversellBadge +
+                    ' ' + stockHint + '</div>' +
+                    '<div class="pos-price-row">Precio und ' +
+                    '<input type="number" min="0" step="any" class="pos-price" data-idx="' + idx + '" value="' + it.unit_price + '" title="Editar precio de venta">' +
+                    ' · Total ' + money(it.subtotal) + '</div></td>' +
                     '<td class="pos-actions">' +
                     '<button type="button" class="pos-btn-plus" data-idx="' + idx + '" title="Sumar">+1</button>' +
                     '<button type="button" class="pos-btn-del" data-idx="' + idx + '" title="Quitar">&times;</button>' +
@@ -617,18 +1229,70 @@
 
         var pct = discountPercent();
         var discAmt = subtotal * (pct / 100);
-        var total = Math.max(0, subtotal - discAmt);
+        var delivery = deliveryFee(); // solo parte cliente
+        var deliveryCompany = deliveryCompanyFee();
+        var deliveryClient = deliveryClientFee();
+        var deliveryTotal = deliveryTotalFee();
+        var afterDisc = Math.max(0, subtotal - discAmt);
+        var taxAmt = taxAmountOn(afterDisc);
+        var creditSurcharge = creditSurchargeAmount(afterDisc);
+        var total = afterDisc + taxAmt + creditSurcharge + delivery;
         cartTotal = total;
 
-        if (elSubLine && elDiscLine && elSubtotal && elDiscAmt) {
-            if (pct > 0 && subtotal > 0) {
+        var showBreakdown = (pct > 0 && subtotal > 0) || taxAmt > 0 || delivery > 0 || deliveryCompany > 0 || creditSurcharge > 0;
+        if (elSubLine && elSubtotal) {
+            if (showBreakdown && subtotal > 0) {
                 elSubLine.style.display = '';
-                elDiscLine.style.display = '';
                 elSubtotal.textContent = money(subtotal);
-                elDiscAmt.textContent = '-' + money(discAmt) + ' (' + pct + '%)';
             } else {
                 elSubLine.style.display = 'none';
+            }
+        }
+        if (elDiscLine && elDiscAmt) {
+            if (pct > 0 && subtotal > 0) {
+                elDiscLine.style.display = '';
+                elDiscAmt.textContent = '-' + money(discAmt) + ' (' + pct + '%)';
+            } else {
                 elDiscLine.style.display = 'none';
+            }
+        }
+        if (elDeliveryLine && elDeliveryAmt) {
+            if (delivery > 0 || deliveryTotal > 0) {
+                elDeliveryLine.style.display = '';
+                elDeliveryAmt.textContent = '+' + money(delivery)
+                    + (deliveryCompany > 0.009
+                        ? ' (de ' + money(deliveryTotal) + ' · empresa ' + money(deliveryCompany) + ' no suma)'
+                        : '');
+            } else {
+                elDeliveryLine.style.display = 'none';
+            }
+        }
+        if (elDeliveryCompanyLine && elDeliveryCompanyAmt) {
+            if (deliveryCompany > 0) {
+                elDeliveryCompanyLine.style.display = '';
+                elDeliveryCompanyAmt.textContent = money(deliveryCompany) + ' (gasto interno, no en total)';
+            } else {
+                elDeliveryCompanyLine.style.display = 'none';
+            }
+        }
+        var elTaxLine = document.getElementById('posTaxLine');
+        var elTaxAmt = document.getElementById('posTaxAmt');
+        if (elTaxLine && elTaxAmt) {
+            if (taxAmt > 0.009) {
+                elTaxLine.style.display = '';
+                elTaxAmt.textContent = '+' + money(taxAmt) + ' (' + taxRatePct() + '%)';
+            } else {
+                elTaxLine.style.display = 'none';
+            }
+        }
+        var elCreditLine = document.getElementById('posCreditSurchargeLine');
+        var elCreditAmt = document.getElementById('posCreditSurchargeAmt');
+        if (elCreditLine && elCreditAmt) {
+            if (creditSurcharge > 0.009) {
+                elCreditLine.style.display = '';
+                elCreditAmt.textContent = '+' + money(creditSurcharge) + ' (' + creditSurchargeRate() + '%)';
+            } else {
+                elCreditLine.style.display = 'none';
             }
         }
 
@@ -648,12 +1312,17 @@
         }
         elResults.innerHTML = '';
         list.forEach(function (p) {
+            var openItem = typeof isOpenItemProduct === 'function' && isOpenItemProduct(p);
             var row = document.createElement('div');
             row.className = 'pos-result-row';
             row.innerHTML =
                 '<div class="pos-result-info">' +
                 '<div class="pos-result-title">' + esc((p.code ? p.code + ' — ' : '') + p.name) + '</div>' +
-                '<div class="pos-result-meta">Stock: ' + p.stock + ' · ' + money(p.sale_price) + '</div>' +
+                '<div class="pos-result-meta">' +
+                (openItem
+                    ? 'Ítem libre · nombre y precio al vender'
+                    : ('Stock: ' + p.stock + ' · ' + money(p.sale_price))) +
+                '</div>' +
                 '</div>' +
                 '<button type="button" class="pos-result-add" title="Agregar">+</button>';
             row.querySelector('.pos-result-add').addEventListener('click', function () {
@@ -776,6 +1445,19 @@
         elDiscountPreset.addEventListener('change', syncDiscountFromPreset);
     }
 
+    if (elDelivery) {
+        elDelivery.addEventListener('input', onDeliveryTotalChanged);
+        elDelivery.addEventListener('change', onDeliveryTotalChanged);
+    }
+    if (elDeliveryClient) {
+        elDeliveryClient.addEventListener('input', onDeliveryClientChanged);
+        elDeliveryClient.addEventListener('change', onDeliveryClientChanged);
+    }
+    if (elDeliveryCompany) {
+        elDeliveryCompany.addEventListener('input', onDeliveryCompanyChanged);
+        elDeliveryCompany.addEventListener('change', onDeliveryCompanyChanged);
+    }
+
     if (elDiscount) {
         elDiscount.addEventListener('input', renderCart);
         elDiscount.addEventListener('change', function () {
@@ -799,14 +1481,30 @@
     });
 
     elBody.addEventListener('change', function (e) {
-        var inp = e.target.closest('.pos-qty');
-        if (!inp) return;
-        setQty(parseInt(inp.getAttribute('data-idx'), 10), inp.value);
+        var qty = e.target.closest('.pos-qty');
+        if (qty) {
+            setQty(parseInt(qty.getAttribute('data-idx'), 10), qty.value);
+            return;
+        }
+        var price = e.target.closest('.pos-price');
+        if (price) {
+            setUnitPrice(parseInt(price.getAttribute('data-idx'), 10), price.value);
+        }
+    });
+
+    elBody.addEventListener('keydown', function (e) {
+        if (e.key !== 'Enter') return;
+        var price = e.target.closest('.pos-price');
+        if (!price) return;
+        e.preventDefault();
+        price.blur();
     });
 
     elPayBtn.addEventListener('click', function () {
         if (!items.length) return;
         elPayBar.hidden = false;
+        syncMixedVisibility();
+        updateCashChange();
     });
 
     document.getElementById('posCancelPay').addEventListener('click', function () {
@@ -819,6 +1517,9 @@
         var payMethod = (elPayMethod && elPayMethod.value) || 'cash';
         var payType = (elPayType && elPayType.value) || 'full';
         var online = Offline ? Offline.isOnline() : navigator.onLine !== false;
+        var mixed = isMixedMode();
+        var splits = mixed ? collectMixedSplits() : [];
+        var due = amountToCollect();
 
         if (!online && payType === 'credit') {
             if (typeof showAlert === 'function') {
@@ -827,12 +1528,38 @@
             return;
         }
 
-        if (payMethod === 'cash') {
+        if (mixed) {
+            if (splits.length < 2) {
+                if (typeof showAlert === 'function') {
+                    showAlert('En pago mixto agregue al menos 2 métodos con monto.', 'error');
+                }
+                return;
+            }
+            if (Math.abs(mixedAssignedTotal() - due) > 0.02) {
+                if (typeof showAlert === 'function') {
+                    showAlert('La suma de los métodos debe igualar ' + money(due) + '.', 'error');
+                }
+                return;
+            }
+            var cashPart = mixedCashPortion();
+            if (cashPart > 0.009) {
+                var receivedMix = parseMoneyInput(elCashReceived ? elCashReceived.value : 0);
+                if (receivedMix < cashPart) {
+                    if (typeof showAlert === 'function') {
+                        showAlert('En la parte en efectivo indique el billete recibido (mínimo ' + money(cashPart) + ').', 'error');
+                    }
+                    if (elCashReceived) elCashReceived.focus();
+                    return;
+                }
+            }
+            payMethod = 'mixed';
+        } else if (payMethod === 'cash') {
             var received = parseMoneyInput(elCashReceived ? elCashReceived.value : 0);
             cartTotal = currentCartTotal();
-            if (received < cartTotal) {
+            var cashNeed = payType === 'credit' ? due : cartTotal;
+            if (received < cashNeed) {
                 if (typeof showAlert === 'function') {
-                    showAlert('En efectivo indique el billete/monto recibido (debe cubrir el total).', 'error');
+                    showAlert('En efectivo indique el billete/monto recibido (debe cubrir ' + money(cashNeed) + ').', 'error');
                 }
                 if (elCashReceived) elCashReceived.focus();
                 return;
@@ -849,7 +1576,7 @@
         fd.append('client_sale_uuid', clientUuid);
         var customerId = document.getElementById('posCustomer').value;
         if (customerId) fd.append('customer_id', customerId);
-        fd.append('payment_method', payMethod);
+        fd.append('payment_method', mixed ? (splits[0] && splits[0].method) || 'cash' : payMethod);
         fd.append('payment_type', payType);
         fd.append('document_type', 'invoice');
         fd.append('payment_terms', payType === 'credit'
@@ -861,10 +1588,27 @@
         }
         var notes = 'Venta rápida desde caja';
         if (!online) notes += ' | Offline';
-        if (payMethod === 'cash' && elCashReceived) {
+        if (mixed) {
+            splits.forEach(function (s, i) {
+                fd.append('payment_splits[' + i + '][method]', s.method);
+                fd.append('payment_splits[' + i + '][amount]', String(s.amount));
+            });
+            notes += ' | Mixto: ' + splits.map(function (s) {
+                return s.method + ' ' + s.amount;
+            }).join(' + ');
+            var cashPartNote = mixedCashPortion();
+            if (cashPartNote > 0.009 && elCashReceived) {
+                var recvM = parseMoneyInput(elCashReceived.value);
+                var changeM = Math.max(0, recvM - cashPartNote);
+                notes += ' | Recibido efectivo: ' + recvM + ' | Cambio: ' + changeM;
+                fd.append('cash_received', String(recvM));
+                fd.append('cash_change', String(changeM));
+            }
+        } else if (payMethod === 'cash' && elCashReceived) {
             var recv = parseMoneyInput(elCashReceived.value);
             cartTotal = currentCartTotal();
-            var change = Math.max(0, recv - cartTotal);
+            var cashNeed2 = payType === 'credit' ? due : cartTotal;
+            var change = Math.max(0, recv - cashNeed2);
             notes += ' | Recibido: ' + recv + ' | Cambio: ' + change;
             fd.append('cash_received', String(recv));
             fd.append('cash_change', String(change));
@@ -872,6 +1616,22 @@
         fd.append('notes', notes);
         var pct = discountPercent();
         if (pct > 0) fd.append('discount_percent', String(pct));
+        var delivery = deliveryFee(); // cliente → total venta
+        var deliveryCompany = deliveryCompanyFee();
+        var deliveryTotal = deliveryTotalFee();
+        if (deliveryTotal > 0.009 || delivery > 0.009 || deliveryCompany > 0.009) {
+            fd.append('delivery_total', String(deliveryTotal > 0.009 ? deliveryTotal : roundMoney(delivery + deliveryCompany)));
+            fd.append('delivery_fee', String(delivery));
+            fd.append('delivery_company_fee', String(deliveryCompany));
+        }
+        if (isWholesaleMode()) fd.append('sale_channel', 'wholesale');
+        var cs = creditSurchargeAmount(Math.max(0, (function () {
+            var sub = 0;
+            items.forEach(function (it) { sub += Number(it.subtotal) || 0; });
+            var pct = discountPercent();
+            return sub - (sub * (pct / 100));
+        })()));
+        if (cs > 0.009) fd.append('credit_surcharge', String(cs));
 
         items.forEach(function (it, i) {
             fd.append('items[' + i + '][product_id]', it.product_id);
@@ -879,6 +1639,10 @@
             fd.append('items[' + i + '][unit_price]', it.unit_price);
             fd.append('items[' + i + '][product_name]', it.product_name);
             fd.append('items[' + i + '][subtotal]', it.subtotal);
+            if (it.stock_oversell_reason) {
+                fd.append('items[' + i + '][stock_oversell_reason]', it.stock_oversell_reason);
+                fd.append('items[' + i + '][stock_oversell_note]', it.stock_oversell_note || '');
+            }
         });
 
         function buildOfflinePayload() {
@@ -984,7 +1748,9 @@
             name: target.getAttribute('data-name'),
             code: target.getAttribute('data-code') || '',
             sale_price: parseFloat(target.getAttribute('data-price') || '0'),
-            stock: parseInt(target.getAttribute('data-stock') || '0', 10)
+            stock: parseInt(target.getAttribute('data-stock') || '0', 10),
+            product_type: target.getAttribute('data-type') || 'product',
+            is_open_item: target.getAttribute('data-open-item') === '1' ? 1 : 0
         };
         if (addProduct(p, 1)) { /* aviso de restante lo muestra addProduct */ }
     });

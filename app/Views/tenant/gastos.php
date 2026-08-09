@@ -10,6 +10,7 @@ $categories = $categories ?? [];
 $monthTotal = $monthTotal ?? 0;
 $monthFinancial = $monthFinancial ?? 0;
 $monthOperational = $monthOperational ?? 0;
+$monthAdministrative = $monthAdministrative ?? 0;
 $kindFilter = $kindFilter ?? '';
 $currency = $currency ?? ['symbol' => '$', 'decimals' => 2, 'decimal' => ',', 'thousands' => '.'];
 $pagination = $pagination ?? null;
@@ -22,6 +23,10 @@ function fmtG(float $a, array $c): string
 
 $financialCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '') === 'financial');
 $operationalCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '') === 'operational');
+$administrativeCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '') === 'administrative');
+$canCreateExpense = \SoftNova\Core\TenantMiddleware::canDo('create', 'gastos');
+$canDeleteExpense = \SoftNova\Core\TenantMiddleware::canDo('delete', 'gastos');
+$canExportExpense = \SoftNova\Core\TenantMiddleware::canDo('export', 'gastos');
 ?>
 <?php echo flashMessage(); ?>
 
@@ -29,24 +34,31 @@ $operationalCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '')
     <div class="stat-card neumorphic"><h4>Gastos mes</h4><div class="stat-value" style="color:#DC2626;"><?php echo fmtG((float)$monthTotal, $currency); ?></div></div>
     <div class="stat-card neumorphic"><h4>Financieros (mes)</h4><div class="stat-value" style="color:#B45309;"><?php echo fmtG((float)$monthFinancial, $currency); ?></div></div>
     <div class="stat-card neumorphic"><h4>Operativos (mes)</h4><div class="stat-value"><?php echo fmtG((float)$monthOperational, $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Registros</h4><div class="stat-value"><?php echo (int)($pagination['total'] ?? count($expenses)); ?></div></div>
+    <div class="stat-card neumorphic"><h4>Administrativos (mes)</h4><div class="stat-value"><?php echo fmtG((float)$monthAdministrative, $currency); ?></div></div>
 </div>
 
 <div style="display:flex;gap:15px;margin-bottom:20px;flex-wrap:wrap;align-items:center;">
+    <?php if ($canCreateExpense): ?>
     <button onclick="document.getElementById('expenseModal').style.display='flex'" class="btn btn-primary neumorphic-btn" title="Nuevo gasto">Nuevo Gasto</button>
+    <?php endif; ?>
+    <?php if ($canExportExpense): ?>
     <a href="<?php echo $viewInstance->route('app/gastos'); ?>?action=export" class="btn btn-secondary" title="Exportar CSV">Exportar CSV</a>
+    <?php endif; ?>
     <form method="GET" action="<?php echo $viewInstance->route('app/gastos'); ?>" style="display:flex;gap:8px;margin:0;align-items:center;">
         <select name="kind" class="form-control" style="width:auto;" onchange="this.form.submit()">
             <option value="">Todos los tipos</option>
             <option value="financial" <?php echo $kindFilter === 'financial' ? 'selected' : ''; ?>>Financieros</option>
             <option value="operational" <?php echo $kindFilter === 'operational' ? 'selected' : ''; ?>>Operativos</option>
+            <option value="administrative" <?php echo $kindFilter === 'administrative' ? 'selected' : ''; ?>>Administrativos</option>
         </select>
     </form>
 </div>
 
 <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 14px;">
     <strong>Financieros:</strong> comisiones banco, datáfono, ventas, 4x1000.
-    <strong>Operativos:</strong> arriendo, servicios, gasolina, etc. Cada categoría lleva su cuenta contable.
+    <strong>Operativos:</strong> arriendo, servicios, gasolina, etc.
+    <strong>Administrativos:</strong> cámara de comercio, derechos de autor, IVA, ICA, etc.
+    Use <em>Otro</em> en el desplegable para agregar un tipo nuevo de forma permanente.
 </p>
 
 <div class="card neumorphic">
@@ -56,13 +68,14 @@ $operationalCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '')
             <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">No hay gastos registrados</p>
         <?php else: ?>
             <div class="table-container"><table>
-                <thead><tr><th>Fecha</th><th>Descripcion</th><th>Categoria</th><th>Proveedor</th><th>Monto</th><th>Metodo</th><th>Soporte</th><th>Acciones</th></tr></thead>
+                <thead><tr><th>Fecha</th><th>Descripcion</th><th>Categoria</th><th>Proveedor</th><th>Monto</th><th>Metodo</th><th>Soporte</th><?php if ($canDeleteExpense): ?><th>Acciones</th><?php endif; ?></tr></thead>
                 <tbody>
                 <?php foreach ($expenses as $exp): ?>
                     <?php
                     $catLabel = $exp['category_label'] ?? ($exp['category'] ?? '');
-                    $kindBadge = ($exp['category_kind'] ?? '') === 'financial' ? 'badge-warning' : 'badge-secondary';
-                    $kindText = ($exp['category_kind'] ?? '') === 'financial' ? 'Financiero' : (($exp['category_kind'] ?? '') === 'operational' ? 'Operativo' : '');
+                    $ck = (string)($exp['category_kind'] ?? '');
+                    $kindBadge = $ck === 'financial' ? 'badge-warning' : ($ck === 'administrative' ? 'badge-info' : 'badge-secondary');
+                    $kindText = $ck === 'financial' ? 'Financiero' : ($ck === 'operational' ? 'Operativo' : ($ck === 'administrative' ? 'Administrativo' : ''));
                     $methodLabel = \SoftNova\Services\PaymentMethodCatalog::label((string)($exp['payment_method'] ?? 'cash'));
                     ?>
                     <tr>
@@ -82,15 +95,17 @@ $operationalCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '')
                                 —
                             <?php endif; ?>
                         </td>
+                        <?php if ($canDeleteExpense): ?>
                         <td class="table-actions">
                             <form method="POST" action="<?php echo $viewInstance->route('app/gastos'); ?>?action=delete" style="display:inline;" data-ajax="true">
                                 <?php echo \SoftNova\Core\csrf_field(); ?>
                                 <input type="hidden" name="id" value="<?php echo (int)$exp['id']; ?>">
-                                <button type="submit" onclick="return confirm('Eliminar gasto?')" class="btn btn-sm btn-danger" title="Eliminar">
+                                <button type="submit" data-confirm="Eliminar gasto?" class="btn btn-sm btn-danger" title="Eliminar">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
                                 </button>
                             </form>
                         </td>
+                        <?php endif; ?>
                     </tr>
                 <?php endforeach; ?>
                 </tbody>
@@ -104,6 +119,7 @@ $operationalCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '')
     </div>
 </div>
 
+<?php if ($canCreateExpense): ?>
 <div id="expenseModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:600px;max-height:90vh;overflow-y:auto;">
         <div class="modal-header">
@@ -130,7 +146,7 @@ $operationalCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '')
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                     <div class="form-group">
                         <label>Categoria *</label>
-                        <select name="category_id" class="form-control" required>
+                        <select name="category_id" class="form-control" required data-custom-other="expense_category">
                             <option value="">Seleccionar…</option>
                             <optgroup label="Gastos financieros">
                                 <?php foreach ($financialCats as $c): ?>
@@ -142,6 +158,12 @@ $operationalCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '')
                                     <option value="<?php echo (int)$c['id']; ?>" <?php echo ($c['code'] ?? '') === 'general' ? 'selected' : ''; ?>><?php echo htmlspecialchars($c['name']); ?></option>
                                 <?php endforeach; ?>
                             </optgroup>
+                            <optgroup label="Gastos administrativos">
+                                <?php foreach ($administrativeCats as $c): ?>
+                                    <option value="<?php echo (int)$c['id']; ?>"><?php echo htmlspecialchars($c['name']); ?></option>
+                                <?php endforeach; ?>
+                            </optgroup>
+                            <option value="__other__">Otro (agregar nuevo tipo)…</option>
                         </select>
                     </div>
                     <div class="form-group">
@@ -188,3 +210,4 @@ $operationalCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '')
         </form>
     </div>
 </div>
+<?php endif; ?>

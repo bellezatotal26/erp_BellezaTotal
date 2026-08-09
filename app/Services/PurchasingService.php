@@ -161,7 +161,8 @@ class PurchasingService
         float $earlyPaymentDiscountPct = 0.0,
         ?string $dueDate = null,
         ?string $invoiceDate = null,
-        ?string $invoiceNumber = null
+        ?string $invoiceNumber = null,
+        bool $autoApplyAllyDiscount = true
     ): int {
         if (!in_array($status, ['draft', 'ordered'], true)) {
             $status = 'ordered';
@@ -170,8 +171,9 @@ class PurchasingService
             throw new \InvalidArgumentException('Agregue al menos un producto a la orden');
         }
 
-        // Descuento aliado del proveedor (si no se envió otro)
-        if ($earlyPaymentDiscountPct <= 0 && $supplierId) {
+        // Descuento aliado solo si se permite auto y no se envió un % explícito (>0).
+        // Con 0.0 y autoApplyAllyDiscount=false (importaciones) se respeta el cero.
+        if ($autoApplyAllyDiscount && $earlyPaymentDiscountPct <= 0 && $supplierId) {
             $ally = $this->query(
                 "SELECT is_ally, discount_percent FROM suppliers WHERE id = ?",
                 [$supplierId]
@@ -434,6 +436,7 @@ class PurchasingService
         $stock = new StockService($this->db);
         $warehouseDate = $stock->normalizeDate($warehouseDate);
         $movementIds = [];
+        $debtAlerts = [];
 
         $this->db->beginTransaction();
         try {
@@ -451,6 +454,7 @@ class PurchasingService
                     continue;
                 }
 
+                $debtCover = null;
                 $movementId = $stock->increase(
                     $productId,
                     $qty,
@@ -468,10 +472,14 @@ class PurchasingService
                         'expiry_date' => $item['expiry_date'] ?? null,
                         'supplier_id' => $order['supplier_id'] ? (int)$order['supplier_id'] : null,
                         'purchase_order_id' => $orderId,
-                    ]
+                    ],
+                    $debtCover
                 );
                 if ($movementId > 0) {
                     $movementIds[] = $movementId;
+                }
+                if ($debtCover && (int)($debtCover['covered'] ?? 0) > 0) {
+                    $debtAlerts[] = $stock->formatDebtCoverAlert($qty, $debtCover);
                 }
                 $this->query(
                     "UPDATE purchase_order_items SET received_qty = quantity WHERE id = ?",
@@ -523,6 +531,7 @@ class PurchasingService
         return [
             'order_id' => $orderId,
             'movement_ids' => $movementIds,
+            'debt_alerts' => $debtAlerts,
         ];
     }
 
@@ -566,6 +575,131 @@ class PurchasingService
     }
 
     /**
+     * Egreso de caja física al recibir OC pagada en efectivo.
+     * @return string Nota UI (vacía si no aplica)
+     */
+    public function syncCashForReceivedOrder(int $orderId): string
+    {
+        $order = $this->getOrder($orderId);
+        if (!$order || ($order['status'] ?? '') !== 'received') {
+            return '';
+        }
+        if ((string)($order['payment_mode'] ?? '') !== 'cash') {
+            return '';
+        }
+        $total = round((float)($order['total'] ?? 0), 2);
+        if ($total <= 0.009) {
+            return '';
+        }
+        $label = 'Compra OC ' . ($order['order_number'] ?? ('#' . $orderId))
+            . (!empty($order['supplier_name']) ? ' · ' . $order['supplier_name'] : '');
+        return $this->postCashMovement($total, $label, 'expense', 'purchase_order', $orderId);
+    }
+
+    /**
+     * Egreso de caja física por abono a proveedor en efectivo.
+     * @return string Nota UI
+     */
+    public function syncCashForSupplierPayment(int $paymentId): string
+    {
+        $payment = $this->query(
+            "SELECT sp.id, sp.amount, sp.payment_method, sp.status,
+                    po.order_number, s.name supplier_name
+             FROM supplier_payments sp
+             LEFT JOIN purchase_orders po ON po.id = sp.purchase_order_id
+             LEFT JOIN suppliers s ON s.id = sp.supplier_id
+             WHERE sp.id = ?",
+            [$paymentId]
+        )->fetch();
+        if (!$payment || ($payment['status'] ?? 'applied') === 'cancelled') {
+            return '';
+        }
+        if (!PaymentMethodCatalog::affectsCash((string)($payment['payment_method'] ?? ''))) {
+            return '';
+        }
+        $amount = round((float)$payment['amount'], 2);
+        $label = 'Abono proveedor'
+            . (!empty($payment['order_number']) ? ' OC ' . $payment['order_number'] : '')
+            . (!empty($payment['supplier_name']) ? ' · ' . $payment['supplier_name'] : '');
+        return $this->postCashMovement($amount, $label, 'expense', 'supplier_payment', $paymentId);
+    }
+
+    /**
+     * Ingreso a caja cuando una NC revierte una compra pagada en efectivo.
+     * @return string Nota UI
+     */
+    public function syncCashForCreditNote(int $creditNoteId): string
+    {
+        $note = $this->query(
+            "SELECT cn.id, cn.total, cn.credit_number, cn.status,
+                    po.payment_mode, po.order_number
+             FROM purchase_credit_notes cn
+             JOIN purchase_orders po ON po.id = cn.purchase_order_id
+             WHERE cn.id = ?",
+            [$creditNoteId]
+        )->fetch();
+        if (!$note || ($note['status'] ?? '') !== 'posted') {
+            return '';
+        }
+        if ((string)($note['payment_mode'] ?? '') !== 'cash') {
+            return '';
+        }
+        $total = round((float)$note['total'], 2);
+        if ($total <= 0.009) {
+            return '';
+        }
+        $label = 'Nota crédito compra ' . ($note['credit_number'] ?? ('#' . $creditNoteId))
+            . (!empty($note['order_number']) ? ' / OC ' . $note['order_number'] : '');
+        return $this->postCashMovement($total, $label, 'income', 'purchase_credit_note', $creditNoteId);
+    }
+
+    /**
+     * @return string Nota para el usuario
+     */
+    private function postCashMovement(
+        float $amount,
+        string $description,
+        string $type,
+        string $referenceType,
+        int $referenceId
+    ): string {
+        $amount = round(max(0, $amount), 2);
+        if ($amount <= 0.009 || $referenceId <= 0) {
+            return '';
+        }
+        if ($this->hasCashMovementRef($referenceType, $referenceId)) {
+            return '';
+        }
+        $cash = new CashService($this->db);
+        if (!$cash->getOpenSession()) {
+            return 'Aviso: no hay caja abierta; el movimiento de efectivo no se registró en el cajón (sí en contabilidad).';
+        }
+        try {
+            $cash->registerMovement($amount, $description, $type, $referenceType, $referenceId);
+            return $type === 'expense'
+                ? 'Egreso de caja registrado.'
+                : 'Ingreso a caja registrado.';
+        } catch (\Throwable $e) {
+            error_log('Purchasing→Caja ' . $referenceType . ' #' . $referenceId . ': ' . $e->getMessage());
+            return 'Aviso: no se pudo registrar el movimiento en caja física.';
+        }
+    }
+
+    private function hasCashMovementRef(string $referenceType, int $referenceId): bool
+    {
+        try {
+            $n = (int)$this->query(
+                "SELECT COUNT(*) FROM cash_movements
+                 WHERE reference_type = ? AND reference_id = ?",
+                [$referenceType, $referenceId]
+            )->fetchColumn();
+            return $n > 0;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
      * Registra un abono al proveedor y actualiza el saldo de la orden.
      * Solo aplica a órdenes recibidas que quedaron como cuenta por pagar.
      *
@@ -587,6 +721,9 @@ class PurchasingService
         }
         if ($order['status'] !== 'received') {
             throw new \RuntimeException('Solo se pueden abonar órdenes ya recibidas');
+        }
+        if ((string)($order['payment_mode'] ?? 'payable') !== 'payable') {
+            throw new \RuntimeException('Esta orden se pagó de contado; no admite abonos adicionales');
         }
         if (empty($order['supplier_id'])) {
             throw new \RuntimeException('La orden no tiene proveedor asignado');

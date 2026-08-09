@@ -2,7 +2,7 @@
  * Cachea el shell estático y la última página de caja para continuidad sin red.
  * Las APIs (ventas/caja) van network-first; no se cachean respuestas mutables.
  */
-var CACHE_VERSION = 'seri-pos-v2';
+var CACHE_VERSION = 'seri-pos-v4';
 var SHELL_CACHE = CACHE_VERSION + '-shell';
 var PAGE_CACHE = CACHE_VERSION + '-pages';
 
@@ -81,16 +81,19 @@ self.addEventListener('fetch', function (event) {
   }
 
   if (isStaticAsset(url)) {
+    // Network-first: en demos/deploys el JS/CSS nuevo debe ganar al cache viejo.
     event.respondWith(
-      caches.open(SHELL_CACHE).then(function (cache) {
-        return cache.match(req).then(function (hit) {
-          var fetchPromise = fetch(req).then(function (res) {
-            if (res && res.ok) cache.put(req, res.clone());
-            return res;
-          }).catch(function () {
-            return hit;
-          });
-          return hit || fetchPromise;
+      fetch(req).then(function (res) {
+        if (res && res.ok) {
+          var copy = res.clone();
+          caches.open(SHELL_CACHE).then(function (cache) {
+            cache.put(req, copy);
+          }).catch(function () {});
+        }
+        return res;
+      }).catch(function () {
+        return caches.open(SHELL_CACHE).then(function (cache) {
+          return cache.match(req);
         });
       })
     );

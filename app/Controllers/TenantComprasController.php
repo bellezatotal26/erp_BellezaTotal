@@ -5,6 +5,7 @@ namespace SoftNova\Controllers;
 use SoftNova\Core\TenantController;
 use SoftNova\Core\TenantMiddleware;
 use SoftNova\Services\AccountingService;
+use SoftNova\Services\PaymentMethodCatalog;
 use SoftNova\Services\PurchasingService;
 use function SoftNova\Core\base_url;
 
@@ -280,6 +281,9 @@ class TenantComprasController extends TenantController
         );
         if ($resultado['skipped'] > 0) {
             $mensaje .= sprintf(', %d omitida(s)', $resultado['skipped']);
+        }
+        if (!empty($resultado['cash_note'])) {
+            $mensaje .= ' ' . $resultado['cash_note'];
         }
 
         $this->respond(true, $mensaje, '/app/compras');
@@ -607,6 +611,9 @@ class TenantComprasController extends TenantController
                 error_log('Contabilidad nota crédito compra ' . $result['credit_note_id'] . ': ' . $e->getMessage());
             }
 
+            // Si la OC se pagó en efectivo, la NC recupera dinero al cajón.
+            $cashNote = $this->purchasing->syncCashForCreditNote((int)$result['credit_note_id']);
+
             $message = 'Nota de crédito ' . $result['credit_number']
                 . ' por ' . $this->formatMoney($result['total']) . '. ';
             if ($result['balance'] <= 0.009) {
@@ -615,6 +622,9 @@ class TenantComprasController extends TenantController
                 $message .= 'Saldo a favor: ' . $this->formatMoney(abs($result['balance'])) . '.';
             } else {
                 $message .= 'Saldo pendiente: ' . $this->formatMoney($result['balance']) . '.';
+            }
+            if ($cashNote !== '') {
+                $message .= ' ' . $cashNote;
             }
 
             $pdfUrl = base_url('/app/compras?action=credit_note_pdf&id=' . (int)$result['credit_note_id']);
@@ -693,6 +703,7 @@ class TenantComprasController extends TenantController
         $notes = trim((string)$this->request->post('notes', ''));
 
         try {
+            $method = PaymentMethodCatalog::normalize($method);
             $result = $this->purchasing->registerPayment(
                 $orderId,
                 $amount,
@@ -708,10 +719,15 @@ class TenantComprasController extends TenantController
                 error_log('Contabilidad abono proveedor ' . $result['payment_id'] . ': ' . $e->getMessage());
             }
 
+            $cashNote = $this->purchasing->syncCashForSupplierPayment((int)$result['payment_id']);
+
             $message = 'Abono registrado por ' . $this->formatMoney($amount) . '. ';
             $message .= $result['balance'] <= 0.009
                 ? 'La orden queda pagada en su totalidad.'
                 : 'Saldo pendiente: ' . $this->formatMoney($result['balance']) . '.';
+            if ($cashNote !== '') {
+                $message .= ' ' . $cashNote;
+            }
 
             $this->respond(true, $message, '/app/compras');
         } catch (\Throwable $e) {
@@ -731,7 +747,9 @@ class TenantComprasController extends TenantController
         $expectedDate = trim((string)$this->request->post('expected_date', ''));
         $notes = trim((string)$this->request->post('notes', ''));
         $receiveNow = $this->request->post('receive_now') === '1';
-        $earlyDiscount = (float)$this->request->post('early_payment_discount_pct', 0);
+        $rawEarlyDiscount = $this->request->post('early_payment_discount_pct', null);
+        $autoApplyAllyDiscount = ($rawEarlyDiscount === null || $rawEarlyDiscount === '');
+        $earlyDiscount = $autoApplyAllyDiscount ? 0.0 : (float)$rawEarlyDiscount;
         $dueDate = trim((string)$this->request->post('due_date', ''));
         $invoiceDate = trim((string)$this->request->post('invoice_date', ''));
         $invoiceNumberCreate = trim((string)$this->request->post('invoice_number', ''));
@@ -768,7 +786,8 @@ class TenantComprasController extends TenantController
                 $earlyDiscount,
                 $dueDate !== '' ? $dueDate : null,
                 $invoiceDate !== '' ? $invoiceDate : null,
-                $invoiceNumberCreate !== '' ? $invoiceNumberCreate : null
+                $invoiceNumberCreate !== '' ? $invoiceNumberCreate : null,
+                $autoApplyAllyDiscount
             );
 
             $invoiceFile = $this->storeInvoiceUpload();
@@ -781,14 +800,21 @@ class TenantComprasController extends TenantController
             }
 
             if ($receiveNow) {
-                $this->doReceive(
+                $recv = $this->doReceive(
                     $orderId,
                     $warehouseDate !== '' ? $warehouseDate : $orderDate,
                     trim((string)$this->request->post('invoice_number', '')),
                     (string)$this->request->post('payment_mode', 'payable'),
                     $notes
                 );
-                $this->respond(true, 'Orden creada y mercancía recibida/contabilizada', '/app/compras');
+                $msg = 'Orden creada y mercancía recibida/contabilizada';
+                if (!empty($recv['debt_alerts'])) {
+                    $msg .= '. ' . implode(' ', $recv['debt_alerts']);
+                }
+                if (!empty($recv['cash_note'])) {
+                    $msg .= ' ' . $recv['cash_note'];
+                }
+                $this->respond(true, $msg, '/app/compras');
                 return;
             }
 
@@ -810,7 +836,7 @@ class TenantComprasController extends TenantController
         }
         try {
             $orderId = (int)$this->request->post('id', 0);
-            $this->doReceive(
+            $recv = $this->doReceive(
                 $orderId,
                 (string)$this->request->post('warehouse_date', date('Y-m-d')),
                 trim((string)$this->request->post('invoice_number', '')),
@@ -825,7 +851,14 @@ class TenantComprasController extends TenantController
             if ($invoiceFile !== null) {
                 $this->purchasing->attachInvoiceFile($orderId, $invoiceFile);
             }
-            $this->respond(true, 'Mercancía recibida, inventario y contabilidad actualizados', '/app/compras');
+            $msg = 'Mercancía recibida, inventario y contabilidad actualizados';
+            if (!empty($recv['debt_alerts'])) {
+                $msg .= '. ' . implode(' ', $recv['debt_alerts']);
+            }
+            if (!empty($recv['cash_note'])) {
+                $msg .= ' ' . $recv['cash_note'];
+            }
+            $this->respond(true, $msg, '/app/compras');
         } catch (\Throwable $e) {
             $this->respond(false, $e->getMessage(), '/app/compras');
         }
@@ -837,13 +870,21 @@ class TenantComprasController extends TenantController
         string $invoiceNumber,
         string $paymentMode,
         string $notes
-    ): void {
-        $this->purchasing->receiveOrder($orderId, $warehouseDate, $invoiceNumber, $paymentMode, $notes);
+    ): array {
+        $result = $this->purchasing->receiveOrder($orderId, $warehouseDate, $invoiceNumber, $paymentMode, $notes);
         try {
             $this->accounting->postPurchaseOrder($orderId);
         } catch (\Throwable $e) {
             error_log('Contabilidad OC ' . $orderId . ': ' . $e->getMessage());
         }
+
+        // Compra al contado en efectivo → egreso en caja física.
+        $out = is_array($result) ? $result : [];
+        $cashNote = $this->purchasing->syncCashForReceivedOrder($orderId);
+        if ($cashNote !== '') {
+            $out['cash_note'] = $cashNote;
+        }
+        return $out;
     }
 
     private function cancel(): void

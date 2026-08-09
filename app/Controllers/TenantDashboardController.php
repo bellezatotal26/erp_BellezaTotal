@@ -38,6 +38,9 @@ class TenantDashboardController extends TenantController
             $this->saveLayout($db);
             return;
         }
+
+        // La página del dashboard requiere Ver; los endpoints AJAX de arriba se autorizan aparte.
+        TenantMiddleware::authorize('dashboard', 'view');
         
         $layoutService = new DashboardLayoutService($db);
         $userId = (int)($_SESSION['tenant_user_id'] ?? 0);
@@ -237,6 +240,10 @@ class TenantDashboardController extends TenantController
         }
         $group = trim((string)$this->request->post('group', ''));
         $label = trim((string)$this->request->post('label', ''));
+        if (!$this->canSaveCustomOptionGroup($group)) {
+            $this->json(['success' => false, 'message' => 'No tienes permiso para agregar esta opción']);
+            return;
+        }
         try {
             $svc = new \SoftNova\Services\CustomOptionService($db);
             $opt = $svc->add($group, $label);
@@ -252,6 +259,36 @@ class TenantDashboardController extends TenantController
         } catch (\Throwable $e) {
             $this->json(['success' => false, 'message' => $e->getMessage()]);
         }
+    }
+
+    private function canSaveCustomOptionGroup(string $group): bool
+    {
+        if (TenantMiddleware::getRole() === 'admin') {
+            return true;
+        }
+        return match ($group) {
+            \SoftNova\Services\CustomOptionService::GROUP_EXPENSE_CATEGORY =>
+                TenantMiddleware::canDo('create', 'gastos')
+                || TenantMiddleware::canDo('create', 'caja'),
+            \SoftNova\Services\CustomOptionService::GROUP_PAYMENT_METHOD =>
+                TenantMiddleware::canDo('create', 'ventas')
+                || TenantMiddleware::canDo('create', 'caja')
+                || TenantMiddleware::canDo('create', 'gastos'),
+            \SoftNova\Services\CustomOptionService::GROUP_CANCEL_REASON =>
+                TenantMiddleware::canDo('create', 'ventas')
+                || TenantMiddleware::canDo('edit', 'ventas')
+                || TenantMiddleware::canDo('create', 'caja'),
+            \SoftNova\Services\CustomOptionService::GROUP_DISCOUNT_PERCENT =>
+                TenantMiddleware::canDo('create', 'ventas')
+                || TenantMiddleware::canDo('create', 'caja'),
+            \SoftNova\Services\CustomOptionService::GROUP_CUSTOMER_SOURCE =>
+                TenantMiddleware::canDo('create', 'clientes')
+                || TenantMiddleware::canDo('edit', 'clientes'),
+            \SoftNova\Services\CustomOptionService::GROUP_PRODUCT_LOCATION =>
+                TenantMiddleware::canDo('create', 'inventario')
+                || TenantMiddleware::canDo('edit', 'inventario'),
+            default => false,
+        };
     }
 
     private function lookupBarcode(\PDO $db): void

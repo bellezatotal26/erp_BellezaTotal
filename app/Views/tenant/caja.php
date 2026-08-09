@@ -9,6 +9,7 @@ $totals = $totals ?? ['incomes'=>0,'expenses'=>0,'balance'=>0];
 $historySessions = $historySessions ?? [];
 $currency = $currency ?? ['symbol'=>'$','name'=>'Peso','decimals'=>0];
 $isPosRole = $isPosRole ?? \SoftNova\Core\TenantMiddleware::isPosRole();
+$stockAlert = $stockAlert ?? ['count' => 0, 'negative_count' => 0, 'loan_count' => 0, 'sale_debt_count' => 0, 'summary_lines' => []];
 $needBarcode = true;
 $pageScripts = ['ventas.js', 'caja.js'];
 if (!function_exists('fmt')) {
@@ -27,6 +28,24 @@ if (!function_exists('hoursOpen')) {
 </div>
 
 <?php if (!$openSession): ?>
+<?php if (($stockAlert['count'] ?? 0) > 0): ?>
+<div class="alert alert-warning" style="margin-bottom:16px;text-align:left;">
+    <strong>Pendiente del día anterior:</strong>
+    hay <?php echo (int)$stockAlert['count']; ?> producto(s) con stock negativo o unidades pendientes
+    (<?php echo (int)($stockAlert['negative_count'] ?? 0); ?> en negativo ·
+    <?php echo (int)($stockAlert['loan_count'] ?? 0); ?> préstamo(s) ·
+    <?php echo (int)($stockAlert['sale_debt_count'] ?? 0); ?> venta(s) sin stock).
+    Revise motivos antes de operar.
+    <?php if (!$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('prestamos')): ?>
+        <a href="<?php echo $viewInstance->route('app/prestamos'); ?>" style="margin-left:8px;">Ver préstamos / trazabilidad</a>
+    <?php endif; ?>
+    <ul style="margin:8px 0 0;padding-left:18px;font-size:13px;max-height:160px;overflow:auto;">
+        <?php foreach (array_slice($stockAlert['summary_lines'] ?? [], 0, 15) as $line): ?>
+            <li><?php echo htmlspecialchars((string)$line); ?></li>
+        <?php endforeach; ?>
+    </ul>
+</div>
+<?php endif; ?>
 <div class="card neumorphic" style="text-align:center;padding:40px;">
     <div style="font-size:64px;margin-bottom:15px;">🔒</div>
     <h2 style="color:var(--color-primary);margin-bottom:10px;">Caja Cerrada</h2>
@@ -35,11 +54,21 @@ if (!function_exists('hoursOpen')) {
 </div>
 
 <div id="openCashModal" class="modal-overlay" style="display:none;">
-    <div class="modal-content neumorphic" style="max-width:450px;">
+    <div class="modal-content neumorphic" style="max-width:520px;">
         <div class="modal-header"><h3>Abrir Caja</h3><button onclick="document.getElementById('openCashModal').style.display='none'" class="modal-close">&times;</button></div>
         <form method="POST" action="<?php echo $viewInstance->route('app/caja'); ?>?action=open" data-ajax="true">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <div class="modal-body">
+                <?php if (($stockAlert['count'] ?? 0) > 0): ?>
+                <div class="alert alert-warning" style="margin-bottom:12px;font-size:13px;text-align:left;">
+                    <strong>Recordatorio de inventario:</strong> hay productos en negativo o préstamos/ventas sin stock pendientes. Quedan registrados para trazabilidad.
+                    <ul style="margin:6px 0 0;padding-left:18px;max-height:120px;overflow:auto;">
+                        <?php foreach (array_slice($stockAlert['summary_lines'] ?? [], 0, 8) as $line): ?>
+                            <li><?php echo htmlspecialchars((string)$line); ?></li>
+                        <?php endforeach; ?>
+                    </ul>
+                </div>
+                <?php endif; ?>
                 <div class="form-group"><label>Monto de Apertura (<?php echo $currency['symbol']; ?>) *</label><input type="number" name="opening_amount" class="form-control" step="0.01" min="0" placeholder="0" required autofocus></div>
                 <div class="form-group"><label>Notas</label><textarea name="notes" class="form-control" rows="2" placeholder="Observaciones..."></textarea></div>
             </div>
@@ -52,10 +81,26 @@ if (!function_exists('hoursOpen')) {
 <?php
 $isPosRole = $isPosRole ?? \SoftNova\Core\TenantMiddleware::isPosRole();
 $hours = hoursOpen($openSession['opening_date']); $warningClass = $hours > 20 ? 'badge-danger' : ($hours > 16 ? 'badge-warning' : 'badge-success');
-$canExpense = \SoftNova\Core\TenantMiddleware::canAccess('gastos') && \SoftNova\Core\TenantMiddleware::canDo('create', 'gastos');
-$canCompras = \SoftNova\Core\TenantMiddleware::canAccess('compras');
+$canExpense = $canExpenseFromCaja ?? (
+    \SoftNova\Core\TenantMiddleware::isPosRole()
+    || \SoftNova\Core\TenantMiddleware::canDo('create', 'gastos')
+);
+$canLoanFromCaja = $canLoanFromCaja ?? false;
+$canCompras = !$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('compras');
 ?>
 <!-- CAJA ABIERTA -->
+<?php if (($stockAlert['count'] ?? 0) > 0): ?>
+<div class="alert alert-warning" style="margin-bottom:14px;">
+    <strong>Inventario pendiente:</strong>
+    <?php echo (int)$stockAlert['count']; ?> producto(s) con stock negativo o unidades por reponer/devolver
+    (negativos: <?php echo (int)($stockAlert['negative_count'] ?? 0); ?> ·
+    préstamos: <?php echo (int)($stockAlert['loan_count'] ?? 0); ?> ·
+    ventas sin stock: <?php echo (int)($stockAlert['sale_debt_count'] ?? 0); ?>).
+    <?php if (!$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('prestamos')): ?>
+        <a href="<?php echo $viewInstance->route('app/prestamos'); ?>">Ver detalle</a>
+    <?php endif; ?>
+</div>
+<?php endif; ?>
 <?php
 if (!$isPosRole) {
     $pageTopStatsHtml = '
@@ -81,9 +126,11 @@ if (!$isPosRole) {
         </div>
         <?php endif; ?>
     </div>
-    <?php if (!$isPosRole && ($canExpense || $canCompras)): ?>
+    <?php if ($canExpense && !$canCompras): ?>
+    <button type="button" class="btn btn-primary neumorphic-btn" onclick="document.getElementById('expenseModal').style.display='flex'">+ Registrar gasto</button>
+    <?php elseif ($canExpense || $canCompras): ?>
     <div class="pos-gasto-menu" style="position:relative;display:inline-block;">
-        <button type="button" class="btn btn-primary neumorphic-btn" id="posGastoMenuBtn" onclick="var m=document.getElementById('posGastoDropdown');m.style.display=m.style.display==='block'?'none':'block';">+ Gasto / Compra</button>
+        <button type="button" class="btn btn-primary neumorphic-btn" id="posGastoMenuBtn" onclick="var m=document.getElementById('posGastoDropdown');m.style.display=m.style.display==='block'?'none':'block';">+ Gasto<?php echo $canCompras ? ' / Compra' : ''; ?></button>
         <div id="posGastoDropdown" style="display:none;position:absolute;right:0;top:110%;background:var(--bg-card);border:1px solid var(--color-border);border-radius:8px;min-width:200px;z-index:50;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:6px;">
             <?php if ($canExpense): ?>
                 <button type="button" class="btn btn-secondary" style="width:100%;margin-bottom:4px;justify-content:flex-start;" onclick="document.getElementById('posGastoDropdown').style.display='none';document.getElementById('expenseModal').style.display='flex'">Registrar gasto</button>
@@ -93,6 +140,9 @@ if (!$isPosRole) {
             <?php endif; ?>
         </div>
     </div>
+    <?php endif; ?>
+    <?php if (!empty($canLoanFromCaja)): ?>
+    <button type="button" class="btn btn-secondary neumorphic-btn" onclick="openCajaLoanModal()" title="Registrar salida por préstamo">+ Préstamo</button>
     <?php endif; ?>
     <?php if (!$isPosRole || \SoftNova\Core\TenantMiddleware::canDo('edit', 'caja')): ?>
     <button type="button" onclick="openCloseCashModal()" class="btn btn-danger"
@@ -119,6 +169,8 @@ $syncUrl = $viewInstance->route('app/ventas') . '?action=sync_offline';
 $ventasBase = $viewInstance->route('app/ventas');
 $canSell = \SoftNova\Core\TenantMiddleware::canAccess('ventas') && \SoftNova\Core\TenantMiddleware::canDo('create', 'ventas');
 $canDeleteSale = \SoftNova\Core\TenantMiddleware::canDo('delete', 'ventas');
+$canEditPaymentMethod = \SoftNova\Core\TenantMiddleware::canDo('create', 'ventas')
+    || \SoftNova\Core\TenantMiddleware::canDo('edit', 'ventas');
 $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes');
 ?>
 
@@ -198,6 +250,8 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                         <span id="posDiscountOtherWrap" style="display:none;">
                             <input type="number" id="posDiscountPercent" class="form-control" min="0" max="100" step="0.01" value="0" style="width:90px;" placeholder="Otro %" title="Porcentaje manual">
                         </span>
+                        <label class="pos-label" for="posDeliveryTotal" style="margin:0 0 0 6px;">Domicilio</label>
+                        <input type="number" id="posDeliveryTotal" class="form-control" min="0" step="0.01" value="0" style="width:110px;" placeholder="Total" inputmode="decimal" title="Costo total del domicilio / envío">
                     </div>
                     <div class="pos-meta-side">
                         <div class="pos-attendant">
@@ -210,12 +264,24 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                         </div>
                     </div>
                 </div>
+                <div id="posDeliverySplit" class="pos-delivery-split" style="display:none;width:100%;margin:0 0 8px;gap:8px;align-items:center;flex-wrap:wrap;">
+                    <span class="pos-label" style="margin:0;">División domicilio (sugerido 50/50)</span>
+                        <label class="pos-label" for="posDeliveryClient" style="margin:0;">Cliente</label>
+                        <input type="number" id="posDeliveryClient" class="form-control" min="0" step="0.01" value="0" style="width:100px;" placeholder="0" inputmode="decimal" title="Parte del cliente que suma al total de la venta">
+                        <label class="pos-label" for="posDeliveryCompany" style="margin:0;">Empresa</label>
+                        <input type="number" id="posDeliveryCompany" class="form-control" min="0" step="0.01" value="0" style="width:100px;" placeholder="0" inputmode="decimal" title="Parte empresa → gasto Transporte (no suma al total de la venta)">
+                        <span id="posDeliverySplitHint" class="pos-label" style="margin:0;opacity:.75;font-weight:400;">Cliente → total venta · Empresa → gasto Transporte</span>
+                </div>
                 <div class="pos-ticket-meta">
                     <span>Items: <strong id="posItemCount">0</strong></span>
                     <span>Registro: <strong id="posClock"><?php echo date('g:i A'); ?></strong></span>
                 </div>
                 <div id="posSubtotalLine" class="pos-sub-line" style="display:none;">Subtotal: <span id="posSubtotal"><?php echo fmt(0, $currency); ?></span></div>
                 <div id="posDiscountLine" class="pos-sub-line" style="display:none;color:#B45309;">Descuento: <span id="posDiscountAmt"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posDeliveryLine" class="pos-sub-line" style="display:none;color:#1D4ED8;">Domicilio: <span id="posDeliveryAmt"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posDeliveryCompanyLine" class="pos-sub-line" style="display:none;color:#7C3AED;">Empresa (transporte): <span id="posDeliveryCompanyAmt"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posTaxLine" class="pos-sub-line" style="display:none;color:#0F766E;">Impuesto: <span id="posTaxAmt"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posCreditSurchargeLine" class="pos-sub-line" style="display:none;color:#B45309;">Recargo crédito &gt;<?php echo (int)($creditSurchargeDays ?? 60); ?> días: <span id="posCreditSurchargeAmt"><?php echo fmt(0, $currency); ?></span></div>
                 <div class="pos-total-block">
                     <div class="pos-total-line">TOTAL: <span id="posTotal"><?php echo fmt(0, $currency); ?></span></div>
                     <div class="pos-cash-change" id="posCashChangeBlock">
@@ -259,6 +325,9 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                     <select id="posPaymentTerms" class="form-control">
                         <option value="net_15">15 días</option>
                         <option value="net_30" selected>30 días</option>
+                        <option value="net_60">60 días</option>
+                        <option value="net_90">90 días</option>
+                        <option value="net_120">120 días</option>
                         <option value="overdue">Vencido</option>
                     </select>
                 </div>
@@ -266,14 +335,32 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                     <label style="font-size:12px;">Abono inicial</label>
                     <input type="number" id="posInitialPayment" class="form-control" step="0.01" min="0" value="0">
                 </div>
-                <div class="form-group" style="margin:0;min-width:140px;flex:1;">
+                <label class="pos-mixed-toggle" for="posWholesaleMode" style="display:inline-flex;align-items:center;gap:6px;margin:0 4px 2px;font-size:13px;cursor:pointer;user-select:none;padding:6px 10px;border:1px solid var(--color-border);border-radius:8px;background:var(--bg-input,#f8fafc);" title="Usa el precio al por mayor del producto">
+                    <input type="checkbox" id="posWholesaleMode" style="width:16px;height:16px;">
+                    Al por mayor
+                </label>
+                <div class="form-group" style="margin:0;min-width:140px;flex:1;" id="posSinglePayWrap">
                     <label style="font-size:12px;">Método de pago</label>
                     <select id="posPayMethod" class="form-control" data-custom-other="payment_method">
                         <?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?>
                     </select>
                 </div>
+                <label class="pos-mixed-toggle" for="posMixedPay" style="display:inline-flex;align-items:center;gap:6px;margin:0 4px 2px;font-size:13px;cursor:pointer;user-select:none;padding:6px 10px;border:1px solid var(--color-border);border-radius:8px;background:var(--bg-input,#f8fafc);">
+                    <input type="checkbox" id="posMixedPay" style="width:16px;height:16px;">
+                    Pago mixto
+                </label>
                 <button type="button" class="btn btn-success" id="posConfirmPay">Cobrar ahora</button>
                 <button type="button" class="btn btn-secondary" id="posCancelPay">Cancelar</button>
+            </div>
+            <div id="posMixedPayWrap" class="pos-mixed-wrap" style="display:none;">
+                <div id="posMixedRows" class="pos-mixed-rows"></div>
+                <div class="pos-mixed-actions">
+                    <button type="button" class="btn btn-sm btn-secondary" id="posMixedAdd">+ Agregar método</button>
+                    <span id="posMixedSummary" class="pos-mixed-summary" title="Al editar un monto, el otro se completa con el restante"></span>
+                </div>
+                <select id="posPayMethodOptionsTpl" hidden aria-hidden="true" tabindex="-1">
+                    <?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', false, \SoftNova\Core\TenantMiddleware::getDb()); ?>
+                </select>
             </div>
         </div>
     </div>
@@ -291,17 +378,28 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
             $recentProducts = $recentProducts ?? [];
             if (!empty($recentProducts)):
             ?>
-                <p class="pos-search-hint" style="margin-bottom:8px;">Últimos productos</p>
-                <?php foreach ($recentProducts as $rp): ?>
+                <p class="pos-search-hint" style="margin-bottom:8px;">Últimos 5 vendidos</p>
+                <?php foreach ($recentProducts as $rp):
+                    $isOpen = !empty($rp['is_open_item'])
+                        || strtoupper((string)($rp['code'] ?? '')) === \SoftNova\Services\OpenItemProduct::CODE;
+                ?>
                     <div class="pos-result-row pos-recent-product"
                          data-id="<?php echo (int)$rp['id']; ?>"
-                         data-name="<?php echo htmlspecialchars($rp['name']); ?>"
-                         data-code="<?php echo htmlspecialchars($rp['code'] ?? ''); ?>"
+                         data-name="<?php echo \SoftNova\Core\e((string)$rp['name']); ?>"
+                         data-code="<?php echo \SoftNova\Core\e((string)($rp['code'] ?? '')); ?>"
                          data-price="<?php echo (float)$rp['sale_price']; ?>"
-                         data-stock="<?php echo (int)$rp['stock']; ?>">
+                         data-stock="<?php echo (int)$rp['stock']; ?>"
+                         data-type="<?php echo htmlspecialchars((string)($rp['product_type'] ?? 'product')); ?>"
+                         data-open-item="<?php echo $isOpen ? '1' : '0'; ?>">
                         <div class="pos-result-info">
-                            <div class="pos-result-title"><?php echo htmlspecialchars((($rp['code'] ?? '') !== '' ? ($rp['code'] . ' — ') : '') . $rp['name']); ?></div>
-                            <div class="pos-result-meta">Stock: <?php echo (int)$rp['stock']; ?> · <?php echo fmt((float)$rp['sale_price'], $currency); ?></div>
+                            <div class="pos-result-title"><?php echo \SoftNova\Core\e((($rp['code'] ?? '') !== '' ? ($rp['code'] . ' — ') : '') . $rp['name']); ?></div>
+                            <div class="pos-result-meta">
+                                <?php if ($isOpen): ?>
+                                    Ítem libre · nombre y precio al vender
+                                <?php else: ?>
+                                    Stock: <?php echo (int)$rp['stock']; ?> · <?php echo fmt((float)$rp['sale_price'], $currency); ?>
+                                <?php endif; ?>
+                            </div>
                         </div>
                         <button type="button" class="pos-result-add" title="Agregar">+</button>
                     </div>
@@ -339,7 +437,10 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                         <td style="font-weight:600;"><?php echo fmt((float)$sale['total'], $currency); ?></td>
                         <td><?php echo ($sale['payment_status'] ?? '') === 'paid' ? fmt((float)$sale['total'], $currency) : fmt((float)($sale['paid_amount'] ?? 0), $currency); ?></td>
                         <td>
-                            <span class="badge <?php echo ($sale['payment_method'] ?? '') === 'cash' ? 'badge-success' : (in_array($sale['payment_method'] ?? '', ['card','dataphone','payment_link','transfer'], true) ? 'badge-info' : 'badge-warning'); ?>">
+                            <span class="badge <?php
+                                $pm = (string)($sale['payment_method'] ?? '');
+                                echo $pm === 'cash' ? 'badge-success' : ($pm === 'mixed' || in_array($pm, ['card','dataphone','payment_link','transfer','debit_card','credit_card','nequi'], true) ? 'badge-info' : 'badge-warning');
+                            ?>">
                                 <?php echo htmlspecialchars(\SoftNova\Services\PaymentMethodCatalog::label((string)($sale['payment_method'] ?? 'cash'))); ?>
                             </span>
                         </td>
@@ -359,15 +460,20 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                             <a href="<?php echo $ventasBase; ?>?action=pdf&id=<?php echo (int)$sale['id']; ?>" class="btn btn-sm btn-secondary" target="_blank" title="PDF carta"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg></a>
                             <a href="<?php echo $ventasBase; ?>?action=pdf&format=ticket&id=<?php echo (int)$sale['id']; ?>" class="btn btn-sm btn-secondary" target="_blank" title="Ticket 58mm">58mm</a>
                             <button type="button" class="btn btn-sm btn-success" onclick="shareSale(<?php echo (int)$sale['id']; ?>)" title="WhatsApp / Correo">↗</button>
+                            <?php if ($canEditPaymentMethod && ($sale['status'] ?? '') !== 'cancelled'): ?>
+                                <button type="button" class="btn btn-sm btn-secondary" title="Editar medio de pago"
+                                    onclick="openEditPaymentMethodModal(<?php echo (int)$sale['id']; ?>, '<?php echo htmlspecialchars((string)($sale['invoice_number'] ?? ''), ENT_QUOTES); ?>', '<?php echo htmlspecialchars((string)($sale['payment_method'] ?? 'cash'), ENT_QUOTES); ?>')">
+                                    Pago
+                                </button>
+                            <?php endif; ?>
                             <?php if (in_array($sale['payment_status'] ?? '', ['pending', 'partial'], true) && ($sale['status'] ?? '') !== 'cancelled'): ?>
                                 <button type="button" onclick="openPaymentModal(<?php echo (int)$sale['id']; ?>,<?php echo (float)$sale['total']; ?>,<?php echo (float)($sale['paid_amount'] ?? 0); ?>)" class="btn btn-sm btn-success" title="Registrar abono"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></button>
                             <?php endif; ?>
                             <?php if ($canDeleteSale && ($sale['status'] ?? '') !== 'cancelled'): ?>
-                                <form method="POST" action="<?php echo $ventasBase; ?>?action=cancel" style="display:inline;" data-ajax="true">
-                                    <?php echo \SoftNova\Core\csrf_field(); ?>
-                                    <input type="hidden" name="id" value="<?php echo (int)$sale['id']; ?>">
-                                    <button type="submit" data-confirm="Eliminar esta venta? Se cancelara, se devolvera el stock y se ajustara la caja." class="btn btn-sm btn-danger" title="Eliminar venta"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
-                                </form>
+                                <button type="button" class="btn btn-sm btn-danger" title="Eliminar venta"
+                                    onclick="openCancelSaleModal(<?php echo (int)$sale['id']; ?>, '<?php echo htmlspecialchars($sale['invoice_number'] ?? '', ENT_QUOTES); ?>')">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                                </button>
                             <?php endif; ?>
                         </td>
                     </tr>
@@ -380,6 +486,73 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
             $paginationQuery = [];
             $viewInstance->partial('pagination', compact('pagination', 'paginationBaseUrl', 'paginationQuery'));
             ?>
+        <?php endif; ?>
+    </div>
+</div>
+
+<?php
+$todayExpensesByUser = $todayExpensesByUser ?? [];
+$todayExpensesTotal = (float)($todayExpensesTotal ?? 0);
+$todayExpensesCount = (int)($todayExpensesCount ?? 0);
+?>
+<div class="card neumorphic" style="margin-bottom:20px;">
+    <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <h3>Gastos del día<?php echo $todayExpensesCount > 0 ? ' (' . $todayExpensesCount . ')' : ''; ?></h3>
+        <?php if ($todayExpensesCount > 0): ?>
+            <span style="font-size:13px;color:#DC2626;font-weight:600;">Total: -<?php echo fmt($todayExpensesTotal, $currency); ?></span>
+        <?php endif; ?>
+    </div>
+    <div class="card-body">
+        <?php if (empty($todayExpensesByUser)): ?>
+            <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">No hay gastos registrados hoy</p>
+        <?php else: ?>
+            <?php foreach ($todayExpensesByUser as $group): ?>
+                <div style="margin-bottom:18px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--color-border);">
+                        <strong><?php echo htmlspecialchars((string)$group['user_name']); ?></strong>
+                        <span style="color:#DC2626;font-weight:600;font-size:13px;">-<?php echo fmt((float)$group['total'], $currency); ?> · <?php echo count($group['items']); ?> gasto(s)</span>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Hora</th>
+                                    <th>Descripción</th>
+                                    <th>Categoría</th>
+                                    <th>Pago</th>
+                                    <th>Monto</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                            <?php foreach ($group['items'] as $exp): ?>
+                                <tr>
+                                    <td><?php
+                                        $ts = $exp['created_at'] ?? $exp['expense_date'] ?? '';
+                                        echo $ts !== '' ? date('H:i', strtotime((string)$ts)) : '—';
+                                    ?></td>
+                                    <td>
+                                        <strong><?php echo htmlspecialchars((string)$exp['description']); ?></strong>
+                                        <?php if (!empty($exp['supplier_name'])): ?>
+                                            <div style="font-size:12px;color:var(--color-text-secondary);"><?php echo htmlspecialchars((string)$exp['supplier_name']); ?></div>
+                                        <?php endif; ?>
+                                        <?php if (!empty($exp['receipt_number'])): ?>
+                                            <div style="font-size:12px;color:var(--color-text-secondary);">Comp: <?php echo htmlspecialchars((string)$exp['receipt_number']); ?></div>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td><?php echo htmlspecialchars((string)($exp['category_label'] ?? 'General')); ?></td>
+                                    <td>
+                                        <span class="badge badge-info">
+                                            <?php echo htmlspecialchars(\SoftNova\Services\PaymentMethodCatalog::label((string)($exp['payment_method'] ?? 'cash'))); ?>
+                                        </span>
+                                    </td>
+                                    <td style="color:#DC2626;font-weight:600;">-<?php echo fmt((float)$exp['amount'], $currency); ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            <?php endforeach; ?>
         <?php endif; ?>
     </div>
 </div>
@@ -421,11 +594,28 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
 <?php endif; ?>
 
 <div id="closeCashModal" class="modal-overlay" style="display:none;">
-    <div class="modal-content neumorphic" style="max-width:480px;">
+    <div class="modal-content neumorphic" style="max-width:520px;max-height:92vh;overflow-y:auto;">
         <div class="modal-header"><h3>Cerrar Caja</h3><button type="button" onclick="document.getElementById('closeCashModal').style.display='none'" class="modal-close">&times;</button></div>
         <form method="POST" action="<?php echo $viewInstance->route('app/caja'); ?>?action=close" data-ajax="true" id="closeCashForm">
             <?php echo \SoftNova\Core\csrf_field(); ?><input type="hidden" name="session_id" value="<?php echo (int)$openSession['id']; ?>">
             <div class="modal-body">
+                <?php if (($stockAlert['count'] ?? 0) > 0): ?>
+                <div class="alert alert-warning" style="margin-bottom:12px;font-size:13px;">
+                    <strong>Productos en stock negativo / pendientes</strong>
+                    (<?php echo (int)($stockAlert['negative_count'] ?? 0); ?> negativos ·
+                    <?php echo (int)($stockAlert['loan_count'] ?? 0); ?> préstamos ·
+                    <?php echo (int)($stockAlert['sale_debt_count'] ?? 0); ?> ventas sin stock).
+                    Se guardará en las notas del cierre para trazabilidad.
+                    <ul style="margin:6px 0 0;padding-left:18px;max-height:130px;overflow:auto;">
+                        <?php foreach (array_slice($stockAlert['summary_lines'] ?? [], 0, 12) as $line): ?>
+                            <li><?php echo htmlspecialchars((string)$line); ?></li>
+                        <?php endforeach; ?>
+                    </ul>
+                    <?php if (!$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('prestamos')): ?>
+                        <a href="<?php echo $viewInstance->route('app/prestamos'); ?>">Gestionar préstamos</a>
+                    <?php endif; ?>
+                </div>
+                <?php endif; ?>
                 <div id="closeCashSummary" style="background:var(--bg-body,#f5f5f5);border:1px solid var(--color-border);border-radius:8px;padding:12px;margin-bottom:14px;font-size:13px;">
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Apertura</span><strong id="closeSumOpening">—</strong></div>
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Ingresos</span><strong id="closeSumIncomes" style="color:#10B981;">—</strong></div>
@@ -527,6 +717,7 @@ function openCloseCashModal() {
 <?php
 $financialCats = $financialCats ?? [];
 $operationalCats = $operationalCats ?? [];
+$administrativeCats = $administrativeCats ?? [];
 $expenseSuppliers = $expenseSuppliers ?? [];
 if ($canExpense):
 ?>
@@ -536,7 +727,7 @@ if ($canExpense):
             <h3>Nuevo Gasto</h3>
             <button type="button" class="modal-close" onclick="document.getElementById('expenseModal').style.display='none'">&times;</button>
         </div>
-        <form method="POST" action="<?php echo $viewInstance->route('app/gastos'); ?>?action=create" data-ajax="true" enctype="multipart/form-data">
+        <form method="POST" action="<?php echo $viewInstance->route('app/caja'); ?>?action=expense" data-ajax="true" enctype="multipart/form-data">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <div class="modal-body">
                 <div class="form-group">
@@ -556,7 +747,7 @@ if ($canExpense):
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                     <div class="form-group">
                         <label>Categoria *</label>
-                        <select name="category_id" class="form-control" required>
+                        <select name="category_id" class="form-control" required data-custom-other="expense_category">
                             <option value="">Seleccionar…</option>
                             <optgroup label="Gastos financieros">
                                 <?php foreach ($financialCats as $c): ?>
@@ -568,6 +759,12 @@ if ($canExpense):
                                     <option value="<?php echo (int)$c['id']; ?>" <?php echo ($c['code'] ?? '') === 'general' ? 'selected' : ''; ?>><?php echo htmlspecialchars($c['name']); ?></option>
                                 <?php endforeach; ?>
                             </optgroup>
+                            <optgroup label="Gastos administrativos">
+                                <?php foreach ($administrativeCats as $c): ?>
+                                    <option value="<?php echo (int)$c['id']; ?>"><?php echo htmlspecialchars($c['name']); ?></option>
+                                <?php endforeach; ?>
+                            </optgroup>
+                            <option value="__other__">Otro (agregar nuevo tipo)…</option>
                         </select>
                     </div>
                     <div class="form-group">
@@ -616,6 +813,239 @@ if ($canExpense):
 </div>
 <?php endif; ?>
 
+<?php
+$canLoanFromCaja = !empty($canLoanFromCaja);
+$loanProducts = $loanProducts ?? [];
+$loanReasonsHtml = $loanReasonsHtml ?? \SoftNova\Services\ProductLoan::optionsHtml();
+if ($canLoanFromCaja):
+?>
+<div id="cajaLoanModal" class="modal-overlay" style="display:none;z-index:1100;">
+    <div class="modal-content neumorphic" style="max-width:520px;">
+        <div class="modal-header">
+            <h3>Salida por préstamo</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('cajaLoanModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $viewInstance->route('app/caja'); ?>?action=loan" data-ajax="true" id="cajaLoanForm">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Producto *</label>
+                    <input type="hidden" name="product_id" id="cajaLoanProductId" required>
+                    <input type="text" id="cajaLoanProductSearch" class="form-control" autocomplete="off"
+                           placeholder="Buscar nombre, SKU o escanear…"
+                           data-barcode-input="true">
+                    <div id="cajaLoanProductResults" class="product-picker-results" style="display:none;"></div>
+                    <div id="cajaLoanProductSelected" class="product-picker-selected" style="display:none;"></div>
+                    <small id="cajaLoanStockHint" style="color:var(--color-text-secondary);"></small>
+                </div>
+                <div class="form-group">
+                    <label>Cantidad *</label>
+                    <input type="number" name="quantity" id="cajaLoanQty" class="form-control" min="1" value="1" required>
+                </div>
+                <div class="form-group">
+                    <label>Motivo *</label>
+                    <select name="reason" id="cajaLoanReason" class="form-control" required>
+                        <?php echo $loanReasonsHtml; ?>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>A quién se presta *</label>
+                    <input type="text" name="borrower" id="cajaLoanBorrower" class="form-control" maxlength="120" placeholder="Nombre de la persona o empresa" required>
+                </div>
+                <div class="form-group">
+                    <label>Nota / detalle <span id="cajaLoanNoteReq" style="display:none;">*</span></label>
+                    <input type="text" name="note" id="cajaLoanNote" class="form-control" maxlength="180" placeholder="Detalle adicional">
+                </div>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:0;">
+                    Si no hay stock suficiente, el inventario quedará en negativo y el préstamo seguirá pendiente hasta la devolución.
+                    <?php if (!$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('prestamos')): ?>
+                        <a href="<?php echo $viewInstance->route('app/prestamos'); ?>">Ver préstamos</a>
+                    <?php endif; ?>
+                </p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('cajaLoanModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-primary">Registrar salida</button>
+            </div>
+        </form>
+    </div>
+</div>
+<script>
+(function(){
+    var searchUrl = <?php echo json_encode($viewInstance->route('app/caja') . '?action=searchProducts'); ?>;
+    var seed = <?php echo json_encode(array_values(array_map(static function ($p) {
+        return [
+            'id' => (int)$p['id'],
+            'code' => (string)($p['code'] ?? ''),
+            'name' => (string)($p['name'] ?? ''),
+            'stock' => (int)($p['stock'] ?? 0),
+            'barcode' => (string)($p['barcode'] ?? ''),
+        ];
+    }, $loanProducts)), JSON_UNESCAPED_UNICODE); ?>;
+
+    function esc(s) {
+        return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+    function label(p) { return ((p.code ? p.code + ' · ' : '') + (p.name || '')).trim(); }
+
+    window.setCajaLoanProduct = function (p) {
+        var hid = document.getElementById('cajaLoanProductId');
+        var sel = document.getElementById('cajaLoanProductSelected');
+        var search = document.getElementById('cajaLoanProductSearch');
+        var results = document.getElementById('cajaLoanProductResults');
+        if (!hid || !p) return;
+        hid.value = String(p.id);
+        hid.dataset.stock = String(p.stock != null ? p.stock : 0);
+        if (sel) {
+            sel.style.display = '';
+            sel.innerHTML = '<strong>' + esc(label(p)) + '</strong> · stock ' + esc(p.stock)
+                + ' <button type="button" class="btn btn-sm btn-secondary" style="margin-left:8px;" onclick="clearCajaLoanProduct()">Cambiar</button>';
+        }
+        if (search) { search.value = ''; search.style.display = 'none'; }
+        if (results) { results.style.display = 'none'; results.innerHTML = ''; }
+        updateCajaLoanStockHint();
+    };
+    window.clearCajaLoanProduct = function () {
+        var hid = document.getElementById('cajaLoanProductId');
+        var sel = document.getElementById('cajaLoanProductSelected');
+        var search = document.getElementById('cajaLoanProductSearch');
+        if (hid) { hid.value = ''; delete hid.dataset.stock; }
+        if (sel) { sel.style.display = 'none'; sel.innerHTML = ''; }
+        if (search) { search.style.display = ''; search.focus(); }
+        updateCajaLoanStockHint();
+    };
+    window.openCajaLoanModal = function () {
+        var modal = document.getElementById('cajaLoanModal');
+        if (!modal) return;
+        clearCajaLoanProduct();
+        modal.style.display = 'flex';
+        var s = document.getElementById('cajaLoanProductSearch');
+        if (s) setTimeout(function () { s.focus(); }, 40);
+    };
+    window.updateCajaLoanStockHint = function () {
+        var hid = document.getElementById('cajaLoanProductId');
+        var hint = document.getElementById('cajaLoanStockHint');
+        if (!hid || !hint) return;
+        if (!hid.value) { hint.textContent = ''; return; }
+        var stock = parseInt(hid.dataset.stock || '0', 10);
+        var qty = parseInt((document.getElementById('cajaLoanQty') || {}).value || '1', 10) || 1;
+        if (qty > Math.max(0, stock)) {
+            hint.textContent = 'Stock actual: ' + stock + '. Esta salida dejará el inventario en ' + (stock - qty) + '.';
+            hint.style.color = '#B45309';
+        } else {
+            hint.textContent = 'Stock actual: ' + stock;
+            hint.style.color = '';
+        }
+    };
+
+    function render(list) {
+        var box = document.getElementById('cajaLoanProductResults');
+        if (!box) return;
+        if (!list || !list.length) {
+            box.style.display = '';
+            box.innerHTML = '<div class="product-picker-row" style="cursor:default;color:var(--color-text-secondary);">Sin resultados</div>';
+            return;
+        }
+        box.style.display = '';
+        box.innerHTML = '';
+        list.forEach(function (p) {
+            var row = document.createElement('div');
+            row.className = 'product-picker-row';
+            row.innerHTML = '<span>' + esc(label(p)) + '</span><span style="color:var(--color-text-secondary);">stock ' + esc(p.stock) + '</span>';
+            row.addEventListener('click', function () { setCajaLoanProduct(p); });
+            box.appendChild(row);
+        });
+    }
+    function localSearch(q) {
+        q = String(q || '').toLowerCase();
+        return (seed || []).filter(function (p) {
+            return String(p.name||'').toLowerCase().indexOf(q) >= 0
+                || String(p.code||'').toLowerCase().indexOf(q) >= 0
+                || String(p.barcode||'').toLowerCase() === q;
+        }).slice(0, 25);
+    }
+    var timer = null;
+    var input = document.getElementById('cajaLoanProductSearch');
+    function run(autoExact) {
+        var q = (input && input.value || '').trim();
+        if (!q) {
+            var box = document.getElementById('cajaLoanProductResults');
+            if (box) { box.style.display = 'none'; box.innerHTML = ''; }
+            return;
+        }
+        fetch(searchUrl + '&q=' + encodeURIComponent(q), { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                var list = (d && d.products) ? d.products : localSearch(q);
+                if (autoExact && list.length) {
+                    var ql = q.toLowerCase();
+                    var exact = list.find(function (p) {
+                        return String(p.code||'').toLowerCase() === ql || String(p.barcode||'').toLowerCase() === ql;
+                    }) || (list.length === 1 ? list[0] : null);
+                    if (exact) { setCajaLoanProduct(exact); return; }
+                }
+                render(list);
+            })
+            .catch(function () { render(localSearch(q)); });
+    }
+    if (input) {
+        input.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(function () { run(false); }, 220); });
+        input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); clearTimeout(timer); run(true); } });
+    }
+    var qty = document.getElementById('cajaLoanQty');
+    var reason = document.getElementById('cajaLoanReason');
+    if (qty) qty.addEventListener('input', updateCajaLoanStockHint);
+    if (reason) reason.addEventListener('change', function(){
+        var req = document.getElementById('cajaLoanNoteReq');
+        var note = document.getElementById('cajaLoanNote');
+        var isOther = reason.value === 'otro';
+        if (req) req.style.display = isOther ? 'inline' : 'none';
+        if (note) note.required = isOther;
+    });
+    var form = document.getElementById('cajaLoanForm');
+    if (form) {
+        form.addEventListener('submit', function (e) {
+            var hid = document.getElementById('cajaLoanProductId');
+            if (!hid || !hid.value) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                if (typeof showAlert === 'function') showAlert('Seleccione o escanee un producto', 'error');
+            }
+        }, true);
+    }
+    if (window.SoftNovaBarcode && SoftNovaBarcode.onScan) {
+        SoftNovaBarcode.onScan(function (code, product) {
+            var modal = document.getElementById('cajaLoanModal');
+            if (!modal || modal.style.display === 'none' || !product) return false;
+            setCajaLoanProduct(product);
+            return true;
+        });
+    }
+    var prefill = <?php echo (int)($loanProductIdPrefill ?? 0); ?>;
+    if (prefill > 0) {
+        var hit = (seed || []).find(function (p) { return String(p.id) === String(prefill); });
+        openCajaLoanModal();
+        if (hit) setCajaLoanProduct(hit);
+    }
+})();
+</script>
+<style>
+.product-picker-results {
+    margin-top: 6px; border: 1px solid var(--color-border); border-radius: 8px;
+    max-height: 220px; overflow: auto; background: var(--bg-card, #fff); z-index: 2; position: relative;
+}
+.product-picker-row {
+    display: flex; justify-content: space-between; gap: 10px;
+    padding: 8px 10px; cursor: pointer; border-bottom: 1px solid var(--color-border); font-size: 13px;
+}
+.product-picker-row:last-child { border-bottom: 0; }
+.product-picker-row:hover { background: var(--bg-input, #f8fafc); }
+.product-picker-selected {
+    margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+    background: var(--bg-input, #f1f5f9); font-size: 13px;
+}
+</style>
+<?php endif; ?>
+
 <!-- Modal Quick Customer (POS) -->
 <div id="quickCustomerModal" class="modal-overlay" style="display:none;z-index:1100;">
     <div class="modal-content neumorphic" style="max-width:450px;">
@@ -644,6 +1074,63 @@ if ($canExpense):
     </div>
 </div>
 
+<!-- Modal venta sin stock -->
+<div id="oversellModal" class="modal-overlay" style="display:none;z-index:1200;">
+    <div class="modal-content neumorphic" style="max-width:440px;">
+        <div class="modal-header">
+            <h3>Vender sin stock</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('oversellModal').style.display='none'">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p id="oversellInfo" style="margin:0 0 12px;color:var(--color-text-secondary);font-size:13px;"></p>
+            <div class="form-group">
+                <label>Motivo *</label>
+                <select id="oversellReason" class="form-control">
+                    <?php echo \SoftNova\Services\StockOversell::optionsHtml(); ?>
+                </select>
+            </div>
+            <div class="form-group" id="oversellNoteGroup" style="display:none;">
+                <label>Detalle (obligatorio si elige Otro)</label>
+                <input type="text" id="oversellNote" class="form-control" maxlength="180" placeholder="Describa el motivo…">
+            </div>
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0;">
+                El inventario quedará en negativo o cero. Al reponer mercancía se cubrirá esta deuda y se mostrará el motivo.
+            </p>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="document.getElementById('oversellModal').style.display='none'">Cancelar</button>
+            <button type="button" class="btn btn-primary" id="oversellConfirmBtn">Continuar venta</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal producto comodín -->
+<div id="openItemModal" class="modal-overlay" style="display:none;z-index:1250;">
+    <div class="modal-content neumorphic" style="max-width:420px;">
+        <div class="modal-header">
+            <h3>Producto comodín</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('openItemModal').style.display='none'">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p style="margin:0 0 12px;font-size:13px;color:var(--color-text-secondary);">
+                Para ventas puntuales que no están en inventario. No descuenta stock.
+            </p>
+            <div class="form-group">
+                <label>Nombre del producto *</label>
+                <input type="text" id="openItemName" class="form-control" maxlength="255" placeholder="Ej: Servicio de instalación">
+            </div>
+            <div class="form-group">
+                <label>Precio de venta *</label>
+                <input type="number" id="openItemPrice" class="form-control" min="0.01" step="any" placeholder="0">
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="document.getElementById('openItemModal').style.display='none'">Cancelar</button>
+            <button type="button" class="btn btn-primary" id="openItemConfirmBtn">Agregar a la venta</button>
+        </div>
+    </div>
+</div>
+
 <!-- Modal Abono -->
 <div id="paymentModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:400px;">
@@ -656,6 +1143,84 @@ if ($canExpense):
             <div class="form-group"><label>Método</label><select name="payment_method" class="form-control" data-custom-other="payment_method"><?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?></select></div>
             <div class="form-group"><label>Notas</label><input type="text" name="notes" class="form-control" placeholder="Abono"></div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('paymentModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-success">Registrar Abono</button></div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal editar medio de pago (simple o mixto) -->
+<div id="editPaymentMethodModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:520px;">
+        <div class="modal-header">
+            <h3>Editar medio de pago</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('editPaymentMethodModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $ventasBase; ?>?action=update_payment_method" data-ajax="true" id="editPayMethodForm">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="sale_id" id="editPaySaleId" value="">
+            <input type="hidden" name="is_mixed" id="editPayIsMixed" value="0">
+            <div class="modal-body">
+                <p style="margin:0 0 12px;color:var(--color-text-secondary);">
+                    Venta <strong id="editPayInvoice"></strong>
+                    · Monto a repartir: <strong id="editPayTarget">—</strong>
+                </p>
+                <label style="display:inline-flex;align-items:center;gap:6px;margin-bottom:10px;cursor:pointer;">
+                    <input type="checkbox" id="editPayMixedToggle"> Pago mixto (varios medios)
+                </label>
+                <div id="editPaySingleWrap" class="form-group">
+                    <label>Nuevo medio de pago *</label>
+                    <select name="payment_method" id="editPayMethodSelect" class="form-control" data-custom-other="payment_method">
+                        <?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?>
+                    </select>
+                </div>
+                <div id="editPayMixedWrap" style="display:none;">
+                    <div id="editPayMixedRows"></div>
+                    <button type="button" class="btn btn-sm btn-secondary" id="editPayMixedAdd" style="margin-top:6px;">+ Agregar método</button>
+                    <p id="editPayMixedSummary" style="font-size:12px;margin:8px 0 0;color:var(--color-text-secondary);"></p>
+                </div>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:10px 0 0;">
+                    La suma de los montos debe igualar lo cobrado. La caja se ajusta si cambia la parte en efectivo.
+                </p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('editPaymentMethodModal').style.display='none'">Volver</button>
+                <button type="submit" class="btn btn-primary">Guardar</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<template id="editPayMethodOptionsTpl"><?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?></template>
+
+<!-- Modal cancelar venta (mismo flujo que módulo Ventas) -->
+<?php $cancelReasons = $cancelReasons ?? []; ?>
+<div id="cancelSaleModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:440px;">
+        <div class="modal-header">
+            <h3>Eliminar venta</h3>
+            <button type="button" class="modal-close" onclick="closeCancelSaleModal()">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $ventasBase; ?>?action=cancel" data-ajax="true" id="cancelSaleForm" onsubmit="return prepareCancelSale()">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="id" id="cancelSaleId" value="">
+            <input type="hidden" name="cancel_reason_other" id="cancelReasonOther" value="">
+            <div class="modal-body">
+                <p style="margin:0 0 12px;color:var(--color-text-secondary);">
+                    Se cancelará <strong id="cancelSaleInvoice"></strong>, se devolverá el stock y se ajustará la caja.
+                </p>
+                <div class="form-group">
+                    <label>Motivo de eliminación *</label>
+                    <select name="cancel_reason" id="cancelReasonSelect" class="form-control" required data-custom-other="sale_cancel_reason">
+                        <option value="">Seleccione un motivo...</option>
+                        <?php foreach ($cancelReasons as $opt): ?>
+                            <option value="<?php echo htmlspecialchars((string)$opt['value']); ?>"><?php echo htmlspecialchars((string)$opt['label']); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeCancelSaleModal()">Volver</button>
+                <button type="submit" class="btn btn-danger">Confirmar eliminación</button>
+            </div>
         </form>
     </div>
 </div>
@@ -677,6 +1242,7 @@ if ($canExpense):
                 <?php echo \SoftNova\Core\csrf_field(); ?>
                 <input type="hidden" name="id" id="shareSaleId">
                 <div class="form-group"><label>Correo</label><input type="email" name="email" id="shareEmail" class="form-control" required></div>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">Se adjunta el ticket 58mm en PDF.</p>
                 <button type="submit" class="btn btn-primary" style="width:100%;">Enviar por correo</button>
             </form>
         </div>
@@ -741,15 +1307,40 @@ $cajaBase = $viewInstance->route('app/caja');
             <h3>Enviar cierre por correo</h3>
             <button type="button" class="modal-close" onclick="document.getElementById('cajaShareEmailModal').style.display='none'">&times;</button>
         </div>
-        <form method="POST" action="<?php echo $cajaBase; ?>?action=report_email" data-ajax="true">
+        <form method="POST" action="<?php echo $cajaBase; ?>?action=report_email" data-ajax="true" id="cajaShareEmailForm">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="id" id="cajaShareEmailId" value="">
+            <?php
+            $cajaReportEmail = trim((string)($cajaReportEmail ?? $companyEmail ?? ''));
+            $hasCajaDefaultEmail = $cajaReportEmail !== '';
+            ?>
             <div class="modal-body">
                 <div class="form-group">
                     <label>Correo destino</label>
-                    <input type="email" name="email" id="cajaShareEmailTo" class="form-control" required placeholder="correo@empresa.com" value="<?php echo htmlspecialchars((string)($companyEmail ?? '')); ?>">
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <input type="email" name="email" id="cajaShareEmailTo" class="form-control" required
+                               placeholder="correo@empresa.com"
+                               value="<?php echo htmlspecialchars($cajaReportEmail); ?>"
+                               data-default-email="<?php echo htmlspecialchars($cajaReportEmail); ?>"
+                               <?php echo $hasCajaDefaultEmail ? 'readonly' : ''; ?>>
+                        <?php if ($hasCajaDefaultEmail): ?>
+                        <button type="button" class="btn btn-secondary btn-sm" id="cajaShareEmailUnlock" title="Cambiar correo predeterminado">Cambiar</button>
+                        <?php endif; ?>
+                    </div>
                 </div>
-                <p style="font-size:12px;color:var(--color-text-secondary);margin:0;">Se adjuntará el PDF del reporte de cierre.</p>
+                <div class="form-group" id="cajaShareEmailAdminWrap" style="display:none;">
+                    <label>Clave de administrador</label>
+                    <input type="password" name="admin_password" id="cajaShareEmailAdminPass" class="form-control" autocomplete="current-password" placeholder="Requerida para cambiar el correo">
+                    <small style="color:var(--color-text-secondary);">Solo se pide al cambiar el correo predeterminado.</small>
+                </div>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:0;">
+                    Se adjuntará el PDF del cierre.
+                    <?php if ($hasCajaDefaultEmail): ?>
+                        El correo actual es el <strong>predeterminado</strong>; para cambiarlo use la clave de administrador.
+                    <?php else: ?>
+                        El correo que ingrese quedará como <strong>predeterminado</strong> para próximos envíos.
+                    <?php endif; ?>
+                </p>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('cajaShareEmailModal').style.display='none'">Cancelar</button>
@@ -783,6 +1374,9 @@ $cajaBase = $viewInstance->route('app/caja');
     window.invRouteVentasDetail = '<?php echo $viewInstance->route('app/ventas'); ?>?action=detail';
     window.invRouteVentasShare = '<?php echo $viewInstance->route('app/ventas'); ?>?action=share';
     window.cajaBase = <?php echo json_encode($cajaBase); ?>;
+    window.cajaCreditSurchargeRate = <?php echo json_encode((float)($creditSurchargeRate ?? 0)); ?>;
+    window.cajaCreditSurchargeDays = <?php echo json_encode((int)($creditSurchargeDays ?? 60)); ?>;
+    window.cajaTaxRate = <?php echo json_encode((float)($taxRate ?? 0)); ?>;
 
     function cajaShareWhatsapp(sessionId) {
         fetch(window.cajaBase + '?action=report_whatsapp&id=' + sessionId, {
@@ -809,10 +1403,49 @@ $cajaBase = $viewInstance->route('app/caja');
     }
 
     function cajaShareEmail(sessionId) {
-        document.getElementById('cajaShareEmailId').value = String(sessionId);
-        document.getElementById('cajaShareEmailModal').style.display = 'flex';
-        var input = document.getElementById('cajaShareEmailTo');
-        if (input) setTimeout(function() { input.focus(); }, 50);
+        var modal = document.getElementById('cajaShareEmailModal');
+        var idInput = document.getElementById('cajaShareEmailId');
+        var emailInput = document.getElementById('cajaShareEmailTo');
+        var adminWrap = document.getElementById('cajaShareEmailAdminWrap');
+        var adminPass = document.getElementById('cajaShareEmailAdminPass');
+        var unlockBtn = document.getElementById('cajaShareEmailUnlock');
+        if (idInput) idInput.value = String(sessionId);
+        if (emailInput) {
+            var def = (emailInput.getAttribute('data-default-email') || '').trim();
+            emailInput.value = def || emailInput.value || '';
+            if (def) {
+                emailInput.readOnly = true;
+                if (adminWrap) adminWrap.style.display = 'none';
+                if (adminPass) { adminPass.value = ''; adminPass.required = false; }
+            } else {
+                emailInput.readOnly = false;
+            }
+        }
+        if (modal) modal.style.display = 'flex';
+        if (emailInput && !emailInput.readOnly) setTimeout(function() { emailInput.focus(); }, 50);
+        if (unlockBtn && !unlockBtn._bound) {
+            unlockBtn._bound = true;
+            unlockBtn.addEventListener('click', function () {
+                if (!emailInput) return;
+                emailInput.readOnly = false;
+                emailInput.focus();
+                if (adminWrap) adminWrap.style.display = '';
+                if (adminPass) {
+                    adminPass.required = true;
+                    adminPass.focus();
+                }
+            });
+        }
+        if (emailInput && !emailInput._boundChange) {
+            emailInput._boundChange = true;
+            emailInput.addEventListener('input', function () {
+                var def = (emailInput.getAttribute('data-default-email') || '').trim().toLowerCase();
+                var cur = (emailInput.value || '').trim().toLowerCase();
+                var changing = def !== '' && cur !== '' && cur !== def;
+                if (adminWrap) adminWrap.style.display = changing || !emailInput.readOnly && def !== '' ? '' : 'none';
+                if (adminPass) adminPass.required = changing;
+            });
+        }
     }
 
     (function() {
@@ -838,6 +1471,53 @@ $cajaBase = $viewInstance->route('app/caja');
     })();
 </script>
 <?php else: ?>
+<?php
+$cajaReportEmailPos = trim((string)($cajaReportEmail ?? $companyEmail ?? ''));
+$hasCajaDefaultEmailPos = $cajaReportEmailPos !== '';
+$cajaBasePos = $viewInstance->route('app/caja');
+?>
+<div id="cajaShareEmailModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content" style="max-width:420px;">
+        <div class="modal-header">
+            <h3>Enviar cierre por correo</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('cajaShareEmailModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $cajaBasePos; ?>?action=report_email" data-ajax="true" id="cajaShareEmailForm">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="id" id="cajaShareEmailId" value="">
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Correo destino</label>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <input type="email" name="email" id="cajaShareEmailTo" class="form-control" required
+                               placeholder="correo@empresa.com"
+                               value="<?php echo htmlspecialchars($cajaReportEmailPos); ?>"
+                               data-default-email="<?php echo htmlspecialchars($cajaReportEmailPos); ?>"
+                               <?php echo $hasCajaDefaultEmailPos ? 'readonly' : ''; ?>>
+                        <?php if ($hasCajaDefaultEmailPos): ?>
+                        <button type="button" class="btn btn-secondary btn-sm" id="cajaShareEmailUnlock" title="Cambiar correo predeterminado">Cambiar</button>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                <div class="form-group" id="cajaShareEmailAdminWrap" style="display:none;">
+                    <label>Clave de administrador</label>
+                    <input type="password" name="admin_password" id="cajaShareEmailAdminPass" class="form-control" autocomplete="current-password" placeholder="Requerida para cambiar el correo">
+                </div>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:0;">
+                    <?php if ($hasCajaDefaultEmailPos): ?>
+                        Correo <strong>predeterminado</strong>. Para cambiarlo use la clave de administrador.
+                    <?php else: ?>
+                        El correo quedará como <strong>predeterminado</strong> para próximos envíos.
+                    <?php endif; ?>
+                </p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('cajaShareEmailModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-primary">Enviar</button>
+            </div>
+        </form>
+    </div>
+</div>
 <script>
     window.invRouteVentasDetail = '<?php echo $viewInstance->route('app/ventas'); ?>?action=detail';
     window.invRouteVentasShare = '<?php echo $viewInstance->route('app/ventas'); ?>?action=share';
@@ -868,21 +1548,46 @@ $cajaBase = $viewInstance->route('app/caja');
     }
 
     function cajaShareEmail(sessionId) {
-        var email = prompt('Correo destino para el PDF de cierre:');
-        if (!email) return;
-        var form = document.createElement('form');
-        form.method = 'POST';
-        form.action = window.cajaBase + '?action=report_email';
-        form.setAttribute('data-ajax', 'true');
-        form.style.display = 'none';
-        var csrf = <?php echo json_encode(\SoftNova\Core\csrf_token()); ?>;
-        form.innerHTML = '<input type="hidden" name="csrf_token" value="' + csrf + '">' +
-            '<input type="hidden" name="id" value="' + String(sessionId).replace(/"/g, '') + '">' +
-            '<input type="hidden" name="email" value="">';
-        form.querySelector('[name=email]').value = email;
-        document.body.appendChild(form);
-        if (typeof handleAjaxSubmit === 'function') handleAjaxSubmit(form);
-        else form.submit();
+        var modal = document.getElementById('cajaShareEmailModal');
+        var idInput = document.getElementById('cajaShareEmailId');
+        var emailInput = document.getElementById('cajaShareEmailTo');
+        var adminWrap = document.getElementById('cajaShareEmailAdminWrap');
+        var adminPass = document.getElementById('cajaShareEmailAdminPass');
+        var unlockBtn = document.getElementById('cajaShareEmailUnlock');
+        if (idInput) idInput.value = String(sessionId);
+        if (emailInput) {
+            var def = (emailInput.getAttribute('data-default-email') || '').trim();
+            emailInput.value = def || emailInput.value || '';
+            if (def) {
+                emailInput.readOnly = true;
+                if (adminWrap) adminWrap.style.display = 'none';
+                if (adminPass) { adminPass.value = ''; adminPass.required = false; }
+            } else {
+                emailInput.readOnly = false;
+            }
+        }
+        if (modal) modal.style.display = 'flex';
+        if (emailInput && !emailInput.readOnly) setTimeout(function() { emailInput.focus(); }, 50);
+        if (unlockBtn && !unlockBtn._bound) {
+            unlockBtn._bound = true;
+            unlockBtn.addEventListener('click', function () {
+                if (!emailInput) return;
+                emailInput.readOnly = false;
+                if (adminWrap) adminWrap.style.display = '';
+                if (adminPass) adminPass.required = true;
+                emailInput.focus();
+            });
+        }
+        if (emailInput && !emailInput._boundChange) {
+            emailInput._boundChange = true;
+            emailInput.addEventListener('input', function () {
+                var def = (emailInput.getAttribute('data-default-email') || '').trim().toLowerCase();
+                var cur = (emailInput.value || '').trim().toLowerCase();
+                var changing = def !== '' && cur !== '' && cur !== def;
+                if (adminWrap) adminWrap.style.display = changing || (!emailInput.readOnly && def !== '') ? '' : 'none';
+                if (adminPass) adminPass.required = changing;
+            });
+        }
     }
 
     (function() {

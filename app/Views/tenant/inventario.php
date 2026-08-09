@@ -22,8 +22,11 @@ $catalogStatuses = $catalogStatuses ?? [];
 $filters = $filters ?? ['q' => '', 'sort' => 'name', 'dir' => 'asc', 'query' => []];
 $canCreateProduct = \SoftNova\Core\TenantMiddleware::canDo('create', 'inventario');
 $canEditProduct = \SoftNova\Core\TenantMiddleware::canDo('edit', 'inventario');
+$canViewPrestamos = \SoftNova\Core\TenantMiddleware::canAccess('prestamos');
+$canCreatePrestamos = \SoftNova\Core\TenantMiddleware::canDo('create', 'prestamos');
 $canDeleteProduct = \SoftNova\Core\TenantMiddleware::canDo('delete', 'inventario');
 $canExportInv = \SoftNova\Core\TenantMiddleware::canDo('export', 'inventario');
+$inventoryValue = $inventoryValue ?? ['cost' => 0.0, 'sale' => 0.0, 'units' => 0];
 $expirySummary = $expirySummary ?? [];
 $expiryAlerts = (int)($expirySummary['expired_lots'] ?? 0) + (int)($expirySummary['expiring_lots'] ?? 0);
 
@@ -41,16 +44,35 @@ function fmtI(float $a, array $c): string
     <div class="stat-card neumorphic"><h4>Servicios</h4><div class="stat-value" style="color:#3B82F6;"><?php echo $totalServices; ?></div></div>
     <div class="stat-card neumorphic"><h4>Stock Bajo</h4><div class="stat-value" style="color:<?php echo $lowStock > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo $lowStock; ?></div></div>
     <div class="stat-card neumorphic"><h4>Total Ítems</h4><div class="stat-value"><?php echo $totalProducts + $totalServices; ?></div></div>
+    <div class="stat-card neumorphic">
+        <h4>Costo del inventario</h4>
+        <div class="stat-value" style="font-size:1.35rem;"><?php echo fmtI((float)($inventoryValue['cost'] ?? 0), $currency); ?></div>
+        <p style="font-size:12px;color:var(--color-text-secondary);margin:6px 0 0;">
+            A precio de venta: <strong><?php echo fmtI((float)($inventoryValue['sale'] ?? 0), $currency); ?></strong>
+            · <?php echo (int)($inventoryValue['units'] ?? 0); ?> uds
+        </p>
+    </div>
     <a href="<?php echo $viewInstance->route('app/inventario'); ?>?action=vencimientos" class="stat-card neumorphic" style="text-decoration:none;color:inherit;">
         <h4>Por vencer / vencidos</h4>
         <div class="stat-value" style="color:<?php echo $expiryAlerts > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo $expiryAlerts; ?></div>
         <p style="font-size:12px;color:var(--color-text-secondary);margin:4px 0 0;">Ver control de vencimientos</p>
     </a>
+    <?php if ($canViewPrestamos): ?>
+    <a href="<?php echo $viewInstance->route('app/prestamos'); ?>" class="stat-card neumorphic" style="text-decoration:none;color:inherit;">
+        <h4>Préstamos</h4>
+        <div class="stat-value" style="color:var(--color-primary);">→</div>
+        <p style="font-size:12px;color:var(--color-text-secondary);margin:4px 0 0;">Salidas por préstamo y devoluciones</p>
+    </a>
+    <?php endif; ?>
 </div>
+<p style="font-size:13px;color:var(--color-text-secondary);margin:-6px 0 16px;">
+    Producto <strong>COMODIN</strong> (comodín): al venderlo en Caja/Ventas pide nombre y precio libres; no descuenta inventario. No lo elimine.
+</p>
 
 <?php
 $invBase = $viewInstance->route('app/inventario');
 $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['query'] ?? []));
+$exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $filters['query'] ?? []));
 ?>
 <form method="GET" action="<?php echo $invBase; ?>" class="inv-filters-form" style="margin-bottom:16px;">
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
@@ -139,12 +161,17 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
                 <a href="<?php echo $invBase; ?>?action=category_report<?php echo (int)$categoryFilter > 0 ? '&category_id=' . (int)$categoryFilter : ''; ?>" class="btn btn-secondary" target="_blank">Reporte por categoría</a>
                 <a href="<?php echo $invBase; ?>?action=category_report&format=csv<?php echo (int)$categoryFilter > 0 ? '&category_id=' . (int)$categoryFilter : ''; ?>" class="btn btn-secondary">CSV categorías</a>
                 <a href="<?php echo $invBase . '?' . $exportQuery; ?>" class="btn btn-secondary">Exportar CSV</a>
+                <a href="<?php echo $invBase . '?' . $exportCountQuery; ?>" class="btn btn-secondary" title="CSV con Cantidad vacía para conteo físico e impresión">Exportar para conteo</a>
             <?php endif; ?>
             <?php if ($canCreateProduct): ?>
+                <a href="<?php echo $invBase; ?>?action=import_template" class="btn btn-secondary" title="Descargar plantilla CSV para importar">Plantilla CSV</a>
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('importCsvModal').style.display='flex'">Importar CSV</button>
             <?php endif; ?>
             <a href="<?php echo $viewInstance->route('app/compras'); ?>?action=reposicion" class="btn btn-secondary">Reposición</a>
             <a href="<?php echo $viewInstance->route('app/compras'); ?>" class="btn btn-secondary">Compras</a>
+            <?php if ($canEditProduct): ?>
+                <button type="button" class="btn btn-secondary" onclick="openStockExitModal()">Salidas</button>
+            <?php endif; ?>
             <?php
             $hasContabilidad = \SoftNova\Core\TenantMiddleware::canAccess('contabilidad');
             $wooSt = $catalogStatuses['woocommerce'] ?? [];
@@ -169,6 +196,21 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
             <?php endif; ?>
         </div>
     </details>
+    <?php if ($canDeleteProduct && !empty($products)): ?>
+    <div class="inv-bulk-bar" id="invBulkBar" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none;margin:0;">
+            <input type="checkbox" id="invSelectAll" style="width:16px;height:16px;">
+            Seleccionar página
+        </label>
+        <button type="button" class="btn btn-sm btn-danger" id="invBulkDeleteBtn" disabled title="Desactivar productos seleccionados">
+            Eliminar seleccionados (<span id="invBulkCount">0</span>)
+        </button>
+    </div>
+    <form method="POST" action="<?php echo $invBase; ?>?action=delete_bulk" data-ajax="true" id="invBulkDeleteForm" style="display:none;">
+        <?php echo \SoftNova\Core\csrf_field(); ?>
+        <div id="invBulkIds"></div>
+    </form>
+    <?php endif; ?>
     <div class="inv-view-toggle" role="group" aria-label="Vista de productos" style="margin-left:auto;display:flex;gap:6px;">
         <button type="button" class="btn btn-secondary inv-view-btn is-active" id="invViewGridBtn" onclick="setInventarioView('grid')" title="Vista con imágenes">Cuadrícula</button>
         <button type="button" class="btn btn-secondary inv-view-btn" id="invViewListBtn" onclick="setInventarioView('list')" title="Vista en lista sin imágenes">Lista</button>
@@ -186,7 +228,7 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
         <?php foreach ($products as $p): ?>
             <?php $isService = ($p['product_type'] ?? 'product') === 'service'; ?>
             <div class="card neumorphic product-card"
-                 style="border-left:5px solid <?php echo $isService ? '#3B82F6' : 'var(--color-primary)'; ?>;padding:20px;"
+                 style="border-left:5px solid <?php echo $isService ? '#3B82F6' : 'var(--color-primary)'; ?>;padding:20px;position:relative;"
                  data-id="<?php echo $p['id']; ?>"
                  data-name="<?php echo htmlspecialchars($p['name']); ?>"
                  data-code="<?php echo htmlspecialchars($p['code'] ?? ''); ?>"
@@ -196,13 +238,22 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
                  data-unit="<?php echo htmlspecialchars($p['unit'] ?? 'UNIDAD'); ?>"
                  data-pcompra="<?php echo $p['purchase_price'] ?? 0; ?>"
                  data-pventa="<?php echo $p['sale_price'] ?? 0; ?>"
+                 data-pmayoreo="<?php echo $p['wholesale_price'] ?? 0; ?>"
                  data-stock="<?php echo $p['stock'] ?? 0; ?>"
                  data-minstock="<?php echo $p['min_stock'] ?? 5; ?>"
                  data-maxstock="<?php echo $p['max_stock'] ?? ''; ?>"
                  data-tracklots="<?php echo !empty($p['track_lots']) ? '1' : '0'; ?>"
                  data-alertdays="<?php echo $p['expiry_alert_days'] ?? 30; ?>"
                  data-status="<?php echo $p['status'] ?? 'active'; ?>"
-                 data-type="<?php echo $p['product_type'] ?? 'product'; ?>">
+                 data-type="<?php echo $p['product_type'] ?? 'product'; ?>"
+                 data-desc="<?php echo htmlspecialchars((string)($p['description'] ?? ''), ENT_QUOTES); ?>"
+                 data-notes="<?php echo htmlspecialchars((string)($p['notes'] ?? ''), ENT_QUOTES); ?>"
+                 data-debt="<?php echo (int)($p['stock_debt_qty'] ?? 0); ?>">
+                <?php if ($canDeleteProduct): ?>
+                <label class="inv-select-wrap" title="Seleccionar" style="position:absolute;top:10px;right:10px;z-index:2;margin:0;cursor:pointer;">
+                    <input type="checkbox" class="inv-product-check" value="<?php echo (int)$p['id']; ?>" style="width:18px;height:18px;">
+                </label>
+                <?php endif; ?>
                 <div style="display:flex;align-items:flex-start;gap:18px;">
                     <div class="product-card-image" style="width:90px;height:90px;border-radius:14px;overflow:hidden;flex-shrink:0;background:var(--bg-input);display:flex;align-items:center;justify-content:center;border:2px solid var(--color-border);box-shadow:0 2px 8px rgba(0,0,0,0.06);">
                         <?php if (!empty($p['image'])): ?>
@@ -252,6 +303,16 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
                                         📝 <?php echo $p['reserved_qty']; ?> en cotización
                                     </span>
                                 <?php endif; ?>
+                                <?php if (!empty($p['stock_debt_qty']) && (int)$p['stock_debt_qty'] > 0): ?>
+                                    <span class="badge badge-danger" style="margin-left:4px;" title="Unidades vendidas sin stock físico pendientes de reponer">
+                                        Deuda stock: <?php echo (int)$p['stock_debt_qty']; ?>
+                                    </span>
+                                <?php endif; ?>
+                            </div>
+                        <?php endif; ?>
+                        <?php if (!empty($p['notes'])): ?>
+                            <div style="font-size:12px;color:var(--color-text-secondary);margin-top:4px;white-space:pre-wrap;">
+                                <?php echo \SoftNova\Core\e((string)$p['notes']); ?>
                             </div>
                         <?php endif; ?>
                         <?php if (!empty($p['last_sale_date'])): ?>
@@ -277,6 +338,11 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
                                 <button onclick="editProduct(<?php echo $p['id']; ?>)" class="btn btn-sm btn-secondary" title="Editar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg></button>
                                 <?php if (!$isService): ?>
                                     <button onclick="addStock(<?php echo $p['id']; ?>)" class="btn btn-sm btn-success" title="Agregar stock"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg></button>
+                                    <?php if ($canViewPrestamos): ?>
+                                    <a href="<?php echo $viewInstance->route('app/prestamos'); ?>?product_id=<?php echo (int)$p['id']; ?>" class="btn btn-sm btn-secondary" title="Salida por préstamo">Préstamo</a>
+                                    <?php elseif ($canCreatePrestamos && \SoftNova\Core\TenantMiddleware::canAccess('caja')): ?>
+                                    <a href="<?php echo $viewInstance->route('app/caja'); ?>?loan_product_id=<?php echo (int)$p['id']; ?>" class="btn btn-sm btn-secondary" title="Registrar préstamo desde Caja">Préstamo</a>
+                                    <?php endif; ?>
                                 <?php endif; ?>
                             <?php endif; ?>
                             <?php if ($canDeleteProduct): ?>
@@ -304,6 +370,11 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
         <table class="inv-list-table" id="invListTable">
             <thead>
                 <tr>
+                    <?php if ($canDeleteProduct): ?>
+                    <th style="width:36px;" title="Seleccionar">
+                        <input type="checkbox" id="invSelectAllList" class="inv-select-all-list" style="width:16px;height:16px;" aria-label="Seleccionar todos">
+                    </th>
+                    <?php endif; ?>
                     <th><?php $viewInstance->partial('sortable_th', ['label' => 'Código', 'column' => 'code', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
                     <th><?php $viewInstance->partial('sortable_th', ['label' => 'Nombre', 'column' => 'name', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
                     <th>Tipo</th>
@@ -315,6 +386,7 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
                     <th>Acciones</th>
                 </tr>
                 <tr class="inv-list-filters">
+                    <?php if ($canDeleteProduct): ?><th></th><?php endif; ?>
                     <th><input type="text" class="inv-col-filter form-control" data-col="code" placeholder="Filtrar…" autocomplete="off"></th>
                     <th><input type="text" class="inv-col-filter form-control" data-col="name" placeholder="Filtrar…" autocomplete="off"></th>
                     <th>
@@ -337,9 +409,9 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
                     <?php
                     $isService = ($p['product_type'] ?? 'product') === 'service';
                     $typeKey = $isService ? 'service' : 'product';
-                    $codeVal = (string)($p['code'] ?? '');
-                    $nameVal = (string)($p['name'] ?? '');
-                    $catVal = (string)($p['category_name'] ?? '');
+                    $codeVal = \SoftNova\Core\utf8_fix((string)($p['code'] ?? ''));
+                    $nameVal = \SoftNova\Core\utf8_fix((string)($p['name'] ?? ''));
+                    $catVal = \SoftNova\Core\utf8_fix((string)($p['category_name'] ?? ''));
                     $stockVal = $isService ? '' : (string)(int)($p['stock'] ?? 0);
                     $purchaseVal = (string)(float)($p['purchase_price'] ?? 0);
                     $saleVal = (string)(float)($p['sale_price'] ?? 0);
@@ -374,6 +446,7 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
                     }
                     ?>
                     <tr class="inv-list-row"
+                        data-id="<?php echo (int)$p['id']; ?>"
                         data-code="<?php echo htmlspecialchars(mb_strtolower($codeVal)); ?>"
                         data-name="<?php echo htmlspecialchars(mb_strtolower($nameVal)); ?>"
                         data-type="<?php echo $typeKey; ?>"
@@ -382,8 +455,13 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
                         data-expiry="<?php echo htmlspecialchars($expiryVal); ?>"
                         data-purchase="<?php echo htmlspecialchars($purchaseVal); ?>"
                         data-sale="<?php echo htmlspecialchars($saleVal); ?>">
-                        <td class="inv-td-code"><?php echo $codeVal !== '' ? htmlspecialchars($codeVal) : '—'; ?></td>
-                        <td class="inv-td-name"><?php echo htmlspecialchars($nameVal); ?></td>
+                        <?php if ($canDeleteProduct): ?>
+                        <td>
+                            <input type="checkbox" class="inv-product-check" value="<?php echo (int)$p['id']; ?>" style="width:16px;height:16px;" aria-label="Seleccionar">
+                        </td>
+                        <?php endif; ?>
+                        <td class="inv-td-code"><?php echo $codeVal !== '' ? \SoftNova\Core\e($codeVal) : '—'; ?></td>
+                        <td class="inv-td-name"><?php echo \SoftNova\Core\e($nameVal); ?></td>
                         <td><?php echo $isService ? 'Servicio' : 'Producto'; ?></td>
                         <td><?php echo $catVal !== '' ? htmlspecialchars($catVal) : '—'; ?></td>
                         <td class="<?php echo $stockLow ? 'inv-stock-low' : ''; ?>">
@@ -411,6 +489,11 @@ $exportQuery = http_build_query(array_merge(['action' => 'export'], $filters['qu
                                 <button type="button" onclick="editProduct(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-secondary" title="Editar">Editar</button>
                                 <?php if (!$isService): ?>
                                     <button type="button" onclick="addStock(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-success" title="Stock">Stock</button>
+                                    <?php if ($canViewPrestamos): ?>
+                                    <a href="<?php echo $viewInstance->route('app/prestamos'); ?>?product_id=<?php echo (int)$p['id']; ?>" class="btn btn-sm btn-secondary" title="Salida por préstamo">Préstamo</a>
+                                    <?php elseif ($canCreatePrestamos && \SoftNova\Core\TenantMiddleware::canAccess('caja')): ?>
+                                    <a href="<?php echo $viewInstance->route('app/caja'); ?>?loan_product_id=<?php echo (int)$p['id']; ?>" class="btn btn-sm btn-secondary" title="Registrar préstamo desde Caja">Préstamo</a>
+                                    <?php endif; ?>
                                 <?php endif; ?>
                             <?php endif; ?>
                             <?php if ($canDeleteProduct): ?>
@@ -503,6 +586,10 @@ if (!empty($products)) {
                     <label>Precio Venta * <span class="field-tip" data-tip="Precio al público que se usará en ventas.">?</span></label>
                     <input type="number" step="0.01" name="sale_price" id="prodPventa" required class="form-control" placeholder="0">
                 </div>
+                <div class="form-group">
+                    <label>Precio al por mayor <span class="field-tip" data-tip="Precio para ventas al por mayor en Caja.">?</span></label>
+                    <input type="number" step="0.01" name="wholesale_price" id="prodPmayoreo" class="form-control" placeholder="0">
+                </div>
                 <div class="form-group" id="stockGroup">
                     <label>Stock Inicial <span class="field-tip" data-tip="Cantidad disponible al crear el producto.">?</span></label>
                     <input type="number" name="stock" id="prodStock" class="form-control" placeholder="0">
@@ -543,8 +630,12 @@ if (!empty($products)) {
                 </div>
             </div>
             <div class="form-group">
-                <label>Descripción <span class="field-tip" data-tip="Detalle adicional del producto o servicio.">?</span></label>
+                <label>Descripción <span class="field-tip" data-tip="Detalle comercial del producto o servicio.">?</span></label>
                 <textarea name="description" id="prodDesc" rows="2" class="form-control"></textarea>
+            </div>
+            <div class="form-group">
+                <label>Notas internas <span class="field-tip" data-tip="Anotaciones operativas editables en cualquier momento (ubicación especial, acuerdos, recordatorios).">?</span></label>
+                <textarea name="notes" id="prodNotes" rows="2" class="form-control" placeholder="Ej: Se vende a veces a crédito, revisar con bodega…"></textarea>
             </div>
             <div class="form-group">
                 <label>Imagen <span class="field-tip" data-tip="Foto opcional para identificar el producto en el catálogo.">?</span></label>
@@ -569,6 +660,7 @@ if (!empty($products)) {
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="id" id="stockProdId">
             <p id="stockProdName" style="margin-bottom:10px;font-weight:600;"></p>
+            <div id="stockDebtAlert" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:8px;background:#FEF3C7;border:1px solid #F59E0B;color:#92400E;font-size:13px;"></div>
             <p style="font-size:12px;color:var(--color-text-secondary);margin-bottom:12px;">
                 Esto es un <strong>ajuste manual</strong> (no crea compra ni CxP).
                 Para mercancía de proveedor use
@@ -603,6 +695,174 @@ if (!empty($products)) {
         </form>
     </div>
 </div>
+
+<?php if ($canEditProduct): ?>
+<!-- Modal Salidas (pérdida operativa) -->
+<div id="stockExitModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:480px;">
+        <div class="modal-header">
+            <h3>Salida de inventario</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('stockExitModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=stock_exit" data-ajax="true" id="stockExitForm">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <div class="modal-body">
+                <p style="font-size:13px;color:var(--color-text-secondary);margin-top:0;">
+                    Descuenta stock, genera <strong>gasto operativo del día</strong> (módulo Gastos)
+                    y asiento de pérdida (519595). También queda en Trazabilidad.
+                    No es préstamo ni venta.
+                </p>
+                <div class="form-group">
+                    <label>Producto *</label>
+                    <input type="hidden" name="product_id" id="exitProductId" required>
+                    <input type="text" id="exitProductSearch" class="form-control" autocomplete="off"
+                           placeholder="Buscar nombre, SKU o escanear…"
+                           data-barcode-input="true">
+                    <div id="exitProductResults" class="product-picker-results" style="display:none;"></div>
+                    <div id="exitProductSelected" class="product-picker-selected" style="display:none;"></div>
+                </div>
+                <div class="form-group">
+                    <label>Motivo *</label>
+                    <select name="reason" id="exitReason" class="form-control" required>
+                        <?php foreach (\SoftNova\Services\StockService::inventoryExitReasons() as $code => $label): ?>
+                            <option value="<?php echo htmlspecialchars($code); ?>"><?php echo htmlspecialchars($label); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Cantidad *</label>
+                    <input type="number" name="quantity" id="exitQty" class="form-control" min="1" value="1" required>
+                </div>
+                <div class="form-group">
+                    <label>Fecha *</label>
+                    <input type="date" name="movement_date" class="form-control" value="<?php echo date('Y-m-d'); ?>" required>
+                </div>
+                <div class="form-group">
+                    <label>Nota / detalle</label>
+                    <input type="text" name="notes" class="form-control" maxlength="180" placeholder="Opcional">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('stockExitModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-danger">Registrar salida</button>
+            </div>
+        </form>
+    </div>
+</div>
+<style>
+.product-picker-results {
+    margin-top: 6px; border: 1px solid var(--color-border); border-radius: 8px;
+    max-height: 220px; overflow: auto; background: var(--bg-card, #fff);
+}
+.product-picker-row {
+    display: flex; justify-content: space-between; gap: 10px;
+    padding: 8px 10px; cursor: pointer; border-bottom: 1px solid var(--color-border); font-size: 13px;
+}
+.product-picker-row:last-child { border-bottom: 0; }
+.product-picker-row:hover { background: var(--bg-input, #f8fafc); }
+.product-picker-selected {
+    margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+    background: var(--bg-input, #f1f5f9); font-size: 13px;
+}
+</style>
+<script>
+(function () {
+    var searchUrl = <?php echo json_encode($viewInstance->route('app/inventario') . '?action=searchProducts'); ?>;
+    function esc(s) {
+        return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+    function label(p) { return ((p.code ? p.code + ' · ' : '') + (p.name || '')).trim(); }
+    window.openStockExitModal = function () {
+        clearExitProduct();
+        document.getElementById('stockExitModal').style.display = 'flex';
+        var s = document.getElementById('exitProductSearch');
+        if (s) setTimeout(function () { s.focus(); }, 40);
+    };
+    window.setExitProduct = function (p) {
+        var hid = document.getElementById('exitProductId');
+        var sel = document.getElementById('exitProductSelected');
+        var search = document.getElementById('exitProductSearch');
+        var results = document.getElementById('exitProductResults');
+        if (!hid || !p) return;
+        hid.value = String(p.id);
+        if (sel) {
+            sel.style.display = '';
+            sel.innerHTML = '<strong>' + esc(label(p)) + '</strong> · stock ' + esc(p.stock)
+                + ' <button type="button" class="btn btn-sm btn-secondary" style="margin-left:8px;" onclick="clearExitProduct()">Cambiar</button>';
+        }
+        if (search) { search.value = ''; search.style.display = 'none'; }
+        if (results) { results.style.display = 'none'; results.innerHTML = ''; }
+    };
+    window.clearExitProduct = function () {
+        var hid = document.getElementById('exitProductId');
+        var sel = document.getElementById('exitProductSelected');
+        var search = document.getElementById('exitProductSearch');
+        if (hid) hid.value = '';
+        if (sel) { sel.style.display = 'none'; sel.innerHTML = ''; }
+        if (search) { search.style.display = ''; search.focus(); }
+    };
+    var timer = null;
+    var input = document.getElementById('exitProductSearch');
+    function render(list) {
+        var box = document.getElementById('exitProductResults');
+        if (!box) return;
+        if (!list || !list.length) {
+            box.style.display = '';
+            box.innerHTML = '<div class="product-picker-row" style="cursor:default;color:var(--color-text-secondary);">Sin resultados</div>';
+            return;
+        }
+        box.style.display = '';
+        box.innerHTML = '';
+        list.forEach(function (p) {
+            var row = document.createElement('div');
+            row.className = 'product-picker-row';
+            row.innerHTML = '<span>' + esc(label(p)) + '</span><span style="color:var(--color-text-secondary);">stock ' + esc(p.stock) + '</span>';
+            row.addEventListener('click', function () { setExitProduct(p); });
+            box.appendChild(row);
+        });
+    }
+    function run(autoExact) {
+        var q = (input && input.value || '').trim();
+        if (!q) { var box = document.getElementById('exitProductResults'); if (box) { box.style.display='none'; box.innerHTML=''; } return; }
+        fetch(searchUrl + '&q=' + encodeURIComponent(q), { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                var list = (d && d.products) ? d.products : [];
+                if (autoExact && list.length) {
+                    var ql = q.toLowerCase();
+                    var exact = list.find(function (p) {
+                        return String(p.code || '').toLowerCase() === ql || String(p.barcode || '').toLowerCase() === ql;
+                    }) || (list.length === 1 ? list[0] : null);
+                    if (exact) { setExitProduct(exact); return; }
+                }
+                render(list);
+            });
+    }
+    if (input) {
+        input.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(function () { run(false); }, 220); });
+        input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); clearTimeout(timer); run(true); } });
+    }
+    var form = document.getElementById('stockExitForm');
+    if (form) {
+        form.addEventListener('submit', function (e) {
+            var hid = document.getElementById('exitProductId');
+            if (!hid || !hid.value) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                if (typeof showAlert === 'function') showAlert('Seleccione o escanee un producto', 'error');
+            }
+        }, true);
+    }
+    if (window.SoftNovaBarcode && SoftNovaBarcode.onScan) {
+        SoftNovaBarcode.onScan(function (code, product) {
+            var modal = document.getElementById('stockExitModal');
+            if (!modal || modal.style.display === 'none' || !product) return false;
+            setExitProduct(product);
+            return true;
+        });
+    }
+})();
+</script>
+<?php endif; ?>
 
 <?php if ($canEditProduct): ?>
 <!-- Modal Proveedor del producto -->
@@ -709,20 +969,27 @@ if (!empty($products)) {
         <form method="POST" action="<?php echo $invBase; ?>?action=import_csv" enctype="multipart/form-data" data-ajax="true">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <div class="modal-body">
+                <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px;">
+                    <a href="<?php echo $invBase; ?>?action=import_template" class="btn btn-primary" download>
+                        Descargar plantilla CSV
+                    </a>
+                    <span style="font-size:12px;color:var(--color-text-secondary);">UTF-8 · separador <code>;</code> · con ejemplos</span>
+                </div>
                 <div class="alert alert-info" style="font-size:13px;margin-bottom:14px;">
-                    <strong>Instrucciones</strong>
-                    <ul style="margin:8px 0 0 18px;padding:0;">
-                        <li>Use el mismo formato que <strong>Exportar CSV</strong> (separador <code>;</code>, UTF-8). También acepta comas o tabulador.</li>
-                        <li>Columnas: <code>SKU; Nombre; Tipo; Categoria; Costo; Precio; Stock; Min; Unidad; Estado; Ubicacion</code></li>
-                        <li>La columna de nombre puede llamarse <code>Nombre</code>, <code>Producto</code> o <code>Name</code> (obligatoria).</li>
-                        <li>El SKU / código de barras se guarda <strong>exactamente</strong> como texto (EAN-13 largos incluidos). No lo convierta a número en Excel.</li>
-                        <li>En Excel: seleccione la columna SKU → Formato de celdas → <strong>Texto</strong> antes de pegar o guardar el CSV.</li>
-                        <li>Si el SKU existe se actualiza; si no, se crea (SKU vacío genera uno).</li>
+                    <strong>Cómo usarla</strong>
+                    <ol style="margin:8px 0 0 18px;padding:0;">
+                        <li>Descargue la <strong>plantilla</strong> (botón de arriba).</li>
+                        <li>Ábrala en Excel o Google Sheets. No borre la fila de encabezados.</li>
+                        <li>Reemplace las filas de ejemplo por sus productos. Columna <strong>Nombre</strong> es obligatoria.</li>
+                        <li>Columnas SKU y EAN: formato <strong>Texto</strong> (evita que Excel corte códigos largos).</li>
+                        <li>Guarde como CSV y súbalo aquí. En Excel: <em>CSV UTF-8</em> o CSV delimitado por <code>;</code>.</li>
+                    </ol>
+                    <ul style="margin:10px 0 0 18px;padding:0;">
+                        <li>Columnas: <code>SKU; EAN; Nombre; Tipo; Categoria; Costo; Precio; Stock; Min; Unidad; Estado; Ubicacion</code></li>
                         <li>Tipo: <code>product</code> o <code>service</code>. Estado: <code>active</code> o <code>inactive</code>.</li>
-                        <li>Si la categoría no existe, se crea automáticamente.</li>
-                        <li>Los cambios de stock por importación quedan en <strong>Trazabilidad</strong> (origen: Importación CSV). La exportación también deja huella.</li>
-                        <li>Archivos grandes (&gt;200KB) se procesan en cola (Config → Procesar jobs).</li>
-                        <li>Máximo 5MB.</li>
+                        <li>Si el SKU ya existe se actualiza; si va vacío se genera uno.</li>
+                        <li>Si la categoría no existe, se crea sola.</li>
+                        <li>Máximo 5MB. Archivos &gt;200KB van a cola (Config → Procesar jobs).</li>
                     </ul>
                 </div>
                 <div class="form-group">

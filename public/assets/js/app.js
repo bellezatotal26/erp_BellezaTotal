@@ -94,6 +94,107 @@ function submitFormWithAjax(form, callback) {
     });
 }
 
+/** ¿Es el producto comodín (nombre/precio libres)? */
+function isOpenItemProduct(p) {
+    if (!p) return false;
+    if (p.is_open_item === 1 || p.is_open_item === true || p.is_open_item === '1') return true;
+    var code = String(p.code || '').toUpperCase().trim();
+    return code === 'COMODIN';
+}
+
+/**
+ * Modal para nombre + precio del producto comodín.
+ * @param {function(string,number):void} onOk
+ */
+function requestOpenItemDetails(onOk) {
+    var modal = document.getElementById('openItemModal');
+    var nameEl = document.getElementById('openItemName');
+    var priceEl = document.getElementById('openItemPrice');
+    var btn = document.getElementById('openItemConfirmBtn');
+    if (!modal || !nameEl || !priceEl || !btn) {
+        var name = window.prompt('Nombre del producto', '');
+        if (name === null) return;
+        name = String(name).trim();
+        if (!name) {
+            if (typeof showAlert === 'function') showAlert('Indique el nombre del producto', 'error');
+            return;
+        }
+        var priceStr = window.prompt('Precio de venta', '');
+        if (priceStr === null) return;
+        var price = parseFloat(String(priceStr).replace(',', '.'));
+        if (isNaN(price) || price <= 0) {
+            if (typeof showAlert === 'function') showAlert('Indique un precio válido', 'error');
+            return;
+        }
+        onOk(name, Math.round(price * 100) / 100);
+        return;
+    }
+    nameEl.value = '';
+    priceEl.value = '';
+    modal.style.display = 'flex';
+    setTimeout(function () { nameEl.focus(); }, 50);
+
+    function cleanup() {
+        btn.onclick = null;
+        nameEl.onkeydown = null;
+        priceEl.onkeydown = null;
+    }
+    function confirm() {
+        var name = String(nameEl.value || '').trim();
+        var price = parseFloat(String(priceEl.value || '').replace(',', '.'));
+        if (!name) {
+            if (typeof showAlert === 'function') showAlert('Indique el nombre del producto', 'error');
+            nameEl.focus();
+            return;
+        }
+        if (isNaN(price) || price <= 0) {
+            if (typeof showAlert === 'function') showAlert('Indique un precio válido mayor a 0', 'error');
+            priceEl.focus();
+            return;
+        }
+        cleanup();
+        modal.style.display = 'none';
+        onOk(name, Math.round(price * 100) / 100);
+    }
+    btn.onclick = confirm;
+    nameEl.onkeydown = function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); priceEl.focus(); }
+    };
+    priceEl.onkeydown = function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); confirm(); }
+    };
+}
+
+/**
+ * Tras un AJAX ok: navega a redirect o recarga.
+ * Si el destino es la misma página (solo cambia o repite el hash), recarga sí o sí.
+ */
+function navigateAfterAjaxSuccess(redirectUrl) {
+    if (!redirectUrl) {
+        window.location.reload();
+        return;
+    }
+    try {
+        var next = new URL(redirectUrl, window.location.href);
+        var cur = window.location;
+        var samePath = next.pathname === cur.pathname && next.search === cur.search;
+        if (samePath) {
+            if (next.hash && next.hash !== cur.hash) {
+                try {
+                    history.replaceState(null, '', next.pathname + next.search + next.hash);
+                } catch (e) {
+                    window.location.hash = next.hash.replace(/^#/, '');
+                }
+            }
+            window.location.reload();
+            return;
+        }
+        window.location.href = next.href;
+    } catch (e) {
+        window.location.href = redirectUrl;
+    }
+}
+
 // Maneja el envio de formularios marcados con data-ajax="true"
 function handleAjaxSubmit(form) {
     if (form.dataset.submitting === '1') {
@@ -201,11 +302,11 @@ function handleAjaxSubmit(form) {
                     } catch (e2) {}
                 }
             }
-            if (data.redirect) {
-                setTimeout(function() { window.location.href = data.redirect; }, data.pdf_url ? 1200 : 700);
-            } else {
-                setTimeout(function() { window.location.reload(); }, data.pdf_url ? 1200 : 700);
-            }
+            // Misma ruta + #hash (ej. /app/configuracion#usuarios) no navega en el navegador
+            // y deja el botón en btn-loading para siempre. Forzar recarga en ese caso.
+            setTimeout(function() {
+                navigateAfterAjaxSuccess(data.redirect || '');
+            }, data.pdf_url ? 1200 : 700);
         } else {
             showAlert(data.message || 'No se pudo completar la accion', 'error');
             if (submitBtn) {
@@ -670,7 +771,7 @@ document.addEventListener('DOMContentLoaded', function() {
 /**
  * Desplegables con opción "Otro": pide valor, lo guarda permanente y lo selecciona.
  * Uso: <select data-custom-other="payment_method">…<option value="__other__">Otro</option>
- * Grupos: payment_method | customer_source | sale_cancel_reason | discount_percent
+ * Grupos: payment_method | customer_source | sale_cancel_reason | discount_percent | product_location | expense_category
  */
 window.SoftNovaCustomSelect = {
     otherValues: { __other__: true, other: true, Otro: true },
@@ -693,6 +794,7 @@ window.SoftNovaCustomSelect = {
         if (group === 'customer_source') return '¿De dónde viene el cliente? Escriba el origen:';
         if (group === 'sale_cancel_reason') return 'Escriba el motivo de eliminación:';
         if (group === 'product_location') return 'Nombre de la nueva ubicación (bodega, local, etc.):';
+        if (group === 'expense_category') return 'Nombre del nuevo tipo de gasto (se guardará de forma permanente):';
         return 'Escriba la nueva opción:';
     },
 
@@ -733,7 +835,17 @@ window.SoftNovaCustomSelect = {
         var opt = document.createElement('option');
         opt.value = value;
         opt.textContent = label;
-        if (otherOpt) {
+        var group = select.getAttribute('data-custom-other') || '';
+        var adminGroup = null;
+        if (group === 'expense_category') {
+            Array.prototype.forEach.call(select.getElementsByTagName('optgroup'), function(og) {
+                var lbl = String(og.label || '').toLowerCase();
+                if (lbl.indexOf('administrativ') !== -1) adminGroup = og;
+            });
+        }
+        if (adminGroup) {
+            adminGroup.appendChild(opt);
+        } else if (otherOpt) {
             select.insertBefore(opt, otherOpt);
         } else {
             select.appendChild(opt);
@@ -758,17 +870,22 @@ window.SoftNovaCustomSelect = {
             if (typeof showAlert === 'function') showAlert('Debe escribir una opción', 'warning');
             return;
         }
-        select.disabled = true;
+        // No deshabilitar el <select>: FormData omite disabled y el gasto podría
+        // guardarse sin category_id si el usuario envía el form durante el fetch.
+        select.dataset.customSaving = '1';
+        select.setAttribute('aria-busy', 'true');
         this.save(group, label).then(function(opt) {
             self.upsertOption(select, opt.value, opt.label);
-            select.disabled = false;
+            delete select.dataset.customSaving;
+            select.removeAttribute('aria-busy');
             select.dispatchEvent(new Event('change', { bubbles: true }));
             if (typeof showAlert === 'function') {
                 showAlert(opt.created === false ? 'Opción seleccionada' : 'Opción añadida permanentemente', 'success');
             }
         }).catch(function(err) {
             select.value = prevValue || '';
-            select.disabled = false;
+            delete select.dataset.customSaving;
+            select.removeAttribute('aria-busy');
             if (typeof showAlert === 'function') showAlert(err.message || 'Error', 'error');
         });
     },
@@ -786,6 +903,27 @@ window.SoftNovaCustomSelect = {
                 prev = select.value;
             }
         });
+        var form = select.closest('form');
+        if (form && form.dataset.customOtherSubmitBound !== '1') {
+            form.dataset.customOtherSubmitBound = '1';
+            form.addEventListener('submit', function(e) {
+                var pending = form.querySelector('select[data-custom-other][data-custom-saving="1"]');
+                var otherSel = null;
+                form.querySelectorAll('select[data-custom-other]').forEach(function(sel) {
+                    if (SoftNovaCustomSelect.isOther(sel.value)) otherSel = sel;
+                });
+                if (pending || otherSel) {
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+                    if (typeof showAlert === 'function') {
+                        showAlert(pending
+                            ? 'Espere a que se guarde la nueva opción'
+                            : 'Seleccione una opción válida (termine de agregar "Otro")', 'warning');
+                    }
+                    return false;
+                }
+            }, true);
+        }
     },
 
     bindAll: function(root) {

@@ -30,7 +30,7 @@ function fmtT(float $a, array $c): string
         <form method="GET" action="<?php echo $viewInstance->route('app/inventario'); ?>" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;">
             <input type="hidden" name="action" value="traceability">
             <div class="form-group" style="margin:0;"><label>Buscar</label><input class="form-control" name="q" value="<?php echo htmlspecialchars($filters['q']); ?>" placeholder="Producto, nota, referencia"></div>
-            <div class="form-group" style="margin:0;"><label>Tipo</label>
+            <div class="form-group" style="margin:0;"><label>Tipo movimiento</label>
                 <select name="type" class="form-control">
                     <option value="">Todos</option>
                     <?php foreach (['in'=>'Entrada','out'=>'Salida','adjustment'=>'Ajuste'] as $k=>$v): ?>
@@ -46,9 +46,12 @@ function fmtT(float $a, array $c): string
                         'purchase_order'=>'Orden de compra',
                         'purchase_credit_note'=>'Nota crédito compra',
                         'sale'=>'Venta',
-                        'adjustment'=>'Ajuste',
+                        'adjustment'=>'Ajuste / agregar stock',
                         'opening'=>'Inventario inicial',
-                        'return'=>'Devolución',
+                        'return'=>'Devolución venta',
+                        'inventory_exit'=>'Salida / pérdida',
+                        'loan'=>'Préstamo',
+                        'loan_return'=>'Devolución préstamo',
                         'csv_import'=>'Importación CSV',
                         'csv_export'=>'Exportación CSV',
                         'woocommerce'=>'WooCommerce',
@@ -62,6 +65,7 @@ function fmtT(float $a, array $c): string
             <div class="form-group" style="margin:0;"><label>Desde</label><input type="date" name="from" class="form-control" value="<?php echo htmlspecialchars($filters['from']??''); ?>"></div>
             <div class="form-group" style="margin:0;"><label>Hasta</label><input type="date" name="to" class="form-control" value="<?php echo htmlspecialchars($filters['to']??''); ?>"></div>
             <button class="btn btn-primary" type="submit">Filtrar</button>
+            <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/inventario'); ?>?action=traceability">Limpiar</a>
             <?php
             $tracePdfQ = http_build_query(array_filter([
                 'action' => 'traceability_pdf',
@@ -77,6 +81,20 @@ function fmtT(float $a, array $c): string
             <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/inventario'); ?>">Volver a inventario</a>
             <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/compras'); ?>">Compras</a>
         </form>
+        <?php
+        $hasFilters = ($filters['q'] ?? '') !== ''
+            || ($filters['type'] ?? '') !== ''
+            || ($filters['reference_type'] ?? '') !== ''
+            || ($filters['from'] ?? '') !== ''
+            || ($filters['to'] ?? '') !== '';
+        ?>
+        <?php if ($hasFilters): ?>
+            <p style="margin:10px 0 0;font-size:12px;color:var(--color-text-secondary);">
+                Filtros activos.
+                Tip: para ver salidas por garantía/vencimiento use Origen = <strong>Salida / pérdida</strong>
+                (o Tipo = Salida). Use <strong>Limpiar</strong> para ver todos los movimientos.
+            </p>
+        <?php endif; ?>
     </div>
 </div>
 
@@ -127,43 +145,23 @@ function fmtT(float $a, array $c): string
 </div>
 
 <div class="card neumorphic" style="margin-bottom:16px;">
-    <div class="card-header"><h3>Kardex valorizado (reciente)</h3></div>
-    <div class="card-body">
-        <?php if (empty($kardex)): ?>
-            <p style="color:var(--color-text-secondary);font-size:13px;margin:0;">Sin movimientos valorizados.</p>
-        <?php else: ?>
-            <div class="table-container"><table>
-                <thead><tr><th>Fecha</th><th>Producto</th><th>Tipo</th><th>Cant.</th><th>Costo u.</th><th>Total</th><th>Stock</th></tr></thead>
-                <tbody>
-                <?php foreach (array_slice($kardex, 0, 15) as $k): ?>
-                    <tr>
-                        <td><?php echo !empty($k['movement_date']) ? date('d/m/Y', strtotime($k['movement_date'])) : (!empty($k['created_at']) ? date('d/m/Y', strtotime($k['created_at'])) : '—'); ?></td>
-                        <td><?php echo htmlspecialchars($k['product_name'] ?? $k['name'] ?? '—'); ?></td>
-                        <td><?php echo htmlspecialchars($k['type'] ?? '—'); ?></td>
-                        <td><?php echo (int)($k['quantity'] ?? 0); ?></td>
-                        <td><?php echo fmtT((float)($k['unit_cost'] ?? 0), $currency); ?></td>
-                        <td><?php echo fmtT((float)($k['total_cost'] ?? 0), $currency); ?></td>
-                        <td><?php echo isset($k['stock_after']) ? (int)$k['stock_after'] : '—'; ?></td>
-                    </tr>
-                <?php endforeach; ?>
-                </tbody>
-            </table></div>
-        <?php endif; ?>
-    </div>
-</div>
-
-<div class="card neumorphic">
     <div class="card-header"><h3>Movimientos de stock</h3></div>
     <div class="card-body">
         <?php if (empty($movements)): ?>
-            <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">Sin movimientos con esos filtros</p>
+            <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">
+                Sin movimientos con esos filtros.
+                <?php if (!empty($hasFilters)): ?>
+                    <br><a href="<?php echo $viewInstance->route('app/inventario'); ?>?action=traceability">Limpiar filtros</a>
+                <?php endif; ?>
+            </p>
         <?php else: ?>
-            <div class="table-container"><table>
+            <div class="table-container trace-movements-wrap">
+            <table class="trace-movements-table">
                 <thead>
                 <tr>
                     <th>Fecha ingreso</th><th>Producto</th><th>Ubicación</th><th>Canal</th><th>Tipo</th><th>Cant.</th>
                     <th>Costo u.</th><th>Total</th><th>Stock</th>
-                    <th>Origen</th><th>Notas</th><th>Usuario</th><th>Editar fecha</th>
+                    <th>Origen</th><th class="trace-col-motivo">Motivo</th><th>Usuario</th><th>Editar fecha</th>
                 </tr>
                 </thead>
                 <tbody>
@@ -180,12 +178,16 @@ function fmtT(float $a, array $c): string
                         'return' => 'Devolución',
                         'adjustment' => 'Ajuste',
                         'purchase' => 'Compra',
+                        'inventory_exit' => 'Salida / pérdida',
+                        'loan' => 'Préstamo',
+                        'loan_return' => 'Devolución préstamo',
                     ];
                     $refLabel = $refMap[$m['reference_type'] ?? ''] ?? ($m['reference_type'] ?: '—');
+                    $motivoLines = \SoftNova\Services\StockService::describeMovementMotiveLines($m);
                 ?>
                     <tr>
-                        <td><?php echo $dt ? date('d/m/Y H:i', strtotime($dt)) : '—'; ?></td>
-                        <td>
+                        <td class="trace-col-date"><?php echo $dt ? date('d/m/Y H:i', strtotime($dt)) : '—'; ?></td>
+                        <td class="trace-col-product">
                             <strong><?php echo htmlspecialchars($m['product_name'] ?? '—'); ?></strong>
                             <?php if (!empty($m['product_code'])): ?>
                                 <br><small><?php echo htmlspecialchars($m['product_code']); ?></small>
@@ -198,9 +200,10 @@ function fmtT(float $a, array $c): string
                         <td><?php echo htmlspecialchars(\SoftNova\Core\product_channel_label((string)($m['source_channel'] ?? 'manual'))); ?></td>
                         <td>
                             <?php
+                            $typeLabels = ['in' => 'Entrada', 'out' => 'Salida', 'adjustment' => 'Ajuste'];
                             $badge = $m['type'] === 'in' ? 'badge-success' : ($m['type'] === 'out' ? 'badge-danger' : 'badge-warning');
                             ?>
-                            <span class="badge <?php echo $badge; ?>"><?php echo htmlspecialchars($m['type']); ?></span>
+                            <span class="badge <?php echo $badge; ?>"><?php echo htmlspecialchars($typeLabels[$m['type'] ?? ''] ?? (string)($m['type'] ?? '—')); ?></span>
                         </td>
                         <td><?php echo (int)$m['quantity']; ?></td>
                         <td><?php echo fmtT((float)($m['unit_cost'] ?? 0), $currency); ?></td>
@@ -212,9 +215,17 @@ function fmtT(float $a, array $c): string
                                 #<?php echo (int)$m['reference_id']; ?>
                             <?php endif; ?>
                         </td>
-                        <td><?php echo htmlspecialchars((string)($m['notes'] ?? '')); ?></td>
+                        <td class="trace-col-motivo">
+                            <div class="trace-motivo">
+                                <?php foreach ($motivoLines as $i => $line): ?>
+                                    <div class="trace-motivo-line<?php echo $i === 0 ? ' is-kind' : ''; ?>">
+                                        <?php echo htmlspecialchars($line); ?>
+                                    </div>
+                                <?php endforeach; ?>
+                            </div>
+                        </td>
                         <td><?php echo htmlspecialchars((string)($m['user_name'] ?? '—')); ?></td>
-                        <td>
+                        <td class="trace-col-edit">
                             <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=edit_movement_date" data-ajax="true" style="display:flex;gap:4px;align-items:center;">
                                 <?php echo \SoftNova\Core\csrf_field(); ?>
                                 <input type="hidden" name="movement_id" value="<?php echo (int)$m['id']; ?>">
@@ -238,6 +249,32 @@ function fmtT(float $a, array $c): string
             ]);
             $viewInstance->partial('pagination', compact('pagination', 'paginationBaseUrl', 'paginationQuery'));
             ?>
+        <?php endif; ?>
+    </div>
+</div>
+
+<div class="card neumorphic">
+    <div class="card-header"><h3>Kardex valorizado (reciente)</h3></div>
+    <div class="card-body">
+        <?php if (empty($kardex)): ?>
+            <p style="color:var(--color-text-secondary);font-size:13px;margin:0;">Sin movimientos valorizados.</p>
+        <?php else: ?>
+            <div class="table-container"><table>
+                <thead><tr><th>Fecha</th><th>Producto</th><th>Tipo</th><th>Cant.</th><th>Costo u.</th><th>Total</th><th>Stock</th></tr></thead>
+                <tbody>
+                <?php foreach (array_slice($kardex, 0, 15) as $k): ?>
+                    <tr>
+                        <td><?php echo !empty($k['movement_date']) ? date('d/m/Y', strtotime($k['movement_date'])) : (!empty($k['created_at']) ? date('d/m/Y', strtotime($k['created_at'])) : '—'); ?></td>
+                        <td><?php echo htmlspecialchars($k['product_name'] ?? $k['name'] ?? '—'); ?></td>
+                        <td><?php echo htmlspecialchars($k['type'] ?? '—'); ?></td>
+                        <td><?php echo (int)($k['quantity'] ?? 0); ?></td>
+                        <td><?php echo fmtT((float)($k['unit_cost'] ?? 0), $currency); ?></td>
+                        <td><?php echo fmtT((float)($k['total_cost'] ?? 0), $currency); ?></td>
+                        <td><?php echo isset($k['stock_after']) ? (int)$k['stock_after'] : '—'; ?></td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table></div>
         <?php endif; ?>
     </div>
 </div>

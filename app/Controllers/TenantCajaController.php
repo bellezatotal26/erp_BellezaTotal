@@ -5,6 +5,7 @@ namespace SoftNova\Controllers;
 use SoftNova\Core\TenantController;
 use SoftNova\Core\TenantMiddleware;
 use SoftNova\Services\SupplyChainSchema;
+use SoftNova\Services\CustomOptionService;
 use function SoftNova\Core\base_url;
 use function SoftNova\Core\config;
 
@@ -46,6 +47,17 @@ class TenantCajaController extends TenantController
         if ($action === 'movement' && $this->request->method() === 'POST') {
             TenantMiddleware::authorize('caja', 'create');
             $this->addMovement();
+            return;
+        }
+        if ($action === 'expense' && $this->request->method() === 'POST') {
+            // Create en Gastos basta (sin exigir Crear en Caja), igual que el botón en UI.
+            TenantMiddleware::authorize('caja', 'view');
+            $this->createExpenseFromCaja();
+            return;
+        }
+        if ($action === 'loan' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('caja', 'view');
+            $this->createLoanFromCaja();
             return;
         }
         if ($action === 'pdf' && $this->request->method() === 'GET') {
@@ -115,6 +127,45 @@ class TenantCajaController extends TenantController
             )->fetchAll();
         }
 
+        $todayExpenses = [];
+        $todayExpensesByUser = [];
+        $todayExpensesTotal = 0.0;
+        try {
+            $todayExpenses = $this->query(
+                "SELECT e.id, e.description, e.amount, e.expense_date, e.payment_method,
+                        e.receipt_number, e.user_id, e.created_at,
+                        COALESCE(NULLIF(TRIM(u.name), ''), 'Sin usuario') AS user_name,
+                        COALESCE(NULLIF(TRIM(ec.name), ''), NULLIF(TRIM(e.category), ''), 'General') AS category_label,
+                        s.name AS supplier_name
+                 FROM expenses e
+                 LEFT JOIN users u ON u.id = e.user_id
+                 LEFT JOIN expense_categories ec ON ec.id = e.category_id
+                 LEFT JOIN suppliers s ON s.id = e.supplier_id
+                 WHERE DATE(e.expense_date) = CURDATE()
+                 ORDER BY user_name ASC, e.created_at DESC, e.id DESC"
+            )->fetchAll();
+
+            foreach ($todayExpenses as $exp) {
+                $uid = (string)((int)($exp['user_id'] ?? 0));
+                if (!isset($todayExpensesByUser[$uid])) {
+                    $todayExpensesByUser[$uid] = [
+                        'user_id' => (int)($exp['user_id'] ?? 0),
+                        'user_name' => (string)$exp['user_name'],
+                        'total' => 0.0,
+                        'items' => [],
+                    ];
+                }
+                $amount = (float)$exp['amount'];
+                $todayExpensesByUser[$uid]['total'] += $amount;
+                $todayExpensesByUser[$uid]['items'][] = $exp;
+                $todayExpensesTotal += $amount;
+            }
+        } catch (\Throwable $e) {
+            $todayExpenses = [];
+            $todayExpensesByUser = [];
+            $todayExpensesTotal = 0.0;
+        }
+
         $historyFrom = trim((string)$this->request->get('history_from', ''));
         $historyTo = trim((string)$this->request->get('history_to', ''));
         if ($historyFrom === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $historyFrom)) {
@@ -150,7 +201,9 @@ class TenantCajaController extends TenantController
         $recentProducts = [];
         $financialCats = [];
         $operationalCats = [];
+        $administrativeCats = [];
         $expenseSuppliers = [];
+        $loanProducts = [];
         if ($openSession) {
             try {
                 $posCustomers = $this->query(
@@ -165,27 +218,74 @@ class TenantCajaController extends TenantController
             }
             $paymentMethods = \SoftNova\Services\PaymentMethodCatalog::all();
             try {
+                $this->ensureWholesalePriceColumn();
+                $this->repairProductUtf8Names();
+                $openItem = \SoftNova\Services\OpenItemProduct::ensure($this->db);
+                // Últimos 5 productos vendidos (por fecha de venta más reciente).
                 $recentProducts = $this->query(
-                    "SELECT p.id, p.name, p.code, p.sale_price, p.stock
-                     FROM products p
+                    "SELECT p.id, p.name, p.code, p.sale_price, COALESCE(p.wholesale_price, 0) AS wholesale_price,
+                            p.stock, COALESCE(p.product_type,'product') AS product_type,
+                            MAX(s.sale_date) AS last_sold_at
+                     FROM sale_items si
+                     INNER JOIN sales s ON s.id = si.sale_id
+                     INNER JOIN products p ON p.id = si.product_id
                      WHERE p.status = 'active'
-                     ORDER BY p.updated_at DESC, p.id DESC
-                     LIMIT 12"
+                       AND COALESCE(s.status, 'completed') <> 'cancelled'
+                       AND si.product_id IS NOT NULL
+                       AND UPPER(COALESCE(p.code,'')) <> ?
+                     GROUP BY p.id, p.name, p.code, p.sale_price, p.wholesale_price, p.stock, p.product_type
+                     ORDER BY last_sold_at DESC, p.id DESC
+                     LIMIT 5",
+                    [\SoftNova\Services\OpenItemProduct::CODE]
                 )->fetchAll();
+                // Comodín siempre visible al inicio de accesos rápidos.
+                array_unshift($recentProducts, [
+                    'id' => (int)$openItem['id'],
+                    'name' => (string)$openItem['name'],
+                    'code' => \SoftNova\Services\OpenItemProduct::CODE,
+                    'sale_price' => 0,
+                    'wholesale_price' => 0,
+                    'stock' => 0,
+                    'product_type' => 'service',
+                    'is_open_item' => 1,
+                    'last_sold_at' => null,
+                ]);
             } catch (\Throwable $e) {
-                $recentProducts = $this->query(
-                    "SELECT id, name, code, sale_price, stock FROM products WHERE status = 'active' ORDER BY id DESC LIMIT 12"
-                )->fetchAll();
+                try {
+                    $recentProducts = $this->query(
+                        "SELECT p.id, p.name, p.code, p.sale_price, 0 AS wholesale_price,
+                                p.stock, COALESCE(p.product_type,'product') AS product_type,
+                                MAX(s.sale_date) AS last_sold_at
+                         FROM sale_items si
+                         INNER JOIN sales s ON s.id = si.sale_id
+                         INNER JOIN products p ON p.id = si.product_id
+                         WHERE p.status = 'active'
+                           AND COALESCE(s.status, 'completed') <> 'cancelled'
+                           AND si.product_id IS NOT NULL
+                         GROUP BY p.id
+                         ORDER BY last_sold_at DESC, p.id DESC
+                         LIMIT 5"
+                    )->fetchAll();
+                } catch (\Throwable $e2) {
+                    $recentProducts = [];
+                }
             }
+            foreach ($recentProducts as &$rp) {
+                $rp['name'] = \SoftNova\Core\utf8_fix((string)($rp['name'] ?? ''));
+                $rp['code'] = \SoftNova\Core\utf8_fix((string)($rp['code'] ?? ''));
+            }
+            unset($rp);
 
-            if (!$isPosRole && TenantMiddleware::canAccess('gastos') && TenantMiddleware::canDo('create', 'gastos')) {
+            if ($openSession && $this->canRegisterExpenseFromCaja()) {
                 try {
                     $catSvc = new \SoftNova\Services\ExpenseCategoryService($this->db);
                     $financialCats = $catSvc->listActive('financial');
                     $operationalCats = $catSvc->listActive('operational');
+                    $administrativeCats = $catSvc->listActive('administrative');
                 } catch (\Throwable $e) {
                     $financialCats = [];
                     $operationalCats = [];
+                    $administrativeCats = [];
                 }
                 try {
                     $expenseSuppliers = $this->query(
@@ -193,6 +293,46 @@ class TenantCajaController extends TenantController
                     )->fetchAll();
                 } catch (\Throwable $e) {
                     $expenseSuppliers = [];
+                }
+            }
+            if ($openSession && $this->canLoanFromCaja()) {
+                try {
+                    $loanProducts = $this->query(
+                        "SELECT id, code, name, stock, COALESCE(barcode,'') AS barcode
+                         FROM products
+                         WHERE status = 'active'
+                           AND COALESCE(product_type, 'product') = 'product'
+                           AND UPPER(COALESCE(code,'')) <> ?
+                         ORDER BY name ASC
+                         LIMIT 400",
+                        [\SoftNova\Services\OpenItemProduct::CODE]
+                    )->fetchAll();
+                    // Deep-link desde Inventario: asegurar el producto aunque no esté en el top 400.
+                    $preselectLoanId = (int)$this->request->get('loan_product_id', 0);
+                    if ($preselectLoanId > 0) {
+                        $found = false;
+                        foreach ($loanProducts as $lp) {
+                            if ((int)$lp['id'] === $preselectLoanId) {
+                                $found = true;
+                                break;
+                            }
+                        }
+                        if (!$found) {
+                            $extra = $this->query(
+                                "SELECT id, code, name, stock, COALESCE(barcode,'') AS barcode FROM products
+                                 WHERE id = ? AND status = 'active'
+                                   AND COALESCE(product_type, 'product') = 'product'
+                                   AND UPPER(COALESCE(code,'')) <> ?
+                                 LIMIT 1",
+                                [$preselectLoanId, \SoftNova\Services\OpenItemProduct::CODE]
+                            )->fetch();
+                            if ($extra) {
+                                array_unshift($loanProducts, $extra);
+                            }
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    $loanProducts = [];
                 }
             }
         }
@@ -204,11 +344,53 @@ class TenantCajaController extends TenantController
         }
         
         $company = $this->companySettings();
+        $cancelReasons = [];
+        try {
+            $cancelReasons = (new CustomOptionService($this->db))
+                ->options(CustomOptionService::GROUP_CANCEL_REASON);
+        } catch (\Throwable $e) {
+            $cancelReasons = [];
+        }
+
+        $creditSurchargeRate = 0.0;
+        $creditSurchargeDays = 60;
+        try {
+            $commCfg = (new \SoftNova\Services\CommissionService($this->db))->config();
+            $creditSurchargeRate = (float)($commCfg['credit_over_60_rate'] ?? 0);
+            $creditSurchargeDays = (int)($commCfg['credit_over_60_days'] ?? 60);
+            if ($creditSurchargeDays < 1) {
+                $creditSurchargeDays = 60;
+            }
+        } catch (\Throwable $e) {
+        }
+        $taxRate = (float)$this->getSetting('tax_rate', '0');
+        if ($taxRate < 0) {
+            $taxRate = 0.0;
+        }
+
+        $stockAlert = [
+            'count' => 0,
+            'negative_count' => 0,
+            'loan_count' => 0,
+            'sale_debt_count' => 0,
+            'summary_lines' => [],
+            'summary_text' => '',
+        ];
+        try {
+            $stockAlert = (new \SoftNova\Services\StockService($this->db))->negativeStockAlertReport(30);
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
         $this->view('tenant.caja', $this->tenantViewData([
             'openSession' => $openSession,
             'movements' => $movements,
             'todaySales' => $todaySales,
             'salesPagination' => $salesPagination,
+            'todayExpensesByUser' => $todayExpensesByUser,
+            'todayExpensesTotal' => $todayExpensesTotal,
+            'todayExpensesCount' => count($todayExpenses),
+            'taxRate' => $taxRate,
             'totals' => $totals,
             'historySessions' => $historySessions,
             'historyFrom' => $historyFrom,
@@ -218,14 +400,100 @@ class TenantCajaController extends TenantController
             'recentProducts' => $recentProducts,
             'financialCats' => $financialCats,
             'operationalCats' => $operationalCats,
+            'administrativeCats' => $administrativeCats,
             'expenseSuppliers' => $expenseSuppliers,
+            'loanProducts' => $loanProducts,
+            'canLoanFromCaja' => $this->canLoanFromCaja(),
+            'loanReasonsHtml' => \SoftNova\Services\ProductLoan::optionsHtml(),
+            'loanProductIdPrefill' => (int)$this->request->get('loan_product_id', 0),
             'isPosRole' => $isPosRole,
+            'canExpenseFromCaja' => $this->canRegisterExpenseFromCaja(),
+            'cancelReasons' => $cancelReasons,
+            'stockAlert' => $stockAlert,
             'companyEmail' => (string)($company['company_email'] ?? ''),
+            'cajaReportEmail' => $this->resolveCajaReportEmail((string)($company['company_email'] ?? '')),
+            'creditSurchargeRate' => $creditSurchargeRate,
+            'creditSurchargeDays' => $creditSurchargeDays,
             'invoicePrefix' => $this->query(
                 "SELECT setting_value FROM settings WHERE setting_key = 'invoice_prefix' LIMIT 1"
             )->fetchColumn() ?: 'FAC-',
             'formatMoney' => fn($a) => $this->formatMoney($a),
         ]));
+    }
+
+    /** Correo predeterminado para reportes de cierre (settings → company_email). */
+    private function resolveCajaReportEmail(string $companyEmailFallback = ''): string
+    {
+        $saved = trim($this->getSetting('caja_report_email', ''));
+        if ($saved !== '' && filter_var($saved, FILTER_VALIDATE_EMAIL)) {
+            return $saved;
+        }
+        $fallback = trim($companyEmailFallback);
+        return ($fallback !== '' && filter_var($fallback, FILTER_VALIDATE_EMAIL)) ? $fallback : '';
+    }
+
+    private function upsertSetting(string $key, string $value): void
+    {
+        $existing = $this->query(
+            "SELECT id FROM settings WHERE setting_key = ?",
+            [$key]
+        )->fetch();
+        if ($existing) {
+            $this->query(
+                "UPDATE settings SET setting_value = ? WHERE setting_key = ?",
+                [$value, $key]
+            );
+        } else {
+            $this->query(
+                "INSERT INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                [$key, $value]
+            );
+        }
+        \SoftNova\Services\SettingsCache::invalidate();
+    }
+
+    /** Valida la contraseña de cualquier administrador activo del tenant. */
+    private function verifyTenantAdminPassword(string $password): bool
+    {
+        if ($password === '') {
+            return false;
+        }
+        try {
+            $rows = $this->query(
+                "SELECT password, role FROM users WHERE status = 'active'"
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            return false;
+        }
+        foreach ($rows as $row) {
+            $role = TenantMiddleware::normalizeRole((string)($row['role'] ?? ''));
+            if ($role !== 'admin') {
+                continue;
+            }
+            if (\SoftNova\Core\Security::verifyPassword($password, (string)($row['password'] ?? ''))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function ensureWholesalePriceColumn(): void
+    {
+        static $done = false;
+        if ($done) {
+            return;
+        }
+        $done = true;
+        try {
+            $col = $this->db->query("SHOW COLUMNS FROM products LIKE 'wholesale_price'")->fetch();
+            if (!$col) {
+                $this->db->exec(
+                    "ALTER TABLE products ADD COLUMN wholesale_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER sale_price"
+                );
+            }
+        } catch (\Throwable $e) {
+            error_log('ensureWholesalePriceColumn: ' . $e->getMessage());
+        }
     }
 
     /**
@@ -234,6 +502,7 @@ class TenantCajaController extends TenantController
     private function searchProducts(): void
     {
         TenantMiddleware::authorize('caja');
+        $this->ensureWholesalePriceColumn();
         $q = trim((string)$this->request->get('q', ''));
         if (mb_strlen($q) < 1) {
             $this->json(['success' => true, 'products' => []]);
@@ -244,25 +513,30 @@ class TenantCajaController extends TenantController
         $exact = $q;
         try {
             $rows = $this->query(
-                "SELECT id, name, code, sale_price, stock, min_stock
+                "SELECT id, name, code, sale_price, COALESCE(wholesale_price, 0) AS wholesale_price,
+                        stock, min_stock, COALESCE(product_type,'product') AS product_type,
+                        COALESCE(barcode,'') AS barcode
                  FROM products
                  WHERE status = 'active'
                    AND (
                         code = ?
+                        OR barcode = ?
                         OR code LIKE ?
                         OR name LIKE ?
+                        OR barcode LIKE ?
                         OR CAST(id AS CHAR) = ?
                    )
                  ORDER BY
                     CASE
                         WHEN code = ? THEN 0
-                        WHEN code LIKE ? THEN 1
-                        WHEN name LIKE ? THEN 2
-                        ELSE 3
+                        WHEN barcode = ? THEN 1
+                        WHEN code LIKE ? THEN 2
+                        WHEN name LIKE ? THEN 3
+                        ELSE 4
                     END,
                     name ASC
                  LIMIT 25",
-                [$exact, $like, $like, $exact, $exact, $exact . '%', $like]
+                [$exact, $exact, $like, $like, $like, $exact, $exact, $exact, $exact . '%', $like]
             )->fetchAll();
         } catch (\Throwable $e) {
             $this->json(['success' => false, 'message' => 'No se pudo buscar productos', 'products' => []]);
@@ -270,12 +544,16 @@ class TenantCajaController extends TenantController
         }
 
         $products = array_map(static function (array $p): array {
+            $code = \SoftNova\Core\utf8_fix((string)($p['code'] ?? ''));
             return [
                 'id' => (int)$p['id'],
-                'name' => (string)$p['name'],
-                'code' => (string)($p['code'] ?? ''),
+                'name' => \SoftNova\Core\utf8_fix((string)$p['name']),
+                'code' => $code,
                 'sale_price' => (float)$p['sale_price'],
+                'wholesale_price' => (float)($p['wholesale_price'] ?? 0),
                 'stock' => (int)$p['stock'],
+                'product_type' => (string)($p['product_type'] ?? 'product'),
+                'is_open_item' => strtoupper($code) === \SoftNova\Services\OpenItemProduct::CODE ? 1 : 0,
             ];
         }, $rows);
 
@@ -291,12 +569,16 @@ class TenantCajaController extends TenantController
         $limit = max(100, min(5000, (int)$this->request->get('limit', 2500)));
 
         try {
+            \SoftNova\Services\OpenItemProduct::ensure($this->db);
             $rows = $this->query(
                 "SELECT id, name, code, sale_price, stock, COALESCE(product_type, 'product') AS product_type
                  FROM products
                  WHERE status = 'active'
-                 ORDER BY name ASC
-                 LIMIT {$limit}"
+                 ORDER BY
+                    CASE WHEN UPPER(COALESCE(code,'')) = ? THEN 0 ELSE 1 END,
+                    name ASC
+                 LIMIT {$limit}",
+                [\SoftNova\Services\OpenItemProduct::CODE]
             )->fetchAll();
         } catch (\Throwable $e) {
             $this->json(['success' => false, 'message' => 'No se pudo cargar el catálogo', 'products' => []]);
@@ -304,13 +586,15 @@ class TenantCajaController extends TenantController
         }
 
         $products = array_map(static function (array $p): array {
+            $code = \SoftNova\Core\utf8_fix((string)($p['code'] ?? ''));
             return [
                 'id' => (int)$p['id'],
-                'name' => (string)$p['name'],
-                'code' => (string)($p['code'] ?? ''),
+                'name' => \SoftNova\Core\utf8_fix((string)$p['name']),
+                'code' => $code,
                 'sale_price' => (float)$p['sale_price'],
                 'stock' => (int)$p['stock'],
                 'product_type' => (string)($p['product_type'] ?? 'product'),
+                'is_open_item' => strtoupper($code) === \SoftNova\Services\OpenItemProduct::CODE ? 1 : 0,
             ];
         }, $rows);
 
@@ -322,6 +606,44 @@ class TenantCajaController extends TenantController
         ]);
     }
     
+    /**
+     * Corrige en BD nombres/códigos con mojibake (Ã', Ã±, etc.).
+     * Idempotente y barato: solo toca filas sospechosas.
+     */
+    private function repairProductUtf8Names(): void
+    {
+        static $done = false;
+        if ($done) {
+            return;
+        }
+        $done = true;
+        try {
+            $rows = $this->query(
+                "SELECT id, name, code FROM products
+                 WHERE name LIKE '%Ã%' OR name LIKE '%Â%' OR code LIKE '%Ã%' OR code LIKE '%Â%'
+                 LIMIT 500"
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            return;
+        }
+        foreach ($rows as $row) {
+            $id = (int)$row['id'];
+            $name = \SoftNova\Core\utf8_fix((string)$row['name']);
+            $code = \SoftNova\Core\utf8_fix((string)($row['code'] ?? ''));
+            if ($name === (string)$row['name'] && $code === (string)($row['code'] ?? '')) {
+                continue;
+            }
+            try {
+                $this->query(
+                    "UPDATE products SET name = ?, code = ? WHERE id = ?",
+                    [$name, $code !== '' ? $code : null, $id]
+                );
+            } catch (\Throwable $e) {
+                // ignore fila
+            }
+        }
+    }
+
     private function openCash(): void
     {
         if (!$this->validateCsrfOrFail('/app/caja')) {
@@ -389,6 +711,16 @@ class TenantCajaController extends TenantController
         $noteLine = $notes !== '' ? ('Cierre: ' . $notes) : 'Cierre manual';
         $newNotes = trim($prevNotes . ($prevNotes !== '' ? "\n" : '') . $noteLine);
 
+        // Trazabilidad: dejar constancia de stock negativo / deudas al cerrar.
+        try {
+            $stockAlert = (new \SoftNova\Services\StockService($this->db))->negativeStockAlertReport(25);
+            if (!empty($stockAlert['summary_text'])) {
+                $newNotes = trim($newNotes . "\n" . $stockAlert['summary_text']);
+            }
+        } catch (\Throwable $e) {
+            $stockAlert = ['count' => 0, 'summary_lines' => []];
+        }
+
         $expectedCash = $this->computeExpectedCash($session);
         $difference = round($closingAmount - $expectedCash, 2);
 
@@ -420,6 +752,10 @@ class TenantCajaController extends TenantController
                 ? ' Faltante de ' . $this->formatMoney(abs($difference)) . '.'
                 : ' Sobrante de ' . $this->formatMoney($difference) . '.';
         }
+        if (!empty($stockAlert['count'])) {
+            $message .= ' Atención: ' . (int)$stockAlert['count']
+                . ' producto(s) con stock negativo o pendiente (préstamo/venta sin stock).';
+        }
 
         $this->json([
             'success' => true,
@@ -429,6 +765,7 @@ class TenantCajaController extends TenantController
             'session_id' => $sessionId,
             'expected_cash' => $expectedCash,
             'difference' => $difference,
+            'stock_alert_count' => (int)($stockAlert['count'] ?? 0),
         ]);
     }
 
@@ -491,6 +828,238 @@ class TenantCajaController extends TenantController
         }
     }
     
+    /**
+     * POS y usuarios con "Crear" en Préstamos pueden registrar salidas desde caja
+     * sin entrar al módulo Préstamos (mismo patrón que Gastos).
+     */
+    private function canLoanFromCaja(): bool
+    {
+        if (TenantMiddleware::isPosRole()) {
+            return TenantMiddleware::canDo('create', 'caja')
+                || TenantMiddleware::canDo('create', 'prestamos');
+        }
+        return TenantMiddleware::canDo('create', 'prestamos');
+    }
+
+    private function createLoanFromCaja(): void
+    {
+        if (!$this->canLoanFromCaja()) {
+            $this->respond(false, 'No tienes permiso para registrar préstamos desde caja', '/app/caja');
+            return;
+        }
+        if (!$this->validateCsrfOrFail('/app/caja')) {
+            return;
+        }
+
+        $openSession = $this->query(
+            "SELECT id FROM cash_sessions WHERE status = 'open' ORDER BY id DESC LIMIT 1"
+        )->fetch();
+        if (!$openSession) {
+            $this->respond(false, 'Debe haber una caja abierta para registrar el préstamo', '/app/caja');
+            return;
+        }
+
+        try {
+            $stock = new \SoftNova\Services\StockService($this->db);
+            $productId = (int)$this->request->post('product_id', 0);
+            $qty = (int)$this->request->post('quantity', 0);
+            $result = $stock->registerLoan(
+                $productId,
+                $qty,
+                (string)$this->request->post('reason', ''),
+                (string)$this->request->post('note', ''),
+                (string)$this->request->post('borrower', '')
+            );
+            $msg = 'Préstamo registrado. Stock actual: ' . (int)$result['stock_after'];
+            if ((int)$result['stock_after'] < 0) {
+                $msg .= ' (inventario en negativo — pendiente de devolución).';
+            }
+            $this->respond(true, $msg, '/app/caja');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/caja');
+        }
+    }
+
+    /**
+     * POS y usuarios con permiso de gastos pueden registrar egresos desde caja
+     * sin entrar al módulo Gastos.
+     */
+    private function canRegisterExpenseFromCaja(): bool
+    {
+        if (TenantMiddleware::isPosRole()) {
+            return TenantMiddleware::canDo('create', 'caja')
+                || TenantMiddleware::canDo('create', 'gastos');
+        }
+        // Solo "Crear" en Gastos basta (sin Ver): registra desde Caja, no abre el módulo.
+        return TenantMiddleware::canDo('create', 'gastos');
+    }
+
+    private function createExpenseFromCaja(): void
+    {
+        if (!$this->canRegisterExpenseFromCaja()) {
+            $this->respond(false, 'No tienes permiso para registrar gastos desde caja', '/app/caja');
+            return;
+        }
+        if (!$this->validateCsrfOrFail('/app/caja')) {
+            return;
+        }
+
+        $openSession = $this->query(
+            "SELECT id FROM cash_sessions WHERE status = 'open' ORDER BY id DESC LIMIT 1"
+        )->fetch();
+        if (!$openSession) {
+            $this->respond(false, 'Debe haber una caja abierta para registrar el gasto', '/app/caja');
+            return;
+        }
+
+        $description = trim((string)$this->request->post('description', ''));
+        $amount = (float)$this->request->post('amount', 0);
+        $categoryId = (int)$this->request->post('category_id', 0);
+        $expenseDate = trim((string)$this->request->post('expense_date', date('Y-m-d')));
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $expenseDate)) {
+            $expenseDate = date('Y-m-d');
+        }
+        $supplierId = $this->request->post('supplier_id') ? (int)$this->request->post('supplier_id') : null;
+        $paymentMethod = \SoftNova\Services\PaymentMethodCatalog::normalize(
+            $this->request->post('payment_method', 'cash')
+        );
+        $receiptNumber = trim((string)$this->request->post('receipt_number', ''));
+        $notes = trim((string)$this->request->post('notes', ''));
+        $affectCash = $this->request->post('affect_cash') === '1';
+
+        if ($description === '' || $amount <= 0) {
+            $this->respond(false, 'Descripción y monto son requeridos', '/app/caja');
+            return;
+        }
+
+        $rawCategory = trim((string)$this->request->post('category_id', ''));
+        if ($rawCategory === '' || $rawCategory === '__other__' || $categoryId <= 0) {
+            $this->respond(false, 'Seleccione una categoría de gasto válida', '/app/caja');
+            return;
+        }
+
+        $categories = new \SoftNova\Services\ExpenseCategoryService($this->db);
+        $cat = $categories->find($categoryId);
+        if (!$cat) {
+            $this->respond(false, 'La categoría de gasto no existe o está inactiva', '/app/caja');
+            return;
+        }
+        $category = (string)$cat['name'];
+
+        $receipt = $this->storeExpenseReceiptUpload();
+        if ($receipt === false) {
+            $this->respond(false, 'Comprobante inválido (JPG/PNG/WebP/PDF, máx. 5 MB)', '/app/caja');
+            return;
+        }
+
+        try {
+            $this->db->beginTransaction();
+            $this->query(
+                "INSERT INTO expenses
+                    (description, amount, category, category_id, expense_date, supplier_id,
+                     payment_method, receipt_number, receipt_path, receipt_original_name, receipt_mime,
+                     notes, user_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    $description,
+                    $amount,
+                    $category,
+                    $cat ? (int)$cat['id'] : null,
+                    $expenseDate,
+                    $supplierId,
+                    $paymentMethod,
+                    $receiptNumber !== '' ? $receiptNumber : null,
+                    $receipt['path'] ?? null,
+                    $receipt['original'] ?? null,
+                    $receipt['mime'] ?? null,
+                    $notes !== '' ? $notes : null,
+                    $_SESSION['tenant_user_id'] ?? null,
+                ]
+            );
+            $expenseId = (int)$this->db->lastInsertId();
+            $this->db->commit();
+        } catch (\Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            if (!empty($receipt['path'])) {
+                $this->deleteExpenseReceiptFile((string)$receipt['path']);
+            }
+            $this->respond(false, 'No se pudo registrar el gasto: ' . $e->getMessage(), '/app/caja');
+            return;
+        }
+
+        try {
+            (new \SoftNova\Services\AccountingService($this->db))->postExpense($expenseId, $affectCash);
+        } catch (\Throwable $e) {
+            error_log('Contabilidad gasto caja ' . $expenseId . ': ' . $e->getMessage());
+        }
+
+        if ($affectCash && \SoftNova\Services\PaymentMethodCatalog::affectsCash($paymentMethod)) {
+            (new \SoftNova\Services\CashService($this->db))->registerMovement(
+                $amount,
+                'Gasto: ' . $description,
+                'expense',
+                'expense',
+                $expenseId
+            );
+        }
+
+        $this->respond(true, 'Gasto registrado: ' . $this->formatMoney($amount), '/app/caja');
+    }
+
+    /**
+     * @return array{path:string,original:string,mime:string}|null|false
+     */
+    private function storeExpenseReceiptUpload(): array|null|false
+    {
+        if (empty($_FILES['receipt_file']['tmp_name'])) {
+            return null;
+        }
+        if (!is_uploaded_file($_FILES['receipt_file']['tmp_name'])) {
+            return false;
+        }
+        if (($_FILES['receipt_file']['size'] ?? 0) > 5242880) {
+            return false;
+        }
+        $allowed = [
+            'image/jpeg' => 'jpg',
+            'image/png' => 'png',
+            'image/webp' => 'webp',
+            'application/pdf' => 'pdf',
+        ];
+        $finfo = new \finfo(FILEINFO_MIME_TYPE);
+        $mime = $finfo->file($_FILES['receipt_file']['tmp_name']);
+        if (!isset($allowed[$mime])) {
+            return false;
+        }
+        $ext = $allowed[$mime];
+        $tenantKey = preg_replace('/[^a-zA-Z0-9_-]/', '', (string)($_SESSION['tenant_db_name'] ?? 'tenant')) ?: 'tenant';
+        $dir = STORAGE_PATH . '/expenses/' . $tenantKey;
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+        $filename = 'exp_' . time() . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
+        $dest = $dir . '/' . $filename;
+        if (!move_uploaded_file($_FILES['receipt_file']['tmp_name'], $dest)) {
+            return false;
+        }
+        return [
+            'path' => $tenantKey . '/' . $filename,
+            'original' => (string)($_FILES['receipt_file']['name'] ?? $filename),
+            'mime' => $mime,
+        ];
+    }
+
+    private function deleteExpenseReceiptFile(string $relative): void
+    {
+        $relative = str_replace(['..', '\\'], ['', '/'], $relative);
+        $full = STORAGE_PATH . '/expenses/' . ltrim($relative, '/');
+        if (is_file($full)) {
+            @unlink($full);
+        }
+    }
+
     private function addMovement(): void
     {
         if (TenantMiddleware::isPosRole()) {
@@ -615,7 +1184,8 @@ class TenantCajaController extends TenantController
         TenantMiddleware::authorize('caja');
 
         $id = (int)$this->request->post('id', 0);
-        $to = trim((string)$this->request->post('email', ''));
+        $to = strtolower(trim((string)$this->request->post('email', '')));
+        $adminPassword = (string)$this->request->post('admin_password', '');
         $report = $this->loadClosingReport($id);
         if ($report === null) {
             $this->respond(false, 'Sesión de caja no encontrada', '/app/caja');
@@ -626,11 +1196,23 @@ class TenantCajaController extends TenantController
             return;
         }
 
+        $defaultEmail = strtolower(trim($this->getSetting('caja_report_email', '')));
+        $isChangingDefault = ($defaultEmail !== '' && strcasecmp($defaultEmail, $to) !== 0);
+        if ($isChangingDefault && !$this->verifyTenantAdminPassword($adminPassword)) {
+            $this->respond(
+                false,
+                'Para cambiar el correo predeterminado debe ingresar la clave de administrador del sistema',
+                '/app/caja?share_close=' . $id
+            );
+            return;
+        }
+
         $company = $this->companySettings();
         $empresa = (string)($company['company_name'] ?? 'Seri ERP');
         $session = $report['session'];
         $filename = 'Cierre_Caja_' . $id . '.pdf';
         $temporal = null;
+        $resultado = ['success' => false, 'message' => 'No se pudo enviar'];
 
         try {
             $pdf = new \SoftNova\Services\PdfService($company, $this->getCurrency());
@@ -675,9 +1257,25 @@ class TenantCajaController extends TenantController
             }
         }
 
+        if (!empty($resultado['success'])) {
+            // Primer envío o cambio autorizado → queda como predeterminado.
+            if ($defaultEmail === '' || $isChangingDefault) {
+                try {
+                    $this->upsertSetting('caja_report_email', $to);
+                } catch (\Throwable $e) {
+                    error_log('caja_report_email save: ' . $e->getMessage());
+                }
+            }
+        }
+
+        $msg = (string)($resultado['message'] ?? '');
+        if (!empty($resultado['success']) && ($defaultEmail === '' || $isChangingDefault)) {
+            $msg .= ($defaultEmail === '' ? ' Correo guardado como predeterminado.' : ' Correo predeterminado actualizado.');
+        }
+
         $this->respond(
             (bool)$resultado['success'],
-            (string)$resultado['message'],
+            $msg,
             '/app/caja?focus=cierresReportes'
         );
     }
@@ -832,29 +1430,52 @@ class TenantCajaController extends TenantController
             "SELECT reference_type, reference_id FROM cash_movements WHERE cash_session_id = ?",
             [$sessionId]
         )->fetchAll();
-        $movementSaleIds = [];
+        $coveredSaleIds = [];
         foreach ($movements as $mov) {
-            if (($mov['reference_type'] ?? '') === 'sale' && !empty($mov['reference_id'])) {
-                $movementSaleIds[] = (int)$mov['reference_id'];
+            $rt = (string)($mov['reference_type'] ?? '');
+            if (
+                in_array($rt, ['sale', 'sale_payment', 'sale_payment_adjust', 'sale_cancel'], true)
+                && !empty($mov['reference_id'])
+            ) {
+                $coveredSaleIds[(int)$mov['reference_id']] = true;
             }
         }
 
         if ($until) {
             $sales = $this->query(
-                "SELECT id, total, status, payment_method FROM sales WHERE sale_date >= ? AND sale_date <= ?",
+                "SELECT id, total, status, payment_method, payment_status
+                 FROM sales WHERE sale_date >= ? AND sale_date <= ?",
+                [$openingDate, $until]
+            )->fetchAll();
+            $payRows = $this->query(
+                "SELECT sp.payment_method, sp.amount
+                 FROM sale_payments sp
+                 INNER JOIN sales s ON s.id = sp.sale_id
+                 WHERE s.sale_date >= ? AND s.sale_date <= ?
+                   AND COALESCE(s.status, '') <> 'cancelled'",
                 [$openingDate, $until]
             )->fetchAll();
         } else {
             $sales = $this->query(
-                "SELECT id, total, status, payment_method FROM sales WHERE sale_date >= ?",
+                "SELECT id, total, status, payment_method, payment_status
+                 FROM sales WHERE sale_date >= ?",
+                [$openingDate]
+            )->fetchAll();
+            $payRows = $this->query(
+                "SELECT sp.payment_method, sp.amount
+                 FROM sale_payments sp
+                 INNER JOIN sales s ON s.id = sp.sale_id
+                 WHERE s.sale_date >= ?
+                   AND COALESCE(s.status, '') <> 'cancelled'",
                 [$openingDate]
             )->fetchAll();
         }
 
+        // Solo ventas en efectivo/pagadas SIN movimiento de caja (legacy) entran a ingresos.
+        // Evita inflar el balance con tarjeta/Nequi/crédito o doble conteo de abonos.
         $salesIncome = 0.0;
         $salesCount = 0;
         $salesTotal = 0.0;
-        $paymentBreakdown = [];
         foreach ($sales as $sale) {
             if (($sale['status'] ?? '') === 'cancelled') {
                 continue;
@@ -862,22 +1483,53 @@ class TenantCajaController extends TenantController
             $salesCount++;
             $saleTotal = (float)$sale['total'];
             $salesTotal += $saleTotal;
-            if (!in_array((int)$sale['id'], $movementSaleIds, true)) {
-                $salesIncome += $saleTotal;
+            $saleId = (int)$sale['id'];
+            if (isset($coveredSaleIds[$saleId])) {
+                continue;
             }
             $methodCode = \SoftNova\Services\PaymentMethodCatalog::normalize((string)($sale['payment_method'] ?? 'cash'));
-            if (!isset($paymentBreakdown[$methodCode])) {
-                $paymentBreakdown[$methodCode] = [
-                    'label' => \SoftNova\Services\PaymentMethodCatalog::label($methodCode),
-                    'total' => 0.0,
-                    'count' => 0,
-                ];
+            $payStatus = (string)($sale['payment_status'] ?? '');
+            if (
+                \SoftNova\Services\PaymentMethodCatalog::affectsCash($methodCode)
+                && in_array($payStatus, ['paid', ''], true)
+            ) {
+                $salesIncome += $saleTotal;
             }
-            $paymentBreakdown[$methodCode]['total'] += $saleTotal;
-            $paymentBreakdown[$methodCode]['count']++;
         }
-
         $incomes += $salesIncome;
+
+        $paymentBreakdown = [];
+        if ($payRows !== []) {
+            foreach ($payRows as $pr) {
+                $methodCode = \SoftNova\Services\PaymentMethodCatalog::normalize((string)($pr['payment_method'] ?? 'cash'));
+                if (!isset($paymentBreakdown[$methodCode])) {
+                    $paymentBreakdown[$methodCode] = [
+                        'label' => \SoftNova\Services\PaymentMethodCatalog::label($methodCode),
+                        'total' => 0.0,
+                        'count' => 0,
+                    ];
+                }
+                $paymentBreakdown[$methodCode]['total'] += (float)$pr['amount'];
+                $paymentBreakdown[$methodCode]['count']++;
+            }
+        } else {
+            // Fallback: ventas sin filas de pago (instalaciones viejas).
+            foreach ($sales as $sale) {
+                if (($sale['status'] ?? '') === 'cancelled') {
+                    continue;
+                }
+                $methodCode = \SoftNova\Services\PaymentMethodCatalog::normalize((string)($sale['payment_method'] ?? 'cash'));
+                if (!isset($paymentBreakdown[$methodCode])) {
+                    $paymentBreakdown[$methodCode] = [
+                        'label' => \SoftNova\Services\PaymentMethodCatalog::label($methodCode),
+                        'total' => 0.0,
+                        'count' => 0,
+                    ];
+                }
+                $paymentBreakdown[$methodCode]['total'] += (float)$sale['total'];
+                $paymentBreakdown[$methodCode]['count']++;
+            }
+        }
 
         return [
             'incomes' => $incomes,

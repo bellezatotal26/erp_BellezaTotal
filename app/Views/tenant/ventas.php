@@ -13,6 +13,7 @@ $currency = $currency ?? ['symbol' => '$', 'decimals' => 0];
 $canCreateSale = \SoftNova\Core\TenantMiddleware::canDo('create', 'ventas');
 $canDeleteSale = \SoftNova\Core\TenantMiddleware::canDo('delete', 'ventas');
 $canExportSale = \SoftNova\Core\TenantMiddleware::canDo('export', 'ventas');
+$canEditPaymentMethod = $canCreateSale || \SoftNova\Core\TenantMiddleware::canDo('edit', 'ventas');
 $filters = $filters ?? ['q'=>'','from'=>'','to'=>'','status'=>'','customer_id'=>'','payment_method'=>'','record_status'=>'active','sort'=>'date','dir'=>'desc','query'=>[]];
 $cancelReasons = $cancelReasons ?? [];
 $paymentMethodOptionsHtml = $paymentMethodOptionsHtml ?? \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true);
@@ -127,7 +128,7 @@ function fmtV(float $a, array $c): string
                         <td style="font-weight:600;"><?php echo fmtV($sale['total'], $currency); ?></td>
                         <td><?php echo $sale['payment_status'] === 'paid' ? fmtV($sale['total'], $currency) : fmtV($sale['paid_amount'] ?? 0, $currency); ?></td>
                         <td>
-                            <span class="badge <?php echo $sale['payment_method'] === 'cash' ? 'badge-success' : (in_array($sale['payment_method'], ['card','dataphone','payment_link','transfer'], true) ? 'badge-info' : 'badge-warning'); ?>">
+                            <span class="badge <?php echo $sale['payment_method'] === 'cash' ? 'badge-success' : (in_array($sale['payment_method'], ['mixed','card','dataphone','payment_link','transfer','debit_card','credit_card','nequi'], true) ? 'badge-info' : 'badge-warning'); ?>">
                                 <?php echo htmlspecialchars(\SoftNova\Services\PaymentMethodCatalog::label((string)$sale['payment_method'])); ?>
                             </span>
                         </td>
@@ -147,6 +148,12 @@ function fmtV(float $a, array $c): string
                             <a href="<?php echo $ventasBase; ?>?action=pdf&id=<?php echo $sale['id']; ?>" class="btn btn-sm btn-secondary" target="_blank" title="PDF carta"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg></a>
                             <a href="<?php echo $ventasBase; ?>?action=pdf&format=ticket&id=<?php echo $sale['id']; ?>" class="btn btn-sm btn-secondary" target="_blank" title="Ticket 58mm">58mm</a>
                             <button type="button" class="btn btn-sm btn-success" onclick="shareSale(<?php echo (int)$sale['id']; ?>)" title="WhatsApp / Correo">↗</button>
+                            <?php if ($canEditPaymentMethod && ($sale['status'] ?? '') !== 'cancelled'): ?>
+                                <button type="button" class="btn btn-sm btn-secondary" title="Editar medio de pago"
+                                    onclick="openEditPaymentMethodModal(<?php echo (int)$sale['id']; ?>, '<?php echo htmlspecialchars((string)($sale['invoice_number'] ?? ''), ENT_QUOTES); ?>', '<?php echo htmlspecialchars((string)($sale['payment_method'] ?? 'cash'), ENT_QUOTES); ?>')">
+                                    Pago
+                                </button>
+                            <?php endif; ?>
                             <?php if (in_array($sale['payment_status'], ['pending', 'partial'])): ?>
                                 <button onclick="openPaymentModal(<?php echo $sale['id']; ?>,<?php echo $sale['total']; ?>,<?php echo ($sale['paid_amount'] ?? 0); ?>)" class="btn btn-sm btn-success" title="Registrar abono"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></button>
                             <?php endif; ?>
@@ -205,13 +212,22 @@ function fmtV(float $a, array $c): string
                     <input type="text" id="saleBarcodeScan" class="form-control" placeholder="Escanear…" autocomplete="off" data-barcode-input="true" style="flex:1;min-width:120px;" title="Pistola de códigos de barras">
                     <select id="productSelect" class="form-control" style="flex:2;min-width:180px;">
                         <option value="">Seleccionar producto...</option>
-                        <?php foreach ($products as $p): ?>
+                        <?php foreach ($products as $p):
+                            $isOpen = strtoupper((string)($p['code'] ?? '')) === \SoftNova\Services\OpenItemProduct::CODE;
+                        ?>
                             <option value="<?php echo $p['id']; ?>"
                                     data-price="<?php echo $p['sale_price']; ?>"
                                     data-name="<?php echo htmlspecialchars($p['name']); ?>"
                                     data-stock="<?php echo $p['stock']; ?>"
-                                    data-code="<?php echo htmlspecialchars($p['code'] ?? ''); ?>">
-                                <?php echo htmlspecialchars(($p['code'] ?? '') !== '' ? ($p['code'] . ' — ') : ''); ?><?php echo htmlspecialchars($p['name']); ?> (<?php echo fmtV($p['sale_price'], $currency); ?>) — Stock: <?php echo (int)$p['stock']; ?>
+                                    data-type="<?php echo htmlspecialchars($p['product_type'] ?? 'product'); ?>"
+                                    data-code="<?php echo htmlspecialchars($p['code'] ?? ''); ?>"
+                                    data-open-item="<?php echo $isOpen ? '1' : '0'; ?>">
+                                <?php echo htmlspecialchars(($p['code'] ?? '') !== '' ? ($p['code'] . ' — ') : ''); ?><?php echo htmlspecialchars($p['name']); ?>
+                                <?php if ($isOpen): ?>
+                                    (nombre y precio libres)
+                                <?php else: ?>
+                                    (<?php echo fmtV($p['sale_price'], $currency); ?>) — Stock: <?php echo (int)$p['stock']; ?>
+                                <?php endif; ?>
                             </option>
                         <?php endforeach; ?>
                     </select>
@@ -309,6 +325,63 @@ function fmtV(float $a, array $c): string
     </div>
 </div>
 
+<!-- Modal venta sin stock -->
+<div id="oversellModal" class="modal-overlay" style="display:none;z-index:1200;">
+    <div class="modal-content neumorphic" style="max-width:440px;">
+        <div class="modal-header">
+            <h3>Vender sin stock</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('oversellModal').style.display='none'">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p id="oversellInfo" style="margin:0 0 12px;color:var(--color-text-secondary);font-size:13px;"></p>
+            <div class="form-group">
+                <label>Motivo *</label>
+                <select id="oversellReason" class="form-control">
+                    <?php echo \SoftNova\Services\StockOversell::optionsHtml(); ?>
+                </select>
+            </div>
+            <div class="form-group" id="oversellNoteGroup" style="display:none;">
+                <label>Detalle (obligatorio si elige Otro)</label>
+                <input type="text" id="oversellNote" class="form-control" maxlength="180" placeholder="Describa el motivo…">
+            </div>
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0;">
+                El inventario quedará en negativo o cero. Al reponer mercancía se cubrirá esta deuda y se mostrará el motivo.
+            </p>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="document.getElementById('oversellModal').style.display='none'">Cancelar</button>
+            <button type="button" class="btn btn-primary" id="oversellConfirmBtn">Continuar venta</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal producto comodín -->
+<div id="openItemModal" class="modal-overlay" style="display:none;z-index:1250;">
+    <div class="modal-content neumorphic" style="max-width:420px;">
+        <div class="modal-header">
+            <h3>Producto comodín</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('openItemModal').style.display='none'">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p style="margin:0 0 12px;font-size:13px;color:var(--color-text-secondary);">
+                Para ventas puntuales que no están en inventario. No descuenta stock.
+            </p>
+            <div class="form-group">
+                <label>Nombre del producto *</label>
+                <input type="text" id="openItemName" class="form-control" maxlength="255" placeholder="Ej: Servicio de instalación">
+            </div>
+            <div class="form-group">
+                <label>Precio de venta *</label>
+                <input type="number" id="openItemPrice" class="form-control" min="0.01" step="any" placeholder="0">
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="document.getElementById('openItemModal').style.display='none'">Cancelar</button>
+            <button type="button" class="btn btn-primary" id="openItemConfirmBtn">Agregar a la venta</button>
+        </div>
+    </div>
+</div>
+
 <!-- Modal Abono -->
 <div id="paymentModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:400px;">
@@ -324,6 +397,49 @@ function fmtV(float $a, array $c): string
         </form>
     </div>
 </div>
+
+<!-- Modal editar medio de pago (simple o mixto) -->
+<div id="editPaymentMethodModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:520px;">
+        <div class="modal-header">
+            <h3>Editar medio de pago</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('editPaymentMethodModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $ventasBase; ?>?action=update_payment_method" data-ajax="true" id="editPayMethodForm">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="sale_id" id="editPaySaleId" value="">
+            <input type="hidden" name="is_mixed" id="editPayIsMixed" value="0">
+            <div class="modal-body">
+                <p style="margin:0 0 12px;color:var(--color-text-secondary);">
+                    Venta <strong id="editPayInvoice"></strong>
+                    · Monto a repartir: <strong id="editPayTarget">—</strong>
+                </p>
+                <label style="display:inline-flex;align-items:center;gap:6px;margin-bottom:10px;cursor:pointer;">
+                    <input type="checkbox" id="editPayMixedToggle"> Pago mixto (varios medios)
+                </label>
+                <div id="editPaySingleWrap" class="form-group">
+                    <label>Nuevo medio de pago *</label>
+                    <select name="payment_method" id="editPayMethodSelect" class="form-control" data-custom-other="payment_method">
+                        <?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?>
+                    </select>
+                </div>
+                <div id="editPayMixedWrap" style="display:none;">
+                    <div id="editPayMixedRows"></div>
+                    <button type="button" class="btn btn-sm btn-secondary" id="editPayMixedAdd" style="margin-top:6px;">+ Agregar método</button>
+                    <p id="editPayMixedSummary" style="font-size:12px;margin:8px 0 0;color:var(--color-text-secondary);"></p>
+                </div>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:10px 0 0;">
+                    La suma de los montos debe igualar lo cobrado. La caja se ajusta si cambia la parte en efectivo.
+                </p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('editPaymentMethodModal').style.display='none'">Volver</button>
+                <button type="submit" class="btn btn-primary">Guardar</button>
+            </div>
+        </form>
+    </div>
+</div>
+<template id="editPayMethodOptionsTpl"><?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?></template>
 
 <!-- Modal Detalle -->
 <div id="saleDetailModal" class="modal-overlay" style="display:none;">
@@ -342,6 +458,7 @@ function fmtV(float $a, array $c): string
                 <?php echo \SoftNova\Core\csrf_field(); ?>
                 <input type="hidden" name="id" id="shareSaleId">
                 <div class="form-group"><label>Correo</label><input type="email" name="email" id="shareEmail" class="form-control" required></div>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">Se adjunta el ticket 58mm en PDF.</p>
                 <button type="submit" class="btn btn-primary" style="width:100%;">Enviar por correo</button>
             </form>
         </div>

@@ -34,8 +34,23 @@ class TenantMediaController extends TenantController
             exit;
         }
 
-        $finfo = new \finfo(FILEINFO_MIME_TYPE);
-        $mime = $finfo->file($full) ?: 'application/octet-stream';
+        $mime = 'application/octet-stream';
+        if (class_exists(\finfo::class)) {
+            try {
+                $finfo = new \finfo(FILEINFO_MIME_TYPE);
+                $detected = $finfo->file($full);
+                if (is_string($detected) && $detected !== '') {
+                    $mime = $detected;
+                }
+            } catch (\Throwable $e) {
+                // ignore
+            }
+        } elseif (function_exists('mime_content_type')) {
+            $detected = @mime_content_type($full);
+            if (is_string($detected) && $detected !== '') {
+                $mime = $detected;
+            }
+        }
         $name = basename($full);
 
         header('Content-Type: ' . $mime);

@@ -408,7 +408,8 @@ function viewPurchase(id) {
                     </div>
                     <div class="form-group" style="margin:0;">
                         <label>Desc. pronto pago %</label>
-                        <input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" class="form-control" value="0" placeholder="Ej. 2">
+                        <input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" class="form-control" value="" placeholder="Vacío = auto aliado">
+                        <small class="text-muted">Deje vacío para aplicar el descuento del aliado; 0 = sin descuento.</small>
                     </div>
                 </div>
 
@@ -433,7 +434,7 @@ function viewPurchase(id) {
                             <label>Pago / contrapartida</label>
                             <select name="payment_mode" class="form-control">
                                 <option value="payable">Por pagar (Proveedores + IVA descontable)</option>
-                                <option value="cash">Efectivo</option>
+                                <option value="cash">Efectivo (sale del cajón)</option>
                                 <option value="transfer">Transferencia/tarjeta</option>
                             </select>
                         </div>
@@ -475,9 +476,10 @@ function viewPurchase(id) {
                 <label>Pago / contrapartida *</label>
                 <select name="payment_mode" class="form-control" required>
                     <option value="payable">Por pagar (220505) + IVA descontable (240802)</option>
-                    <option value="cash">Efectivo (110505)</option>
+                    <option value="cash">Efectivo (110505) · sale del cajón de caja</option>
                     <option value="transfer">Transferencia (111005)</option>
                 </select>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:6px 0 0;">Si elige <strong>Efectivo</strong>, debe haber una caja abierta: el total se registra como egreso en Caja.</p>
             </div>
             <div class="form-group">
                 <label>Notas</label>
@@ -514,10 +516,11 @@ function viewPurchase(id) {
             <div class="form-group">
                 <label>Medio de pago *</label>
                 <select name="payment_method" class="form-control" required>
-                    <option value="cash">Efectivo (110505)</option>
+                    <option value="cash">Efectivo (110505) · sale del cajón</option>
                     <option value="transfer">Transferencia (111005)</option>
                     <option value="card">Tarjeta (111005)</option>
                 </select>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:6px 0 0;">Abonos en <strong>efectivo</strong> descuentan el cajón de la caja abierta.</p>
             </div>
             <div class="form-group">
                 <label>Referencia / comprobante</label>
@@ -640,9 +643,11 @@ function viewPurchase(id) {
                 <label>Archivo de la factura</label>
                 <input type="file" name="invoice_file" class="form-control" style="padding:8px;"
                        accept=".csv,.txt,.pdf,.xml,image/*">
-                <small style="color:var(--color-text-secondary);">
-                    CSV o Excel exportado a CSV es lo más confiable. También se leen PDF con texto y XML.
-                    Columnas sugeridas: código, descripción, cantidad, costo, IVA, descuento, lote, vencimiento.
+                <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
+                    <strong>CSV</strong> es lo más confiable.
+                    <strong>PDF con texto</strong> y XML se leen directo.
+                    <strong>PDF solo imagen / foto</strong> (escaneo) requiere marcar «Interpretar con IA».
+                    Columnas CSV: código, descripción, cantidad, costo, IVA, descuento, lote, vencimiento.
                 </small>
             </div>
             <div class="form-group">
@@ -651,12 +656,18 @@ function viewPurchase(id) {
                           placeholder="Pegue aquí las líneas de la factura si no tiene archivo"></textarea>
             </div>
             <div class="form-group">
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;<?php echo $aiInvoiceReady ? '' : 'opacity:.55;'; ?>">
-                    <input type="checkbox" name="use_ai" value="1" style="width:auto;" <?php echo $aiInvoiceReady ? '' : 'disabled'; ?>>
-                    Interpretar con IA
-                    <?php if (!$aiInvoiceReady): ?>
-                        <small style="color:var(--color-text-secondary);">(configure OPENROUTER_API_KEY para habilitarlo)</small>
-                    <?php endif; ?>
+                <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;<?php echo $aiInvoiceReady ? '' : 'opacity:.55;'; ?>">
+                    <input type="checkbox" name="use_ai" id="invoiceUseAi" value="1" style="width:auto;margin-top:3px;"
+                           <?php echo $aiInvoiceReady ? 'checked' : 'disabled'; ?>>
+                    <span>
+                        Interpretar con IA
+                        <small style="display:block;color:var(--color-text-secondary);font-weight:400;">
+                            Necesario para PDF escaneados o fotos. Si el PDF ya trae texto, también mejora la lectura.
+                        </small>
+                        <?php if (!$aiInvoiceReady): ?>
+                            <small style="display:block;color:#B45309;">Configure OPENROUTER_API_KEY para habilitarlo.</small>
+                        <?php endif; ?>
+                    </span>
                 </label>
             </div>
             <div class="modal-footer">
@@ -823,7 +834,7 @@ function renderInvoiceReview(imp, items) {
     h += '<div class="form-group" style="margin:0;"><label>Fecha a bodega</label>' +
          '<input type="date" name="warehouse_date" class="form-control" value="' + (imp.invoice_date || poToday()) + '"></div>';
     h += '<div class="form-group" style="margin:0;"><label>Forma de pago</label><select name="payment_mode" class="form-control">';
-    [['payable','Crédito (CxP)'],['cash','Efectivo'],['transfer','Transferencia'],['card','Tarjeta']].forEach(function(o) {
+    [['payable','Crédito (CxP)'],['cash','Efectivo (sale del cajón)'],['transfer','Transferencia'],['card','Tarjeta']].forEach(function(o) {
         h += '<option value="' + o[0] + '"' + (imp.payment_mode === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
     });
     h += '</select></div></div>';

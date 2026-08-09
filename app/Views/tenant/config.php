@@ -21,12 +21,19 @@ $permActions = $permActions ?? \SoftNova\Core\TenantMiddleware::ACTIONS;
 $teamRoleLabels = $teamRoleLabels ?? \SoftNova\Core\TenantMiddleware::teamRoleLabels();
 $moduleLabels = [
     'dashboard' => 'Dashboard', 'caja' => 'Caja', 'ventas' => 'Ventas', 'inventario' => 'Inventario',
-    'clientes' => 'Clientes', 'proveedores' => 'Proveedores', 'compras' => 'Compras',
+    'prestamos' => 'Préstamos', 'clientes' => 'Clientes', 'proveedores' => 'Proveedores', 'compras' => 'Compras',
     'cotizaciones' => 'Cotizaciones', 'gastos' => 'Gastos', 'contabilidad' => 'Contabilidad',
     'nomina' => 'Nómina', 'reportes' => 'Reportes',
 ];
 $actionLabels = ['view' => 'Ver', 'create' => 'Crear', 'edit' => 'Editar', 'delete' => 'Eliminar', 'export' => 'Exportar'];
 $configBase = $viewInstance->route('app/configuracion');
+$docConfig = \SoftNova\Services\SalesDocumentConfig::fromSettings($settings);
+$docToggleLabels = \SoftNova\Services\SalesDocumentConfig::toggleLabels();
+$logoRel = trim((string)($settings['company_logo'] ?? ''));
+// Preview autenticado: evita 404/403 si DocumentRoot o .htaccess bloquean /uploads/
+$logoUrl = $logoRel !== ''
+    ? \SoftNova\Core\base_url('/app/media?f=' . rawurlencode($logoRel))
+    : null;
 $activeTab = 'general';
 if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_URI'], '#usuarios')) {
     $activeTab = 'usuarios';
@@ -49,6 +56,7 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
     <button type="button" class="config-tab-btn" data-config-tab="usuarios">Usuarios</button>
     <?php endif; ?>
     <button type="button" class="config-tab-btn" data-config-tab="empresa">Empresa</button>
+    <button type="button" class="config-tab-btn" data-config-tab="documentos">Documentos</button>
     <button type="button" class="config-tab-btn" data-config-tab="sistema">Sistema</button>
 </nav>
 
@@ -119,7 +127,7 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
         </div>
         <div class="card-body">
             <p style="font-size:13px;color:var(--color-text-secondary);margin-bottom:12px;">
-                Roles: <strong>User</strong> (elige modulos y permisos), <strong>POS</strong> (solo punto de venta y lista de ventas).
+                Roles: <strong>User</strong> (elige módulos y permisos), <strong>POS</strong> (Caja/Ventas; gastos y préstamos desde Caja sin ver esos módulos).
                 El rol <strong>Administrativo</strong> no se crea desde aqui.
             </p>
             <?php if (empty($teamUsers)): ?>
@@ -193,7 +201,11 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
                     </div>
                     <div id="permMatrixWrap" style="margin-top:12px;">
                         <h4 style="margin-bottom:8px;">Permisos por modulo (rol User)</h4>
-                        <p style="font-size:12px;color:var(--color-text-secondary);margin-bottom:8px;">Marque Ver / Crear / Editar / Eliminar / Exportar por cada modulo.</p>
+                        <p style="font-size:12px;color:var(--color-text-secondary);margin-bottom:8px;">
+                            Marque Ver / Crear / Editar / Eliminar / Exportar por cada módulo.
+                            En <strong>Gastos</strong> y <strong>Préstamos</strong>: solo <em>Crear</em> (sin Ver) permite registrar desde Caja sin ver esos menús.
+                            En Préstamos, <em>Editar</em> permite devoluciones desde el módulo.
+                        </p>
                         <div class="table-container"><table style="font-size:13px;">
                             <thead><tr>
                                 <th>Modulo</th>
@@ -216,8 +228,8 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
                         </table></div>
                     </div>
                     <div id="posRoleHint" style="display:none;margin-top:10px;" class="alert alert-info">
-                        Rol POS: solo acceso al punto de venta (Caja/POS) y lista de ventas de la sesion.
-                        No ve tarjetas de informacion, movimientos de caja ni el boton Gasto/Compra. Home: POS.
+                        Rol POS: acceso a Caja y Ventas. Puede registrar gastos y préstamos desde Caja (sin esos módulos).
+                        Home: Caja/POS.
                     </div>
                 </div>
                 <div class="modal-footer">
@@ -386,6 +398,121 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
 </div>
 </div><!-- /tab empresa -->
 
+<div class="config-tab-panel" id="configTab-documentos">
+<div class="settings-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 20px;">
+
+    <div class="card neumorphic">
+        <div class="card-header"><h3>Datos en documentos</h3></div>
+        <div class="card-body">
+            <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 14px;">
+                Información que puede mostrarse en el ticket 58mm y en el PDF carta. Use los interruptores de cada formato para mostrar u ocultar.
+            </p>
+            <form method="POST" action="<?php echo $configBase; ?>?action=uploadLogo" enctype="multipart/form-data" data-ajax="true" id="companyLogoForm" style="margin-bottom:12px;">
+                <?php echo \SoftNova\Core\csrf_field(); ?>
+                <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:10px;">
+                    <div id="companyLogoPreview" style="width:88px;height:88px;border:1px dashed var(--color-border);border-radius:10px;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--bg-input,#f8fafc);">
+                        <?php if ($logoUrl): ?>
+                            <img src="<?php echo htmlspecialchars($logoUrl); ?>" alt="Logo" style="max-width:100%;max-height:100%;object-fit:contain;">
+                        <?php else: ?>
+                            <span style="font-size:11px;color:var(--color-text-secondary);">Sin logo</span>
+                        <?php endif; ?>
+                    </div>
+                    <div style="flex:1;min-width:180px;">
+                        <label style="font-size:13px;" for="companyLogoInput">Logo de empresa</label>
+                        <input type="file" name="logo" id="companyLogoInput" accept="image/jpeg,image/png,image/gif,image/webp" class="form-control" style="margin-top:4px;" onchange="previewAndUploadCompanyLogo(this)">
+                        <small style="color:var(--color-text-secondary);">JPG/PNG/WebP · máx. 2MB · se sube al seleccionar</small>
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-primary btn-sm">Subir logo</button>
+            </form>
+            <?php if ($logoUrl): ?>
+            <form method="POST" action="<?php echo $configBase; ?>?action=removeLogo" data-ajax="true" style="margin-bottom:16px;">
+                <?php echo \SoftNova\Core\csrf_field(); ?>
+                <button type="submit" class="btn btn-secondary btn-sm">Quitar logo</button>
+            </form>
+            <?php endif; ?>
+
+            <div class="form-group">
+                <label>NIT / Documento</label>
+                <input type="text" name="company_nit" class="form-control" form="docsConfigForm" value="<?php echo htmlspecialchars($settings['company_nit'] ?? ''); ?>" placeholder="900.123.456-7">
+            </div>
+            <div class="form-group">
+                <label>Dirección</label>
+                <input type="text" name="company_address" class="form-control" form="docsConfigForm" value="<?php echo htmlspecialchars($settings['company_address'] ?? ''); ?>" placeholder="Calle, ciudad">
+            </div>
+            <div class="form-group">
+                <label>Teléfono</label>
+                <input type="text" name="company_phone" class="form-control" form="docsConfigForm" value="<?php echo htmlspecialchars($settings['company_phone'] ?? ''); ?>" placeholder="300 000 0000">
+            </div>
+            <div class="form-group">
+                <label>Correo (también usado al enviar documentos)</label>
+                <input type="email" name="company_email" class="form-control" form="docsConfigForm" value="<?php echo htmlspecialchars($settings['company_email'] ?? ''); ?>" placeholder="ventas@empresa.com">
+            </div>
+        </div>
+    </div>
+
+    <div class="card neumorphic">
+        <div class="card-header"><h3>Ticket 58mm</h3></div>
+        <div class="card-body">
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 12px;">Campos visibles en el ticket térmico / PDF angosto.</p>
+            <?php foreach ($docToggleLabels as $key => $label): ?>
+                <?php if (in_array($key, ['show_payments_table', 'show_system_footer'], true)) continue; ?>
+                <label style="display:flex;align-items:center;gap:8px;margin:0 0 8px;font-size:13px;cursor:pointer;">
+                    <input type="checkbox" name="doc_ticket_<?php echo htmlspecialchars($key); ?>" value="1" form="docsConfigForm"
+                        <?php echo !empty($docConfig['ticket'][$key]) ? 'checked' : ''; ?>
+                        style="width:16px;height:16px;">
+                    <?php echo htmlspecialchars($label); ?>
+                </label>
+            <?php endforeach; ?>
+            <div class="form-group" style="margin-top:12px;">
+                <label>Texto superior adicional</label>
+                <textarea name="doc_ticket_header_extra" class="form-control" rows="2" form="docsConfigForm"
+                    placeholder="Ej. Régimen simple · www.tienda.com"><?php echo htmlspecialchars((string)($docConfig['ticket']['header_extra'] ?? '')); ?></textarea>
+            </div>
+            <div class="form-group">
+                <label>Mensaje de pie</label>
+                <textarea name="doc_ticket_footer_text" class="form-control" rows="2" form="docsConfigForm"><?php echo htmlspecialchars((string)($docConfig['ticket']['footer_text'] ?? 'Gracias por su compra')); ?></textarea>
+            </div>
+        </div>
+    </div>
+
+    <div class="card neumorphic">
+        <div class="card-header"><h3>PDF Carta (A4)</h3></div>
+        <div class="card-body">
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 12px;">Campos visibles en la factura / documento en tamaño carta.</p>
+            <?php foreach ($docToggleLabels as $key => $label): ?>
+                <label style="display:flex;align-items:center;gap:8px;margin:0 0 8px;font-size:13px;cursor:pointer;">
+                    <input type="checkbox" name="doc_a4_<?php echo htmlspecialchars($key); ?>" value="1" form="docsConfigForm"
+                        <?php echo !empty($docConfig['a4'][$key]) ? 'checked' : ''; ?>
+                        style="width:16px;height:16px;">
+                    <?php echo htmlspecialchars($label); ?>
+                </label>
+            <?php endforeach; ?>
+            <div class="form-group" style="margin-top:12px;">
+                <label>Color de encabezado / tabla</label>
+                <input type="color" name="doc_a4_header_color" form="docsConfigForm" class="form-control"
+                       value="<?php echo htmlspecialchars((string)($docConfig['a4']['header_color'] ?? '#0D7C4A')); ?>"
+                       style="width:70px;height:40px;padding:4px;cursor:pointer;">
+            </div>
+            <div class="form-group">
+                <label>Texto superior adicional</label>
+                <textarea name="doc_a4_header_extra" class="form-control" rows="2" form="docsConfigForm"
+                    placeholder="Ej. Resolución DIAN · sucursal"><?php echo htmlspecialchars((string)($docConfig['a4']['header_extra'] ?? '')); ?></textarea>
+            </div>
+            <div class="form-group">
+                <label>Mensaje de pie personalizado</label>
+                <textarea name="doc_a4_footer_text" class="form-control" rows="2" form="docsConfigForm"><?php echo htmlspecialchars((string)($docConfig['a4']['footer_text'] ?? '')); ?></textarea>
+            </div>
+            <button type="submit" form="docsConfigForm" class="btn btn-primary" style="width:100%;margin-top:8px;">Guardar documentos</button>
+        </div>
+    </div>
+
+</div>
+<form method="POST" action="<?php echo $configBase; ?>?action=saveDocuments" data-ajax="true" id="docsConfigForm" style="display:none;">
+    <?php echo \SoftNova\Core\csrf_field(); ?>
+</form>
+</div><!-- /tab documentos -->
+
 <div class="config-tab-panel" id="configTab-sistema">
 <div class="settings-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 20px;">
 
@@ -465,7 +592,7 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
     $backupEnabled = ($settings['backup_enabled'] ?? '0') === '1';
     $backupTime = $settings['backup_time'] ?? '02:00';
     $backupLast = $settings['backup_last_run'] ?? '';
-    $isAdmin = ($_SESSION['tenant_user_role'] ?? '') === 'admin';
+    $isAdmin = \SoftNova\Core\TenantMiddleware::getRole() === 'admin';
     ?>
     <div class="card neumorphic" style="grid-column: 1 / -1;">
         <div class="card-header">
@@ -784,6 +911,30 @@ function uploadAvatar(input) {
     });
 }
 
+function previewAndUploadCompanyLogo(input) {
+    if (!input.files || !input.files[0]) return;
+    var file = input.files[0];
+    if (file.size > 2 * 1024 * 1024) {
+        showAlert('El logo no debe superar 2MB', 'error');
+        input.value = '';
+        return;
+    }
+    var preview = document.getElementById('companyLogoPreview');
+    if (preview && typeof FileReader !== 'undefined') {
+        var reader = new FileReader();
+        reader.onload = function(e) {
+            preview.innerHTML = '<img src="' + e.target.result + '" alt="Logo" style="max-width:100%;max-height:100%;object-fit:contain;">';
+        };
+        reader.readAsDataURL(file);
+    }
+    var form = document.getElementById('companyLogoForm');
+    if (form && typeof handleAjaxSubmit === 'function') {
+        handleAjaxSubmit(form);
+    } else if (form) {
+        form.requestSubmit ? form.requestSubmit() : form.submit();
+    }
+}
+
 (function(){
     if(localStorage.getItem('theme')==='dark') setTheme('dark'); else document.getElementById('btnLight').className='btn btn-primary neumorphic-btn';
     var savedLang = localStorage.getItem('lang') || '<?php echo $currentLang; ?>';
@@ -819,6 +970,8 @@ function uploadAvatar(input) {
         activateConfigTab('sistema');
     } else if (hash === 'empresa') {
         activateConfigTab('empresa');
+    } else if (hash === 'documentos') {
+        activateConfigTab('documentos');
     } else if (hash === 'general') {
         activateConfigTab('general');
     }

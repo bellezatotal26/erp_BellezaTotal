@@ -46,12 +46,22 @@ class SaleService
             if ($productId <= 0 || $quantity <= 0) {
                 continue;
             }
+            $oversell = null;
+            if (!empty($item['stock_oversell_reason'])) {
+                $oversell = [
+                    'reason' => (string)$item['stock_oversell_reason'],
+                    'note' => (string)($item['stock_oversell_note'] ?? ''),
+                    'sale_item_id' => isset($item['sale_item_id']) ? (int)$item['sale_item_id'] : null,
+                ];
+            }
             $this->stock->decrease(
                 $productId,
                 $quantity,
                 'sale',
                 $saleId,
-                $notesPrefix . ': ' . $invoiceNumber
+                $notesPrefix . ': ' . $invoiceNumber,
+                isset($item['unit_cost']) ? (float)$item['unit_cost'] : null,
+                $oversell
             );
         }
     }
@@ -63,15 +73,12 @@ class SaleService
      */
     public function cancelSale(int $saleId, string $reasonLabel = '', string $reasonCode = ''): array
     {
-        $sale = $this->query(
-            "SELECT * FROM sales WHERE id = ? AND status IN ('completed', 'pending')",
-            [$saleId]
-        )->fetch();
-        
-        if (!$sale) {
-            throw new \RuntimeException('Venta no encontrada o ya cancelada');
+        if ($saleId <= 0) {
+            throw new \InvalidArgumentException('ID de venta inválido');
         }
 
+        // Cualquier estado distinto de cancelado es anulable.
+        // (Instalaciones viejas pueden tener status vacío o sin ENUM 'pending'.)
         $reasonLabel = trim(preg_replace('/\s+/', ' ', $reasonLabel) ?? '');
         if ($reasonLabel === '') {
             throw new \InvalidArgumentException('Debe indicar el motivo de la eliminación');
@@ -79,9 +86,40 @@ class SaleService
         if (mb_strlen($reasonLabel) > 180) {
             $reasonLabel = mb_substr($reasonLabel, 0, 180);
         }
+
+        // DDL fuera de la transacción (CREATE/ALTER en MySQL hace COMMIT implícito).
+        try {
+            $this->stock->lots();
+        } catch (\Throwable $e) {
+            // ignore
+        }
         
         $this->db->beginTransaction();
         try {
+            try {
+                $sale = $this->query(
+                    "SELECT * FROM sales WHERE id = ? LIMIT 1 FOR UPDATE",
+                    [$saleId]
+                )->fetch();
+            } catch (\Throwable $e) {
+                $sale = $this->query(
+                    "SELECT * FROM sales WHERE id = ? LIMIT 1",
+                    [$saleId]
+                )->fetch();
+            }
+
+            if (!$sale) {
+                throw new \RuntimeException('Venta no encontrada');
+            }
+
+            $status = strtolower(trim((string)($sale['status'] ?? '')));
+            if ($status === 'cancelled') {
+                throw new \RuntimeException('La venta ya está cancelada');
+            }
+
+            // Anular deudas de sobreventa antes de devolver stock (evitar cubrir otras deudas).
+            $this->stock->cancelDebtsForSale($saleId);
+
             $items = $this->query("SELECT * FROM sale_items WHERE sale_id = ?", [$saleId])->fetchAll();
             foreach ($items as $item) {
                 if (empty($item['product_id'])) {
@@ -103,24 +141,31 @@ class SaleService
 
             // cancel_reason puede no existir aún en installs viejas; el schema lo crea al usar CustomOptionService.
             try {
-                $this->query(
+                $upd = $this->query(
                     "UPDATE sales SET status = 'cancelled', cancel_reason = ?,
                         notes = CONCAT(IFNULL(notes, ''), ?)
-                     WHERE id = ?",
+                     WHERE id = ? AND (status IS NULL OR status = '' OR status <> 'cancelled')",
                     [$reasonLabel, $noteSuffix, $saleId]
                 );
             } catch (\Throwable $e) {
-                $this->query(
+                $upd = $this->query(
                     "UPDATE sales SET status = 'cancelled',
                         notes = CONCAT(IFNULL(notes, ''), ?)
-                     WHERE id = ?",
+                     WHERE id = ? AND (status IS NULL OR status = '' OR status <> 'cancelled')",
                     [$noteSuffix, $saleId]
                 );
             }
-            
-            $this->db->commit();
+            if ($upd->rowCount() < 1) {
+                throw new \RuntimeException('La venta ya está cancelada');
+            }
+
+            if ($this->db->inTransaction()) {
+                $this->db->commit();
+            }
         } catch (\Exception $e) {
-            $this->db->rollBack();
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
             throw $e;
         }
         

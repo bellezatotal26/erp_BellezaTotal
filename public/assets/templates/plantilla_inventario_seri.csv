@@ -1,0 +1,5 @@
+﻿SKU;EAN;Nombre;Tipo;Categoria;Costo;Precio;Stock;Min;Unidad;Estado;Ubicacion
+PROD-001;	7701234567890;Cepillo para uñas;product;Cuidado personal;1500;2500;50;5;UNIDAD;active;Estante A1
+PROD-002;;Shampoo anticaspa 400ml;product;Cuidado personal;8000;12000;20;3;UNIDAD;active;Estante B2
+SERV-001;;Servicio de domicilio;service;Servicios;0;5000;0;0;UNIDAD;active;
+;;Producto sin SKU (se genera automático);product;General;1000;2000;10;5;UNIDAD;active;

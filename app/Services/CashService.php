@@ -101,33 +101,43 @@ class CashService
         if (!$openSession) {
             return 0.0;
         }
-        
+
+        // Neto de ingresos/egresos ligados a la venta (incluye ajustes de medio de pago).
         $row = $this->query(
-            "SELECT COALESCE(SUM(amount), 0) as total
+            "SELECT
+                COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS incomes,
+                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS expenses
              FROM cash_movements
              WHERE cash_session_id = ?
-               AND type = 'income'
-               AND (
-                    (reference_type = 'sale' AND reference_id = ?)
-                    OR (reference_type = 'sale_payment' AND reference_id = ?)
-               )",
-            [$openSession['id'], $saleId, $saleId]
+               AND reference_id = ?
+               AND reference_type IN ('sale', 'sale_payment', 'sale_payment_adjust')",
+            [$openSession['id'], $saleId]
         )->fetch();
-        
-        $total = (float)($row['total'] ?? 0);
-        if ($total <= 0) {
+
+        $net = round((float)($row['incomes'] ?? 0) - (float)($row['expenses'] ?? 0), 2);
+        if (abs($net) <= 0.009) {
             return 0.0;
         }
-        
+
+        if ($net > 0) {
+            $this->registerMovement(
+                $net,
+                'Reverso cancelacion venta: ' . $invoiceNumber,
+                'expense',
+                'sale_cancel',
+                $saleId
+            );
+            return $net;
+        }
+
         $this->registerMovement(
-            $total,
-            'Reverso cancelacion venta: ' . $invoiceNumber,
-            'expense',
+            abs($net),
+            'Reverso cancelacion venta (ajuste): ' . $invoiceNumber,
+            'income',
             'sale_cancel',
             $saleId
         );
-        
-        return $total;
+        return $net;
     }
 
     public function reverseExpenseMovements(int $expenseId, string $description): float

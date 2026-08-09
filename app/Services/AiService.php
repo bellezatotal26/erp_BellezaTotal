@@ -486,6 +486,166 @@ PROMPT;
     }
 
     /**
+     * Extrae factura desde imágenes (foto o páginas de PDF escaneado) vía modelo con visión.
+     *
+     * @param list<array{mime:string,data:string}> $images
+     * @return array{invoice_number?:string,invoice_date?:string,due_date?:string,supplier_name?:string,subtotal?:float,tax_total?:float,total?:float,items:list<array<string,mixed>>}|null
+     */
+    public function extractInvoiceFromImages(array $images): ?array
+    {
+        if (!$this->isConfigured() || $images === []) {
+            return null;
+        }
+
+        $parts = [[
+            'type' => 'text',
+            'text' => <<<'PROMPT'
+Eres un extractor de datos de facturas de compra. Analiza la(s) imagen(es) de la factura
+(puede ser un escaneo o foto) y devuelve EXCLUSIVAMENTE un objeto JSON válido,
+sin explicaciones ni bloques de código.
+
+Estructura exacta:
+{
+  "invoice_number": "string o vacio",
+  "invoice_date": "YYYY-MM-DD o vacio",
+  "due_date": "YYYY-MM-DD o vacio",
+  "supplier_name": "string o vacio",
+  "subtotal": 0,
+  "tax_total": 0,
+  "total": 0,
+  "items": [
+    {
+      "supplier_sku": "codigo del proveedor o vacio",
+      "description": "nombre del producto",
+      "quantity": 0,
+      "unit_cost": 0,
+      "tax_rate": 0,
+      "discount_pct": 0,
+      "line_total": 0,
+      "lot_code": "codigo de lote o vacio",
+      "expiry_date": "YYYY-MM-DD o vacio"
+    }
+  ]
+}
+
+Reglas: usa punto decimal; no inventes datos ausentes (deja vacío o 0);
+incluye todas las líneas de producto visibles; si no es una factura devuelve {"items": []}.
+PROMPT
+        ]];
+
+        foreach (array_slice($images, 0, 3) as $img) {
+            $data = $img['data'] ?? '';
+            $mime = (string)($img['mime'] ?? 'image/jpeg');
+            if ($data === '' || !str_starts_with($mime, 'image/')) {
+                continue;
+            }
+            // Limitar tamaño (~3.5MB base64) para no saturar el request
+            if (strlen($data) > 3_500_000) {
+                $data = $this->downscaleImageBinary($data, $mime) ?? $data;
+            }
+            if (strlen($data) > 4_500_000) {
+                continue;
+            }
+            $parts[] = [
+                'type' => 'image_url',
+                'image_url' => [
+                    'url' => 'data:' . $mime . ';base64,' . base64_encode($data),
+                ],
+            ];
+        }
+
+        if (count($parts) < 2) {
+            return null;
+        }
+
+        $model = (string)($this->config['vision_model'] ?? '');
+        if ($model === '') {
+            $model = (string)($this->config['model'] ?? 'google/gemini-2.0-flash-exp:free');
+        }
+
+        try {
+            $baseUrl = rtrim((string)($this->config['base_url'] ?? 'https://openrouter.ai/api/v1'), '/');
+            $response = $this->httpPostJson(
+                $baseUrl . '/chat/completions',
+                [
+                    'model' => $model,
+                    'messages' => [
+                        ['role' => 'user', 'content' => $parts],
+                    ],
+                    'temperature' => 0,
+                    'max_tokens' => 4000,
+                ],
+                [
+                    'Content-Type: application/json',
+                    'Authorization: Bearer ' . (string)$this->config['api_key'],
+                    'HTTP-Referer: ' . ($this->config['site_url'] ?? 'http://localhost'),
+                    'X-Title: ' . ($this->config['site_name'] ?? 'Seri ERP'),
+                ],
+                (int)($this->config['vision_timeout'] ?? $this->config['timeout'] ?? 90)
+            );
+        } catch (\Throwable $e) {
+            error_log('AiService extractInvoiceFromImages: ' . $this->safeError($e->getMessage()));
+            return null;
+        }
+
+        if (isset($response['error'])) {
+            error_log('AiService vision error: ' . $this->safeError(json_encode($response['error'])));
+            return null;
+        }
+
+        $content = $response['choices'][0]['message']['content'] ?? '';
+        if (is_array($content)) {
+            $text = '';
+            foreach ($content as $part) {
+                if (is_array($part) && ($part['type'] ?? '') === 'text') {
+                    $text .= (string)($part['text'] ?? '');
+                } elseif (is_string($part)) {
+                    $text .= $part;
+                }
+            }
+            $content = $text;
+        }
+        if (!is_string($content) || trim($content) === '') {
+            return null;
+        }
+
+        return $this->decodeJsonPayload($content);
+    }
+
+    private function downscaleImageBinary(string $data, string $mime): ?string
+    {
+        if (!function_exists('imagecreatefromstring') || !function_exists('imagejpeg')) {
+            return null;
+        }
+        $img = @imagecreatefromstring($data);
+        if ($img === false) {
+            return null;
+        }
+        $w = imagesx($img);
+        $h = imagesy($img);
+        if ($w < 1 || $h < 1) {
+            imagedestroy($img);
+            return null;
+        }
+        $max = 1600;
+        $scale = min(1.0, $max / max($w, $h));
+        $nw = max(1, (int)round($w * $scale));
+        $nh = max(1, (int)round($h * $scale));
+        $dst = imagecreatetruecolor($nw, $nh);
+        if ($dst === false) {
+            imagedestroy($img);
+            return null;
+        }
+        imagecopyresampled($dst, $img, 0, 0, 0, 0, $nw, $nh, $w, $h);
+        ob_start();
+        imagejpeg($dst, null, 82);
+        $out = ob_get_clean();
+        imagedestroy($dst);
+        imagedestroy($img);
+        return is_string($out) && $out !== '' ? $out : null;
+    }
+
+    /**
      * Aísla el objeto JSON de una respuesta que puede venir con texto alrededor.
      *
      * @return array<string,mixed>|null

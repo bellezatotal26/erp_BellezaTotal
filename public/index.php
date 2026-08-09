@@ -65,6 +65,10 @@ session_set_cookie_params([
 // Iniciar sesión
 session_start();
 
+if (!headers_sent()) {
+    header('Content-Type: text/html; charset=utf-8');
+}
+
 // Iniciar aplicación
 try {
     $app = new SoftNova\Core\App();

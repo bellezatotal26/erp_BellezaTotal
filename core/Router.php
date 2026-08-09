@@ -172,6 +172,8 @@ class Router
         $this->post('/app/ventas', 'TenantVentasController', 'index');
         $this->get('/app/inventario', 'TenantInventarioController', 'index');
         $this->post('/app/inventario', 'TenantInventarioController', 'index');
+        $this->get('/app/prestamos', 'TenantPrestamosController', 'index');
+        $this->post('/app/prestamos', 'TenantPrestamosController', 'index');
         $this->get('/app/clientes', 'TenantClientesController', 'index');
         $this->post('/app/clientes', 'TenantClientesController', 'index');
         $this->get('/app/proveedores', 'TenantProveedoresController', 'index');

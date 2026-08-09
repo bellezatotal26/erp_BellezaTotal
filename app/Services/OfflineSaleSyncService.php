@@ -219,6 +219,8 @@ class OfflineSaleSyncService
                 'quantity' => $qty,
                 'unit_price' => isset($item['unit_price']) ? (float)$item['unit_price'] : null,
                 'product_name' => (string)($item['product_name'] ?? ''),
+                'stock_oversell_reason' => (string)($item['stock_oversell_reason'] ?? ($item['oversell_reason'] ?? '')),
+                'stock_oversell_note' => (string)($item['stock_oversell_note'] ?? ($item['oversell_note'] ?? '')),
             ];
         }
 
@@ -249,8 +251,15 @@ class OfflineSaleSyncService
             'received_date' => trim((string)($raw['received_date'] ?? '')),
             'initial_payment' => (float)($raw['initial_payment'] ?? 0),
             'discount_percent' => max(0, min(100, (float)($raw['discount_percent'] ?? 0))),
+            'delivery_fee' => max(0, round((float)($raw['delivery_fee'] ?? 0), 2)),
+            'delivery_company_fee' => max(0, round((float)($raw['delivery_company_fee'] ?? 0), 2)),
+            'delivery_total' => max(0, round((float)($raw['delivery_total'] ?? 0), 2)),
+            'sale_channel' => in_array(strtolower(trim((string)($raw['sale_channel'] ?? 'retail'))), ['retail', 'wholesale'], true)
+                ? strtolower(trim((string)($raw['sale_channel'] ?? 'retail')))
+                : 'retail',
             'notes' => trim((string)($raw['notes'] ?? '')),
             'items' => $normalizedItems,
+            'payment_splits' => SalePaymentSplitter::extractFromArray($raw),
             'cash_received' => isset($raw['cash_received']) ? (float)$raw['cash_received'] : null,
             'cash_change' => isset($raw['cash_change']) ? (float)$raw['cash_change'] : null,
         ];
@@ -286,11 +295,24 @@ class OfflineSaleSyncService
         }
 
         // Agrupa líneas del mismo producto para no aprobar 3+3 con stock 5.
+        // Excepción: producto comodín (open item) — cada línea es independiente
+        // (nombre/precio distintos); fusionarlas distorsiona totales.
         $grouped = [];
+        $openItemLines = [];
         foreach ($items as $item) {
             $productId = (int)($item['product_id'] ?? 0);
             $quantity = (int)($item['quantity'] ?? 0);
             if ($productId <= 0 || $quantity <= 0) {
+                continue;
+            }
+            $probe = $this->query(
+                "SELECT id, code, COALESCE(product_type,'product') product_type FROM products WHERE id = ?",
+                [$productId]
+            )->fetch();
+            if ($probe && OpenItemProduct::isOpenItem($probe)) {
+                $row = $item;
+                $row['quantity'] = $quantity;
+                $openItemLines[] = $row;
                 continue;
             }
             if (!isset($grouped[$productId])) {
@@ -298,13 +320,19 @@ class OfflineSaleSyncService
                 $grouped[$productId]['quantity'] = $quantity;
             } else {
                 $grouped[$productId]['quantity'] = (int)$grouped[$productId]['quantity'] + $quantity;
+                // Conserva motivo si alguna línea lo trae (prioridad a la última no vacía).
+                $r = (string)($item['stock_oversell_reason'] ?? '');
+                if ($r !== '') {
+                    $grouped[$productId]['stock_oversell_reason'] = $r;
+                    $grouped[$productId]['stock_oversell_note'] = (string)($item['stock_oversell_note'] ?? '');
+                }
             }
         }
 
         $valid = [];
         $conflicts = [];
 
-        foreach ($grouped as $item) {
+        foreach (array_merge(array_values($grouped), $openItemLines) as $item) {
             $productId = (int)$item['product_id'];
             $quantity = (int)$item['quantity'];
             $product = $this->query(
@@ -327,27 +355,81 @@ class OfflineSaleSyncService
 
             $isService = ($product['product_type'] ?? 'product') === 'service';
             $available = (int)$product['stock'];
+            $oversellReason = '';
+            $oversellNote = '';
             if (!$isService && $available < $quantity) {
-                $conflicts[] = [
-                    'product_id' => $productId,
-                    'code' => (string)($product['code'] ?? ''),
-                    'name' => (string)$product['name'],
-                    'requested' => $quantity,
-                    'available' => $available,
-                    'reason' => 'stock',
-                ];
-                continue;
+                try {
+                    $parsed = StockOversell::parse(
+                        $item['stock_oversell_reason'] ?? null,
+                        $item['stock_oversell_note'] ?? null
+                    );
+                } catch (\InvalidArgumentException $e) {
+                    $conflicts[] = [
+                        'product_id' => $productId,
+                        'code' => (string)($product['code'] ?? ''),
+                        'name' => (string)$product['name'],
+                        'requested' => $quantity,
+                        'available' => $available,
+                        'reason' => 'stock',
+                        'message' => $e->getMessage(),
+                    ];
+                    continue;
+                }
+                if ($parsed === null) {
+                    $conflicts[] = [
+                        'product_id' => $productId,
+                        'code' => (string)($product['code'] ?? ''),
+                        'name' => (string)$product['name'],
+                        'requested' => $quantity,
+                        'available' => $available,
+                        'reason' => 'stock',
+                    ];
+                    continue;
+                }
+                $oversellReason = $parsed['reason'];
+                $oversellNote = $parsed['note'];
             }
 
-            $up = (float)$product['sale_price'];
+            $isOpenItem = OpenItemProduct::isOpenItem($product);
+            $up = array_key_exists('unit_price', $item) && $item['unit_price'] !== null
+                ? round((float)$item['unit_price'], 2)
+                : round((float)$product['sale_price'], 2);
+            if ($up < 0) {
+                $up = 0.0;
+            }
+            $lineName = (string)$product['name'];
+            if ($isOpenItem) {
+                try {
+                    $lineName = OpenItemProduct::sanitizeLineName(
+                        (string)($item['product_name'] ?? $item['name'] ?? '')
+                    );
+                    $up = OpenItemProduct::sanitizeLinePrice($up);
+                } catch (\InvalidArgumentException $e) {
+                    $conflicts[] = [
+                        'product_id' => $productId,
+                        'code' => (string)($product['code'] ?? ''),
+                        'name' => (string)$product['name'],
+                        'requested' => $quantity,
+                        'available' => 0,
+                        'reason' => 'open_item',
+                        'message' => $e->getMessage(),
+                    ];
+                    continue;
+                }
+            }
+            $catalogPrice = round((float)$product['sale_price'], 2);
             $valid[] = [
                 'product_id' => $productId,
-                'product_name' => (string)$product['name'],
+                'product_name' => $lineName,
                 'quantity' => $quantity,
                 'unit_price' => $up,
-                'unit_cost' => (float)($product['purchase_price'] ?? 0),
+                'catalog_price' => $catalogPrice,
+                'sync_catalog_price' => !$isOpenItem && abs($up - $catalogPrice) >= 0.01,
+                'unit_cost' => $isOpenItem ? 0.0 : (float)($product['purchase_price'] ?? 0),
                 'subtotal' => $up * $quantity,
-                'product_type' => (string)($product['product_type'] ?? 'product'),
+                'product_type' => $isOpenItem ? 'service' : (string)($product['product_type'] ?? 'product'),
+                'stock_oversell_reason' => $oversellReason,
+                'stock_oversell_note' => $oversellNote,
             ];
         }
 
@@ -414,12 +496,79 @@ class OfflineSaleSyncService
         $taxable = max(0, $subtotal - $discount);
         $taxRate = (float)($settings['tax_rate'] ?? 0);
         $tax = round($taxable * ($taxRate / 100), 2);
-        $total = $taxable + $tax;
+        $deliveryFee = max(0, round((float)($payload['delivery_fee'] ?? 0), 2));
+        $deliveryCompanyFee = max(0, round((float)($payload['delivery_company_fee'] ?? 0), 2));
+        $deliveryTotalPosted = max(0, round((float)($payload['delivery_total'] ?? 0), 2));
+        // Solo la parte del cliente entra al total; empresa → gasto Transporte.
+        $deliveryTotal = $deliveryTotalPosted;
+        if ($deliveryTotal <= 0.009 && ($deliveryFee > 0.009 || $deliveryCompanyFee > 0.009)) {
+            $deliveryTotal = round($deliveryFee + $deliveryCompanyFee, 2);
+        }
+        if ($deliveryTotal > 0.009) {
+            if ($deliveryCompanyFee > $deliveryTotal) {
+                $deliveryCompanyFee = $deliveryTotal;
+            }
+            if (abs($deliveryFee - $deliveryTotal) < 0.011 && $deliveryCompanyFee > 0.009) {
+                $deliveryFee = round(max(0, $deliveryTotal - $deliveryCompanyFee), 2);
+            } elseif ($deliveryFee <= 0.009 && $deliveryCompanyFee > 0.009) {
+                $deliveryFee = round(max(0, $deliveryTotal - $deliveryCompanyFee), 2);
+            } elseif ($deliveryFee > $deliveryTotal) {
+                $deliveryFee = $deliveryTotal;
+            }
+            $sumParts = round($deliveryFee + $deliveryCompanyFee, 2);
+            if ($deliveryCompanyFee <= 0.009 && $deliveryFee < $deliveryTotal) {
+                $deliveryCompanyFee = round(max(0, $deliveryTotal - $deliveryFee), 2);
+            } elseif (abs($sumParts - $deliveryTotal) > 0.02 && $deliveryCompanyFee > 0.009) {
+                $deliveryFee = round(max(0, $deliveryTotal - $deliveryCompanyFee), 2);
+            }
+        }
+
+        $creditSurcharge = 0.0;
+        $creditSurchargeRate = 0.0;
+        $threshold = 60;
+        if ($paymentType === 'credit') {
+            $termDays = SalesDocumentService::termDays($paymentTerms);
+            try {
+                $commCfg = (new CommissionService($this->db))->config();
+                $threshold = (int)($commCfg['credit_over_60_days'] ?? 60);
+                $creditSurchargeRate = (float)($commCfg['credit_over_60_rate'] ?? 0);
+                if ($threshold < 1) {
+                    $threshold = 60;
+                }
+                if ($termDays > $threshold && $creditSurchargeRate > 0) {
+                    $creditSurcharge = round($taxable * ($creditSurchargeRate / 100), 2);
+                }
+            } catch (\Throwable $e) {
+            }
+        }
+        $total = $taxable + $tax + $creditSurcharge + $deliveryFee;
 
         $notes = (string)$payload['notes'];
         if ($discountPercent > 0) {
             $discountNote = 'Descuento ' . rtrim(rtrim(number_format($discountPercent, 2, '.', ''), '0'), '.') . '%';
             $notes = $notes !== '' ? ($notes . ' · ' . $discountNote) : $discountNote;
+        }
+        $saleChannel = (string)($payload['sale_channel'] ?? 'retail');
+        if ($saleChannel === 'wholesale') {
+            $notes = $notes !== '' ? ($notes . ' · Venta al por mayor') : 'Venta al por mayor';
+        }
+        if ($creditSurcharge > 0.009) {
+            $sNote = 'Recargo crédito >' . (int)$threshold . 'd '
+                . number_format($creditSurchargeRate, 2, '.', '') . '%: '
+                . number_format($creditSurcharge, 2, '.', '');
+            $notes = $notes !== '' ? ($notes . ' · ' . $sNote) : $sNote;
+        }
+        $deliveryClientShare = $deliveryFee;
+        $deliveryTotalNote = isset($deliveryTotal) && $deliveryTotal > 0.009
+            ? $deliveryTotal
+            : round($deliveryFee + $deliveryCompanyFee, 2);
+        if ($deliveryTotalNote > 0.009) {
+            $deliveryNote = 'Domicilio: ' . number_format($deliveryTotalNote, 2, '.', '');
+            if ($deliveryCompanyFee > 0.009) {
+                $deliveryNote .= ' (cliente ' . number_format($deliveryClientShare, 2, '.', '')
+                    . ' + empresa ' . number_format($deliveryCompanyFee, 2, '.', '') . ')';
+            }
+            $notes = $notes !== '' ? ($notes . ' · ' . $deliveryNote) : $deliveryNote;
         }
         if (!str_contains($notes, 'Offline sync')) {
             $notes = $notes !== '' ? ($notes . ' · Offline sync') : 'Offline sync';
@@ -434,16 +583,41 @@ class OfflineSaleSyncService
             }
         }
 
+        $paidNow = $paymentType === 'credit' ? $initialPayment : $total;
+        $payPlan = SalePaymentSplitter::resolve(
+            $payload['payment_splits'] ?? [],
+            $paymentMethod,
+            $paidNow,
+            $this->db
+        );
+        $paymentMethod = $payPlan['method'];
+        if ($payPlan['label'] !== '' && str_contains($payPlan['label'], 'Mixto')) {
+            $notes = $notes !== '' ? ($notes . ' · ' . $payPlan['label']) : $payPlan['label'];
+        }
+
         $customerId = $payload['customer_id'];
+
+        // DDL fuera de la transacción (MySQL hace COMMIT implícito con CREATE/ALTER).
+        try {
+            new SalesDocumentService($this->db);
+        } catch (\Throwable $e) {
+            // ignore
+        }
+        try {
+            SupplyChainSchema::ensure($this->db);
+            $this->sales->stock()->lots();
+        } catch (\Throwable $e) {
+            // ignore
+        }
 
         $this->db->beginTransaction();
         try {
             $this->query(
                 "INSERT INTO sales
                     (invoice_number, document_type, customer_id, user_id, sale_date, due_date, received_date,
-                     subtotal, tax, discount, total, payment_method, payment_terms, payment_status, notes,
+                     subtotal, tax, discount, delivery_fee, delivery_company_fee, total, payment_method, payment_terms, payment_status, notes,
                      client_sale_uuid, status)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     $invoiceNumber,
                     $documentType,
@@ -455,6 +629,8 @@ class OfflineSaleSyncService
                     $subtotal,
                     $tax,
                     $discount,
+                    $deliveryFee,
+                    $deliveryCompanyFee,
                     $total,
                     $paymentMethod,
                     $paymentTerms,
@@ -467,42 +643,86 @@ class OfflineSaleSyncService
             $saleId = (int)$this->db->lastInsertId();
 
             foreach ($validItems as $vi) {
-                $this->query(
-                    "INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    [$saleId, $vi['product_id'], $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['unit_cost'] ?? 0, $vi['subtotal']]
-                );
+                try {
+                    $this->query(
+                        "INSERT INTO sale_items
+                            (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal,
+                             stock_oversell_reason, stock_oversell_note)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            $saleId,
+                            $vi['product_id'],
+                            $vi['product_name'],
+                            $vi['quantity'],
+                            $vi['unit_price'],
+                            $vi['unit_cost'] ?? 0,
+                            $vi['subtotal'],
+                            !empty($vi['stock_oversell_reason']) ? $vi['stock_oversell_reason'] : null,
+                            !empty($vi['stock_oversell_note']) ? $vi['stock_oversell_note'] : null,
+                        ]
+                    );
+                } catch (\Throwable $e) {
+                    $this->query(
+                        "INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        [$saleId, $vi['product_id'], $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['unit_cost'] ?? 0, $vi['subtotal']]
+                    );
+                }
+                $saleItemId = (int)$this->db->lastInsertId();
+                if (!empty($vi['sync_catalog_price'])) {
+                    $this->sales->stock()->recordSalePriceChange(
+                        (int)$vi['product_id'],
+                        (float)$vi['catalog_price'],
+                        (float)$vi['unit_price'],
+                        $saleId,
+                        $invoiceNumber
+                    );
+                }
+                $oversell = null;
+                if (!empty($vi['stock_oversell_reason'])) {
+                    $oversell = [
+                        'reason' => (string)$vi['stock_oversell_reason'],
+                        'note' => (string)($vi['stock_oversell_note'] ?? ''),
+                        'sale_item_id' => $saleItemId,
+                    ];
+                }
                 $this->sales->stock()->decrease(
                     $vi['product_id'],
                     $vi['quantity'],
                     'sale',
                     $saleId,
                     'Venta: ' . $invoiceNumber,
-                    (float)($vi['unit_cost'] ?? 0)
+                    (float)($vi['unit_cost'] ?? 0),
+                    $oversell
                 );
             }
 
             $cashAmount = 0.0;
-            $paidNow = $paymentType === 'credit' ? $initialPayment : $total;
-            if ($paidNow > 0) {
-                $this->query(
-                    "INSERT INTO sale_payments (sale_id, amount, payment_method, notes, user_id)
-                     VALUES (?, ?, ?, ?, ?)",
-                    [
-                        $saleId,
-                        $paidNow,
-                        $paymentMethod,
-                        $paymentType === 'credit' ? 'Pago inicial - credito' : 'Pago completo',
-                        $userId,
-                    ]
-                );
-                $cashAmount = $paidNow;
+            if ($paidNow > 0.009 && !empty($payPlan['splits'])) {
+                foreach ($payPlan['splits'] as $split) {
+                    $this->query(
+                        "INSERT INTO sale_payments (sale_id, amount, payment_method, notes, user_id)
+                         VALUES (?, ?, ?, ?, ?)",
+                        [
+                            $saleId,
+                            $split['amount'],
+                            $split['method'],
+                            $paymentType === 'credit'
+                                ? ('Pago inicial - credito · ' . PaymentMethodCatalog::label($split['method'], $this->db))
+                                : ('Pago · ' . PaymentMethodCatalog::label($split['method'], $this->db)),
+                            $userId,
+                        ]
+                    );
+                }
+                $cashAmount = (float)$payPlan['cash_total'];
                 if ($paymentType === 'credit' && $paidNow < $total) {
                     $this->query("UPDATE sales SET payment_status = 'partial' WHERE id = ?", [$saleId]);
                 }
             }
 
-            $this->db->commit();
+            if ($this->db->inTransaction()) {
+                $this->db->commit();
+            }
         } catch (\Throwable $e) {
             if ($this->db->inTransaction()) {
                 $this->db->rollBack();
@@ -525,14 +745,31 @@ class OfflineSaleSyncService
             error_log('Comisiones venta offline ' . $saleId . ': ' . $e->getMessage());
         }
 
-        if ($cashAmount > 0 && PaymentMethodCatalog::affectsCash($paymentMethod)) {
+        if ($cashAmount > 0.009) {
             try {
                 $label = ($paymentType === 'credit' && $paymentStatus !== 'paid')
                     ? 'Abono inicial: ' . $invoiceNumber
                     : 'Venta: ' . $invoiceNumber;
+                if ($paymentMethod === 'mixed') {
+                    $label .= ' (efectivo mixto)';
+                }
                 $this->cash->registerIncome($cashAmount, $label, 'sale', $saleId);
             } catch (\Throwable $e) {
                 error_log('Caja venta offline ' . $saleId . ': ' . $e->getMessage());
+            }
+        }
+
+        if ($deliveryCompanyFee > 0.009) {
+            try {
+                (new DeliveryCompanyExpenseService($this->db))->postForSale(
+                    $saleId,
+                    $invoiceNumber,
+                    $deliveryCompanyFee,
+                    $userId,
+                    true
+                );
+            } catch (\Throwable $e) {
+                error_log('Gasto transporte domicilio offline ' . $saleId . ': ' . $e->getMessage());
             }
         }
 

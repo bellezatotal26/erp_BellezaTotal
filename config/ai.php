@@ -12,8 +12,11 @@ return [
         'base_url' => 'https://openrouter.ai/api/v1',
         // NVIDIA Nemotron 3 Ultra (free) via OpenRouter
         'model' => 'nvidia/nemotron-3-ultra-550b-a55b:free',
+        // Modelo con visión para facturas escaneadas / PDF solo imagen
+        'vision_model' => getenv('OPENROUTER_VISION_MODEL') ?: 'google/gemini-2.0-flash-exp:free',
         'api_key' => getenv('OPENROUTER_API_KEY') ?: '',
         'timeout' => 60,
+        'vision_timeout' => 90,
         'max_tokens' => 1200,
         'temperature' => 0.4,
         'site_url' => 'http://localhost/SoftNova/public',

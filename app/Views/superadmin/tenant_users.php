@@ -6,12 +6,13 @@ $userName = $_SESSION['super_admin_name'] ?? 'Super Admin';
 $tenant = $tenant ?? [];
 $users = $users ?? [];
 
-$availableModules = ['dashboard', 'caja', 'ventas', 'inventario', 'clientes', 'proveedores', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes'];
+$availableModules = ['dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'clientes', 'proveedores', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes'];
 $moduleNames = [
     'dashboard' => 'Dashboard',
     'caja' => 'Caja',
     'ventas' => 'Ventas',
     'inventario' => 'Inventario',
+    'prestamos' => 'Préstamos',
     'clientes' => 'Clientes',
     'proveedores' => 'Proveedores',
     'cotizaciones' => 'Cotizaciones',

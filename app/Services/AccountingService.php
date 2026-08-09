@@ -163,11 +163,22 @@ class AccountingService
             ['421040', 'Descuentos en compras', 'revenue', 'credit', 1],
             ['429595', 'Otros ingresos no operacionales', 'revenue', 'credit', 1],
             ['510505', 'Gastos generales', 'expense', 'debit', 1],
+            ['511570', 'Impuestos, gravámenes y tasas', 'expense', 'debit', 1],
+            ['512010', 'Arrendamientos', 'expense', 'debit', 1],
+            ['513095', 'Honorarios / asesoría', 'expense', 'debit', 1],
             ['513505', 'Servicios', 'expense', 'debit', 1],
+            ['514505', 'Mantenimiento y reparaciones', 'expense', 'debit', 1],
+            ['515010', 'Combustibles y lubricantes', 'expense', 'debit', 1],
+            ['515505', 'Transporte', 'expense', 'debit', 1],
+            ['516005', 'Publicidad y propaganda', 'expense', 'debit', 1],
             ['519595', 'Otros gastos operacionales', 'expense', 'debit', 1],
             ['530505', 'Gastos financieros y comisiones', 'expense', 'debit', 1],
+            ['530510', 'Comisiones datáfono', 'expense', 'debit', 1],
+            ['530515', 'Comisiones de ventas', 'expense', 'debit', 1],
+            ['530525', 'Gravamen a los movimientos financieros', 'expense', 'debit', 1],
             ['539595', 'Otros gastos no operacionales', 'expense', 'debit', 1],
             ['613501', 'Costo de ventas', 'expense', 'debit', 1],
+            ['135515', 'Retención en la fuente', 'asset', 'debit', 1],
         ];
 
         $stmt = $this->db->prepare(
@@ -541,7 +552,9 @@ class AccountingService
         if ($sourceType !== null && $sourceId !== null && $sourceEvent !== null) {
             $existing = $this->query(
                 "SELECT id FROM accounting_entries
-                 WHERE source_type = ? AND source_id = ? AND source_event = ? LIMIT 1",
+                 WHERE source_type = ? AND source_id = ? AND source_event = ?
+                   AND status = 'posted'
+                 LIMIT 1",
                 [$sourceType, $sourceId, $sourceEvent]
             )->fetchColumn();
             if ($existing) {
@@ -601,6 +614,7 @@ class AccountingService
         $total = round((float)$sale['total'], 2);
         $subtotal = round((float)$sale['subtotal'], 2);
         $tax = round((float)$sale['tax'], 2);
+        $deliveryFee = round((float)($sale['delivery_fee'] ?? 0), 2);
         if ($total <= 0) {
             throw new \RuntimeException('La venta no tiene total contable');
         }
@@ -633,7 +647,15 @@ class AccountingService
                 'IVA generado'
             );
         }
-        $credited = round($subtotal + $tax, 2);
+        if ($deliveryFee > 0) {
+            $lines[] = $this->line(
+                $this->setting('sales_account', '413501'),
+                0,
+                $deliveryFee,
+                'Domicilio / envío'
+            );
+        }
+        $credited = round($subtotal + $tax + $deliveryFee, 2);
         if ($credited <= 0) {
             $lines[] = $this->line(
                 $this->setting('sales_account', '413501'),
@@ -783,28 +805,57 @@ class AccountingService
         }
 
         $category = (string)($expense['category'] ?? 'general');
-        $group = function_exists('\\SoftNova\\Core\\expense_category_group')
-            ? \SoftNova\Core\expense_category_group($category)
-            : 'operating';
+        $categoryId = (int)($expense['category_id'] ?? 0);
+        $categoryLabel = $category;
+        $group = 'operating';
+        $expenseAccount = null;
 
-        $expenseAccount = match ($group) {
-            'financial' => $this->setting('financial_expense_account', '530505'),
-            'fixed' => $category === 'payroll'
-                ? $this->setting('payroll_expense_account', $this->setting('fixed_expense_account', '510505'))
-                : $this->setting('fixed_expense_account', '510505'),
-            default => $this->setting('general_expense_account', '510505'),
-        };
+        // Preferir catálogo tipado (expense_categories) sobre códigos legados del config.
+        if ($categoryId > 0) {
+            try {
+                $catSvc = new ExpenseCategoryService($this->db);
+                $cat = $catSvc->find($categoryId);
+                if ($cat) {
+                    $categoryLabel = (string)($cat['name'] ?? $category);
+                    $kind = (string)($cat['kind'] ?? 'operational');
+                    $group = $kind === 'financial' ? 'financial' : 'operating';
+                    $code = trim((string)($cat['account_code'] ?? ''));
+                    if ($code !== '') {
+                        $expenseAccount = $code;
+                    }
+                }
+            } catch (\Throwable $e) {
+                // fallback legado abajo
+            }
+        }
+
+        if ($expenseAccount === null) {
+            $group = function_exists('\\SoftNova\\Core\\expense_category_group')
+                ? \SoftNova\Core\expense_category_group($category)
+                : $group;
+            $expenseAccount = match ($group) {
+                'financial' => $this->setting('financial_expense_account', '530505'),
+                'fixed' => $category === 'payroll'
+                    ? $this->setting('payroll_expense_account', $this->setting('fixed_expense_account', '510505'))
+                    : $this->setting('fixed_expense_account', '510505'),
+                default => $this->setting('general_expense_account', '510505'),
+            };
+            if (function_exists('\\SoftNova\\Core\\expense_category_label')) {
+                $categoryLabel = \SoftNova\Core\expense_category_label($category);
+            }
+        }
 
         $creditCode = $affectCash
             ? $this->paymentAccount((string)$expense['payment_method'])
             : $this->setting('expense_payable_account', '233595');
 
-        $categoryLabel = function_exists('\\SoftNova\\Core\\expense_category_label')
-            ? \SoftNova\Core\expense_category_label($category)
-            : $category;
-        $groupLabel = function_exists('\\SoftNova\\Core\\expense_group_label')
-            ? \SoftNova\Core\expense_group_label($group)
-            : $group;
+        $groupLabel = match ($group) {
+            'financial' => 'Gastos financieros',
+            'fixed' => 'Gastos fijos',
+            default => (function_exists('\\SoftNova\\Core\\expense_group_label')
+                ? \SoftNova\Core\expense_group_label($group)
+                : 'Gastos operativos'),
+        };
 
         return $this->postEntry(
             $expense['expense_date'],
@@ -1183,6 +1234,8 @@ class AccountingService
                  LEFT JOIN accounting_entries e
                    ON e.source_type = 'expense' AND e.source_id = x.id AND e.source_event = 'created'
                  WHERE e.id IS NULL
+                   AND COALESCE(x.payment_method, '') <> 'inventory_loss'
+                   AND COALESCE(x.notes, '') NOT LIKE '%[salida_inventario:%'
                  ORDER BY x.id" . $expenseLimitSql
             )->fetchAll();
             foreach ($expenses as $expense) {
@@ -1862,8 +1915,9 @@ class AccountingService
         }
 
         $referenceType = (string)($movement['reference_type'] ?? '');
-        if (in_array($referenceType, ['sale', 'return', 'purchase_order', 'purchase_credit_note'], true)) {
-            // sale/return: asiento de venta. purchase_order / NCC: asiento propio con IVA.
+        if (in_array($referenceType, ['sale', 'return', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return'], true)) {
+            // sale/return: asiento de venta. purchase_order / NCC: asiento propio.
+            // loan / loan_return: no son pérdida (se espera devolución).
             return null;
         }
 
@@ -1884,17 +1938,23 @@ class AccountingService
         $paymentMode = (string)($movement['payment_mode'] ?? '');
         $type = (string)$movement['type'];
 
-        // Ajuste negativo o salida no-venta: merma / pérdida
+        // Ajuste negativo o salida no-venta: merma / pérdida operativa
         $isOutbound = $type === 'out'
+            || $referenceType === 'inventory_exit'
             || ($type === 'adjustment' && ($paymentMode === 'loss' || str_contains((string)($movement['notes'] ?? ''), 'Ajuste (−)')));
 
         if ($isOutbound) {
+            $lossAccount = $this->setting(
+                'inventory_loss_account',
+                $this->setting('inventory_adjustment_account', '519595')
+            );
+            $exitNote = trim((string)($movement['notes'] ?? ''));
             $lines = [
                 $this->line(
-                    $this->setting('inventory_adjustment_account', '519595'),
+                    $lossAccount,
                     $amount,
                     0,
-                    'Ajuste/merma inventario: ' . $label
+                    ($exitNote !== '' ? $exitNote : ('Pérdida / salida inventario: ' . $label))
                 ),
                 $this->line(
                     $inventory,
@@ -1903,7 +1963,9 @@ class AccountingService
                     'Salida de inventario: ' . $label
                 ),
             ];
-            $description = 'Ajuste inventario (−) ' . $label;
+            $description = $referenceType === 'inventory_exit'
+                ? ('Salida inventario (pérdida): ' . $label)
+                : ('Ajuste inventario (−) ' . $label);
         } else {
             // Entrada / apertura / ajuste positivo
             $creditCode = match ($paymentMode) {

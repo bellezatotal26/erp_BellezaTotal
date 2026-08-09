@@ -13,6 +13,10 @@
     <?php
     $publicPrefix = \SoftNova\Core\public_web_prefix();
     $swUrl = \SoftNova\Core\base_url(ltrim($publicPrefix . '/sw.php', '/'));
+    $swFile = defined('PUBLIC_PATH') ? (PUBLIC_PATH . '/sw.js') : '';
+    if ($swFile !== '' && is_file($swFile)) {
+        $swUrl .= (str_contains($swUrl, '?') ? '&' : '?') . 'v=' . filemtime($swFile);
+    }
     $manifestUrl = \SoftNova\Core\base_url(ltrim($publicPrefix . '/manifest.php', '/'));
     $appBase = rtrim(parse_url(\SoftNova\Core\config('app.url', ''), PHP_URL_PATH) ?: '', '/');
     $swScope = ($appBase === '' ? '/' : $appBase . '/');

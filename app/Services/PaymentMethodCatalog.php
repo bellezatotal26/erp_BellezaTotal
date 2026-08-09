@@ -62,6 +62,12 @@ class PaymentMethodCatalog
                 'affects_cash' => false,
                 'group' => 'bank',
             ],
+            'mixed' => [
+                'label' => 'Pago mixto',
+                'account' => 'cash',
+                'affects_cash' => false,
+                'group' => 'mixed',
+            ],
         ];
     }
 
@@ -93,6 +99,9 @@ class PaymentMethodCatalog
         $all = self::all();
         if (isset($all[$method])) {
             return $all[$method]['label'];
+        }
+        if ($method === 'inventory_loss') {
+            return 'Pérdida inventario';
         }
         if ($method === 'other' || $method === '__other__') {
             return 'Otro';
@@ -138,6 +147,10 @@ class PaymentMethodCatalog
         $html = '';
         $seen = [];
         foreach (self::all() as $code => $meta) {
+            if ($code === 'mixed') {
+                // "Pago mixto" no se elige como medio unitario en el select.
+                continue;
+            }
             $seen[$code] = true;
             $sel = $code === $selected ? ' selected' : '';
             $html .= '<option value="' . htmlspecialchars($code) . '"' . $sel . '>'

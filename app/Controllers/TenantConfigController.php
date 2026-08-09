@@ -43,6 +43,12 @@ class TenantConfigController extends Controller
             $this->saveSettings();
             return;
         }
+
+        if ($action === 'saveDocuments' && $this->request->method() === 'POST') {
+            \SoftNova\Core\TenantMiddleware::authorize('configuracion', 'edit');
+            $this->saveDocuments();
+            return;
+        }
         
         if ($action === 'changePassword' && $this->request->method() === 'POST') {
             $this->changePassword();
@@ -51,6 +57,18 @@ class TenantConfigController extends Controller
         
         if ($action === 'uploadAvatar' && $this->request->method() === 'POST') {
             $this->uploadAvatar();
+            return;
+        }
+
+        if ($action === 'uploadLogo' && $this->request->method() === 'POST') {
+            \SoftNova\Core\TenantMiddleware::authorize('configuracion', 'edit');
+            $this->uploadLogo();
+            return;
+        }
+
+        if ($action === 'removeLogo' && $this->request->method() === 'POST') {
+            \SoftNova\Core\TenantMiddleware::authorize('configuracion', 'edit');
+            $this->removeLogo();
             return;
         }
         
@@ -222,18 +240,35 @@ class TenantConfigController extends Controller
 
     private function ensureUsersSchema(): void
     {
-        try {
-            $this->db->exec(
-                "ALTER TABLE users
-                 MODIFY COLUMN role ENUM('admin','manager','cashier','viewer','auxiliar','user','pos','mesero') DEFAULT 'admin'"
-            );
-        } catch (\Throwable $e) { /* ignore */ }
+        static $done = false;
+        if ($done) {
+            return;
+        }
+        $done = true;
+
         try {
             $col = $this->db->query("SHOW COLUMNS FROM users LIKE 'permissions'")->fetch();
             if (!$col) {
                 $this->db->exec("ALTER TABLE users ADD COLUMN permissions LONGTEXT NULL AFTER role");
             }
-        } catch (\Throwable $e) { /* ignore */ }
+        } catch (\Throwable $e) {
+            error_log('ensureUsersSchema permissions: ' . $e->getMessage());
+        }
+
+        // Solo ALTER role si faltan valores (evitar MODIFY en cada guardado: puede bloquear MySQL).
+        try {
+            $roleCol = $this->db->query("SHOW COLUMNS FROM users LIKE 'role'")->fetch();
+            $type = strtolower((string)($roleCol['Type'] ?? ''));
+            $needs = !str_contains($type, "'user'") || !str_contains($type, "'pos'");
+            if ($needs) {
+                $this->db->exec(
+                    "ALTER TABLE users
+                     MODIFY COLUMN role ENUM('admin','manager','cashier','viewer','auxiliar','user','pos','mesero') DEFAULT 'admin'"
+                );
+            }
+        } catch (\Throwable $e) {
+            error_log('ensureUsersSchema role: ' . $e->getMessage());
+        }
     }
 
     private function assertLocalAdmin(): bool
@@ -260,53 +295,59 @@ class TenantConfigController extends Controller
         if (!$this->assertLocalAdmin() || !$this->validateCsrfOrFail('/app/configuracion')) {
             return;
         }
-        $this->ensureUsersSchema();
 
-        $name = trim((string)$this->request->post('name', ''));
-        $email = trim((string)$this->request->post('email', ''));
-        $password = (string)$this->request->post('password', '');
-        $role = \SoftNova\Core\TenantMiddleware::normalizeRole((string)$this->request->post('role', 'user'));
+        try {
+            $this->ensureUsersSchema();
 
-        if (!isset(\SoftNova\Core\TenantMiddleware::teamRoleLabels()[$role])) {
-            $this->respond(false, 'Rol no permitido. Solo User o User POS.', '/app/configuracion');
-            return;
+            $name = trim((string)$this->request->post('name', ''));
+            $email = trim((string)$this->request->post('email', ''));
+            $password = (string)$this->request->post('password', '');
+            $role = \SoftNova\Core\TenantMiddleware::normalizeRole((string)$this->request->post('role', 'user'));
+
+            if (!isset(\SoftNova\Core\TenantMiddleware::teamRoleLabels()[$role])) {
+                $this->respond(false, 'Rol no permitido. Solo User o User POS.', '/app/configuracion#usuarios');
+                return;
+            }
+            if ($name === '' || $email === '' || $password === '') {
+                $this->respond(false, 'Nombre, email y contraseña son obligatorios', '/app/configuracion#usuarios');
+                return;
+            }
+            if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $this->respond(false, 'Email inválido', '/app/configuracion#usuarios');
+                return;
+            }
+            if (strlen($password) < 6) {
+                $this->respond(false, 'La contraseña debe tener al menos 6 caracteres', '/app/configuracion#usuarios');
+                return;
+            }
+
+            $exists = $this->query("SELECT id FROM users WHERE email = ? LIMIT 1", [$email])->fetch();
+            if ($exists) {
+                $this->respond(false, 'Ya existe un usuario con ese email', '/app/configuracion#usuarios');
+                return;
+            }
+
+            $hash = Security::hashPassword($password);
+            $perms = $this->buildPermissionsFromPost($role);
+
+            $this->query(
+                "INSERT INTO users (name, email, password, role, permissions, status) VALUES (?, ?, ?, ?, ?, 'active')",
+                [$name, $email, $hash, $role, $perms]
+            );
+            $newId = (int)$this->db->lastInsertId();
+            (new \SoftNova\Services\TenantAuditService($this->db))->log(
+                'create',
+                'usuarios',
+                "Usuario creado: {$name} ({$email}) rol={$role}",
+                'user',
+                $newId
+            );
+
+            $this->respond(true, 'Usuario creado: ' . $name, '/app/configuracion#usuarios');
+        } catch (\Throwable $e) {
+            error_log('createTeamUser: ' . $e->getMessage());
+            $this->respond(false, 'No se pudo crear el usuario: ' . $e->getMessage(), '/app/configuracion#usuarios');
         }
-        if ($name === '' || $email === '' || $password === '') {
-            $this->respond(false, 'Nombre, email y contraseña son obligatorios', '/app/configuracion');
-            return;
-        }
-        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-            $this->respond(false, 'Email inválido', '/app/configuracion');
-            return;
-        }
-        if (strlen($password) < 6) {
-            $this->respond(false, 'La contraseña debe tener al menos 6 caracteres', '/app/configuracion');
-            return;
-        }
-
-        $exists = $this->query("SELECT id FROM users WHERE email = ? LIMIT 1", [$email])->fetch();
-        if ($exists) {
-            $this->respond(false, 'Ya existe un usuario con ese email', '/app/configuracion');
-            return;
-        }
-
-        $hash = Security::hashPassword($password);
-        $perms = $this->buildPermissionsFromPost($role);
-
-        $this->query(
-            "INSERT INTO users (name, email, password, role, permissions, status) VALUES (?, ?, ?, ?, ?, 'active')",
-            [$name, $email, $hash, $role, $perms]
-        );
-        $newId = (int)$this->db->lastInsertId();
-        (new \SoftNova\Services\TenantAuditService($this->db))->log(
-            'create',
-            'usuarios',
-            "Usuario creado: {$name} ({$email}) rol={$role}",
-            'user',
-            $newId
-        );
-
-        $this->respond(true, 'Usuario creado: ' . $name, '/app/configuracion#usuarios');
     }
 
     private function processJobs(): void
@@ -330,66 +371,72 @@ class TenantConfigController extends Controller
         if (!$this->assertLocalAdmin() || !$this->validateCsrfOrFail('/app/configuracion')) {
             return;
         }
-        $this->ensureUsersSchema();
 
-        $id = (int)$this->request->post('id', 0);
-        $name = trim((string)$this->request->post('name', ''));
-        $email = trim((string)$this->request->post('email', ''));
-        $password = (string)$this->request->post('password', '');
-        $role = \SoftNova\Core\TenantMiddleware::normalizeRole((string)$this->request->post('role', 'user'));
+        try {
+            $this->ensureUsersSchema();
 
-        $user = $this->query("SELECT * FROM users WHERE id = ? LIMIT 1", [$id])->fetch();
-        if (!$user || !in_array($user['role'], ['user', 'pos'], true)) {
-            $this->respond(false, 'Usuario no encontrado o no editable', '/app/configuracion');
-            return;
-        }
-        if (!isset(\SoftNova\Core\TenantMiddleware::teamRoleLabels()[$role])) {
-            $this->respond(false, 'Rol no permitido', '/app/configuracion');
-            return;
-        }
-        if ($name === '' || $email === '') {
-            $this->respond(false, 'Nombre y email son obligatorios', '/app/configuracion');
-            return;
-        }
+            $id = (int)$this->request->post('id', 0);
+            $name = trim((string)$this->request->post('name', ''));
+            $email = trim((string)$this->request->post('email', ''));
+            $password = (string)$this->request->post('password', '');
+            $role = \SoftNova\Core\TenantMiddleware::normalizeRole((string)$this->request->post('role', 'user'));
 
-        $dup = $this->query("SELECT id FROM users WHERE email = ? AND id != ? LIMIT 1", [$email, $id])->fetch();
-        if ($dup) {
-            $this->respond(false, 'Email ya usado por otro usuario', '/app/configuracion');
-            return;
-        }
-
-        $perms = $this->buildPermissionsFromPost($role);
-        if ($password !== '') {
-            if (strlen($password) < 6) {
-                $this->respond(false, 'La contraseña debe tener al menos 6 caracteres', '/app/configuracion');
+            $user = $this->query("SELECT * FROM users WHERE id = ? LIMIT 1", [$id])->fetch();
+            if (!$user || !in_array($user['role'], ['user', 'pos'], true)) {
+                $this->respond(false, 'Usuario no encontrado o no editable', '/app/configuracion#usuarios');
                 return;
             }
-            $hash = Security::hashPassword($password);
-            $this->query(
-                "UPDATE users SET name = ?, email = ?, role = ?, permissions = ?, password = ? WHERE id = ?",
-                [$name, $email, $role, $perms, $hash, $id]
+            if (!isset(\SoftNova\Core\TenantMiddleware::teamRoleLabels()[$role])) {
+                $this->respond(false, 'Rol no permitido', '/app/configuracion#usuarios');
+                return;
+            }
+            if ($name === '' || $email === '') {
+                $this->respond(false, 'Nombre y email son obligatorios', '/app/configuracion#usuarios');
+                return;
+            }
+
+            $dup = $this->query("SELECT id FROM users WHERE email = ? AND id != ? LIMIT 1", [$email, $id])->fetch();
+            if ($dup) {
+                $this->respond(false, 'Email ya usado por otro usuario', '/app/configuracion#usuarios');
+                return;
+            }
+
+            $perms = $this->buildPermissionsFromPost($role);
+            if ($password !== '') {
+                if (strlen($password) < 6) {
+                    $this->respond(false, 'La contraseña debe tener al menos 6 caracteres', '/app/configuracion#usuarios');
+                    return;
+                }
+                $hash = Security::hashPassword($password);
+                $this->query(
+                    "UPDATE users SET name = ?, email = ?, role = ?, permissions = ?, password = ? WHERE id = ?",
+                    [$name, $email, $role, $perms, $hash, $id]
+                );
+            } else {
+                $this->query(
+                    "UPDATE users SET name = ?, email = ?, role = ?, permissions = ? WHERE id = ?",
+                    [$name, $email, $role, $perms, $id]
+                );
+            }
+
+            // Si se edita el usuario logueado (raro), rehidratar
+            if ((int)($_SESSION['tenant_user_id'] ?? 0) === $id) {
+                \SoftNova\Core\TenantMiddleware::hydrateSessionPermissions($role, $perms);
+            }
+
+            (new \SoftNova\Services\TenantAuditService($this->db))->log(
+                'update',
+                'usuarios',
+                "Usuario editado: {$name} ({$email}) rol={$role}",
+                'user',
+                $id
             );
-        } else {
-            $this->query(
-                "UPDATE users SET name = ?, email = ?, role = ?, permissions = ? WHERE id = ?",
-                [$name, $email, $role, $perms, $id]
-            );
+
+            $this->respond(true, 'Usuario actualizado', '/app/configuracion#usuarios');
+        } catch (\Throwable $e) {
+            error_log('editTeamUser: ' . $e->getMessage());
+            $this->respond(false, 'No se pudo guardar el usuario: ' . $e->getMessage(), '/app/configuracion#usuarios');
         }
-
-        // Si se edita el usuario logueado (raro), rehidratar
-        if ((int)($_SESSION['tenant_user_id'] ?? 0) === $id) {
-            \SoftNova\Core\TenantMiddleware::hydrateSessionPermissions($role, $perms);
-        }
-
-        (new \SoftNova\Services\TenantAuditService($this->db))->log(
-            'update',
-            'usuarios',
-            "Usuario editado: {$name} ({$email}) rol={$role}",
-            'user',
-            $id
-        );
-
-        $this->respond(true, 'Usuario actualizado', '/app/configuracion#usuarios');
     }
 
     private function toggleTeamUser(): void
@@ -428,7 +475,11 @@ class TenantConfigController extends Controller
             return;
         }
         
-        $fields = ['currency', 'company_name', 'tax_name', 'tax_rate', 'invoice_prefix', 'low_stock_alert', 'language', 'webhook_sale_url'];
+        $fields = [
+            'currency', 'company_name', 'tax_name', 'tax_rate', 'invoice_prefix',
+            'low_stock_alert', 'language', 'webhook_sale_url',
+            'company_nit', 'company_address', 'company_phone', 'company_email',
+        ];
         
         foreach ($fields as $field) {
             $value = $this->request->post($field);
@@ -437,6 +488,13 @@ class TenantConfigController extends Controller
                     $value = trim((string)$value);
                     if ($value !== '' && !filter_var($value, FILTER_VALIDATE_URL)) {
                         $this->respond(false, 'URL de webhook inválida', '/app/configuracion');
+                        return;
+                    }
+                }
+                if ($field === 'company_email') {
+                    $value = trim((string)$value);
+                    if ($value !== '' && !filter_var($value, FILTER_VALIDATE_EMAIL)) {
+                        $this->respond(false, 'Correo de empresa inválido', '/app/configuracion#documentos');
                         return;
                     }
                 }
@@ -455,6 +513,38 @@ class TenantConfigController extends Controller
         \SoftNova\Services\SettingsCache::invalidate();
         
         $this->respond(true, 'Configuración guardada exitosamente', '/app/configuracion');
+    }
+
+    /** Guarda datos de contacto + layout de ticket 58mm / PDF carta. */
+    private function saveDocuments(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/configuracion')) {
+            return;
+        }
+
+        $contactFields = ['company_nit', 'company_address', 'company_phone', 'company_email'];
+        foreach ($contactFields as $field) {
+            $value = $this->request->post($field);
+            if ($value === null) {
+                continue;
+            }
+            $value = trim((string)$value);
+            if ($field === 'company_email' && $value !== '' && !filter_var($value, FILTER_VALIDATE_EMAIL)) {
+                $this->respond(false, 'Correo de empresa inválido', '/app/configuracion#documentos');
+                return;
+            }
+            $this->upsertSetting($field, $value);
+        }
+
+        $posted = $_POST;
+        $config = \SoftNova\Services\SalesDocumentConfig::fromRequest($posted);
+        $this->upsertSetting(
+            \SoftNova\Services\SalesDocumentConfig::SETTING_KEY,
+            (string)json_encode($config, JSON_UNESCAPED_UNICODE)
+        );
+
+        \SoftNova\Services\SettingsCache::invalidate();
+        $this->respond(true, 'Documentos de venta actualizados', '/app/configuracion#documentos');
     }
     
     private function upsertSetting(string $key, string $value): void
@@ -838,5 +928,161 @@ class TenantConfigController extends Controller
         $this->upsertSetting('user_avatar', $avatarUrl);
         
         $this->respond(true, 'Imagen de perfil actualizada');
+    }
+
+    private function uploadLogo(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/configuracion#documentos')) {
+            return;
+        }
+        if (!isset($_FILES['logo'])) {
+            $this->respond(false, 'No se recibió el archivo. Seleccione una imagen y pulse Subir logo.', '/app/configuracion#documentos');
+            return;
+        }
+
+        $file = $_FILES['logo'];
+        $err = (int)($file['error'] ?? UPLOAD_ERR_NO_FILE);
+        if ($err !== UPLOAD_ERR_OK) {
+            $messages = [
+                UPLOAD_ERR_INI_SIZE => 'El archivo supera el límite del servidor (upload_max_filesize)',
+                UPLOAD_ERR_FORM_SIZE => 'El archivo supera el límite del formulario',
+                UPLOAD_ERR_PARTIAL => 'La subida se interrumpió; intente de nuevo',
+                UPLOAD_ERR_NO_FILE => 'No se seleccionó ningún archivo',
+                UPLOAD_ERR_NO_TMP_DIR => 'Falta carpeta temporal en el servidor',
+                UPLOAD_ERR_CANT_WRITE => 'El servidor no pudo escribir el archivo temporal',
+                UPLOAD_ERR_EXTENSION => 'Una extensión de PHP bloqueó la subida',
+            ];
+            $this->respond(
+                false,
+                $messages[$err] ?? ('Error al subir el logo (código ' . $err . ')'),
+                '/app/configuracion#documentos'
+            );
+            return;
+        }
+
+        $allowedMimes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+        if (($file['size'] ?? 0) > 2 * 1024 * 1024) {
+            $this->respond(false, 'El logo no debe superar 2MB', '/app/configuracion#documentos');
+            return;
+        }
+
+        $tmp = (string)($file['tmp_name'] ?? '');
+        if ($tmp === '' || !is_uploaded_file($tmp)) {
+            $this->respond(false, 'Archivo temporal inválido', '/app/configuracion#documentos');
+            return;
+        }
+
+        $realMime = '';
+        if (class_exists(\finfo::class)) {
+            try {
+                $finfo = new \finfo(FILEINFO_MIME_TYPE);
+                $realMime = (string)($finfo->file($tmp) ?: '');
+            } catch (\Throwable $e) {
+                $realMime = '';
+            }
+        }
+        if ($realMime === '' && function_exists('mime_content_type')) {
+            $realMime = (string)(@mime_content_type($tmp) ?: '');
+        }
+        if ($realMime === '' || !in_array($realMime, $allowedMimes, true)) {
+            // Respaldo por extensión si el hosting no reporta MIME
+            $extGuess = strtolower((string)pathinfo((string)($file['name'] ?? ''), PATHINFO_EXTENSION));
+            $extToMime = [
+                'jpg' => 'image/jpeg',
+                'jpeg' => 'image/jpeg',
+                'png' => 'image/png',
+                'gif' => 'image/gif',
+                'webp' => 'image/webp',
+            ];
+            if (isset($extToMime[$extGuess]) && @getimagesize($tmp) !== false) {
+                $realMime = $extToMime[$extGuess];
+            }
+        }
+        if (!in_array($realMime, $allowedMimes, true)) {
+            $this->respond(false, 'Formato no permitido. Use JPG, PNG, GIF o WebP', '/app/configuracion#documentos');
+            return;
+        }
+
+        $mimeToExt = [
+            'image/jpeg' => 'jpg',
+            'image/png' => 'png',
+            'image/gif' => 'gif',
+            'image/webp' => 'webp',
+        ];
+        $ext = $mimeToExt[$realMime] ?? 'png';
+        $uploadDir = (defined('PUBLIC_PATH') ? PUBLIC_PATH : (ROOT_PATH . '/public')) . '/uploads/branding/';
+        if (!is_dir($uploadDir) && !mkdir($uploadDir, 0755, true) && !is_dir($uploadDir)) {
+            $this->respond(false, 'No se pudo crear la carpeta de branding', '/app/configuracion#documentos');
+            return;
+        }
+        if (!is_writable($uploadDir)) {
+            $this->respond(false, 'La carpeta de branding no tiene permisos de escritura', '/app/configuracion#documentos');
+            return;
+        }
+
+        // Garantizar acceso público a branding (Apache) si falta el .htaccess
+        $brandingHtaccess = $uploadDir . '.htaccess';
+        if (!is_file($brandingHtaccess)) {
+            @file_put_contents(
+                $brandingHtaccess,
+                "# Branding público\n"
+                . "<IfModule mod_authz_core.c>\n    Require all granted\n</IfModule>\n"
+                . "<IfModule !mod_authz_core.c>\n    Order allow,deny\n    Allow from all\n</IfModule>\n"
+            );
+        }
+
+        $old = trim((string)$this->getSetting('company_logo', ''));
+        $filename = 'logo_' . time() . '_' . bin2hex(random_bytes(3)) . '.' . $ext;
+        $destPath = $uploadDir . $filename;
+        if (!@move_uploaded_file($tmp, $destPath)) {
+            // Algunos hostings renombran el tmp; intentar copy como respaldo
+            if (!@copy($tmp, $destPath)) {
+                $this->respond(false, 'Error al guardar el logo en disco (permisos)', '/app/configuracion#documentos');
+                return;
+            }
+            @unlink($tmp);
+        }
+        @chmod($destPath, 0644);
+
+        $rel = 'uploads/branding/' . $filename;
+        $this->upsertSetting('company_logo', $rel);
+        if ($old !== '' && $old !== $rel) {
+            $oldPath = (defined('PUBLIC_PATH') ? PUBLIC_PATH : (ROOT_PATH . '/public')) . '/' . ltrim($old, '/');
+            if (is_file($oldPath)) {
+                @unlink($oldPath);
+            }
+        }
+        \SoftNova\Services\SettingsCache::invalidate();
+
+        $logoUrl = \SoftNova\Core\media_url($rel);
+        // Respaldo: si la URL pública no aplica, el front puede usar /app/media
+        $mediaUrl = \SoftNova\Core\base_url('/app/media?f=' . rawurlencode($rel));
+        $this->respond(true, 'Logo actualizado', '/app/configuracion#documentos', [
+            'logo_url' => $logoUrl !== '' ? $logoUrl : $mediaUrl,
+            'logo_media_url' => $mediaUrl,
+            'company_logo' => $rel,
+        ]);
+    }
+
+    private function removeLogo(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/configuracion#documentos')) {
+            return;
+        }
+        $old = trim((string)$this->getSetting('company_logo', ''));
+        if ($old !== '') {
+            $oldPath = (defined('PUBLIC_PATH') ? PUBLIC_PATH : (ROOT_PATH . '/public')) . '/' . ltrim($old, '/');
+            if (is_file($oldPath)) {
+                @unlink($oldPath);
+            }
+        }
+        $this->upsertSetting('company_logo', '');
+        \SoftNova\Services\SettingsCache::invalidate();
+        $this->respond(true, 'Logo eliminado', '/app/configuracion#documentos');
+    }
+
+    private function getSetting(string $key, string $default = ''): string
+    {
+        return \SoftNova\Services\SettingsCache::get($this->db, $key, $default);
     }
 }

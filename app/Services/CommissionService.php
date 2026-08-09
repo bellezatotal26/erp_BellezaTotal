@@ -120,6 +120,8 @@ class CommissionService
             'payment_link_rate' => (float)$this->setting('payment_link_commission_rate', '2.5'),
             'debit_card_rate' => (float)$this->setting('debit_card_commission_rate', '1.5'),
             'credit_card_rate' => (float)$this->setting('credit_card_commission_rate', '2.8'),
+            'credit_over_60_rate' => (float)$this->setting('credit_over_60_surcharge_rate', '0'),
+            'credit_over_60_days' => (int)$this->setting('credit_over_60_surcharge_days', '60'),
             'seller_account' => $this->setting('seller_commission_account', '510508'),
             'gateway_account' => $this->setting('gateway_commission_account', '530505'),
         ];
@@ -141,6 +143,8 @@ class CommissionService
             'payment_link_commission_rate' => (string)max(0, min(30, (float)($input['payment_link_rate'] ?? 2.5))),
             'debit_card_commission_rate' => (string)max(0, min(30, (float)($input['debit_card_rate'] ?? 1.5))),
             'credit_card_commission_rate' => (string)max(0, min(30, (float)($input['credit_card_rate'] ?? 2.8))),
+            'credit_over_60_surcharge_rate' => (string)max(0, min(100, (float)($input['credit_over_60_rate'] ?? 0))),
+            'credit_over_60_surcharge_days' => (string)max(1, min(365, (int)($input['credit_over_60_days'] ?? 60))),
         ];
         $stmt = $this->db->prepare(
             "INSERT INTO accounting_settings (setting_key, setting_value) VALUES (?, ?)

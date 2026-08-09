@@ -7,6 +7,7 @@ use SoftNova\Services\CashService;
 use SoftNova\Services\AccountingService;
 use SoftNova\Services\ExpenseCategoryService;
 use SoftNova\Services\PaymentMethodCatalog;
+use function SoftNova\Core\base_url;
 
 /**
  * Modulo Gastos del tenant (tabla expenses)
@@ -29,6 +30,12 @@ class TenantGastosController extends TenantController
     public function __construct()
     {
         parent::__construct();
+        // El rol POS registra gastos solo desde Caja; no carga este módulo.
+        if (\SoftNova\Core\TenantMiddleware::isPosRole()) {
+            $_SESSION['error'] = 'El rol POS registra gastos desde Caja, no desde el módulo Gastos.';
+            $this->redirect(base_url('/app/caja'));
+            return;
+        }
         \SoftNova\Core\TenantMiddleware::authorize('gastos');
         $this->cash = new CashService($this->db);
         $this->accounting = new AccountingService($this->db);
@@ -67,7 +74,7 @@ class TenantGastosController extends TenantController
         $kindFilter = (string)$this->request->get('kind', '');
         $where = '';
         $params = [];
-        if (in_array($kindFilter, ['financial', 'operational'], true)) {
+        if (in_array($kindFilter, ['financial', 'operational', 'administrative'], true)) {
             $where = 'WHERE ec.kind = ?';
             $params[] = $kindFilter;
         }
@@ -110,6 +117,12 @@ class TenantGastosController extends TenantController
              WHERE MONTH(e.expense_date) = MONTH(CURDATE()) AND YEAR(e.expense_date) = YEAR(CURDATE())
                AND (ec.kind = 'operational' OR ec.id IS NULL)"
         )->fetch()['t'];
+        $monthAdministrative = (float)$this->query(
+            "SELECT COALESCE(SUM(e.amount), 0) t
+             FROM expenses e
+             JOIN expense_categories ec ON ec.id = e.category_id AND ec.kind = 'administrative'
+             WHERE MONTH(e.expense_date) = MONTH(CURDATE()) AND YEAR(e.expense_date) = YEAR(CURDATE())"
+        )->fetch()['t'];
 
         $suppliers = $this->query(
             "SELECT id, name FROM suppliers WHERE status = 'active' ORDER BY name"
@@ -120,6 +133,7 @@ class TenantGastosController extends TenantController
             'monthTotal' => $monthTotal,
             'monthFinancial' => $monthFinancial,
             'monthOperational' => $monthOperational,
+            'monthAdministrative' => $monthAdministrative,
             'suppliers' => $suppliers,
             'categories' => $this->categories->listActive(),
             'kindFilter' => $kindFilter,
@@ -136,9 +150,8 @@ class TenantGastosController extends TenantController
 
         $description = trim($this->request->post('description', ''));
         $amount = (float)$this->request->post('amount', 0);
-        $categoryId = (int)$this->request->post('category_id', 0);
-        $cat = $categoryId > 0 ? $this->categories->find($categoryId) : null;
-        $category = $cat ? (string)$cat['name'] : trim($this->request->post('category', 'General'));
+        $rawCategory = trim((string)$this->request->post('category_id', ''));
+        $categoryId = (int)$rawCategory;
         $expenseDate = $this->request->post('expense_date') ?: date('Y-m-d');
         $supplierId = $this->request->post('supplier_id') ? (int)$this->request->post('supplier_id') : null;
         $paymentMethod = PaymentMethodCatalog::normalize($this->request->post('payment_method', 'cash'));
@@ -150,6 +163,16 @@ class TenantGastosController extends TenantController
             $this->respond(false, 'Descripcion y monto son requeridos', '/app/gastos');
             return;
         }
+        if ($rawCategory === '' || $rawCategory === '__other__' || $categoryId <= 0) {
+            $this->respond(false, 'Seleccione una categoría de gasto válida', '/app/gastos');
+            return;
+        }
+        $cat = $this->categories->find($categoryId);
+        if (!$cat) {
+            $this->respond(false, 'La categoría de gasto no existe o está inactiva', '/app/gastos');
+            return;
+        }
+        $category = (string)$cat['name'];
 
         $receipt = $this->storeReceiptUpload();
         if ($receipt === false) {
@@ -405,7 +428,12 @@ class TenantGastosController extends TenantController
                 $r['expense_date'],
                 $r['description'],
                 $r['category'],
-                $r['kind'] === 'financial' ? 'Financiero' : 'Operativo',
+                match ((string)($r['kind'] ?? '')) {
+                    'financial' => 'Financiero',
+                    'administrative' => 'Administrativo',
+                    'operational' => 'Operativo',
+                    default => '',
+                },
                 $r['amount'],
                 PaymentMethodCatalog::label((string)$r['payment_method']),
                 $r['supplier_name'],

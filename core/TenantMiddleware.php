@@ -13,7 +13,7 @@ class TenantMiddleware
 
     /** Módulos gestionables en la matriz de permisos (User) */
     public const MANAGED_MODULES = [
-        'dashboard', 'caja', 'ventas', 'inventario', 'clientes', 'proveedores',
+        'dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'clientes', 'proveedores',
         'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes',
     ];
 
@@ -80,14 +80,17 @@ class TenantMiddleware
     }
 
     /**
-     * Permisos fijos del rol POS: solo POS de venta (caja) y lista/creación de ventas.
-     * Sin gastos, compras, tarjetas financieras ni movimientos de caja (UI).
+     * Permisos fijos del rol POS: venta en caja + registrar gastos/préstamos desde caja.
+     * Sin módulo Gastos/Préstamos/Compras en menú ni movimientos manuales de caja.
      */
     public static function posDefaultPermissions(): array
     {
         return [
             'caja' => ['view' => true, 'create' => true, 'edit' => true, 'delete' => false, 'export' => false],
             'ventas' => ['view' => true, 'create' => true, 'edit' => false, 'delete' => false, 'export' => false],
+            // Crear gasto / préstamo desde Caja sin ver esos módulos.
+            'gastos' => ['view' => false, 'create' => true, 'edit' => false, 'delete' => false, 'export' => false],
+            'prestamos' => ['view' => false, 'create' => true, 'edit' => false, 'delete' => false, 'export' => false],
         ];
     }
 
@@ -117,10 +120,8 @@ class TenantMiddleware
             foreach (self::ACTIONS as $action) {
                 $row[$action] = !empty($actions[$action]);
             }
-            // Si tiene cualquier acción, view queda implícito
-            if ($row['create'] || $row['edit'] || $row['delete'] || $row['export']) {
-                $row['view'] = true;
-            }
+            // Ver NO se infiere: "Crear" sin "Ver" permite acciones puntuales
+            // (ej. registrar gasto/préstamo desde Caja) sin abrir el módulo en el menú.
             if ($row['view'] || $row['create'] || $row['edit'] || $row['delete'] || $row['export']) {
                 $out[$module] = $row;
             }
@@ -145,7 +146,7 @@ class TenantMiddleware
         if ($role === 'pos') {
             $map = self::posDefaultPermissions();
             $_SESSION['tenant_permissions_map'] = $map;
-            $_SESSION['tenant_permissions'] = array_keys($map);
+            $_SESSION['tenant_permissions'] = array_keys(array_filter($map, static fn($a) => !empty($a['view'])));
             return;
         }
 
@@ -183,11 +184,11 @@ class TenantMiddleware
     private static function rolePermissions(): array
     {
         $admin = [
-            'modules' => ['dashboard', 'caja', 'ventas', 'inventario', 'clientes', 'proveedores', 'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes', 'configuracion'],
+            'modules' => ['dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'clientes', 'proveedores', 'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes', 'configuracion'],
             'actions' => ['create', 'edit', 'delete', 'view', 'export'],
         ];
         $manager = [
-            'modules' => ['dashboard', 'caja', 'ventas', 'inventario', 'clientes', 'proveedores', 'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes'],
+            'modules' => ['dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'clientes', 'proveedores', 'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes'],
             'actions' => ['create', 'edit', 'delete', 'view', 'export'],
         ];
         
@@ -281,6 +282,10 @@ class TenantMiddleware
                     return '/app/' . $mod;
                 }
             }
+            // Solo "Crear" en Caja/Gastos/Préstamos: entrar por Caja.
+            if (!empty($map['caja']['create']) || !empty($map['gastos']['create']) || !empty($map['prestamos']['create'])) {
+                return '/app/caja';
+            }
         }
         return '/app/dashboard';
     }
@@ -365,10 +370,26 @@ class TenantMiddleware
         if (empty($_SESSION['tenant_authenticated'])) {
             return;
         }
-        self::hydrateSessionPermissions(
-            (string)($_SESSION['tenant_user_role'] ?? 'viewer'),
-            null
-        );
+        $role = (string)($_SESSION['tenant_user_role'] ?? 'viewer');
+        $raw = null;
+        // User: recargar JSON de permisos desde BD (null vaciaría el mapa).
+        if (self::normalizeRole($role) === 'user') {
+            try {
+                $uid = (int)($_SESSION['tenant_user_id'] ?? 0);
+                if ($uid > 0) {
+                    $db = self::getDb();
+                    $stmt = $db->prepare('SELECT permissions FROM users WHERE id = ? LIMIT 1');
+                    $stmt->execute([$uid]);
+                    $raw = $stmt->fetchColumn();
+                    if ($raw === false) {
+                        $raw = null;
+                    }
+                }
+            } catch (\Throwable $e) {
+                error_log('ensureHydrated permissions: ' . $e->getMessage());
+            }
+        }
+        self::hydrateSessionPermissions($role, $raw);
     }
     
     /**

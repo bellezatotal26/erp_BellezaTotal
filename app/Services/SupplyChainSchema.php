@@ -171,7 +171,7 @@ class SupplyChainSchema
                 invoice_number VARCHAR(80) NULL,
                 invoice_date DATE NULL,
                 due_date DATE NULL,
-                source ENUM('manual','csv','text','ai') NOT NULL DEFAULT 'manual',
+                source ENUM('manual','csv','text','ai','ai_vision') NOT NULL DEFAULT 'manual',
                 file_path VARCHAR(255) NULL,
                 file_mime VARCHAR(100) NULL,
                 original_name VARCHAR(255) NULL,
@@ -181,7 +181,7 @@ class SupplyChainSchema
                 tax_total DECIMAL(14,2) NOT NULL DEFAULT 0.00,
                 total DECIMAL(14,2) NOT NULL DEFAULT 0.00,
                 payment_mode VARCHAR(20) NOT NULL DEFAULT 'payable',
-                status ENUM('pending','confirmed','discarded') NOT NULL DEFAULT 'pending',
+                status ENUM('pending','processing','confirmed','discarded') NOT NULL DEFAULT 'pending',
                 purchase_order_id INT UNSIGNED NULL,
                 created_by INT UNSIGNED NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -192,6 +192,23 @@ class SupplyChainSchema
                 KEY idx_pii_order (purchase_order_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
         );
+
+        try {
+            $db->exec(
+                "ALTER TABLE purchase_invoice_imports
+                 MODIFY COLUMN status ENUM('pending','processing','confirmed','discarded') NOT NULL DEFAULT 'pending'"
+            );
+        } catch (\Throwable $e) {
+            // ya migrado
+        }
+        try {
+            $db->exec(
+                "ALTER TABLE purchase_invoice_imports
+                 MODIFY COLUMN source ENUM('manual','csv','text','ai','ai_vision') NOT NULL DEFAULT 'manual'"
+            );
+        } catch (\Throwable $e) {
+            // ya migrado
+        }
 
         $db->exec(
             "CREATE TABLE IF NOT EXISTS purchase_invoice_import_items (

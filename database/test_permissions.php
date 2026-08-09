@@ -48,6 +48,9 @@ assertTrue(TenantMiddleware::canDo('create', 'ventas'), 'pos puede create ventas
 assertTrue(!TenantMiddleware::canAccess('configuracion'), 'pos NO accede a configuracion');
 assertTrue(!TenantMiddleware::canAccess('contabilidad'), 'pos NO accede a contabilidad');
 assertTrue(!TenantMiddleware::canAccess('gastos'), 'pos NO accede a gastos');
+assertTrue(TenantMiddleware::canDo('create', 'gastos'), 'pos puede create gastos (desde caja)');
+assertTrue(!TenantMiddleware::canAccess('prestamos'), 'pos NO accede a prestamos');
+assertTrue(TenantMiddleware::canDo('create', 'prestamos'), 'pos puede create prestamos (desde caja)');
 assertTrue(!TenantMiddleware::canAccess('compras'), 'pos NO accede a compras');
 assertTrue(!TenantMiddleware::canAccess('clientes'), 'pos NO accede a clientes');
 assertTrue(!TenantMiddleware::canDo('delete', 'ventas'), 'pos NO puede delete ventas');
@@ -60,6 +63,8 @@ $_SESSION = [];
 $perms = [
     'ventas' => ['view' => true, 'create' => true, 'edit' => false, 'delete' => false, 'export' => true],
     'inventario' => ['view' => true, 'create' => false, 'edit' => false, 'delete' => false, 'export' => false],
+    'prestamos' => ['view' => false, 'create' => true, 'edit' => false, 'delete' => false, 'export' => false],
+    'caja' => ['view' => true, 'create' => true, 'edit' => false, 'delete' => false, 'export' => false],
 ];
 TenantMiddleware::hydrateSessionPermissions('user', $perms);
 assertTrue(TenantMiddleware::canAccess('ventas'), 'user custom: ventas view');
@@ -68,7 +73,9 @@ assertTrue(TenantMiddleware::canDo('export', 'ventas'), 'user custom: ventas exp
 assertTrue(!TenantMiddleware::canDo('delete', 'ventas'), 'user custom: NO delete ventas');
 assertTrue(TenantMiddleware::canAccess('inventario'), 'user custom: inventario view');
 assertTrue(!TenantMiddleware::canDo('create', 'inventario'), 'user custom: NO create inventario');
-assertTrue(!TenantMiddleware::canAccess('caja'), 'user custom: NO caja');
+assertTrue(!TenantMiddleware::canAccess('prestamos'), 'user custom: NO ver prestamos (solo create)');
+assertTrue(TenantMiddleware::canDo('create', 'prestamos'), 'user custom: create prestamos sin ver módulo');
+assertTrue(TenantMiddleware::canAccess('caja'), 'user custom: caja view');
 assertTrue(!TenantMiddleware::canAccess('configuracion'), 'user custom: NO configuracion');
 
 echo "\nResultado: {$passed} pass, {$failed} fail\n";

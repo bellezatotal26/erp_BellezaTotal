@@ -56,7 +56,7 @@ class PurchaseInvoiceImportService
             $source = $stored['extension'] === 'csv' ? 'csv' : 'text';
             $extracted = $this->extractText($stored['path'], $stored['extension']);
             if ($extracted === '' && $rawText === '') {
-                $notas[] = 'No se pudo leer texto del archivo; capture las líneas a mano';
+                $notas[] = 'No se pudo leer texto del archivo';
             }
             if ($extracted !== '') {
                 $rawText = $extracted;
@@ -65,28 +65,70 @@ class PurchaseInvoiceImportService
 
         $header = [];
         $items = [];
+        $ext = (string)($stored['extension'] ?? '');
+        $isImageFile = in_array($ext, ['jpg', 'jpeg', 'png', 'webp'], true);
+        $pdfLooksScanned = $ext === 'pdf' && ($rawText === '' || !$this->pdfTextLooksUsable($rawText));
 
-        if ($stored && $stored['extension'] === 'csv') {
+        if ($stored && $ext === 'csv') {
             $items = $this->parseCsv($stored['path']);
             $notas[] = count($items) . ' línea(s) leídas del CSV';
         }
 
-        if (empty($items) && $rawText !== '' && !empty($meta['use_ai'])) {
-            $ai = (new AiService($this->db))->extractInvoiceData($rawText);
+        $aiService = null;
+        $useAi = !empty($meta['use_ai']);
+
+        // Texto + IA (PDF con capa de texto, TXT pegado, etc.)
+        if (empty($items) && $rawText !== '' && $useAi && !$pdfLooksScanned && !$isImageFile) {
+            $aiService = new AiService($this->db);
+            $ai = $aiService->extractInvoiceData($rawText);
             if ($ai !== null && !empty($ai['items'])) {
                 $header = $ai;
                 $items = $this->normalizeAiItems($ai['items']);
                 $source = 'ai';
-                $notas[] = count($items) . ' línea(s) interpretadas por IA';
+                $notas[] = count($items) . ' línea(s) interpretadas por IA (texto)';
             } else {
-                $notas[] = 'La IA no devolvió líneas utilizables; se usó el análisis por patrones';
+                $notas[] = 'La IA no devolvió líneas utilizables del texto; se usó el análisis por patrones';
             }
         }
 
-        if (empty($items) && $rawText !== '') {
-            $items = $this->parseText($rawText);
-            if ($items) {
-                $notas[] = count($items) . ' línea(s) detectadas por patrones';
+        // PDF solo imagen / foto: visión (requiere IA configurada)
+        if (empty($items) && $stored && ($isImageFile || $pdfLooksScanned)) {
+            if ($useAi) {
+                $aiService = $aiService ?? new AiService($this->db);
+                if ($aiService->isConfigured()) {
+                    $images = $this->collectInvoiceImages($stored['path'], $ext);
+                    if ($images !== []) {
+                        $ai = $aiService->extractInvoiceFromImages($images);
+                        if ($ai !== null && !empty($ai['items'])) {
+                            $header = $ai;
+                            $items = $this->normalizeAiItems($ai['items']);
+                            $source = 'ai';
+                            $notas[] = count($items) . ' línea(s) leídas por IA desde imagen'
+                                . ($pdfLooksScanned ? ' (PDF escaneado)' : '');
+                        } else {
+                            $notas[] = 'La IA con visión no pudo leer productos en la imagen. Pegue el texto o use CSV';
+                        }
+                    } else {
+                        $notas[] = 'PDF/imagen sin contenido visual extraíble. Pruebe exportar a CSV o pegar el texto';
+                    }
+                } else {
+                    $notas[] = 'PDF/imagen requiere IA (OPENROUTER_API_KEY) para leer escaneos';
+                }
+            } else {
+                $notas[] = 'Este archivo parece solo imagen (sin texto). Active «Interpretar con IA» o pegue el texto / use CSV';
+            }
+        }
+
+        if (empty($items) && $rawText !== '' && !$isImageFile) {
+            if ($pdfLooksScanned) {
+                // Ya se intentó visión arriba; no forzar patrones sobre basura.
+            } else {
+                $items = $this->parseText($rawText);
+                if ($items) {
+                    $notas[] = count($items) . ' línea(s) detectadas por patrones';
+                } elseif ($ext === 'pdf') {
+                    $notas[] = 'No se detectaron líneas de producto legibles en el PDF; capture las líneas a mano o use CSV';
+                }
             }
         }
 
@@ -239,7 +281,7 @@ class PurchaseInvoiceImportService
         ];
     }
 
-    /** Texto plano del documento; las imágenes requieren captura manual o IA con visión. */
+    /** Texto plano del documento; imágenes / PDF escaneado → vacío (usar visión). */
     private function extractText(string $relativePath, string $extension): string
     {
         $absolute = dirname(__DIR__, 2) . '/public/' . $relativePath;
@@ -258,10 +300,146 @@ class PurchaseInvoiceImportService
     }
 
     /**
-     * Extrae la capa de texto de un PDF sin dependencias externas.
-     * Los PDF escaneados no tienen texto: en ese caso se devuelve vacío.
+     * Imágenes para IA con visión: archivo imagen directo, o JPEG embebidos en PDF escaneado.
+     *
+     * @return list<array{mime:string,data:string}>
+     */
+    private function collectInvoiceImages(string $relativePath, string $extension): array
+    {
+        $absolute = dirname(__DIR__, 2) . '/public/' . $relativePath;
+        if (!is_readable($absolute)) {
+            return [];
+        }
+
+        if (in_array($extension, ['jpg', 'jpeg', 'png', 'webp'], true)) {
+            $data = (string)file_get_contents($absolute);
+            if ($data === '') {
+                return [];
+            }
+            $mime = match ($extension) {
+                'png' => 'image/png',
+                'webp' => 'image/webp',
+                default => 'image/jpeg',
+            };
+            return [['mime' => $mime, 'data' => $data]];
+        }
+
+        if ($extension === 'pdf') {
+            $fromImagick = $this->pdfPagesToImagesImagick($absolute);
+            if ($fromImagick !== []) {
+                return $fromImagick;
+            }
+            return $this->extractEmbeddedJpegFromPdf($absolute);
+        }
+
+        return [];
+    }
+
+    /** @return list<array{mime:string,data:string}> */
+    private function pdfPagesToImagesImagick(string $absolute): array
+    {
+        if (!class_exists(\Imagick::class)) {
+            return [];
+        }
+        try {
+            $im = new \Imagick();
+            $im->setResolution(150, 150);
+            $im->readImage($absolute . '[0-2]'); // hasta 3 primeras páginas
+            $out = [];
+            foreach ($im as $page) {
+                $page->setImageFormat('jpeg');
+                $page->setImageCompressionQuality(85);
+                $blob = (string)$page->getImageBlob();
+                if ($blob !== '' && strlen($blob) > 2000) {
+                    $out[] = ['mime' => 'image/jpeg', 'data' => $blob];
+                }
+            }
+            $im->clear();
+            $im->destroy();
+            return $out;
+        } catch (\Throwable $e) {
+            error_log('Imagick PDF factura: ' . $e->getMessage());
+            return [];
+        }
+    }
+
+    /**
+     * Muchos PDF escaneados embeben JPEG crudos; se extraen por marcadores SOI/EOI.
+     *
+     * @return list<array{mime:string,data:string}>
+     */
+    private function extractEmbeddedJpegFromPdf(string $absolute): array
+    {
+        $bin = (string)file_get_contents($absolute);
+        if ($bin === '') {
+            return [];
+        }
+        $images = [];
+        $offset = 0;
+        $len = strlen($bin);
+        while ($offset < $len && count($images) < 3) {
+            $start = strpos($bin, "\xFF\xD8\xFF", $offset);
+            if ($start === false) {
+                break;
+            }
+            $end = strpos($bin, "\xFF\xD9", $start + 3);
+            if ($end === false) {
+                break;
+            }
+            $jpeg = substr($bin, $start, $end - $start + 2);
+            $offset = $end + 2;
+            // Ignorar iconos / thumbs diminutos
+            if (strlen($jpeg) < 8000) {
+                continue;
+            }
+            $images[] = ['mime' => 'image/jpeg', 'data' => $jpeg];
+        }
+        return $images;
+    }
+
+    /**
+     * Extrae la capa de texto de un PDF.
+     * Prioriza smalot/pdfparser (ToUnicode / encodings reales). Fallback casero
+     * solo si el parser no está disponible. PDFs escaneados → vacío.
      */
     private function extractPdfText(string $absolute): string
+    {
+        $viaParser = $this->extractPdfTextWithParser($absolute);
+        if ($this->pdfTextLooksUsable($viaParser)) {
+            return $this->normalizePdfExtractedText($viaParser);
+        }
+
+        $fallback = $this->extractPdfTextFallback($absolute);
+        if ($this->pdfTextLooksUsable($fallback)) {
+            return $this->normalizePdfExtractedText($fallback);
+        }
+
+        // Si ambos son pobres, preferir el del parser (menos basura tipográfica).
+        $best = mb_strlen(trim($viaParser)) >= mb_strlen(trim($fallback)) ? $viaParser : $fallback;
+        return $this->normalizePdfExtractedText($best);
+    }
+
+    private function extractPdfTextWithParser(string $absolute): string
+    {
+        if (!class_exists(\Smalot\PdfParser\Parser::class)) {
+            return '';
+        }
+        try {
+            $parser = new \Smalot\PdfParser\Parser();
+            $pdf = $parser->parseFile($absolute);
+            $text = (string)$pdf->getText();
+            return trim($text);
+        } catch (\Throwable $e) {
+            error_log('PDF parser factura compra: ' . $e->getMessage());
+            return '';
+        }
+    }
+
+    /**
+     * Fallback sin librería: solo streams de contenido con operadores de texto.
+     * No interpreta ToUnicode; puede fallar en facturas con fuentes embebidas.
+     */
+    private function extractPdfTextFallback(string $absolute): string
     {
         $binario = (string)file_get_contents($absolute);
         if ($binario === '') {
@@ -269,7 +447,6 @@ class PurchaseInvoiceImportService
         }
 
         $textos = [];
-        // Los flujos comprimidos son la norma; los planos se leen tal cual.
         if (preg_match_all('/stream\r?\n(.*?)\r?\nendstream/s', $binario, $matches)) {
             foreach ($matches[1] as $stream) {
                 $plano = @gzuncompress($stream);
@@ -279,9 +456,14 @@ class PurchaseInvoiceImportService
                 if ($plano === false) {
                     $plano = $stream;
                 }
-                if (is_string($plano) && $plano !== '') {
-                    $textos[] = $plano;
+                if (!is_string($plano) || $plano === '') {
+                    continue;
                 }
+                // Evitar programas de fuente / streams binarios sin operadores de texto.
+                if (!preg_match('/\b(BT|ET|Tj|TJ|Td|TD|Tm|\'|")\b/', $plano)) {
+                    continue;
+                }
+                $textos[] = $plano;
             }
         }
 
@@ -290,22 +472,117 @@ class PurchaseInvoiceImportService
             return '';
         }
 
-        // Operadores de texto de PostScript: (texto) Tj y [(a)(b)] TJ
         $salida = [];
-        if (preg_match_all('/\(((?:\\\\.|[^\\\\()])*)\)\s*(?:Tj|TJ|\')/', $contenido, $tj)) {
+        if (preg_match_all('/\(((?:\\\\.|[^\\\\()])*)\)\s*(?:Tj|\'|")/', $contenido, $tj)) {
             foreach ($tj[1] as $fragmento) {
-                $salida[] = stripcslashes($fragmento);
+                $decoded = $this->decodePdfLiteralString($fragmento);
+                if ($decoded !== '') {
+                    $salida[] = $decoded;
+                }
             }
         }
         if (preg_match_all('/\[(.*?)\]\s*TJ/s', $contenido, $arrays)) {
             foreach ($arrays[1] as $grupo) {
-                if (preg_match_all('/\(((?:\\\\.|[^\\\\()])*)\)/', $grupo, $partes)) {
-                    $salida[] = implode('', array_map('stripcslashes', $partes[1]));
+                $chunk = '';
+                if (preg_match_all('/\(((?:\\\\.|[^\\\\()])*)\)|<([0-9A-Fa-f\s]+)>/', $grupo, $partes, PREG_SET_ORDER)) {
+                    foreach ($partes as $p) {
+                        if (isset($p[1]) && $p[1] !== '') {
+                            $chunk .= $this->decodePdfLiteralString($p[1]);
+                        } elseif (isset($p[2]) && $p[2] !== '') {
+                            $chunk .= $this->decodePdfHexString($p[2]);
+                        }
+                    }
+                }
+                if (trim($chunk) !== '') {
+                    $salida[] = $chunk;
+                }
+            }
+        }
+        if (preg_match_all('/<([0-9A-Fa-f\s]+)>\s*Tj/', $contenido, $hex)) {
+            foreach ($hex[1] as $h) {
+                $decoded = $this->decodePdfHexString($h);
+                if ($decoded !== '') {
+                    $salida[] = $decoded;
                 }
             }
         }
 
-        return $this->toUtf8(trim(implode("\n", $salida)));
+        return trim(implode("\n", $salida));
+    }
+
+    private function decodePdfLiteralString(string $raw): string
+    {
+        $s = stripcslashes($raw);
+        // PDF Unicode strings: BOM UTF-16BE
+        if (str_starts_with($s, "\xFE\xFF") || str_starts_with($s, "\xFF\xFE")) {
+            $converted = @mb_convert_encoding($s, 'UTF-8', 'UTF-16');
+            return is_string($converted) ? $converted : $s;
+        }
+        return $s;
+    }
+
+    private function decodePdfHexString(string $hex): string
+    {
+        $hex = preg_replace('/\s+/', '', $hex) ?? '';
+        if ($hex === '' || (strlen($hex) % 2) === 1) {
+            $hex .= '0';
+        }
+        $bin = @hex2bin($hex);
+        if ($bin === false || $bin === '') {
+            return '';
+        }
+        if (str_starts_with($bin, "\xFE\xFF") || str_starts_with($bin, "\xFF\xFE")) {
+            $converted = @mb_convert_encoding($bin, 'UTF-8', 'UTF-16');
+            return is_string($converted) ? $converted : '';
+        }
+        return $this->toUtf8($bin);
+    }
+
+    private function normalizePdfExtractedText(string $texto): string
+    {
+        $texto = $this->toUtf8($texto);
+        // Dompdf / parsers a veces meten NUL o controles.
+        $texto = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $texto) ?? $texto;
+        $texto = str_replace("\u{FFFD}", '', $texto);
+        $texto = preg_replace("/[ \t]+\n/", "\n", $texto) ?? $texto;
+        $texto = preg_replace("/\n{3,}/", "\n\n", $texto) ?? $texto;
+        return trim($texto);
+    }
+
+    /** Heurística: ¿hay letras reales o solo basura de encoding? */
+    private function pdfTextLooksUsable(string $texto): bool
+    {
+        $texto = trim($texto);
+        if ($texto === '' || mb_strlen($texto) < 12) {
+            return false;
+        }
+        if (str_contains($texto, "\u{FFFD}") || str_contains($texto, '�')) {
+            // Aún puede servir si hay suficientes letras.
+        }
+        $letters = preg_match_all('/\p{L}/u', $texto) ?: 0;
+        $len = max(1, mb_strlen(preg_replace('/\s+/u', '', $texto) ?? $texto));
+        return $letters >= 20 && ($letters / $len) >= 0.35;
+    }
+
+    private function isReadableProductDescription(string $desc): bool
+    {
+        $desc = trim($desc);
+        if ($desc === '' || mb_strlen($desc) < 3) {
+            return false;
+        }
+        if (str_contains($desc, "\u{FFFD}") || str_contains($desc, '�')) {
+            return false;
+        }
+        $letters = preg_match_all('/\p{L}/u', $desc) ?: 0;
+        if ($letters < 3) {
+            return false;
+        }
+        $len = max(1, mb_strlen(preg_replace('/\s+/u', '', $desc) ?? $desc));
+        // Rechaza cosas tipo "$&(," o secuencias sin palabras reales.
+        if (($letters / $len) < 0.45) {
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -843,7 +1120,7 @@ class PurchaseInvoiceImportService
                 $sku = $partes[1];
                 $descripcion = trim($partes[2]);
             }
-            if ($descripcion === '' || mb_strlen($descripcion) < 3) {
+            if (!$this->isReadableProductDescription($descripcion)) {
                 continue;
             }
 
@@ -1070,12 +1347,91 @@ class PurchaseInvoiceImportService
             throw new \RuntimeException('Esta factura ya fue procesada');
         }
 
+        // Claim atómico: evita doble clic / reintento que duplica stock.
+        $claimedOk = false;
+        try {
+            $claimed = $this->query(
+                "UPDATE purchase_invoice_imports
+                 SET status = 'processing', updated_at = NOW()
+                 WHERE id = ? AND status = 'pending'",
+                [$importId]
+            );
+            $claimedOk = $claimed->rowCount() >= 1;
+        } catch (\Throwable $e) {
+            // ENUM sin 'processing' en installs viejos
+            $claimedOk = false;
+        }
+        if (!$claimedOk) {
+            $again = (string)$this->query(
+                "SELECT status FROM purchase_invoice_imports WHERE id = ? LIMIT 1",
+                [$importId]
+            )->fetchColumn();
+            if (in_array($again, ['confirmed', 'discarded', 'processing'], true)) {
+                throw new \RuntimeException('Esta factura ya fue procesada');
+            }
+            $hasOrder = $this->query(
+                "SELECT purchase_order_id FROM purchase_invoice_imports WHERE id = ? LIMIT 1",
+                [$importId]
+            )->fetchColumn();
+            if (!empty($hasOrder)) {
+                throw new \RuntimeException('Esta factura ya fue procesada');
+            }
+        }
+
+        try {
+            return $this->confirmLocked($importId, $warehouseDate);
+        } catch (\Throwable $e) {
+            $this->releaseImportClaim($importId);
+            throw $e;
+        }
+    }
+
+    /**
+     * Cuerpo de confirmación tras haber reclamado el import (status processing o pending legacy).
+     *
+     * @return array{order_id:int,created_products:int,received_items:int,skipped:int,cash_note?:string}
+     */
+    private function confirmLocked(int $importId, ?string $warehouseDate = null): array
+    {
+        $data = $this->get($importId);
+        if (!$data) {
+            throw new \RuntimeException('Importación no encontrada');
+        }
         $import = $data['import'];
         $supplierId = !empty($import['supplier_id']) ? (int)$import['supplier_id'] : null;
         if ($supplierId === null) {
             throw new \RuntimeException('Seleccione el proveedor antes de confirmar');
         }
 
+        return $this->confirmBuildOrder($importId, $data, $import, $supplierId, $warehouseDate);
+    }
+
+    private function releaseImportClaim(int $importId): void
+    {
+        try {
+            $this->query(
+                "UPDATE purchase_invoice_imports SET status = 'pending'
+                 WHERE id = ? AND status = 'processing' AND (purchase_order_id IS NULL OR purchase_order_id = 0)",
+                [$importId]
+            );
+        } catch (\Throwable $e) {
+            // silencioso
+        }
+    }
+
+    /**
+     * @param array<string,mixed> $data
+     * @param array<string,mixed> $import
+     * @return array{order_id:int,created_products:int,received_items:int,skipped:int,cash_note?:string}
+     */
+    private function confirmBuildOrder(
+        int $importId,
+        array $data,
+        array $import,
+        int $supplierId,
+        ?string $warehouseDate
+    ): array
+    {
         $creados = 0;
         $omitidos = 0;
         $sinCantidad = 0;
@@ -1173,7 +1529,8 @@ class PurchaseInvoiceImportService
             0.0,
             $import['due_date'] ?? null,
             $fechaFactura,
-            $import['invoice_number'] ?? null
+            $import['invoice_number'] ?? null,
+            false // no forzar descuento aliado sobre el total de factura
         );
 
         $this->query(
@@ -1195,6 +1552,13 @@ class PurchaseInvoiceImportService
             error_log('Contabilidad OC ' . $orderId . ' desde factura ' . $importId . ': ' . $e->getMessage());
         }
 
+        $cashNote = '';
+        try {
+            $cashNote = $purchasing->syncCashForReceivedOrder($orderId);
+        } catch (\Throwable $e) {
+            error_log('Caja OC ' . $orderId . ' desde factura ' . $importId . ': ' . $e->getMessage());
+        }
+
         $this->query(
             "UPDATE purchase_invoice_imports
              SET status = 'confirmed', purchase_order_id = ?, confirmed_at = NOW()
@@ -1207,6 +1571,7 @@ class PurchaseInvoiceImportService
             'created_products' => $creados,
             'received_items' => count($lineas),
             'skipped' => $omitidos,
+            'cash_note' => $cashNote,
         ];
     }
 
@@ -1374,10 +1739,22 @@ class PurchaseInvoiceImportService
 
     private function toUtf8(string $texto): string
     {
-        if (!mb_check_encoding($texto, 'UTF-8')) {
-            $texto = mb_convert_encoding($texto, 'UTF-8', 'ISO-8859-1, Windows-1252');
+        if ($texto === '') {
+            return '';
         }
-        return $texto;
+        if (str_starts_with($texto, "\xEF\xBB\xBF")) {
+            $texto = substr($texto, 3);
+        }
+        if (mb_check_encoding($texto, 'UTF-8')) {
+            return $texto;
+        }
+        foreach (['Windows-1252', 'ISO-8859-1', 'UTF-16LE', 'UTF-16BE'] as $from) {
+            $converted = @mb_convert_encoding($texto, 'UTF-8', $from);
+            if (is_string($converted) && $converted !== '' && mb_check_encoding($converted, 'UTF-8')) {
+                return $converted;
+            }
+        }
+        return mb_convert_encoding($texto, 'UTF-8', 'UTF-8');
     }
 
     private function normalizeDate(?string $date): ?string

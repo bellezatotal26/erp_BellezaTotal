@@ -13,6 +13,7 @@ class CustomOptionService
     public const GROUP_CUSTOMER_SOURCE = 'customer_source';
     public const GROUP_DISCOUNT_PERCENT = 'discount_percent';
     public const GROUP_PRODUCT_LOCATION = 'product_location';
+    public const GROUP_EXPENSE_CATEGORY = 'expense_category';
 
     private \PDO $db;
 
@@ -182,6 +183,7 @@ class CustomOptionService
             self::GROUP_CUSTOMER_SOURCE,
             self::GROUP_DISCOUNT_PERCENT,
             self::GROUP_PRODUCT_LOCATION,
+            self::GROUP_EXPENSE_CATEGORY,
         ];
         if (!in_array($group, $allowed, true)) {
             throw new \InvalidArgumentException('Grupo de opciones no permitido');
@@ -194,6 +196,16 @@ class CustomOptionService
         }
         if (mb_strlen($label) > 120) {
             $label = mb_substr($label, 0, 120);
+        }
+
+        // Categorías de gasto: se crean en expense_categories (valor = id).
+        if ($group === self::GROUP_EXPENSE_CATEGORY) {
+            $cat = (new ExpenseCategoryService($this->db))->addOrReuse($label, 'administrative');
+            return [
+                'value' => (string)$cat['id'],
+                'label' => (string)$cat['name'],
+                'created' => (bool)$cat['created'],
+            ];
         }
 
         if ($group === self::GROUP_DISCOUNT_PERCENT) {

@@ -28,6 +28,7 @@ class PdfService
     
     /**
      * Generar PDF de factura de venta (carta/A4) o ticket 58mm.
+     * Respeta sales_document_config (Configuración → Documentos).
      */
     public function generateInvoice(array $sale, array $items, array $payments = [], string $format = 'a4'): string
     {
@@ -35,33 +36,34 @@ class PdfService
             return $this->generateTicket58($sale, $items, $payments);
         }
 
+        $cfg = SalesDocumentConfig::fromSettings($this->company)['a4'];
+        $color = htmlspecialchars((string)($cfg['header_color'] ?? '#0D7C4A'));
         $currency = $this->currency['symbol'] ?? '$';
         $decimals = $this->currency['decimals'] ?? 0;
         $thousands = $this->currency['thousands'] ?? '.';
         $decimal = $this->currency['decimal'] ?? ',';
-        
         $fmt = fn($n) => $currency . ' ' . number_format((float)$n, $decimals, $decimal, $thousands);
-        
-        $companyName = htmlspecialchars($this->company['company_name'] ?? 'Mi Empresa');
-        $taxName = htmlspecialchars($this->company['tax_name'] ?? 'IVA');
+
+        $companyName = htmlspecialchars((string)($this->company['company_name'] ?? 'Mi Empresa'));
+        $taxName = htmlspecialchars((string)($this->company['tax_name'] ?? 'IVA'));
         $docTitle = strtoupper($this->documentLabel((string)($sale['document_type'] ?? 'invoice')));
         $saleTax = (float)($sale['tax'] ?? $sale['tax_amount'] ?? 0);
         $saleSubtotal = (float)($sale['subtotal'] ?? 0);
         $saleTotal = (float)($sale['total'] ?? 0);
-        
+
         $itemsHtml = '';
         foreach ($items as $item) {
             $lineTotal = $this->itemLineTotal($item);
-            $itemsHtml .= '<tr>
-                <td>' . htmlspecialchars($item['product_name'] ?? '') . '</td>
-                <td style="text-align:center;">' . (int)($item['quantity'] ?? 0) . '</td>
-                <td style="text-align:right;">' . $fmt($item['unit_price'] ?? 0) . '</td>
-                <td style="text-align:right;">' . $fmt($lineTotal) . '</td>
-            </tr>';
+            $itemsHtml .= '<tr><td>' . htmlspecialchars((string)($item['product_name'] ?? '')) . '</td>'
+                . '<td style="text-align:center;">' . (int)($item['quantity'] ?? 0) . '</td>';
+            if (!empty($cfg['show_unit_price'])) {
+                $itemsHtml .= '<td style="text-align:right;">' . $fmt($item['unit_price'] ?? 0) . '</td>';
+            }
+            $itemsHtml .= '<td style="text-align:right;">' . $fmt($lineTotal) . '</td></tr>';
         }
-        
+
         $paymentsHtml = '';
-        if (!empty($payments)) {
+        if (!empty($cfg['show_payments_table']) && !empty($payments)) {
             $paymentsHtml = '<h3 style="margin-top:20px;">Pagos Registrados</h3>
             <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;margin-top:8px;">
                 <tr style="background:#f5f5f5;">
@@ -71,111 +73,459 @@ class PdfService
                 </tr>';
             foreach ($payments as $p) {
                 $paymentsHtml .= '<tr>
-                    <td>' . date('d/m/Y H:i', strtotime($p['payment_date'])) . '</td>
+                    <td>' . date('d/m/Y H:i', strtotime((string)$p['payment_date'])) . '</td>
                     <td>' . htmlspecialchars(PaymentMethodCatalog::label((string)($p['payment_method'] ?? 'cash'))) . '</td>
-                    <td style="text-align:right;">' . $fmt($p['amount']) . '</td>
+                    <td style="text-align:right;">' . $fmt($p['amount'] ?? 0) . '</td>
                 </tr>';
             }
             $paymentsHtml .= '</table>';
         }
-        
+
         $paidAmount = array_sum(array_map(fn($p) => (float)($p['amount'] ?? 0), $payments));
         $remaining = max(0, $saleTotal - $paidAmount);
-        $dueLine = !empty($sale['due_date'])
+        $dueLine = (!empty($cfg['show_due_date']) && !empty($sale['due_date']))
             ? '<br><strong>Vencimiento:</strong> ' . date('d/m/Y', strtotime((string)$sale['due_date']))
             : '';
-        
-        $html = $this->wrapHtml($docTitle, $companyName, '
-            <div style="margin-bottom:20px;">
-                <table width="100%" cellpadding="4" cellspacing="0">
-                    <tr>
-                        <td width="50%">
-                            <strong>No:</strong> ' . htmlspecialchars($sale['invoice_number']) . '<br>
-                            <strong>Fecha:</strong> ' . date('d/m/Y H:i', strtotime($sale['sale_date'])) . $dueLine . '<br>
-                            <strong>Cliente:</strong> ' . htmlspecialchars($sale['customer_name'] ?? 'Cliente general') . '
-                        </td>
-                        <td width="50%" style="text-align:right;">
-                            <strong>Método de pago:</strong> ' . htmlspecialchars(PaymentMethodCatalog::label((string)($sale['payment_method'] ?? 'cash'))) . '<br>
-                            <strong>Estado:</strong> ' . ($sale['payment_status'] === 'paid' ? 'Pagado' : ($sale['payment_status'] === 'partial' ? 'Parcial' : 'Pendiente')) . '
-                        </td>
-                    </tr>
-                </table>
+
+        $leftMeta = '<strong>No:</strong> ' . htmlspecialchars((string)($sale['invoice_number'] ?? '')) . '<br>'
+            . '<strong>Fecha:</strong> ' . date('d/m/Y H:i', strtotime((string)($sale['sale_date'] ?? 'now'))) . $dueLine;
+        if (!empty($cfg['show_customer'])) {
+            $leftMeta .= '<br><strong>Cliente:</strong> ' . htmlspecialchars((string)($sale['customer_name'] ?? 'Cliente general'));
+        }
+        $rightMeta = '';
+        if (!empty($cfg['show_payment_method'])) {
+            $rightMeta .= '<strong>Método de pago:</strong> ' . htmlspecialchars(PaymentMethodCatalog::label((string)($sale['payment_method'] ?? 'cash'))) . '<br>';
+        }
+        if (!empty($cfg['show_payment_status'])) {
+            $statusLabel = ($sale['payment_status'] ?? '') === 'paid' ? 'Pagado'
+                : (($sale['payment_status'] ?? '') === 'partial' ? 'Parcial' : 'Pendiente');
+            $rightMeta .= '<strong>Estado:</strong> ' . $statusLabel;
+        }
+
+        $totalsHtml = '';
+        if (!empty($cfg['show_subtotal_tax'])) {
+            $totalsHtml .= '<tr><td width="70%" style="text-align:right;"><strong>Subtotal:</strong></td>'
+                . '<td width="30%" style="text-align:right;">' . $fmt($saleSubtotal) . '</td></tr>'
+                . '<tr><td style="text-align:right;"><strong>' . $taxName . ':</strong></td>'
+                . '<td style="text-align:right;">' . $fmt($saleTax) . '</td></tr>';
+        }
+        $totalsHtml .= '<tr style="font-size:16px;font-weight:bold;">
+                <td style="text-align:right;border-top:2px solid ' . $color . ';padding-top:8px;"><strong>TOTAL:</strong></td>
+                <td style="text-align:right;border-top:2px solid ' . $color . ';padding-top:8px;color:' . $color . ';">' . $fmt($saleTotal) . '</td>
+            </tr>';
+        if (!empty($cfg['show_balance_due']) && $remaining > 0.009) {
+            $totalsHtml .= '<tr><td style="text-align:right;color:#DC2626;"><strong>Saldo Pendiente:</strong></td>'
+                . '<td style="text-align:right;color:#DC2626;">' . $fmt($remaining) . '</td></tr>';
+        }
+
+        $notesHtml = '';
+        if (!empty($cfg['show_notes']) && !empty($sale['notes'])) {
+            $notesHtml = '<p style="margin-top:20px;color:#666;"><strong>Notas:</strong> ' . htmlspecialchars((string)$sale['notes']) . '</p>';
+        }
+        $customFooter = trim((string)($cfg['footer_text'] ?? ''));
+        $customFooterHtml = $customFooter !== ''
+            ? '<p style="margin-top:16px;text-align:center;color:#555;">' . nl2br(htmlspecialchars($customFooter)) . '</p>'
+            : '';
+        $systemFooter = !empty($cfg['show_system_footer'])
+            ? '<div class="footer"><p>Seri ERP &copy; ' . date('Y') . ' — Documento generado electrónicamente</p></div>'
+            : '';
+
+        $itemHead = '<th style="text-align:left;padding:10px;">Producto</th>'
+            . '<th style="text-align:center;padding:10px;">Cant.</th>'
+            . (!empty($cfg['show_unit_price']) ? '<th style="text-align:right;padding:10px;">Precio Unit.</th>' : '')
+            . '<th style="text-align:right;padding:10px;">Subtotal</th>';
+
+        $html = '<!DOCTYPE html><html><head><meta charset="UTF-8">
+            <title>' . $docTitle . ' - ' . $companyName . '</title>
+            <style>
+                body { font-family: DejaVu Sans, Helvetica, Arial, sans-serif; font-size: 12px; color: #333; margin: 0; padding: 20px; }
+                .header { text-align: center; margin-bottom: 25px; border-bottom: 3px solid ' . $color . '; padding-bottom: 15px; }
+                .header h1 { color: ' . $color . '; margin: 0; font-size: 22px; }
+                .header .meta { color: #666; margin: 4px 0 0 0; font-size: 11px; }
+                .footer { text-align: center; margin-top: 30px; padding-top: 15px; border-top: 1px solid #ddd; font-size: 10px; color: #999; }
+                table { width: 100%; }
+                @page { margin: 15mm; }
+            </style></head><body>
+            <div class="header">
+                ' . $this->companyLogoHtml(!empty($cfg['show_logo']), '140px', '70px') . '
+                ' . (!empty($cfg['show_company_name']) ? '<h1>' . $companyName . '</h1>' : '') . '
+                <div class="meta">' . $docTitle . '</div>
+                ' . $this->companyContactLinesHtml($cfg, 'meta') . '
+                ' . $this->headerExtraHtml($cfg) . '
             </div>
-            
+            <div style="margin-bottom:20px;">
+                <table width="100%" cellpadding="4" cellspacing="0"><tr>
+                    <td width="55%">' . $leftMeta . '</td>
+                    <td width="45%" style="text-align:right;">' . $rightMeta . '</td>
+                </tr></table>
+            </div>
             <table width="100%" cellpadding="8" cellspacing="0" style="border-collapse:collapse;">
-                <tr style="background:#0D7C4A;color:#fff;">
-                    <th style="text-align:left;padding:10px;">Producto</th>
-                    <th style="text-align:center;padding:10px;">Cant.</th>
-                    <th style="text-align:right;padding:10px;">Precio Unit.</th>
-                    <th style="text-align:right;padding:10px;">Subtotal</th>
-                </tr>
+                <tr style="background:' . $color . ';color:#fff;">' . $itemHead . '</tr>
                 ' . $itemsHtml . '
             </table>
-            
-            <table width="100%" cellpadding="6" cellspacing="0" style="margin-top:15px;">
-                <tr>
-                    <td width="70%" style="text-align:right;"><strong>Subtotal:</strong></td>
-                    <td width="30%" style="text-align:right;">' . $fmt($saleSubtotal) . '</td>
-                </tr>
-                <tr>
-                    <td style="text-align:right;"><strong>' . $taxName . ':</strong></td>
-                    <td style="text-align:right;">' . $fmt($saleTax) . '</td>
-                </tr>
-                <tr style="font-size:16px;font-weight:bold;">
-                    <td style="text-align:right;border-top:2px solid #0D7C4A;padding-top:8px;"><strong>TOTAL:</strong></td>
-                    <td style="text-align:right;border-top:2px solid #0D7C4A;padding-top:8px;color:#0D7C4A;">' . $fmt($saleTotal) . '</td>
-                </tr>
-                ' . ($remaining > 0 ? '<tr><td style="text-align:right;color:#DC2626;"><strong>Saldo Pendiente:</strong></td><td style="text-align:right;color:#DC2626;">' . $fmt($remaining) . '</td></tr>' : '') . '
-            </table>
-            
+            <table width="100%" cellpadding="6" cellspacing="0" style="margin-top:15px;">' . $totalsHtml . '</table>
             ' . $paymentsHtml . '
-            
-            ' . (!empty($sale['notes']) ? '<p style="margin-top:20px;color:#666;"><strong>Notas:</strong> ' . htmlspecialchars($sale['notes']) . '</p>' : '') . '
-        ');
-        
+            ' . $notesHtml . '
+            ' . $customFooterHtml . '
+            ' . $systemFooter . '
+        </body></html>';
+
         return $this->generate($html, 'A4');
     }
 
-    /** Ticket térmico 58mm (compatible Dompdf, sin CSS flex/@page auto). */
+    /** Ticket térmico 58mm estilo POS (logo, cliente, tabla DESC/CANT/VALOR, pagos sin duplicar). */
     public function generateTicket58(array $sale, array $items, array $payments = []): string
     {
+        $cfg = SalesDocumentConfig::fromSettings($this->company)['ticket'];
         $currency = $this->currency['symbol'] ?? '$';
         $decimals = (int)($this->currency['decimals'] ?? 0);
         $fmt = fn($n) => $currency . number_format((float)$n, $decimals, ',', '.');
-        $companyName = htmlspecialchars($this->company['company_name'] ?? 'Mi Empresa');
-        $docTitle = strtoupper($this->documentLabel((string)($sale['document_type'] ?? 'invoice')));
-        $saleDate = !empty($sale['sale_date']) ? date('d/m/Y H:i', strtotime((string)$sale['sale_date'])) : date('d/m/Y H:i');
+        $esc = static fn($s) => htmlspecialchars(self::utf8Clean((string)$s), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+
+        $companyName = $esc($this->company['company_name'] ?? 'Mi Empresa');
+        $taxName = $esc($this->company['tax_name'] ?? 'IVA');
+        $invoice = $esc($sale['invoice_number'] ?? ('VTA-' . ($sale['id'] ?? '')));
+        $saleTs = !empty($sale['sale_date']) ? strtotime((string)$sale['sale_date']) : time();
+        $saleDate = date('Y-m-d', $saleTs);
+        $saleTime = date('H:i:s', $saleTs);
+        $cashier = $esc($sale['user_name'] ?? $sale['cashier_name'] ?? '');
+        $saleTax = (float)($sale['tax'] ?? $sale['tax_amount'] ?? 0);
+        $saleSubtotal = (float)($sale['subtotal'] ?? 0);
+        $saleTotal = (float)($sale['total'] ?? 0);
+        if ($saleSubtotal <= 0 && $saleTotal > 0) {
+            $saleSubtotal = max(0, $saleTotal - $saleTax);
+        }
+
+        $items = $this->uniqueSaleItems($items);
+
+        $header = '';
+        if (!empty($cfg['show_logo'])) {
+            $header .= $this->companyLogoHtml(true, '110px', '55px');
+        }
+        if (!empty($cfg['show_company_name'])) {
+            $header .= '<div class="co">' . $companyName . '</div>';
+        }
+        $contactBits = [];
+        if (!empty($cfg['show_address'])) {
+            $addr = trim((string)($this->company['company_address'] ?? ''));
+            if ($addr !== '') {
+                $contactBits[] = $esc($addr);
+            }
+        }
+        if (!empty($cfg['show_phone'])) {
+            $phone = trim((string)($this->company['company_phone'] ?? ''));
+            if ($phone !== '') {
+                $contactBits[] = 'Tel: ' . $esc($phone);
+            }
+        }
+        if (!empty($cfg['show_nit'])) {
+            $nit = trim((string)($this->company['company_nit'] ?? ''));
+            if ($nit !== '') {
+                $contactBits[] = 'NIT: ' . $esc($nit);
+            }
+        }
+        if (!empty($cfg['show_email'])) {
+            $email = trim((string)($this->company['company_email'] ?? ''));
+            if ($email !== '') {
+                $contactBits[] = $esc($email);
+            }
+        }
+        if ($contactBits !== []) {
+            $header .= '<div class="muted">' . implode('<br>', $contactBits) . '</div>';
+        }
+        $header .= $this->headerExtraHtml($cfg, 'muted');
+        $header .= '<div class="dash"></div>';
+
+        $meta = '<div class="inv">' . $invoice . '</div>'
+            . '<div class="muted">' . $esc($saleDate) . ' | ' . $esc($saleTime) . '</div>';
+        if ($cashier !== '') {
+            $meta .= '<div class="muted">Cajero: ' . $cashier . '</div>';
+        }
+        if (!empty($cfg['show_due_date']) && !empty($sale['due_date'])) {
+            $meta .= '<div class="muted">Vence: ' . $esc(date('Y-m-d', strtotime((string)$sale['due_date']))) . '</div>';
+        }
+
+        $customerBlock = '';
+        if (!empty($cfg['show_customer'])) {
+            $custName = trim((string)($sale['customer_name'] ?? '')) ?: 'CONSUMIDOR FINAL';
+            $custDoc = trim((string)($sale['customer_document'] ?? $sale['document_number'] ?? ''));
+            $customerBlock = '<div class="box">'
+                . '<div>CLIENTE: ' . $esc(mb_strtoupper($custName)) . '</div>'
+                . ($custDoc !== '' ? '<div>NIT/CC: ' . $esc($custDoc) . '</div>' : '')
+                . '</div>';
+        }
+
         $rows = '';
         foreach ($items as $item) {
+            $name = $esc($item['product_name'] ?? '');
             $qty = (int)($item['quantity'] ?? 0);
-            $price = (float)($item['unit_price'] ?? 0);
             $lineTotal = $this->itemLineTotal($item);
-            $rows .= '<table width="100%" cellpadding="0" cellspacing="0" style="margin:4px 0;border-bottom:1px dashed #999;">'
-                . '<tr><td colspan="2" style="font-size:10px;">' . htmlspecialchars((string)($item['product_name'] ?? '')) . '</td></tr>'
-                . '<tr><td style="font-size:9px;">' . $qty . ' x ' . $fmt($price) . '</td>'
-                . '<td style="font-size:10px;text-align:right;"><strong>' . $fmt($lineTotal) . '</strong></td></tr>'
-                . '</table>';
+            $rows .= '<tr>'
+                . '<td class="desc">' . $name . '</td>'
+                . '<td class="cant">' . $qty . '</td>'
+                . '<td class="valor">' . $fmt($lineTotal) . '</td>'
+                . '</tr>';
+            if (!empty($cfg['show_unit_price']) && $qty > 0) {
+                $unit = (float)($item['unit_price'] ?? 0);
+                if ($unit > 0) {
+                    $rows .= '<tr><td colspan="3" class="unit">' . $qty . ' x ' . $fmt($unit) . '</td></tr>';
+                }
+            }
         }
+
+        $totalsInner = '';
+        if (!empty($cfg['show_subtotal_tax'])) {
+            $totalsInner .= '<div>SUBTOTAL: ' . $fmt($saleSubtotal) . '</div>';
+            if ($saleTax > 0.009) {
+                $totalsInner .= '<div>' . $taxName . ': ' . $fmt($saleTax) . '</div>';
+            }
+        }
+        $totalsInner .= '<div class="grand">TOTAL: ' . $fmt($saleTotal) . '</div>';
+        $totalsBox = '<div class="box totals">' . $totalsInner . '</div>';
+
+        $payBlock = '';
+        if (!empty($cfg['show_payment_method'])) {
+            $payBlock .= $this->ticketPaymentHtml($sale, $payments, $fmt, $esc);
+        }
+        if (!empty($cfg['show_payment_status'])) {
+            $st = ($sale['payment_status'] ?? '') === 'paid' ? 'Pagado'
+                : (($sale['payment_status'] ?? '') === 'partial' ? 'Parcial' : 'Pendiente');
+            $payBlock .= '<div class="muted">Estado: ' . $esc($st) . '</div>';
+        }
+        if (!empty($cfg['show_balance_due']) && !empty($payments)) {
+            $paidAmount = array_sum(array_map(static fn($p) => (float)($p['amount'] ?? 0), $payments));
+            $remaining = max(0, $saleTotal - $paidAmount);
+            if ($remaining > 0.009) {
+                $payBlock .= '<div>Saldo: ' . $fmt($remaining) . '</div>';
+            }
+        }
+
+        $notes = '';
+        if (!empty($cfg['show_notes'])) {
+            $cleanNotes = $this->ticketCleanNotes((string)($sale['notes'] ?? ''));
+            if ($cleanNotes !== '') {
+                $notes = '<div class="notes">' . $esc($cleanNotes) . '</div>';
+            }
+        }
+        $footerText = trim((string)($cfg['footer_text'] ?? ''));
+        if ($footerText === '') {
+            $footerText = 'Gracias por su compra';
+        }
+        $footer = '<div class="muted foot">' . nl2br($esc($footerText)) . '</div>';
+
         $html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
-            @page { margin: 4mm; }
-            body { font-family: DejaVu Sans, Helvetica, sans-serif; font-size: 10px; color:#000; }
-            h1 { font-size: 12px; margin: 0 0 4px; text-align:center; }
-            .muted { color:#444; text-align:center; font-size:9px; margin: 1px 0; }
-            .total { font-size: 12px; font-weight:bold; margin-top:8px; border-top:1px solid #000; padding-top:6px; }
+            @page { margin: 3mm; }
+            body { font-family: DejaVu Sans, Helvetica, sans-serif; font-size: 10px; color:#111; margin:0; padding:0; }
+            .co { font-size: 14px; font-weight: bold; text-align:center; margin: 0 0 3px; }
+            .muted { color:#444; text-align:center; font-size:9px; margin: 1px 0; line-height:1.25; }
+            .dash { border-top: 1px dashed #999; margin: 6px 0; }
+            .inv { font-size: 16px; font-weight: bold; text-align:center; margin: 6px 0 2px; }
+            .box { background:#f0f0f0; padding:6px 7px; margin: 6px 0; font-size:9px; }
+            .box.totals { font-size:10px; }
+            .grand { font-size:13px; font-weight:bold; margin-top:3px; }
+            table.items { width:100%; border-collapse:collapse; margin-top:4px; }
+            table.items th { font-size:8px; text-align:left; border-bottom:1px solid #bbb; padding:2px 0; color:#555; }
+            table.items th.cant, table.items td.cant { text-align:center; width:14%; }
+            table.items th.valor, table.items td.valor { text-align:right; width:28%; }
+            table.items td { padding:3px 0; vertical-align:top; font-size:9px; }
+            table.items td.desc { width:58%; }
+            table.items td.unit { font-size:8px; color:#666; padding-top:0; }
+            .pay { margin-top:6px; font-size:9px; }
+            .notes { margin-top:6px; font-size:8px; color:#555; }
+            .foot { margin-top:10px; }
         </style></head><body>
-            <h1>' . $companyName . '</h1>
-            <div class="muted">' . htmlspecialchars($docTitle) . '</div>
-            <div class="muted">' . htmlspecialchars((string)($sale['invoice_number'] ?? '')) . '</div>
-            <div class="muted">' . htmlspecialchars($saleDate) . '</div>
-            <div style="margin:6px 0;">Cliente: ' . htmlspecialchars((string)($sale['customer_name'] ?? 'General')) . '</div>
-            ' . $rows . '
-            <table width="100%" class="total" cellpadding="0" cellspacing="0"><tr>
-                <td>TOTAL</td><td style="text-align:right;">' . $fmt($sale['total'] ?? 0) . '</td>
-            </tr></table>
-            <div class="muted" style="margin-top:8px;">Gracias por su compra</div>
+            ' . $header . '
+            ' . $meta . '
+            ' . $customerBlock . '
+            <table class="items" cellpadding="0" cellspacing="0">
+                <tr><th class="desc">DESC</th><th class="cant">CANT</th><th class="valor">VALOR</th></tr>
+                ' . $rows . '
+            </table>
+            ' . $totalsBox . '
+            <div class="pay">' . $payBlock . '</div>
+            ' . $notes . '
+            ' . $footer . '
         </body></html>';
-        // ~58mm de ancho en puntos (72pt/inch); alto holgado para Dompdf
-        return $this->generate($html, [0.0, 0.0, 164.41, 800.0]);
+
+        // Ancho ~58mm; alto generoso para evitar “corte” visual / segunda página fantasma.
+        return $this->generate($html, [0.0, 0.0, 164.41, 2000.0]);
+    }
+
+    /** @param list<array<string,mixed>> $items */
+    private function uniqueSaleItems(array $items): array
+    {
+        $seen = [];
+        $out = [];
+        foreach ($items as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+            $key = implode('|', [
+                (string)($item['id'] ?? ''),
+                (string)($item['product_id'] ?? ''),
+                self::utf8Clean((string)($item['product_name'] ?? '')),
+                (string)($item['quantity'] ?? ''),
+                (string)($item['unit_price'] ?? ''),
+                (string)($item['subtotal'] ?? $item['total'] ?? ''),
+            ]);
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+            $out[] = $item;
+        }
+        return $out;
+    }
+
+    /**
+     * @param array<string,mixed> $sale
+     * @param list<array<string,mixed>> $payments
+     */
+    private function ticketPaymentHtml(array $sale, array $payments, callable $fmt, callable $esc): string
+    {
+        $html = '';
+        $method = strtolower((string)($sale['payment_method'] ?? 'cash'));
+        if ($payments !== [] && (count($payments) > 1 || $method === 'mixed')) {
+            foreach ($payments as $p) {
+                $label = PaymentMethodCatalog::label((string)($p['payment_method'] ?? 'cash'));
+                $html .= '<div>Medio: ' . $esc($label) . ' · ' . $fmt($p['amount'] ?? 0) . '</div>';
+            }
+        } else {
+            $label = PaymentMethodCatalog::label($method === 'mixed' && $payments !== []
+                ? (string)($payments[0]['payment_method'] ?? 'cash')
+                : $method);
+            $html .= '<div>Medio de Pago: ' . $esc(mb_strtoupper($label)) . '</div>';
+        }
+
+        $received = null;
+        if (isset($sale['cash_received']) && (float)$sale['cash_received'] > 0) {
+            $received = (float)$sale['cash_received'];
+        } else {
+            $notes = (string)($sale['notes'] ?? '');
+            if (preg_match('/Recibido:\s*([\d.,]+)/i', $notes, $m)) {
+                $received = (float)str_replace(',', '.', preg_replace('/[^\d.,]/', '', $m[1]) ?? '0');
+            }
+        }
+        if ($received !== null && $received > 0.009) {
+            $html .= '<div>Recibido: ' . $fmt($received) . '</div>';
+        }
+        return $html;
+    }
+
+    private function ticketCleanNotes(string $notes): string
+    {
+        $notes = trim($notes);
+        if ($notes === '') {
+            return '';
+        }
+        // Quitar fragmentos de pago que ya se muestran aparte (evita repetición en mixto).
+        $parts = preg_split('/\s*[·|]\s*/u', $notes) ?: [];
+        $keep = [];
+        foreach ($parts as $part) {
+            $part = trim($part);
+            if ($part === '') {
+                continue;
+            }
+            if (preg_match('/^(recibido|cambio|pago\s*mixto|medio|efectivo|transferencia|dat[aá]fono|tarjeta)/i', $part)) {
+                continue;
+            }
+            if (preg_match('/^\d+[\d.,]*\s*$/', $part)) {
+                continue;
+            }
+            $keep[] = $part;
+        }
+        return trim(implode(' · ', $keep));
+    }
+
+    private static function utf8Clean(string $text): string
+    {
+        if ($text === '') {
+            return '';
+        }
+        if (!mb_check_encoding($text, 'UTF-8')) {
+            $converted = @mb_convert_encoding($text, 'UTF-8', 'UTF-8, ISO-8859-1, Windows-1252');
+            $text = is_string($converted) ? $converted : $text;
+        }
+        // Repara mojibake típico UTF-8 leído como Latin-1 (CUTÃCULA → CUTÍCULA)
+        if (preg_match('/Ã.|Â./u', $text)) {
+            $fixed = @mb_convert_encoding($text, 'UTF-8', 'ISO-8859-1');
+            if (is_string($fixed) && $fixed !== '' && mb_check_encoding($fixed, 'UTF-8')) {
+                $text = $fixed;
+            }
+        }
+        return str_replace(["\u{FFFD}", '�'], '', $text);
+    }
+
+    /** @param array<string,mixed> $cfg */
+    private function companyContactLinesHtml(array $cfg, string $cssClass = 'meta'): string
+    {
+        $lines = [];
+        if (!empty($cfg['show_nit'])) {
+            $nit = trim((string)($this->company['company_nit'] ?? ''));
+            if ($nit !== '') {
+                $lines[] = 'NIT: ' . htmlspecialchars($nit);
+            }
+        }
+        if (!empty($cfg['show_address'])) {
+            $addr = trim((string)($this->company['company_address'] ?? ''));
+            if ($addr !== '') {
+                $lines[] = htmlspecialchars($addr);
+            }
+        }
+        if (!empty($cfg['show_phone'])) {
+            $phone = trim((string)($this->company['company_phone'] ?? ''));
+            if ($phone !== '') {
+                $lines[] = 'Tel: ' . htmlspecialchars($phone);
+            }
+        }
+        if (!empty($cfg['show_email'])) {
+            $email = trim((string)($this->company['company_email'] ?? ''));
+            if ($email !== '') {
+                $lines[] = htmlspecialchars($email);
+            }
+        }
+        if ($lines === []) {
+            return '';
+        }
+        return '<div class="' . htmlspecialchars($cssClass) . '">' . implode('<br>', $lines) . '</div>';
+    }
+
+    /** @param array<string,mixed> $cfg */
+    private function headerExtraHtml(array $cfg, string $cssClass = 'meta'): string
+    {
+        $extra = trim((string)($cfg['header_extra'] ?? ''));
+        if ($extra === '') {
+            return '';
+        }
+        return '<div class="' . htmlspecialchars($cssClass) . '" style="margin-top:4px;">' . nl2br(htmlspecialchars($extra)) . '</div>';
+    }
+
+    private function companyLogoHtml(bool $show, string $maxW = '140px', string $maxH = '70px'): string
+    {
+        if (!$show) {
+            return '';
+        }
+        $rel = trim((string)($this->company['company_logo'] ?? ''));
+        if ($rel === '') {
+            return '';
+        }
+        $abs = dirname(__DIR__, 2) . '/public/' . ltrim(str_replace('\\', '/', $rel), '/');
+        if (!is_readable($abs)) {
+            return '';
+        }
+        $bin = @file_get_contents($abs);
+        if ($bin === false || $bin === '') {
+            return '';
+        }
+        $mime = 'image/png';
+        if (function_exists('mime_content_type')) {
+            $detected = @mime_content_type($abs);
+            if (is_string($detected) && str_starts_with($detected, 'image/')) {
+                $mime = $detected;
+            }
+        }
+        return '<div style="text-align:center;margin-bottom:8px;"><img src="data:' . $mime . ';base64,'
+            . base64_encode($bin) . '" style="max-width:' . $maxW . ';max-height:' . $maxH . ';"></div>';
     }
 
     private function itemLineTotal(array $item): float
@@ -953,6 +1303,9 @@ class PdfService
             'adjustment' => 'Ajuste',
             'opening' => 'Inventario inicial',
             'return' => 'Devolución',
+            'inventory_exit' => 'Salida / pérdida',
+            'loan' => 'Préstamo',
+            'loan_return' => 'Devolución préstamo',
             'csv_import' => 'Importación CSV',
             'csv_export' => 'Exportación CSV',
             'woocommerce' => 'WooCommerce',
@@ -993,7 +1346,7 @@ class PdfService
                 <td>' . htmlspecialchars($refLabels[$ref] ?? ($ref !== '' ? $ref : '—')) . '</td>
                 <td style="text-align:right;">' . $fmt($m['unit_cost'] ?? 0) . '</td>
                 <td>' . htmlspecialchars((string)($m['user_name'] ?? '—')) . '</td>
-                <td>' . htmlspecialchars((string)($m['notes'] ?? '')) . '</td>
+                <td>' . htmlspecialchars(StockService::describeMovementMotive($m)) . '</td>
             </tr>';
         }
         if ($rowsHtml === '') {
@@ -1018,7 +1371,7 @@ class PdfService
                     <th style="text-align:left;">Origen</th>
                     <th style="text-align:right;">Costo</th>
                     <th style="text-align:left;">Usuario</th>
-                    <th style="text-align:left;">Notas</th>
+                    <th style="text-align:left;">Motivo</th>
                 </tr>
                 ' . $rowsHtml . '
             </table>

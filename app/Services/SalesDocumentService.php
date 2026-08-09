@@ -44,12 +44,46 @@ class SalesDocumentService
         if (!isset($cols['client_sale_uuid'])) {
             $alters[] = "ADD COLUMN client_sale_uuid VARCHAR(64) NULL AFTER notes";
         }
+        if (!isset($cols['delivery_fee'])) {
+            $alters[] = "ADD COLUMN delivery_fee DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER discount";
+        }
+        if (!isset($cols['delivery_company_fee'])) {
+            $alters[] = "ADD COLUMN delivery_company_fee DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER delivery_fee";
+        }
         if ($alters) {
             try {
                 $this->db->exec('ALTER TABLE sales ' . implode(', ', $alters));
             } catch (\Throwable $e) {
                 error_log('SalesDocumentService: ' . $e->getMessage());
             }
+        }
+
+        // Asegura ENUM con pending (crédito) + completed + cancelled.
+        try {
+            $statusCol = $this->db->query("SHOW COLUMNS FROM sales LIKE 'status'")->fetch(\PDO::FETCH_ASSOC);
+            $type = strtolower((string)($statusCol['Type'] ?? ''));
+            if ($type !== '' && (!str_contains($type, "'pending'") || !str_contains($type, "'cancelled'"))) {
+                $this->db->exec(
+                    "ALTER TABLE sales
+                     MODIFY COLUMN status ENUM('completed','pending','cancelled') NOT NULL DEFAULT 'completed'"
+                );
+            }
+        } catch (\Throwable $e) {
+            error_log('SalesDocumentService status enum: ' . $e->getMessage());
+        }
+
+        try {
+            // Corrige ventas con status vacío (ENUM inválido en installs viejas).
+            $this->db->exec(
+                "UPDATE sales
+                 SET status = CASE
+                    WHEN payment_status IN ('pending', 'partial') THEN 'pending'
+                    ELSE 'completed'
+                 END
+                 WHERE status IS NULL OR status = ''"
+            );
+        } catch (\Throwable $e) {
+            // ignore
         }
         try {
             $idx = $this->db->query(
@@ -82,6 +116,9 @@ class SalesDocumentService
             'cash' => 'Contado / pago inmediato',
             'net_15' => 'Crédito 15 días',
             'net_30' => 'Crédito 30 días',
+            'net_60' => 'Crédito 60 días',
+            'net_90' => 'Crédito 90 días',
+            'net_120' => 'Crédito 120 días',
             'overdue' => 'Pago ya vencido',
         ];
     }
@@ -96,6 +133,20 @@ class SalesDocumentService
         };
     }
 
+    public static function termDays(string $terms): int
+    {
+        return match ($terms) {
+            'cash' => 0,
+            'net_15' => 15,
+            'net_30' => 30,
+            'net_60' => 60,
+            'net_90' => 90,
+            'net_120' => 120,
+            'overdue' => 0,
+            default => 30,
+        };
+    }
+
     public static function resolveDueDate(string $terms, string $saleDate): ?string
     {
         $base = strtotime($saleDate) ?: time();
@@ -103,6 +154,9 @@ class SalesDocumentService
             'cash' => date('Y-m-d', $base),
             'net_15' => date('Y-m-d', strtotime('+15 days', $base)),
             'net_30' => date('Y-m-d', strtotime('+30 days', $base)),
+            'net_60' => date('Y-m-d', strtotime('+60 days', $base)),
+            'net_90' => date('Y-m-d', strtotime('+90 days', $base)),
+            'net_120' => date('Y-m-d', strtotime('+120 days', $base)),
             'overdue' => date('Y-m-d', strtotime('-1 day', $base)),
             default => date('Y-m-d', strtotime('+15 days', $base)),
         };

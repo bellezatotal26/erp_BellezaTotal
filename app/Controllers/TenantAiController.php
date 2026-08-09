@@ -15,7 +15,7 @@ class TenantAiController extends TenantController
         $ai = new AiService($this->db);
         $modules = [];
         if (\SoftNova\Core\is_standalone()) {
-            $modules = ['ventas','inventario','clientes','caja','cotizaciones','gastos','contabilidad','nomina','reportes','compras'];
+            $modules = ['ventas','inventario','prestamos','clientes','caja','cotizaciones','gastos','contabilidad','nomina','reportes','compras'];
         } else {
             $tenantId = (int)($_SESSION['tenant_id'] ?? 0);
             if ($tenantId > 0) {

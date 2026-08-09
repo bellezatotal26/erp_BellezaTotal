@@ -102,7 +102,9 @@
                     quantity: Number(it.quantity),
                     unit_price: it.unit_price != null ? Number(it.unit_price) : 0,
                     product_name: String(it.product_name || ''),
-                    subtotal: it.subtotal != null ? Number(it.subtotal) : undefined
+                    subtotal: it.subtotal != null ? Number(it.subtotal) : undefined,
+                    stock_oversell_reason: String(it.stock_oversell_reason || ''),
+                    stock_oversell_note: String(it.stock_oversell_note || '')
                 };
             });
         }
@@ -120,10 +122,42 @@
                 quantity: Number(it.quantity) || 0,
                 unit_price: Number(it.unit_price) || 0,
                 product_name: String(it.product_name || ''),
-                subtotal: it.subtotal != null ? Number(it.subtotal) : undefined
+                subtotal: it.subtotal != null ? Number(it.subtotal) : undefined,
+                stock_oversell_reason: String(it.stock_oversell_reason || ''),
+                stock_oversell_note: String(it.stock_oversell_note || '')
             };
         }).filter(function (it) {
             return it.product_id > 0 && it.quantity > 0;
+        });
+    }
+
+    function rebuildPaymentSplits(obj) {
+        if (!obj || typeof obj !== 'object') return [];
+        if (Array.isArray(obj.payment_splits)) {
+            return obj.payment_splits.filter(function (s) {
+                return s && String(s.method || '') !== '' && Number(s.amount) > 0;
+            }).map(function (s) {
+                return {
+                    method: String(s.method || ''),
+                    amount: Math.round(Number(s.amount) * 100) / 100
+                };
+            });
+        }
+        var rows = [];
+        Object.keys(obj).forEach(function (key) {
+            var m = key.match(/^payment_splits\[(\d+)\]\[(\w+)\]$/);
+            if (!m) return;
+            var idx = parseInt(m[1], 10);
+            if (!rows[idx]) rows[idx] = {};
+            rows[idx][m[2]] = obj[key];
+        });
+        return rows.filter(Boolean).map(function (s) {
+            return {
+                method: String(s.method || s.payment_method || ''),
+                amount: Math.round(Number(s.amount || 0) * 100) / 100
+            };
+        }).filter(function (s) {
+            return s.method && s.amount > 0;
         });
     }
 
@@ -131,6 +165,7 @@
     function normalizePayload(raw) {
         var src = raw || {};
         var items = rebuildItems(src);
+        var splits = rebuildPaymentSplits(src);
         return {
             client_sale_uuid: String(src.client_sale_uuid || ''),
             customer_id: src.customer_id || '',
@@ -140,12 +175,17 @@
             payment_terms: String(src.payment_terms || 'cash'),
             sale_date: String(src.sale_date || ''),
             discount_percent: src.discount_percent != null ? String(src.discount_percent) : '0',
+            delivery_fee: src.delivery_fee != null ? String(src.delivery_fee) : '0',
+            delivery_company_fee: src.delivery_company_fee != null ? String(src.delivery_company_fee) : '0',
+            delivery_total: src.delivery_total != null ? String(src.delivery_total) : '0',
+            sale_channel: String(src.sale_channel || 'retail'),
             initial_payment: src.initial_payment != null ? String(src.initial_payment) : '0',
             notes: String(src.notes || ''),
             cash_received: src.cash_received != null ? String(src.cash_received) : '',
             cash_change: src.cash_change != null ? String(src.cash_change) : '',
             offline_sync: '1',
-            items: items
+            items: items,
+            payment_splits: splits
         };
     }
 
@@ -162,12 +202,12 @@
         return obj;
     }
 
-    /** Expande items[] a items[i][field] para endpoints form-urlencoded. */
+    /** Expande items[] / payment_splits[] a claves planas para FormData. */
     function objectToFormData(obj) {
         var fd = new FormData();
         var src = obj || {};
         Object.keys(src).forEach(function (key) {
-            if (key === 'items') return;
+            if (key === 'items' || key === 'payment_splits') return;
             var val = src[key];
             if (val === undefined || val === null || val === '') return;
             if (Array.isArray(val)) {
@@ -183,6 +223,15 @@
             if (it.unit_price != null) fd.append('items[' + i + '][unit_price]', String(it.unit_price));
             if (it.product_name) fd.append('items[' + i + '][product_name]', String(it.product_name));
             if (it.subtotal != null) fd.append('items[' + i + '][subtotal]', String(it.subtotal));
+            if (it.stock_oversell_reason) {
+                fd.append('items[' + i + '][stock_oversell_reason]', String(it.stock_oversell_reason));
+                fd.append('items[' + i + '][stock_oversell_note]', String(it.stock_oversell_note || ''));
+            }
+        });
+        (src.payment_splits || []).forEach(function (s, i) {
+            if (!s || !s.method) return;
+            fd.append('payment_splits[' + i + '][method]', String(s.method));
+            fd.append('payment_splits[' + i + '][amount]', String(s.amount));
         });
         return fd;
     }
@@ -252,7 +301,7 @@
                         var row = req.result;
                         if (row) {
                             var next = Number(row.stock) || 0;
-                            next = direction < 0 ? Math.max(0, next - qty) : next + qty;
+                            next = direction < 0 ? next - qty : next + qty;
                             row.stock = next;
                             store.put(row);
                         }
@@ -428,7 +477,8 @@
             return getProduct(it.product_id).then(function (p) {
                 var available = p ? Number(p.stock) : Number(it.stock);
                 var isService = p && p.product_type === 'service';
-                if (!isService && available < Number(it.quantity)) {
+                var hasOversell = !!(it.stock_oversell_reason);
+                if (!isService && available < Number(it.quantity) && !hasOversell) {
                     return {
                         ok: false,
                         product_id: it.product_id,

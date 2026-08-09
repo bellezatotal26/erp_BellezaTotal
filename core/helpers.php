@@ -188,7 +188,16 @@ function route(string $path): string
  */
 function asset(string $path): string
 {
-    return base_url(ltrim(public_web_prefix() . '/assets/' . ltrim($path, '/'), '/'));
+    $rel = ltrim($path, '/');
+    $url = base_url(ltrim(public_web_prefix() . '/assets/' . $rel, '/'));
+    // Cache-bust por mtime: evita JS/CSS viejos tras subir ZIP (y ayuda al SW).
+    if (defined('PUBLIC_PATH')) {
+        $file = PUBLIC_PATH . DIRECTORY_SEPARATOR . 'assets' . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $rel);
+        if (is_file($file)) {
+            $url .= (str_contains($url, '?') ? '&' : '?') . 'v=' . filemtime($file);
+        }
+    }
+    return $url;
 }
 
 /**
@@ -392,10 +401,53 @@ function media_url(?string $pathOrUrl): string
         // No es un upload conocido: devolver tal cual (assets, externos)
         return $pathOrUrl;
     }
-    // Branding puede seguir siendo público
-    if (str_starts_with($rel, 'uploads/branding/')) {
-        return base_url($rel);
+        // Branding: URL pública con prefijo /public si el DocumentRoot no es public/.
+        // Si el acceso directo falla (htaccess), el preview autenticado usa /app/media.
+        if (str_starts_with($rel, 'uploads/branding/')) {
+            $webPublic = public_web_prefix(); // '' o '/public'
+            return base_url(ltrim($webPublic . '/' . $rel, '/'));
+        }
+        return base_url('/app/media?f=' . rawurlencode($rel));
     }
-    return base_url('/app/media?f=' . rawurlencode($rel));
+
+/**
+ * Repara texto UTF-8 mal interpretado (mojibake), p.ej. "UÃ'A" → "UÑA".
+ * Seguro: si no detecta corrupción, devuelve el original.
+ */
+function utf8_fix(string $text): string
+{
+    if ($text === '') {
+        return $text;
+    }
+    // Señales típicas de UTF-8 leído como Latin-1/Windows-1252
+    if (!preg_match('/Ã.|Â.|Ð.|Ã|Â/u', $text)) {
+        return $text;
+    }
+
+    foreach (['Windows-1252', 'ISO-8859-1'] as $from) {
+        $candidate = @mb_convert_encoding($text, $from, 'UTF-8');
+        if ($candidate === false || $candidate === '' || $candidate === $text) {
+            continue;
+        }
+        if (!mb_check_encoding($candidate, 'UTF-8')) {
+            continue;
+        }
+        // Aceptar si recupera letras latinas o reduce marcadores de mojibake
+        if (
+            preg_match('/[ÑñÁÉÍÓÚáéíóúÜü¿¡]/u', $candidate)
+            || substr_count($candidate, 'Ã') < substr_count($text, 'Ã')
+        ) {
+            return $candidate;
+        }
+    }
+
+    return $text;
 }
+
+/** Escape HTML con UTF-8 explícito + reparación de mojibake. */
+function e(?string $text): string
+{
+    return htmlspecialchars(utf8_fix((string)$text), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
 
