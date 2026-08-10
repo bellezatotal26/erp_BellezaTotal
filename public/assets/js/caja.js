@@ -498,9 +498,13 @@
     }
 
     function creditSurchargeAmount(baseAfterDiscount) {
-        // El % de crédito largo en Contabilidad es informativo/comisiones:
-        // no debe aumentar el total que paga el cliente.
-        return 0;
+        var days = creditTermsDays();
+        var threshold = Number(window.cajaCreditSurchargeDays || 60);
+        if (isNaN(threshold) || threshold < 1) threshold = 60;
+        if (days <= threshold) return 0;
+        var rate = creditSurchargeRate();
+        if (rate <= 0) return 0;
+        return roundMoney((Number(baseAfterDiscount) || 0) * (rate / 100));
     }
 
     function isWholesaleMode() {
