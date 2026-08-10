@@ -90,7 +90,7 @@ class PdfService
         $leftMeta = '<strong>No:</strong> ' . htmlspecialchars((string)($sale['invoice_number'] ?? '')) . '<br>'
             . '<strong>Fecha:</strong> ' . date('d/m/Y H:i', strtotime((string)($sale['sale_date'] ?? 'now'))) . $dueLine;
         if (!empty($cfg['show_customer'])) {
-            $leftMeta .= '<br><strong>Cliente:</strong> ' . htmlspecialchars((string)($sale['customer_name'] ?? 'Cliente general'));
+            $leftMeta .= '<br><strong>Cliente:</strong> ' . htmlspecialchars((string)($sale['customer_name'] ?? 'Cliente Final'));
         }
         $rightMeta = '';
         if (!empty($cfg['show_payment_method'])) {
@@ -108,6 +108,11 @@ class PdfService
                 . '<td width="30%" style="text-align:right;">' . $fmt($saleSubtotal) . '</td></tr>'
                 . '<tr><td style="text-align:right;"><strong>' . $taxName . ':</strong></td>'
                 . '<td style="text-align:right;">' . $fmt($saleTax) . '</td></tr>';
+        }
+        $deliveryClient = max(0.0, (float)($sale['delivery_fee'] ?? 0));
+        if ($deliveryClient > 0.009) {
+            $totalsHtml .= '<tr><td style="text-align:right;"><strong>Domicilio (cliente):</strong></td>'
+                . '<td style="text-align:right;">' . $fmt($deliveryClient) . '</td></tr>';
         }
         $totalsHtml .= '<tr style="font-size:16px;font-weight:bold;">
                 <td style="text-align:right;border-top:2px solid ' . $color . ';padding-top:8px;"><strong>TOTAL:</strong></td>
@@ -279,6 +284,10 @@ class PdfService
             if ($saleTax > 0.009) {
                 $totalsInner .= '<div>' . $taxName . ': ' . $fmt($saleTax) . '</div>';
             }
+        }
+        $deliveryClient = max(0.0, (float)($sale['delivery_fee'] ?? 0));
+        if ($deliveryClient > 0.009) {
+            $totalsInner .= '<div>DOMICILIO: ' . $fmt($deliveryClient) . '</div>';
         }
         $totalsInner .= '<div class="grand">TOTAL: ' . $fmt($saleTotal) . '</div>';
         $totalsBox = '<div class="box totals">' . $totalsInner . '</div>';

@@ -165,11 +165,26 @@ class StockService
         if ($date === '') {
             return date('Y-m-d');
         }
-        $dt = \DateTimeImmutable::createFromFormat('Y-m-d', $date);
-        if (!$dt || $dt->format('Y-m-d') !== $date) {
-            throw new \InvalidArgumentException('Fecha de ingreso a bodega inválida');
+        // Acepta datetime completo y lo reduce a fecha de bodega.
+        $date = str_replace('T', ' ', $date);
+        if (preg_match('/^(\d{4}-\d{2}-\d{2})/', $date, $m)) {
+            $only = $m[1];
+            $dt = \DateTimeImmutable::createFromFormat('Y-m-d', $only);
+            if ($dt && $dt->format('Y-m-d') === $only) {
+                return $only;
+            }
         }
-        return $date;
+        foreach (['d/m/Y', 'd-m-Y', 'd/m/y', 'd-m-y'] as $fmt) {
+            $dt = \DateTimeImmutable::createFromFormat($fmt, $date);
+            if ($dt instanceof \DateTimeImmutable) {
+                $err = \DateTimeImmutable::getLastErrors();
+                if (is_array($err) && (($err['warning_count'] ?? 0) > 0 || ($err['error_count'] ?? 0) > 0)) {
+                    continue;
+                }
+                return $dt->format('Y-m-d');
+            }
+        }
+        throw new \InvalidArgumentException('Fecha de ingreso a bodega inválida');
     }
 
     /**
@@ -1167,6 +1182,11 @@ class StockService
             'summary_lines' => [],
             'summary_text' => '',
         ];
+
+        // Si el stock ya se repuso por edición/ajuste sin pasar por coverOpenDebts,
+        // cerrar deudas de venta huérfanas para que la alerta desaparezca.
+        $this->reconcileStaleSaleDebts();
+
         try {
             $products = $this->query(
                 "SELECT p.id, p.code, p.name, p.stock,
@@ -1273,6 +1293,45 @@ class StockService
             'summary_lines' => $lines,
             'summary_text' => $summary,
         ];
+    }
+
+    /**
+     * Cierra deudas de venta sin stock cuando el producto ya tiene unidades en bodega
+     * (reposición hecha por edición/ajuste/CSV que no pasó por coverOpenDebts).
+     * Los préstamos NO se auto-cierran: requieren devolución manual.
+     */
+    private function reconcileStaleSaleDebts(): void
+    {
+        try {
+            $rows = $this->query(
+                "SELECT p.id, p.stock,
+                        COALESCE(SUM(d.qty_remaining), 0) AS debt_qty
+                 FROM products p
+                 INNER JOIN product_stock_debts d ON d.product_id = p.id
+                 WHERE p.status = 'active' AND p.product_type = 'product'
+                   AND p.stock > 0
+                   AND d.status IN ('open','partial') AND d.qty_remaining > 0
+                   AND COALESCE(d.source, 'sale') = 'sale'
+                 GROUP BY p.id, p.stock
+                 HAVING debt_qty > 0
+                 LIMIT 200"
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            return;
+        }
+
+        foreach ($rows as $row) {
+            $stock = (int)($row['stock'] ?? 0);
+            $debtQty = (int)($row['debt_qty'] ?? 0);
+            if ($stock <= 0 || $debtQty <= 0) {
+                continue;
+            }
+            try {
+                $this->coverOpenDebts((int)$row['id'], min($stock, $debtQty));
+            } catch (\Throwable $e) {
+                // No bloquear el reporte de alertas.
+            }
+        }
     }
 
     /** @param array<string,mixed> $row */
@@ -1799,7 +1858,7 @@ class StockService
 
         $this->query("UPDATE products SET stock = ? WHERE id = ?", [$newStock, $productId]);
 
-        return $this->addMovement(
+        $movementId = $this->addMovement(
             $productId,
             'adjustment',
             abs($diff),
@@ -1819,6 +1878,246 @@ class StockService
             $diff > 0 ? 'equity' : 'loss',
             $movementDate
         );
+
+        if ($diff > 0) {
+            $this->coverOpenDebts($productId, $diff);
+            try {
+                if ($this->lots()->tracksLots($productId)) {
+                    $this->lots()->registerEntry($productId, $diff, $cost, [
+                        'lot_code' => '',
+                        'expiry_date' => null,
+                        'notes' => 'Ajuste de stock (+)',
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                error_log('Lote en adjustTo +: ' . $e->getMessage());
+            }
+        } elseif ($diff < 0) {
+            $this->consumeLots($productId, abs($diff), $movementId);
+        }
+
+        return $movementId;
+    }
+
+    /**
+     * Ajuste de cantidad de un lote + sincronización de products.stock y kardex.
+     *
+     * @return array{ok:bool,message:string,movement_id:int}
+     */
+    public function adjustLotWithStock(int $lotId, int $newQuantity, string $notes = ''): array
+    {
+        $result = $this->lots()->adjustLot($lotId, $newQuantity, $notes);
+        if (empty($result['ok'])) {
+            return ['ok' => false, 'message' => 'Lote no encontrado', 'movement_id' => 0];
+        }
+        $delta = (int)$result['delta'];
+        if ($delta === 0) {
+            return ['ok' => true, 'message' => 'Lote sin cambios', 'movement_id' => 0];
+        }
+
+        $productId = (int)$result['product_id'];
+        $product = $this->query("SELECT stock, purchase_price FROM products WHERE id = ?", [$productId])->fetch();
+        if (!$product) {
+            return ['ok' => false, 'message' => 'Producto no encontrado', 'movement_id' => 0];
+        }
+
+        $oldStock = (int)$product['stock'];
+        $newStock = max(0, $oldStock + $delta);
+        $this->query("UPDATE products SET stock = ? WHERE id = ?", [$newStock, $productId]);
+
+        $cost = (float)$result['unit_cost'] > 0
+            ? (float)$result['unit_cost']
+            : round((float)($product['purchase_price'] ?? 0), 2);
+
+        $motive = self::buildStockMotive(
+            'adjustment',
+            $delta,
+            $oldStock,
+            $newStock,
+            ($notes !== '' ? $notes . ' · ' : '') . 'Ajuste lote ' . $result['lot_code']
+        );
+
+        $movementId = $this->addMovement(
+            $productId,
+            $delta > 0 ? 'in' : 'out',
+            abs($delta),
+            'lot_adjust',
+            $lotId,
+            $motive,
+            null,
+            $cost,
+            $newStock,
+            null,
+            $delta > 0 ? 'equity' : 'loss'
+        );
+
+        // Traza del lote en el movimiento (sin volver a alterar cantidad del lote).
+        try {
+            $this->query(
+                "INSERT INTO stock_movement_lots
+                    (movement_id, lot_id, lot_code, expiry_date, quantity, unit_cost)
+                 SELECT ?, id, lot_code, expiry_date, ?, ? FROM product_lots WHERE id = ?",
+                [$movementId, abs($delta), $cost, $lotId]
+            );
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        if ($delta > 0) {
+            $this->coverOpenDebts($productId, $delta);
+        }
+
+        return [
+            'ok' => true,
+            'message' => 'Lote ajustado y stock sincronizado',
+            'movement_id' => $movementId,
+        ];
+    }
+
+    /**
+     * Baja formal de un lote (vencimiento/merma): descuenta stock + depleta lote.
+     *
+     * @return array{ok:bool,message:string,movement_id:int}
+     */
+    public function writeOffLotWithStock(int $lotId, string $reason = ''): array
+    {
+        $info = $this->lots()->writeOffLot($lotId, $reason !== '' ? $reason : 'Baja por vencimiento');
+        if (!$info) {
+            return ['ok' => false, 'message' => 'Lote no encontrado o ya vacío', 'movement_id' => 0];
+        }
+
+        $productId = (int)$info['product_id'];
+        $qty = (int)$info['quantity'];
+        $product = $this->query("SELECT stock, purchase_price FROM products WHERE id = ?", [$productId])->fetch();
+        if (!$product) {
+            return ['ok' => false, 'message' => 'Producto no encontrado', 'movement_id' => 0];
+        }
+
+        $oldStock = (int)$product['stock'];
+        $newStock = max(0, $oldStock - $qty);
+        $this->query("UPDATE products SET stock = ? WHERE id = ?", [$newStock, $productId]);
+
+        $cost = (float)$info['unit_cost'] > 0
+            ? (float)$info['unit_cost']
+            : round((float)($product['purchase_price'] ?? 0), 2);
+
+        $movementId = $this->addMovement(
+            $productId,
+            'out',
+            $qty,
+            'lot_writeoff',
+            $lotId,
+            self::buildStockMotive(
+                'expiry_writeoff',
+                -$qty,
+                $oldStock,
+                $newStock,
+                ($reason !== '' ? $reason . ' · ' : '') . 'Baja lote ' . $info['lot_code']
+            ),
+            null,
+            $cost,
+            $newStock,
+            null,
+            'loss'
+        );
+
+        try {
+            $this->query(
+                "INSERT INTO stock_movement_lots
+                    (movement_id, lot_id, lot_code, expiry_date, quantity, unit_cost)
+                 SELECT ?, id, lot_code, expiry_date, ?, ? FROM product_lots WHERE id = ?",
+                [$movementId, $qty, $cost, $lotId]
+            );
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        return [
+            'ok' => true,
+            'message' => "Baja de {$qty} uds del lote {$info['lot_code']}",
+            'movement_id' => $movementId,
+        ];
+    }
+
+    /**
+     * Repara descuadre: si falta lote, siembra apertura; si sobra lote, no toca (requiere ajuste manual).
+     * Si mode=stock, ajusta products.stock a la suma física de lotes.
+     *
+     * @return array{ok:bool,message:string,seeded:int,stock_delta:int}
+     */
+    public function repairLotMismatch(int $productId, string $mode = 'seed'): array
+    {
+        $lots = $this->lots();
+        if (!$lots->tracksLots($productId)) {
+            return ['ok' => false, 'message' => 'El producto no controla lotes', 'seeded' => 0, 'stock_delta' => 0];
+        }
+
+        $product = $this->query(
+            "SELECT stock, purchase_price FROM products WHERE id = ?",
+            [$productId]
+        )->fetch();
+        if (!$product) {
+            return ['ok' => false, 'message' => 'Producto no encontrado', 'seeded' => 0, 'stock_delta' => 0];
+        }
+
+        $stock = (int)$product['stock'];
+        $lotStock = $lots->physicalLotStock($productId);
+        $cost = round((float)($product['purchase_price'] ?? 0), 2);
+
+        if ($mode === 'stock') {
+            $delta = $lotStock - $stock;
+            if ($delta === 0) {
+                return ['ok' => true, 'message' => 'Ya estaba cuadrado', 'seeded' => 0, 'stock_delta' => 0];
+            }
+            $newStock = max(0, $lotStock);
+            $this->query("UPDATE products SET stock = ? WHERE id = ?", [$newStock, $productId]);
+            $this->addMovement(
+                $productId,
+                $delta > 0 ? 'in' : 'out',
+                abs($delta),
+                'lot_reconcile',
+                null,
+                self::buildStockMotive(
+                    'adjustment',
+                    $delta,
+                    $stock,
+                    $newStock,
+                    'Cuadre de stock a suma de lotes (sin alterar remesas)'
+                ),
+                null,
+                $cost,
+                $newStock,
+                null,
+                $delta > 0 ? 'equity' : 'loss'
+            );
+            if ($delta > 0) {
+                $this->coverOpenDebts($productId, $delta);
+            }
+            return ['ok' => true, 'message' => 'Stock ajustado a la suma de lotes', 'seeded' => 0, 'stock_delta' => $delta];
+        }
+
+        // mode seed: crear lote por el faltante
+        if ($stock > $lotStock) {
+            $seeded = $lots->seedOpeningLot($productId, $cost);
+            return [
+                'ok' => true,
+                'message' => $seeded > 0
+                    ? "Se creó lote de apertura por {$seeded} uds"
+                    : 'No había faltante de lote',
+                'seeded' => $seeded,
+                'stock_delta' => 0,
+            ];
+        }
+        if ($stock < $lotStock) {
+            return [
+                'ok' => false,
+                'message' => 'Hay más unidades en lotes que en stock. Use “Ajustar stock a lotes” o ajuste el lote sobrante.',
+                'seeded' => 0,
+                'stock_delta' => 0,
+            ];
+        }
+
+        return ['ok' => true, 'message' => 'Ya estaba cuadrado', 'seeded' => 0, 'stock_delta' => 0];
     }
 
     public function valuedKardex(?int $productId = null, int $limit = 100): array

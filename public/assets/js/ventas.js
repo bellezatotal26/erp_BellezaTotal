@@ -84,7 +84,22 @@ function shareSale(id) {
             document.getElementById('shareSaleId').value = id;
             document.getElementById('shareEmail').value = d.customer_email || '';
             var btn = document.getElementById('shareWhatsappBtn');
-            btn.href = d.whatsapp_url;
+            var ticketUrl = d.ticket_pdf_url || '';
+            var waUrl = d.whatsapp_url || '#';
+            btn.href = waUrl;
+            btn.onclick = function(ev) {
+                if (typeof sharePdfToWhatsApp === 'function' && ticketUrl) {
+                    ev.preventDefault();
+                    sharePdfToWhatsApp({
+                        pdfUrl: ticketUrl,
+                        waLink: waUrl,
+                        text: d.text || '',
+                        title: 'Ticket de venta',
+                        filename: 'Ticket_' + id + '.pdf'
+                    });
+                    return false;
+                }
+            };
             document.getElementById('shareModal').style.display = 'flex';
         });
 }

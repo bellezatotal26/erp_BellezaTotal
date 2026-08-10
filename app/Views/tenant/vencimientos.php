@@ -14,13 +14,16 @@ function vencFmt(float $a, array $c): string
     return ($c['symbol'] ?? '$') . ' ' . number_format($a, (int)($c['decimals'] ?? 2), $c['decimal'] ?? ',', $c['thousands'] ?? '.');
 }
 
-function vencEstado(?int $daysLeft): array
+function vencEstado(?int $daysLeft, string $status = 'active'): array
 {
+    if ($status === 'blocked') {
+        return ['Bloqueado', '#6B7280'];
+    }
     if ($daysLeft === null) {
         return ['Sin fecha', '#6B7280'];
     }
-    if ($daysLeft < 0) {
-        return ['Vencido hace ' . abs($daysLeft) . ' d', '#DC2626'];
+    if ($daysLeft < 0 || $status === 'expired') {
+        return ['Vencido hace ' . abs((int)$daysLeft) . ' d', '#DC2626'];
     }
     if ($daysLeft === 0) {
         return ['Vence hoy', '#DC2626'];
@@ -32,6 +35,13 @@ function vencEstado(?int $daysLeft): array
 }
 ?>
 <?php echo flashMessage(); ?>
+
+<div class="alert alert-info" style="margin-bottom:16px;">
+    <strong>Cómo se manejan los lotes:</strong>
+    cada remesa del mismo producto con distinta caducidad es un lote aparte.
+    La caja vende primero lo que vence antes (FEFO) y <em>no vende</em> lotes vencidos ni bloqueados.
+    Use <strong>Baja</strong> para sacar del inventario la mercancía vencida.
+</div>
 
 <div class="stats-grid" style="margin-bottom:16px;">
     <div class="stat-card neumorphic">
@@ -95,7 +105,9 @@ function vencEstado(?int $daysLeft): array
                 <?php foreach ($lots as $lot): ?>
                     <?php
                     $daysLeft = $lot['days_left'] !== null ? (int)$lot['days_left'] : null;
-                    [$estadoTexto, $estadoColor] = vencEstado($daysLeft);
+                    $status = (string)($lot['status'] ?? 'active');
+                    [$estadoTexto, $estadoColor] = vencEstado($daysLeft, $status);
+                    $isExpired = $status === 'expired' || ($daysLeft !== null && $daysLeft < 0);
                     ?>
                     <tr>
                         <td>
@@ -115,13 +127,30 @@ function vencEstado(?int $daysLeft): array
                                         onclick="openLotAdjust(<?php echo (int)$lot['id']; ?>, '<?php echo htmlspecialchars((string)$lot['lot_code'], ENT_QUOTES); ?>', <?php echo (int)$lot['quantity']; ?>)">
                                     Ajustar
                                 </button>
+                                <?php if ($status !== 'blocked'): ?>
                                 <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=lot_block" style="display:inline;">
                                     <?php echo \SoftNova\Core\csrf_field(); ?>
                                     <input type="hidden" name="lot_id" value="<?php echo (int)$lot['id']; ?>">
                                     <input type="hidden" name="notes" value="Bloqueado por vencimiento">
-                                    <button type="submit" class="btn btn-sm btn-danger"
-                                            onclick="return confirm('¿Bloquear este lote para que no se venda?')">Bloquear</button>
+                                    <button type="submit" class="btn btn-sm btn-secondary"
+                                            onclick="return confirm('¿Bloquear este lote? No se venderá; sigue en bodega hasta dar de baja.')">Bloquear</button>
                                 </form>
+                                <?php else: ?>
+                                <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=lot_unblock" style="display:inline;">
+                                    <?php echo \SoftNova\Core\csrf_field(); ?>
+                                    <input type="hidden" name="lot_id" value="<?php echo (int)$lot['id']; ?>">
+                                    <button type="submit" class="btn btn-sm btn-secondary">Desbloquear</button>
+                                </form>
+                                <?php endif; ?>
+                                <?php if ($isExpired || $status === 'blocked'): ?>
+                                <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=lot_writeoff" style="display:inline;">
+                                    <?php echo \SoftNova\Core\csrf_field(); ?>
+                                    <input type="hidden" name="lot_id" value="<?php echo (int)$lot['id']; ?>">
+                                    <input type="hidden" name="notes" value="Baja por vencimiento">
+                                    <button type="submit" class="btn btn-sm btn-danger"
+                                            onclick="return confirm('¿Dar de baja este lote? Descuenta stock y genera salida por pérdida.')">Baja</button>
+                                </form>
+                                <?php endif; ?>
                             </td>
                         <?php endif; ?>
                     </tr>
@@ -137,13 +166,17 @@ function vencEstado(?int $daysLeft): array
         <div class="card-header"><h3>Productos con lotes descuadrados</h3></div>
         <div class="card-body">
             <p style="font-size:13px;color:var(--color-text-secondary);margin-top:0;">
-                El stock del producto no coincide con la suma de sus lotes. Suele pasar cuando se activa
-                el control de lotes con saldo previo: registre una entrada con el lote correspondiente para cuadrarlo.
+                El stock del producto debe coincidir con la suma de lotes (activos + vencidos + bloqueados).
+                Si activó lotes con saldo previo, cree el lote de apertura; si sobran lotes, ajuste el stock a la suma.
             </p>
             <div class="table-container"><table>
-                <thead><tr><th>Producto</th><th>Stock</th><th>Suma de lotes</th><th>Diferencia</th></tr></thead>
+                <thead><tr>
+                    <th>Producto</th><th>Stock</th><th>Suma lotes</th><th>Vendible</th><th>Vencido</th><th>Bloqueado</th><th>Dif.</th>
+                    <?php if ($canEdit): ?><th>Reparar</th><?php endif; ?>
+                </tr></thead>
                 <tbody>
                 <?php foreach ($mismatches as $row): ?>
+                    <?php $diff = (int)$row['stock'] - (int)$row['lot_stock']; ?>
                     <tr>
                         <td>
                             <strong><?php echo htmlspecialchars((string)$row['name']); ?></strong>
@@ -151,7 +184,30 @@ function vencEstado(?int $daysLeft): array
                         </td>
                         <td><?php echo (int)$row['stock']; ?></td>
                         <td><?php echo (int)$row['lot_stock']; ?></td>
-                        <td style="font-weight:600;color:#DC2626;"><?php echo (int)$row['stock'] - (int)$row['lot_stock']; ?></td>
+                        <td><?php echo (int)($row['sellable_stock'] ?? 0); ?></td>
+                        <td><?php echo (int)($row['expired_stock'] ?? 0); ?></td>
+                        <td><?php echo (int)($row['blocked_stock'] ?? 0); ?></td>
+                        <td style="font-weight:600;color:#DC2626;"><?php echo $diff; ?></td>
+                        <?php if ($canEdit): ?>
+                        <td style="white-space:nowrap;">
+                            <?php if ($diff > 0): ?>
+                            <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=lot_repair" style="display:inline;">
+                                <?php echo \SoftNova\Core\csrf_field(); ?>
+                                <input type="hidden" name="product_id" value="<?php echo (int)$row['id']; ?>">
+                                <input type="hidden" name="mode" value="seed">
+                                <button type="submit" class="btn btn-sm btn-primary"
+                                        onclick="return confirm('¿Crear lote de apertura por la diferencia (<?php echo $diff; ?> uds)?')">Crear lote</button>
+                            </form>
+                            <?php endif; ?>
+                            <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=lot_repair" style="display:inline;">
+                                <?php echo \SoftNova\Core\csrf_field(); ?>
+                                <input type="hidden" name="product_id" value="<?php echo (int)$row['id']; ?>">
+                                <input type="hidden" name="mode" value="stock">
+                                <button type="submit" class="btn btn-sm btn-secondary"
+                                        onclick="return confirm('¿Ajustar el stock del producto a la suma de lotes (<?php echo (int)$row['lot_stock']; ?>)?')">Ajustar stock</button>
+                            </form>
+                        </td>
+                        <?php endif; ?>
                     </tr>
                 <?php endforeach; ?>
                 </tbody>
@@ -171,8 +227,7 @@ function vencEstado(?int $daysLeft): array
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="lot_id" id="lotAdjustId">
             <p style="margin-top:0;font-size:13px;color:var(--color-text-secondary);">
-                Lote <strong id="lotAdjustCode"></strong>. El ajuste corrige la trazabilidad del lote;
-                para corregir el stock total use el ajuste de inventario.
+                Lote <strong id="lotAdjustCode"></strong>. El ajuste sincroniza también el stock del producto y deja traza en kardex.
             </p>
             <div class="form-group">
                 <label>Cantidad real del lote</label>

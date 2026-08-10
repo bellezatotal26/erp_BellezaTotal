@@ -10,13 +10,17 @@ namespace SoftNova\Services;
  * y solo al confirmar se afecta el inventario y la contabilidad. Así una lectura
  * equivocada nunca ensucia el kardex.
  *
- * Orígenes soportados: CSV/Excel exportado a CSV, texto pegado, PDF con capa de
- * texto y, si hay clave de IA configurada, extracción asistida por modelo.
+ * Orígenes soportados: CSV, Excel (xlsx/xls), Word (docx), XML factura electrónica,
+ * texto pegado, PDF con capa de texto, fotos/CamScanner y, con IA, escaneos.
  */
 class PurchaseInvoiceImportService
 {
-    private const MAX_UPLOAD_BYTES = 8388608; // 8MB
-    private const ALLOWED_EXTENSIONS = ['csv', 'txt', 'pdf', 'jpg', 'jpeg', 'png', 'webp', 'xml'];
+    private const MAX_UPLOAD_BYTES = 12582912; // 12MB
+    private const ALLOWED_EXTENSIONS = [
+        'csv', 'txt', 'pdf', 'jpg', 'jpeg', 'png', 'webp', 'xml', 'zip',
+        'xlsx', 'xlsm', 'xls', 'ods', 'docx',
+    ];
+    private const SPREADSHEET_EXTENSIONS = ['csv', 'xlsx', 'xlsm', 'xls', 'ods'];
 
     private \PDO $db;
     private ProductSupplierService $links;
@@ -53,7 +57,7 @@ class PurchaseInvoiceImportService
 
         if ($file && ($file['error'] ?? \UPLOAD_ERR_NO_FILE) !== \UPLOAD_ERR_NO_FILE) {
             $stored = $this->storeFile($file);
-            $source = $stored['extension'] === 'csv' ? 'csv' : 'text';
+            $source = in_array($stored['extension'], self::SPREADSHEET_EXTENSIONS, true) ? 'csv' : 'text';
             $extracted = $this->extractText($stored['path'], $stored['extension']);
             if ($extracted === '' && $rawText === '') {
                 $notas[] = 'No se pudo leer texto del archivo';
@@ -69,13 +73,42 @@ class PurchaseInvoiceImportService
         $isImageFile = in_array($ext, ['jpg', 'jpeg', 'png', 'webp'], true);
         $pdfLooksScanned = $ext === 'pdf' && ($rawText === '' || !$this->pdfTextLooksUsable($rawText));
 
-        if ($stored && $ext === 'csv') {
-            $items = $this->parseCsv($stored['path']);
-            $notas[] = count($items) . ' línea(s) leídas del CSV';
+        if ($stored && in_array($ext, self::SPREADSHEET_EXTENSIONS, true)) {
+            $items = $this->parseSpreadsheet($stored['path'], $ext);
+            $label = strtoupper($ext === 'csv' ? 'CSV' : 'Excel');
+            $notas[] = count($items) . ' línea(s) leídas de ' . $label;
+            if ($items === [] && $ext !== 'csv') {
+                $notas[] = 'No se detectaron filas de producto en la hoja; se intentará lectura por texto/IA';
+                if ($ext === 'xls') {
+                    $notas[] = 'Si el Excel es formato antiguo (.xls binario), guárdelo como .xlsx o CSV';
+                }
+            }
+        }
+
+        if ($stored && in_array($ext, ['xml', 'zip'], true) && empty($items)) {
+            $ubl = $this->parseUblInvoiceXml($stored['path'], $ext);
+            if ($ubl['items'] !== []) {
+                $header = $ubl;
+                $items = $ubl['items'];
+                $source = 'text';
+                $notas[] = count($items) . ' línea(s) leídas de factura electrónica DIAN/UBL';
+            } elseif ($ext === 'xml' || $ext === 'zip') {
+                $notas[] = 'XML/ZIP DIAN sin líneas de producto legibles; se intentará texto/IA';
+            }
         }
 
         $aiService = null;
         $useAi = !empty($meta['use_ai']);
+
+        // Órdenes/facturas con "ID: … / EAN: …" (ej. Recamier): parseo estructurado antes que IA genérica.
+        if (empty($items) && $rawText !== '' && !$isImageFile && !$pdfLooksScanned
+            && preg_match('/\bEAN\s*:/i', $rawText)) {
+            $items = $this->parseIdEanInvoiceText($rawText);
+            if ($items !== []) {
+                $source = 'text';
+                $notas[] = count($items) . ' línea(s) con ID/EAN detectados';
+            }
+        }
 
         // Texto + IA (PDF con capa de texto, TXT pegado, etc.)
         if (empty($items) && $rawText !== '' && $useAi && !$pdfLooksScanned && !$isImageFile) {
@@ -123,14 +156,24 @@ class PurchaseInvoiceImportService
             if ($pdfLooksScanned) {
                 // Ya se intentó visión arriba; no forzar patrones sobre basura.
             } else {
-                $items = $this->parseText($rawText);
+                if (preg_match('/\bEAN\s*:/i', $rawText)) {
+                    $items = $this->parseIdEanInvoiceText($rawText);
+                }
+                if ($items === []) {
+                    $items = $this->parseText($rawText);
+                }
                 if ($items) {
-                    $notas[] = count($items) . ' línea(s) detectadas por patrones';
+                    $withEan = count(array_filter($items, static fn($i) => trim((string)($i['barcode'] ?? '')) !== ''));
+                    $notas[] = count($items) . ' línea(s) detectadas por patrones'
+                        . ($withEan > 0 ? " ({$withEan} con EAN)" : '');
                 } elseif ($ext === 'pdf') {
-                    $notas[] = 'No se detectaron líneas de producto legibles en el PDF; capture las líneas a mano o use CSV';
+                    $notas[] = 'No se detectaron líneas de producto legibles en el PDF; active IA o use CSV/XML DIAN';
                 }
             }
         }
+
+        // Enriquecer ID/EAN si quedaron dentro de la descripción.
+        $items = array_map(fn(array $it) => $this->enrichLineIds($it), $items);
 
         $importId = $this->createImport($meta, $header, $source, $stored, $rawText, $notas);
         $this->saveItems($importId, $items, $meta['supplier_id'] ?? null);
@@ -191,10 +234,10 @@ class PurchaseInvoiceImportService
     {
         $stmt = $this->db->prepare(
             "INSERT INTO purchase_invoice_import_items
-                (import_id, line_no, raw_line, supplier_sku, description, quantity, unit_cost,
+                (import_id, line_no, raw_line, supplier_sku, barcode, description, quantity, unit_cost,
                  tax_rate, discount_pct, line_total, matched_product_id, match_type, row_action,
                  lot_code, expiry_date, sale_price, confidence)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
 
         $lineNo = 0;
@@ -208,7 +251,14 @@ class PurchaseInvoiceImportService
             $lineNo++;
 
             $sku = substr(trim((string)($item['supplier_sku'] ?? '')), 0, 120);
-            $match = $this->links->matchInvoiceLine($supplierId, $sku, $descripcion);
+            $barcode = $this->normalizeBarcodeValue((string)($item['barcode'] ?? $item['ean'] ?? ''));
+            // Si el "SKU" parece EAN y no hay barcode, usarlo como EAN.
+            if ($barcode === '' && $this->looksLikeBarcode($sku)) {
+                $barcode = $this->normalizeBarcodeValue($sku);
+            }
+            $match = $this->links->matchInvoiceLine($supplierId, $sku, $descripcion, $barcode);
+            // Auto-relacionar solo con identificadores fuertes (EAN / SKU / código / nombre exacto).
+            $autoMatch = $match && (int)($match['confidence'] ?? 0) >= 80;
             $costo = round((float)($item['unit_cost'] ?? 0), 2);
             $descuento = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))), 2);
             $impuesto = round(max(0, (float)($item['tax_rate'] ?? 0)), 2);
@@ -221,19 +271,20 @@ class PurchaseInvoiceImportService
                 $lineNo,
                 isset($item['raw_line']) ? substr((string)$item['raw_line'], 0, 500) : null,
                 $sku !== '' ? $sku : null,
+                $barcode !== '' ? $barcode : null,
                 substr($descripcion, 0, 255),
                 $cantidad,
                 $costo,
                 $impuesto,
                 $descuento,
                 $totalLinea,
-                $match['product_id'] ?? null,
-                $match['match_type'] ?? 'none',
-                $match ? 'add_stock' : 'create_product',
+                $autoMatch ? ($match['product_id'] ?? null) : null,
+                $autoMatch ? ($match['match_type'] ?? 'none') : 'none',
+                $autoMatch ? 'add_stock' : 'create_product',
                 substr(trim((string)($item['lot_code'] ?? '')), 0, 60) ?: null,
                 $this->normalizeDate($item['expiry_date'] ?? null),
                 isset($item['sale_price']) && (float)$item['sale_price'] > 0 ? round((float)$item['sale_price'], 2) : null,
-                (int)($match['confidence'] ?? 0),
+                $autoMatch ? (int)($match['confidence'] ?? 0) : 0,
             ]);
         }
     }
@@ -250,13 +301,13 @@ class PurchaseInvoiceImportService
             throw new \RuntimeException('El archivo no se subió correctamente');
         }
         if ((int)($file['size'] ?? 0) > self::MAX_UPLOAD_BYTES) {
-            throw new \RuntimeException('El archivo supera los 8MB permitidos');
+            throw new \RuntimeException('El archivo supera los 12MB permitidos');
         }
 
         $original = (string)($file['name'] ?? 'factura');
         $extension = strtolower(pathinfo($original, PATHINFO_EXTENSION));
         if (!in_array($extension, self::ALLOWED_EXTENSIONS, true)) {
-            throw new \RuntimeException('Formato no soportado. Use CSV, PDF, XML, TXT o imagen');
+            throw new \RuntimeException('Formato no soportado. Use CSV, Excel, Word, PDF, XML, TXT o imagen');
         }
 
         $dir = dirname(__DIR__, 2) . '/public/uploads/purchase-invoices';
@@ -294,6 +345,16 @@ class PurchaseInvoiceImportService
         }
         if ($extension === 'pdf') {
             return $this->extractPdfText($absolute);
+        }
+        if ($extension === 'docx') {
+            return $this->extractDocxText($absolute);
+        }
+        if (in_array($extension, ['xlsx', 'xlsm', 'xls', 'ods'], true)) {
+            // Texto tabular auxiliar para IA si el parseo por filas falla.
+            return $this->spreadsheetToPlainText($absolute, $extension);
+        }
+        if ($extension === 'zip') {
+            return $this->extractZipTextPreview($absolute);
         }
 
         return '';
@@ -544,6 +605,18 @@ class PurchaseInvoiceImportService
         // Dompdf / parsers a veces meten NUL o controles.
         $texto = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $texto) ?? $texto;
         $texto = str_replace("\u{FFFD}", '', $texto);
+        // Separar bloques típicos de órdenes (Recamier y similares).
+        $texto = preg_replace('/\s*(ID\s*:\s*)/iu', "\n$1", $texto) ?? $texto;
+        $texto = preg_replace('/\s*(\/\s*EAN\s*:)/iu', ' $1', $texto) ?? $texto;
+        // EAN-13 pegado a la cantidad: ...84210.0 → ...8421 0.0 (solo 13 dígitos; no partir EAN válidos)
+        $texto = preg_replace('/(EAN\s*:\s*)(\d{13})(\d)/iu', '$1$2 $3', $texto) ?? $texto;
+        // Cant/bonif pegados: 0.03.0 → 0.0 3.0
+        $texto = preg_replace('/(\d+\.0)(\d+\.0)/u', '$1 $2', $texto) ?? $texto;
+        // Recuperar espacios perdidos en PDF: letra↔dígito y camelCase.
+        $texto = preg_replace('/([a-zà-ÿ])([A-ZÁ-Ý])/u', '$1 $2', $texto) ?? $texto;
+        $texto = preg_replace('/([A-Za-zÁ-ý])(\d)/u', '$1 $2', $texto) ?? $texto;
+        $texto = preg_replace('/(\d)([A-Za-zÁ-ý])/u', '$1 $2', $texto) ?? $texto;
+        $texto = preg_replace('/([\$])(\d)/u', '$1 $2', $texto) ?? $texto;
         $texto = preg_replace("/[ \t]+\n/", "\n", $texto) ?? $texto;
         $texto = preg_replace("/\n{3,}/", "\n\n", $texto) ?? $texto;
         return trim($texto);
@@ -583,6 +656,38 @@ class PurchaseInvoiceImportService
             return false;
         }
         return true;
+    }
+
+    /**
+     * Lee CSV o Excel (xlsx/xls/ods) como filas de factura.
+     *
+     * @return list<array<string,mixed>>
+     */
+    public function parseSpreadsheet(string $relativeOrAbsolutePath, string $extension): array
+    {
+        $extension = strtolower($extension);
+        if ($extension === 'csv') {
+            return $this->parseCsv($relativeOrAbsolutePath);
+        }
+
+        $ruta = is_readable($relativeOrAbsolutePath)
+            ? $relativeOrAbsolutePath
+            : dirname(__DIR__, 2) . '/public/' . $relativeOrAbsolutePath;
+        if (!is_readable($ruta)) {
+            return [];
+        }
+
+        $matrix = match ($extension) {
+            'xlsx', 'xlsm' => $this->readXlsxMatrix($ruta),
+            'ods' => $this->readOdsMatrix($ruta),
+            'xls' => $this->readXlsMatrix($ruta),
+            default => [],
+        };
+        if ($matrix === []) {
+            return [];
+        }
+
+        return $this->matrixToInvoiceItems($matrix);
     }
 
     /**
@@ -692,9 +797,15 @@ class PurchaseInvoiceImportService
      */
     private function rowFromCsvFields(array $campos, array $mapa, string $separador): array
     {
+        $sku = $this->csvValue($campos, $mapa, 'supplier_sku');
+        $barcode = $this->normalizeBarcodeValue($this->csvValue($campos, $mapa, 'barcode'));
+        if ($barcode === '' && $this->looksLikeBarcode($sku)) {
+            $barcode = $this->normalizeBarcodeValue($sku);
+        }
         $fila = [
             'raw_line' => implode($separador, $campos),
-            'supplier_sku' => $this->csvValue($campos, $mapa, 'supplier_sku'),
+            'supplier_sku' => $sku,
+            'barcode' => $barcode,
             'description' => $this->csvValue($campos, $mapa, 'description'),
             'quantity' => $this->toNumber($this->csvValue($campos, $mapa, 'quantity')),
             'unit_cost' => $this->toNumber($this->csvValue($campos, $mapa, 'unit_cost')),
@@ -857,6 +968,12 @@ class PurchaseInvoiceImportService
             'supplier_sku' => [
                 'sku', 'codigo', 'código', 'code', 'referencia', 'ref', 'codigo_proveedor',
                 'sku_proveedor', 'cod', 'itemcode', 'codigoproducto', 'plu', 'idproducto',
+                'id', 'idd', 'item_id', 'product_id', 'id_producto', 'codigointerno',
+                'codinterno', 'sku_interno', 'parte', 'partnumber', 'pn',
+            ],
+            'barcode' => [
+                'ean', 'barcode', 'codigo_barras', 'codigobarras', 'barras', 'upc', 'gtin',
+                'ean13', 'ean8', 'codigo_ean', 'codigodebarras', 'bar_code', 'cbarras',
             ],
             'description' => [
                 'descripcion', 'descripción', 'description', 'producto', 'nombre', 'detalle',
@@ -888,7 +1005,7 @@ class PurchaseInvoiceImportService
         $candidatos = [];
         foreach ($campos as $indice => $titulo) {
             $normalizado = $this->slug($titulo);
-            if ($normalizado === '' || in_array($normalizado, ['ean', 'barcode', 'tipo', 'estado', 'n', 'no', 'num', 'numero'], true)) {
+            if ($normalizado === '' || in_array($normalizado, ['tipo', 'estado', 'n', 'no', 'num', 'numero'], true)) {
                 continue;
             }
             foreach ($alias as $clave => $opciones) {
@@ -1087,6 +1204,197 @@ class PurchaseInvoiceImportService
     }
 
     /**
+     * Órdenes/facturas con bloque "ID: 048391 / EAN: 7702113048391"
+     * (Recamier y formatos similares). Evita tomar 5.0 / 6.35 del nombre como cantidad.
+     *
+     * @return list<array<string,mixed>>
+     */
+    public function parseIdEanInvoiceText(string $texto): array
+    {
+        $texto = $this->normalizePdfExtractedText($texto);
+        if (!preg_match('/\bEAN\s*:/i', $texto)) {
+            return [];
+        }
+
+        // Unificar saltos; mantener ID/EAN reconocibles aunque el PDF pegue todo.
+        $texto = preg_replace('/\s+/u', ' ', $texto) ?? $texto;
+        $filas = [];
+
+        if (!preg_match_all(
+            '/ID\s*:\s*([A-Z0-9][A-Z0-9\.\-]{1,40})\s*\/\s*EAN\s*:\s*(\d{13}|\d{8,14})(?!\d)/iu',
+            $texto,
+            $matches,
+            PREG_OFFSET_CAPTURE
+        )) {
+            return [];
+        }
+
+        $count = count($matches[0]);
+        for ($i = 0; $i < $count; $i++) {
+            $sku = trim((string)$matches[1][$i][0]);
+            $ean = $this->normalizeBarcodeValue((string)$matches[2][$i][0]);
+            $matchStart = (int)$matches[0][$i][1];
+            $matchLen = strlen((string)$matches[0][$i][0]);
+            $matchEnd = $matchStart + $matchLen;
+
+            $prevEnd = $i === 0 ? 0 : ((int)$matches[0][$i - 1][1] + strlen((string)$matches[0][$i - 1][0]));
+            // Nombre: texto entre el bloque ID/EAN anterior y este (sin los montos del ítem previo).
+            $before = trim(substr($texto, $prevEnd, max(0, $matchStart - $prevEnd)));
+            // Montos: hasta 100 caracteres después del EAN (o hasta el siguiente ID).
+            $nextStart = $i + 1 < $count ? (int)$matches[0][$i + 1][1] : strlen($texto);
+            $after = trim(substr($texto, $matchEnd, min(120, max(0, $nextStart - $matchEnd))));
+
+            // Quitar del "before" los montos del producto anterior (quedan delante del nombre).
+            $name = $before;
+            $name = preg_replace('/^(?:[\$]?\d[\d\.,]*\s*)+/u', '', $name) ?? $name;
+            $name = preg_replace('/.*?\b(?:PRODUCTO|DETALLE|DESCRIPCION|DESCRIPCIÓN)\b/iu', '', $name) ?? $name;
+            $name = preg_replace('/\b(?:IMAGEN|CANT\.?|BONIF\.?|VLR\.?\s*UNIT\.?|VLR\.?\s*TOTAL|ORDEN DE PEDIDO)\b/iu', ' ', $name) ?? $name;
+            $name = preg_replace('/\bRECAMIER\b.*?\bS\.?A\.?\b/iu', ' ', $name) ?? $name;
+            $name = preg_replace('/^(?:S\.?A\.?|SAS|LTDA)\s+/iu', '', trim($name)) ?? $name;
+            if (preg_match('/([A-Za-zÁ-ý][\p{L}\d\s\.\,\-\/%xX]{6,140})$/u', $name, $nm)) {
+                $name = trim($nm[1]);
+            }
+            $name = $this->softenJammedWords(trim(preg_replace('/\s+/u', ' ', $name) ?? $name));
+            if (!$this->isReadableProductDescription($name)) {
+                $name = 'Producto ' . ($sku !== '' ? $sku : $ean);
+            }
+
+            $amounts = $this->extractQtyCostFromTail($after);
+            // Bonificados: CANT 0 + BONIF > 0 → usar bonificación como cantidad de ingreso.
+            if ($amounts['quantity'] <= 0 && $amounts['bonus'] > 0) {
+                $amounts['quantity'] = $amounts['bonus'];
+            }
+            if ($amounts['quantity'] <= 0 && $amounts['unit_cost'] <= 0 && $amounts['line_total'] <= 0) {
+                $amounts['quantity'] = 1;
+            }
+
+            $filas[] = [
+                'raw_line' => 'ID: ' . $sku . ' / EAN: ' . $ean . ' ' . $name,
+                'supplier_sku' => $sku,
+                'barcode' => $ean,
+                'description' => $name,
+                'quantity' => $amounts['quantity'],
+                'unit_cost' => $amounts['unit_cost'],
+                'tax_rate' => 0.0,
+                'discount_pct' => 0.0,
+                'line_total' => $amounts['line_total'],
+                'lot_code' => '',
+                'expiry_date' => null,
+                'sale_price' => 0.0,
+            ];
+        }
+
+        return $filas;
+    }
+
+    /**
+     * @return array{quantity:float,bonus:float,unit_cost:float,line_total:float}
+     */
+    private function extractQtyCostFromTail(string $tail): array
+    {
+        $out = ['quantity' => 0.0, 'bonus' => 0.0, 'unit_cost' => 0.0, 'line_total' => 0.0];
+        $tail = trim($tail);
+        if ($tail === '') {
+            return $out;
+        }
+
+        // Preferir montos con $ (costo / total).
+        $money = [];
+        if (preg_match_all('/\$\s*([\d.,]+)/u', $tail, $mm)) {
+            foreach ($mm[1] as $raw) {
+                $n = $this->toNumber($raw);
+                if ($n > 0) {
+                    $money[] = $n;
+                }
+            }
+        }
+        if (count($money) >= 2) {
+            $out['unit_cost'] = $money[count($money) - 2];
+            $out['line_total'] = $money[count($money) - 1];
+        } elseif (count($money) === 1) {
+            $out['line_total'] = $money[0];
+            $out['unit_cost'] = $money[0];
+        }
+
+        // Cantidades tipo 2.0 0.0 (cant / bonif) antes de los $
+        $beforeMoney = preg_split('/\$/u', $tail, 2)[0] ?? $tail;
+        // Preferir el patrón Recamier: N.N N.N justo al inicio del tramo.
+        if (preg_match('/^\s*(\d+[.,]\d+)\s+(\d+[.,]\d+)/u', $beforeMoney, $pair)) {
+            $out['quantity'] = $this->toNumber($pair[1]);
+            $out['bonus'] = $this->toNumber($pair[2]);
+        } elseif (preg_match_all('/\b(\d+[.,]\d+)\b/u', $beforeMoney, $qm)) {
+            $nums = array_map([$this, 'toNumber'], $qm[1]);
+            if (isset($nums[0])) {
+                $out['quantity'] = $nums[0];
+            }
+            if (isset($nums[1])) {
+                $out['bonus'] = $nums[1];
+            }
+        }
+
+        if ($out['unit_cost'] <= 0 && $out['line_total'] > 0 && $out['quantity'] > 0) {
+            $out['unit_cost'] = round($out['line_total'] / $out['quantity'], 2);
+        }
+        if ($out['line_total'] <= 0 && $out['unit_cost'] > 0 && $out['quantity'] > 0) {
+            $out['line_total'] = round($out['unit_cost'] * $out['quantity'], 2);
+        }
+
+        return $out;
+    }
+
+    /** @param array<string,mixed> $item @return array<string,mixed> */
+    private function enrichLineIds(array $item): array
+    {
+        $blob = trim(
+            (string)($item['description'] ?? '') . ' ' .
+            (string)($item['raw_line'] ?? '') . ' ' .
+            (string)($item['supplier_sku'] ?? '') . ' ' .
+            (string)($item['barcode'] ?? '')
+        );
+
+        if (preg_match('/ID\s*:\s*([A-Z0-9][A-Z0-9\.\-]{1,40})\s*\/\s*EAN\s*:\s*(\d{8,14})/iu', $blob, $m)) {
+            if (trim((string)($item['supplier_sku'] ?? '')) === '') {
+                $item['supplier_sku'] = trim($m[1]);
+            }
+            if (trim((string)($item['barcode'] ?? '')) === '') {
+                $item['barcode'] = $this->normalizeBarcodeValue($m[2]);
+            }
+            $item['description'] = trim(preg_replace(
+                '/ID\s*:\s*[A-Z0-9\.\-]+\s*\/\s*EAN\s*:\s*\d{8,14}/iu',
+                '',
+                (string)($item['description'] ?? '')
+            ) ?? '');
+        } elseif (preg_match('/EAN\s*:\s*(\d{8,14})/iu', $blob, $m)) {
+            if (trim((string)($item['barcode'] ?? '')) === '') {
+                $item['barcode'] = $this->normalizeBarcodeValue($m[1]);
+            }
+        } elseif (preg_match('/\b(77\d{11})\b/', $blob, $m)) {
+            // EAN-13 Colombia (prefijo 770–773) suelto en el texto
+            if (trim((string)($item['barcode'] ?? '')) === '') {
+                $item['barcode'] = $this->normalizeBarcodeValue($m[1]);
+            }
+        }
+
+        $item['description'] = $this->softenJammedWords(trim((string)($item['description'] ?? '')));
+        return $item;
+    }
+
+    private function softenJammedWords(string $text): string
+    {
+        if ($text === '' || str_contains($text, ' ')) {
+            // Aun con espacios, separar camel residual.
+            $text = preg_replace('/([a-zà-ÿ])([A-ZÁ-Ý])/u', '$1 $2', $text) ?? $text;
+            return trim(preg_replace('/\s+/u', ' ', $text) ?? $text);
+        }
+        $text = preg_replace('/([a-zà-ÿ])([A-ZÁ-Ý])/u', '$1 $2', $text) ?? $text;
+        $text = preg_replace('/([A-Za-zÁ-ý])(\d)/u', '$1 $2', $text) ?? $text;
+        $text = preg_replace('/(\d)([A-Za-zÁ-ý])/u', '$1 $2', $text) ?? $text;
+        // Tokens conocidos en belleza/cosmético
+        $text = preg_replace('/\bSALON\s*IN\b/iu', 'SALON IN', $text) ?? $text;
+        return trim(preg_replace('/\s+/u', ' ', $text) ?? $text);
+    }
+
+    /**
      * Detecta líneas de factura en texto libre.
      * Busca el patrón habitual: [código] descripción cantidad costo [total].
      *
@@ -1094,58 +1402,111 @@ class PurchaseInvoiceImportService
      */
     public function parseText(string $texto): array
     {
+        $idEan = $this->parseIdEanInvoiceText($texto);
+        if ($idEan !== []) {
+            return $idEan;
+        }
+
         $filas = [];
         foreach (preg_split('/\r\n|\r|\n/', $texto) ?: [] as $linea) {
             $linea = trim(preg_replace('/\s{2,}/', ' ', $linea) ?? '');
             if ($linea === '' || mb_strlen($linea) < 8) {
                 continue;
             }
-            if (preg_match('/^(subtotal|total|iva|impuesto|descuento|neto|factura|nit|cliente|proveedor|fecha)\b/i', $linea)) {
+            if (preg_match('/^(subtotal|total|iva|impuesto|descuento|neto|factura|nit|cliente|proveedor|fecha|pedido|vendedor)\b/i', $linea)) {
                 continue;
             }
 
-            // Últimos números de la línea: cantidad, costo unitario y total.
-            if (!preg_match_all('/-?\d[\d.,]*/', $linea, $numeros)) {
+            $sku = '';
+            $barcode = '';
+            $work = $linea;
+            if (preg_match('/ID\s*:\s*([A-Z0-9\.\-]+)\s*\/\s*EAN\s*:\s*(\d{8,14})/iu', $work, $im)) {
+                $sku = trim($im[1]);
+                $barcode = $this->normalizeBarcodeValue($im[2]);
+                $work = trim(str_replace($im[0], ' ', $work));
+            } elseif (preg_match('/EAN\s*:\s*(\d{8,14})/iu', $work, $im)) {
+                $barcode = $this->normalizeBarcodeValue($im[1]);
+                $work = trim(str_replace($im[0], ' ', $work));
+            }
+
+            // Quitar EAN-13 del pool de números para no usarlos como cantidad/costo.
+            $workForNums = preg_replace('/\b\d{8,14}\b/', ' ', $work) ?? $work;
+            $workForNums = preg_replace('/\$\s*/', '$', $workForNums) ?? $workForNums;
+
+            if (!preg_match_all('/\$?\s*-?\d[\d.,]*/', $workForNums, $numeros)) {
                 continue;
             }
-            $valores = array_map([$this, 'toNumber'], $numeros[0]);
+            $tokens = $numeros[0];
+            $valores = array_map([$this, 'toNumber'], $tokens);
             if (count($valores) < 2) {
                 continue;
             }
 
-            $posicionPrimerNumero = mb_strpos($linea, $numeros[0][0]);
-            $descripcion = trim(mb_substr($linea, 0, $posicionPrimerNumero === false ? null : $posicionPrimerNumero));
-            $sku = '';
-            if (preg_match('/^([A-Z0-9][A-Z0-9\-\.\/]{2,})\s+(.+)$/u', $descripcion, $partes)) {
+            $firstTok = ltrim($tokens[0], '$ ');
+            $posicionPrimerNumero = mb_strpos($work, $firstTok);
+            $descripcion = trim(mb_substr($work, 0, $posicionPrimerNumero === false ? null : $posicionPrimerNumero));
+            $descripcion = $this->softenJammedWords($descripcion);
+
+            if ($barcode === '' && preg_match('/\b(77\d{11})\b/', $linea, $eanMatch)) {
+                $barcode = $this->normalizeBarcodeValue($eanMatch[1]);
+            }
+            if ($sku === '' && preg_match('/^([A-Z0-9][A-Z0-9\-\.\/]{2,})\s+(.+)$/u', $descripcion, $partes)) {
                 $sku = $partes[1];
                 $descripcion = trim($partes[2]);
+                if ($barcode === '' && $this->looksLikeBarcode($sku)) {
+                    $barcode = $this->normalizeBarcodeValue($sku);
+                }
             }
             if (!$this->isReadableProductDescription($descripcion)) {
                 continue;
             }
 
-            // La cantidad es el primer número; el costo, el siguiente mayor a cero.
-            $cantidad = $valores[0] > 0 ? $valores[0] : 1.0;
-            $costo = 0.0;
-            for ($i = 1; $i < count($valores); $i++) {
-                if ($valores[$i] > 0) {
-                    $costo = $valores[$i];
-                    break;
+            // Preferir montos con $ como costo/total; cantidades = números sin $.
+            $moneyIdx = [];
+            foreach ($tokens as $i => $tok) {
+                if (str_contains($tok, '$')) {
+                    $moneyIdx[] = $i;
                 }
             }
-            if ($costo <= 0) {
+            $cantidad = 0.0;
+            $costo = 0.0;
+            $total = 0.0;
+            if (count($moneyIdx) >= 2) {
+                $costo = $valores[$moneyIdx[count($moneyIdx) - 2]];
+                $total = $valores[$moneyIdx[count($moneyIdx) - 1]];
+                foreach ($valores as $i => $v) {
+                    if (!in_array($i, $moneyIdx, true) && $v > 0 && $v < 10000) {
+                        $cantidad = $v;
+                        break;
+                    }
+                }
+            } else {
+                $cantidad = $valores[0] > 0 ? $valores[0] : 1.0;
+                for ($i = 1; $i < count($valores); $i++) {
+                    if ($valores[$i] > 0) {
+                        $costo = $valores[$i];
+                        break;
+                    }
+                }
+                $total = end($valores) ?: 0.0;
+            }
+            if ($cantidad <= 0) {
+                $cantidad = 1.0;
+            }
+            if ($costo <= 0 && $total <= 0) {
                 continue;
             }
 
             $filas[] = [
                 'raw_line' => $linea,
                 'supplier_sku' => $sku,
+                'barcode' => $barcode,
                 'description' => $descripcion,
                 'quantity' => $cantidad,
                 'unit_cost' => $costo,
                 'tax_rate' => 0.0,
                 'discount_pct' => 0.0,
-                'line_total' => end($valores) ?: 0.0,
+                'line_total' => $total,
                 'lot_code' => '',
                 'expiry_date' => $this->findExpiryInLine($linea),
                 'sale_price' => 0.0,
@@ -1166,9 +1527,15 @@ class PurchaseInvoiceImportService
             if (!is_array($item)) {
                 continue;
             }
+            $sku = trim((string)($item['supplier_sku'] ?? $item['sku'] ?? $item['id'] ?? $item['codigo'] ?? ''));
+            $barcode = $this->normalizeBarcodeValue((string)($item['barcode'] ?? $item['ean'] ?? $item['gtin'] ?? $item['upc'] ?? ''));
+            if ($barcode === '' && $this->looksLikeBarcode($sku)) {
+                $barcode = $this->normalizeBarcodeValue($sku);
+            }
             $salida[] = [
                 'raw_line' => null,
-                'supplier_sku' => (string)($item['supplier_sku'] ?? ''),
+                'supplier_sku' => $sku,
+                'barcode' => $barcode,
                 'description' => (string)($item['description'] ?? ''),
                 'quantity' => $this->toNumber((string)($item['quantity'] ?? '0')),
                 'unit_cost' => $this->toNumber((string)($item['unit_cost'] ?? '0')),
@@ -1244,7 +1611,7 @@ class PurchaseInvoiceImportService
             "UPDATE purchase_invoice_import_items SET
                 description = ?, quantity = ?, unit_cost = ?, tax_rate = ?, discount_pct = ?,
                 line_total = ?, matched_product_id = ?, row_action = ?, lot_code = ?,
-                expiry_date = ?, sale_price = ?, supplier_sku = ?
+                expiry_date = ?, sale_price = ?, supplier_sku = ?, barcode = ?
              WHERE id = ? AND import_id = ?"
         );
 
@@ -1286,6 +1653,7 @@ class PurchaseInvoiceImportService
                 $this->normalizeDate($row['expiry_date'] ?? null),
                 isset($row['sale_price']) && (float)$row['sale_price'] > 0 ? round((float)$row['sale_price'], 2) : null,
                 substr(trim((string)($row['supplier_sku'] ?? '')), 0, 120) ?: null,
+                $this->normalizeBarcodeValue((string)($row['barcode'] ?? '')) ?: null,
                 $itemId,
                 $importId,
             ]);
@@ -1495,6 +1863,14 @@ class PurchaseInvoiceImportService
                 'last_purchase_date' => (string)($import['invoice_date'] ?? date('Y-m-d')),
             ]);
 
+            $barcodeLine = $this->normalizeBarcodeValue((string)($item['barcode'] ?? ''));
+            if ($barcodeLine !== '' && !$this->barcodeExists($barcodeLine)) {
+                $this->query(
+                    "UPDATE products SET barcode = COALESCE(NULLIF(barcode, ''), ?) WHERE id = ?",
+                    [$barcodeLine, $productoId]
+                );
+            }
+
             if (!empty($item['sale_price']) && (float)$item['sale_price'] > 0) {
                 $this->query(
                     "UPDATE products SET sale_price = ? WHERE id = ?",
@@ -1587,8 +1963,14 @@ class PurchaseInvoiceImportService
         }
 
         $codigo = trim((string)($item['supplier_sku'] ?? ''));
+        $barcode = $this->normalizeBarcodeValue((string)($item['barcode'] ?? ''));
         if ($codigo === '' || $this->codeExists($codigo)) {
-            $codigo = 'SKU-' . strtoupper(bin2hex(random_bytes(3)));
+            $codigo = $barcode !== '' && !$this->codeExists($barcode)
+                ? $barcode
+                : ('SKU-' . strtoupper(bin2hex(random_bytes(3))));
+        }
+        if ($barcode !== '' && $this->barcodeExists($barcode)) {
+            $barcode = '';
         }
 
         $costo = round((float)$item['unit_cost'], 2);
@@ -1598,11 +1980,12 @@ class PurchaseInvoiceImportService
 
         $this->query(
             "INSERT INTO products
-                (code, name, product_type, purchase_price, sale_price, stock, min_stock, unit,
+                (code, barcode, name, product_type, purchase_price, sale_price, stock, min_stock, unit,
                  track_lots, expiry_alert_days, created_by, source_channel)
-             VALUES (?, ?, 'product', ?, ?, 0, ?, 'UNIDAD', ?, 30, ?, 'manual')",
+             VALUES (?, ?, ?, 'product', ?, ?, 0, ?, 'UND', ?, 30, ?, 'manual')",
             [
                 substr($codigo, 0, 255),
+                $barcode !== '' ? $barcode : null,
                 substr($nombre, 0, 255),
                 $costo,
                 $precioVenta,
@@ -1618,6 +2001,572 @@ class PurchaseInvoiceImportService
     private function codeExists(string $code): bool
     {
         return (bool)$this->query("SELECT 1 FROM products WHERE code = ? LIMIT 1", [$code])->fetchColumn();
+    }
+
+    private function barcodeExists(string $barcode): bool
+    {
+        $barcode = $this->normalizeBarcodeValue($barcode);
+        if ($barcode === '') {
+            return false;
+        }
+        return (bool)$this->query(
+            "SELECT 1 FROM products WHERE barcode = ? LIMIT 1",
+            [$barcode]
+        )->fetchColumn();
+    }
+
+    private function normalizeBarcodeValue(string $value): string
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return '';
+        }
+        $compact = preg_replace('/[\s\-]/', '', $value) ?? $value;
+        return substr($compact, 0, 64);
+    }
+
+    private function looksLikeBarcode(string $value): bool
+    {
+        $v = $this->normalizeBarcodeValue($value);
+        return $v !== '' && preg_match('/^\d{8,14}$/', $v) === 1;
+    }
+
+    /**
+     * @param list<list<string>> $matrix
+     * @return list<array<string,mixed>>
+     */
+    private function matrixToInvoiceItems(array $matrix): array
+    {
+        if ($matrix === []) {
+            return [];
+        }
+        $mapa = null;
+        $filas = [];
+        foreach ($matrix as $campos) {
+            $campos = array_map(static fn($v) => trim((string)$v), $campos);
+            while ($campos !== [] && end($campos) === '') {
+                array_pop($campos);
+            }
+            if ($campos === [] || implode('', $campos) === '') {
+                continue;
+            }
+            if ($mapa === null) {
+                $mapped = $this->mapCsvHeader($campos);
+                if ($mapped !== []) {
+                    $mapa = $mapped;
+                    continue;
+                }
+                $mapa = $this->inferCsvMap($campos);
+                if ($mapa === []) {
+                    continue;
+                }
+            }
+            $fila = $this->rowFromCsvFields($campos, $mapa, "\t");
+            if (trim((string)($fila['description'] ?? '')) === ''
+                && (float)($fila['quantity'] ?? 0) <= 0
+                && (float)($fila['unit_cost'] ?? 0) <= 0) {
+                continue;
+            }
+            $filas[] = $fila;
+        }
+        return $this->recoverZeroAmountRows($filas, $mapa ?? []);
+    }
+
+    /** @return list<list<string>> */
+    private function readXlsxMatrix(string $absolute): array
+    {
+        if (!class_exists(\ZipArchive::class)) {
+            return [];
+        }
+        $zip = new \ZipArchive();
+        if ($zip->open($absolute) !== true) {
+            return [];
+        }
+
+        $shared = [];
+        $ssXml = $zip->getFromName('xl/sharedStrings.xml');
+        if (is_string($ssXml) && $ssXml !== '') {
+            $ss = @simplexml_load_string($ssXml);
+            if ($ss !== false) {
+                foreach ($ss->si as $si) {
+                    if (isset($si->t)) {
+                        $shared[] = (string)$si->t;
+                    } else {
+                        $parts = [];
+                        foreach ($si->r as $r) {
+                            $parts[] = (string)$r->t;
+                        }
+                        $shared[] = implode('', $parts);
+                    }
+                }
+            }
+        }
+
+        $sheetPath = 'xl/worksheets/sheet1.xml';
+        $wb = $zip->getFromName('xl/workbook.xml');
+        if (is_string($wb) && $wb !== '') {
+            // Preferir la primera hoja del workbook.
+            if (preg_match('/sheet[^>]*r:id="(rId\d+)"/i', $wb, $m)) {
+                $rels = $zip->getFromName('xl/_rels/workbook.xml.rels');
+                if (is_string($rels) && preg_match(
+                    '/Id="' . preg_quote($m[1], '/') . '"[^>]*Target="([^"]+)"/i',
+                    $rels,
+                    $tm
+                )) {
+                    $target = ltrim(str_replace('\\', '/', $tm[1]), '/');
+                    if (!str_starts_with($target, 'xl/')) {
+                        $target = 'xl/' . $target;
+                    }
+                    $sheetPath = $target;
+                }
+            }
+        }
+
+        $sheetXml = $zip->getFromName($sheetPath);
+        $zip->close();
+        if (!is_string($sheetXml) || $sheetXml === '') {
+            return [];
+        }
+
+        $sheet = @simplexml_load_string($sheetXml);
+        if ($sheet === false) {
+            return [];
+        }
+        $sheet->registerXPathNamespace('m', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main');
+
+        $matrix = [];
+        foreach ($sheet->sheetData->row as $row) {
+            $cells = [];
+            $maxCol = -1;
+            foreach ($row->c as $c) {
+                $ref = (string)($c['r'] ?? '');
+                $colIdx = $this->xlsxColIndex($ref);
+                if ($colIdx < 0) {
+                    $colIdx = $maxCol + 1;
+                }
+                $maxCol = max($maxCol, $colIdx);
+                $type = (string)($c['t'] ?? '');
+                $value = '';
+                if ($type === 's') {
+                    $idx = (int)($c->v ?? -1);
+                    $value = $shared[$idx] ?? '';
+                } elseif ($type === 'inlineStr') {
+                    $value = (string)($c->is->t ?? '');
+                } else {
+                    $value = (string)($c->v ?? '');
+                }
+                $cells[$colIdx] = $this->toUtf8($value);
+            }
+            if ($maxCol < 0) {
+                continue;
+            }
+            $line = array_fill(0, $maxCol + 1, '');
+            foreach ($cells as $i => $v) {
+                $line[$i] = $v;
+            }
+            $matrix[] = $line;
+        }
+
+        return $matrix;
+    }
+
+    private function xlsxColIndex(string $cellRef): int
+    {
+        if (!preg_match('/^([A-Z]+)/i', $cellRef, $m)) {
+            return -1;
+        }
+        $letters = strtoupper($m[1]);
+        $n = 0;
+        for ($i = 0, $len = strlen($letters); $i < $len; $i++) {
+            $n = $n * 26 + (ord($letters[$i]) - 64);
+        }
+        return $n - 1;
+    }
+
+    /** @return list<list<string>> */
+    private function readOdsMatrix(string $absolute): array
+    {
+        if (!class_exists(\ZipArchive::class)) {
+            return [];
+        }
+        $zip = new \ZipArchive();
+        if ($zip->open($absolute) !== true) {
+            return [];
+        }
+        $xml = $zip->getFromName('content.xml');
+        $zip->close();
+        if (!is_string($xml) || $xml === '') {
+            return [];
+        }
+        $doc = @simplexml_load_string($xml);
+        if ($doc === false) {
+            return [];
+        }
+        $doc->registerXPathNamespace('table', 'urn:oasis:names:tc:opendocument:xmlns:table:1.0');
+        $doc->registerXPathNamespace('text', 'urn:oasis:names:tc:opendocument:xmlns:text:1.0');
+        $rows = $doc->xpath('//table:table-row') ?: [];
+        $matrix = [];
+        foreach ($rows as $row) {
+            $line = [];
+            foreach ($row->children('urn:oasis:names:tc:opendocument:xmlns:table:1.0') as $cell) {
+                if ($cell->getName() !== 'table-cell') {
+                    continue;
+                }
+                $repeat = (int)($cell->attributes('urn:oasis:names:tc:opendocument:xmlns:table:1.0')['number-columns-repeated'] ?? 1);
+                $repeat = max(1, min(50, $repeat));
+                $text = trim(html_entity_decode(strip_tags($cell->asXML() ?: ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                for ($i = 0; $i < $repeat; $i++) {
+                    $line[] = $this->toUtf8($text);
+                }
+            }
+            if (implode('', $line) !== '') {
+                $matrix[] = $line;
+            }
+        }
+        return $matrix;
+    }
+
+    /**
+     * XLS antiguo: a veces es HTML/CSV disfrazado; BIFF binario no se parsea aquí.
+     *
+     * @return list<list<string>>
+     */
+    private function readXlsMatrix(string $absolute): array
+    {
+        $raw = (string)@file_get_contents($absolute);
+        if ($raw === '') {
+            return [];
+        }
+        // HTML exportado desde Excel
+        if (stripos($raw, '<table') !== false) {
+            return $this->htmlTableToMatrix($raw);
+        }
+        // CSV/TSV mal nombrado como .xls
+        if (preg_match('/[;\t,].*[;\t,]/', substr($raw, 0, 2000))) {
+            return $this->csvRawToMatrix($this->toUtf8($raw));
+        }
+        return [];
+    }
+
+    /** @return list<list<string>> */
+    private function csvRawToMatrix(string $raw): array
+    {
+        $raw = $this->normalizeCsvEncoding($raw);
+        $primera = preg_split('/\r\n|\n|\r/', $raw, 2)[0] ?? '';
+        $sep = $this->detectCsvSeparator($primera);
+        $handle = fopen('php://memory', 'r+');
+        if (!$handle) {
+            return [];
+        }
+        fwrite($handle, $raw);
+        rewind($handle);
+        $matrix = [];
+        while (($campos = fgetcsv($handle, 0, $sep)) !== false) {
+            if ($campos === [null]) {
+                continue;
+            }
+            $matrix[] = array_map(static fn($v) => trim((string)$v), $campos);
+        }
+        fclose($handle);
+        return $matrix;
+    }
+
+    /** @return list<list<string>> */
+    private function htmlTableToMatrix(string $html): array
+    {
+        $matrix = [];
+        if (!preg_match_all('/<tr[^>]*>(.*?)<\/tr>/is', $html, $rows)) {
+            return [];
+        }
+        foreach ($rows[1] as $rowHtml) {
+            if (!preg_match_all('/<t[dh][^>]*>(.*?)<\/t[dh]>/is', $rowHtml, $cells)) {
+                continue;
+            }
+            $line = [];
+            foreach ($cells[1] as $cell) {
+                $line[] = trim(html_entity_decode(strip_tags($cell), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            }
+            if (implode('', $line) !== '') {
+                $matrix[] = $line;
+            }
+        }
+        return $matrix;
+    }
+
+    private function spreadsheetToPlainText(string $absolute, string $extension): string
+    {
+        $matrix = match (strtolower($extension)) {
+            'xlsx', 'xlsm' => $this->readXlsxMatrix($absolute),
+            'ods' => $this->readOdsMatrix($absolute),
+            'xls' => $this->readXlsMatrix($absolute),
+            default => [],
+        };
+        if ($matrix === []) {
+            return '';
+        }
+        $lines = [];
+        foreach (array_slice($matrix, 0, 400) as $row) {
+            $lines[] = implode("\t", $row);
+        }
+        return implode("\n", $lines);
+    }
+
+    private function extractDocxText(string $absolute): string
+    {
+        if (!class_exists(\ZipArchive::class)) {
+            return '';
+        }
+        $zip = new \ZipArchive();
+        if ($zip->open($absolute) !== true) {
+            return '';
+        }
+        $xml = $zip->getFromName('word/document.xml');
+        $zip->close();
+        if (!is_string($xml) || $xml === '') {
+            return '';
+        }
+        $xml = preg_replace('/<\/w:p>/', "\n", $xml) ?? $xml;
+        $xml = preg_replace('/<w:tab[^>]*\/>/', "\t", $xml) ?? $xml;
+        $text = strip_tags($xml);
+        $text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $text = preg_replace("/[ \t]+\n/", "\n", $text) ?? $text;
+        $text = preg_replace("/\n{3,}/", "\n\n", $text) ?? $text;
+        return $this->toUtf8(trim($text));
+    }
+
+    /**
+     * Factura electrónica UBL / DIAN (Invoice, CreditNote, AttachedDocument, ZIP).
+     *
+     * @return array{invoice_number?:string,invoice_date?:?string,items:list<array<string,mixed>>}
+     */
+    private function parseUblInvoiceXml(string $relativeOrAbsolutePath, string $extension = 'xml'): array
+    {
+        $ruta = is_readable($relativeOrAbsolutePath)
+            ? $relativeOrAbsolutePath
+            : dirname(__DIR__, 2) . '/public/' . $relativeOrAbsolutePath;
+        if (!is_readable($ruta)) {
+            return ['items' => []];
+        }
+
+        $raw = '';
+        if (strtolower($extension) === 'zip') {
+            $raw = $this->extractXmlFromZip($ruta);
+        } else {
+            $raw = (string)file_get_contents($ruta);
+        }
+        if ($raw === '') {
+            return ['items' => []];
+        }
+        $raw = $this->toUtf8($raw);
+        $ubl = $this->extractEmbeddedUblXml($raw);
+        if ($ubl === '') {
+            return ['items' => []];
+        }
+
+        return $this->parseUblDom($ubl);
+    }
+
+    private function extractZipTextPreview(string $absolute): string
+    {
+        $xml = $this->extractXmlFromZip($absolute);
+        if ($xml === '') {
+            return '';
+        }
+        $parsed = $this->parseUblDom($xml);
+        if ($parsed['items'] === []) {
+            return mb_substr(strip_tags($xml), 0, 12000);
+        }
+        $lines = [];
+        foreach ($parsed['items'] as $it) {
+            $lines[] = trim(
+                ($it['description'] ?? '') . ' ID: ' . ($it['supplier_sku'] ?? '') .
+                ' / EAN: ' . ($it['barcode'] ?? '') . ' ' .
+                ($it['quantity'] ?? '') . ' ' . ($it['unit_cost'] ?? '')
+            );
+        }
+        return implode("\n", $lines);
+    }
+
+    private function extractXmlFromZip(string $absolute): string
+    {
+        if (!class_exists(\ZipArchive::class)) {
+            return '';
+        }
+        $zip = new \ZipArchive();
+        if ($zip->open($absolute) !== true) {
+            return '';
+        }
+        $best = '';
+        for ($i = 0; $i < $zip->numFiles; $i++) {
+            $name = (string)$zip->getNameIndex($i);
+            if (!preg_match('/\.xml$/i', $name)) {
+                continue;
+            }
+            $content = $zip->getFromIndex($i);
+            if (!is_string($content) || $content === '') {
+                continue;
+            }
+            if (stripos($content, 'Invoice') !== false || stripos($content, 'CreditNote') !== false
+                || stripos($content, 'AttachedDocument') !== false) {
+                $best = $content;
+                break;
+            }
+            if ($best === '') {
+                $best = $content;
+            }
+        }
+        $zip->close();
+        return $best;
+    }
+
+    /** Extrae el XML Invoice/CreditNote desde AttachedDocument, CDATA, base64 o entidades. */
+    private function extractEmbeddedUblXml(string $raw): string
+    {
+        $candidates = [$raw];
+        $decodedEntities = html_entity_decode($raw, ENT_QUOTES | ENT_XML1, 'UTF-8');
+        if ($decodedEntities !== $raw) {
+            $candidates[] = $decodedEntities;
+        }
+
+        foreach ($candidates as $blob) {
+            if (preg_match('/<(?:\w+:)?Invoice\b[\s\S]*?<\/(?:\w+:)?Invoice>/i', $blob, $m)) {
+                return $m[0];
+            }
+            if (preg_match('/<(?:\w+:)?CreditNote\b[\s\S]*?<\/(?:\w+:)?CreditNote>/i', $blob, $m)) {
+                return $m[0];
+            }
+        }
+
+        // Description / CDATA con XML escapado
+        if (preg_match_all('/<(?:\w+:)?Description[^>]*>([\s\S]*?)<\/(?:\w+:)?Description>/i', $raw, $descs)) {
+            foreach ($descs[1] as $desc) {
+                $inner = html_entity_decode(trim($desc), ENT_QUOTES | ENT_XML1, 'UTF-8');
+                $inner = preg_replace('/^<!\[CDATA\[|\]\]>$/s', '', $inner) ?? $inner;
+                $found = $this->extractEmbeddedUblXml($inner);
+                if ($found !== '' && stripos($found, 'InvoiceLine') !== false) {
+                    return $found;
+                }
+                if ($found !== '') {
+                    return $found;
+                }
+            }
+        }
+
+        // EmbeddedDocumentBinaryObject base64
+        if (preg_match_all(
+            '/<(?:\w+:)?EmbeddedDocumentBinaryObject[^>]*>([\s\S]*?)<\/(?:\w+:)?EmbeddedDocumentBinaryObject>/i',
+            $raw,
+            $bins
+        )) {
+            foreach ($bins[1] as $bin) {
+                $b64 = preg_replace('/\s+/', '', trim($bin)) ?? '';
+                $decoded = base64_decode($b64, true);
+                if (!is_string($decoded) || $decoded === '') {
+                    continue;
+                }
+                $found = $this->extractEmbeddedUblXml($this->toUtf8($decoded));
+                if ($found !== '') {
+                    return $found;
+                }
+            }
+        }
+
+        // AttachedDocument raíz sin InvoiceLine propia: devolver vacío (ya se intentó embeber).
+        if (stripos($raw, 'AttachedDocument') !== false) {
+            return '';
+        }
+
+        return (stripos($raw, 'Invoice') !== false || stripos($raw, 'CreditNote') !== false) ? $raw : '';
+    }
+
+    /**
+     * @return array{invoice_number?:string,invoice_date?:?string,items:list<array<string,mixed>>}
+     */
+    private function parseUblDom(string $ublXml): array
+    {
+        $dom = new \DOMDocument();
+        $prev = libxml_use_internal_errors(true);
+        $ok = $dom->loadXML($ublXml, LIBXML_NONET | LIBXML_COMPACT);
+        libxml_clear_errors();
+        libxml_use_internal_errors($prev);
+        if (!$ok) {
+            // Reintento sin declaración XML duplicada / BOM
+            $clean = preg_replace('/^\xEF\xBB\xBF/', '', $ublXml) ?? $ublXml;
+            $ok = @$dom->loadXML($clean, LIBXML_NONET | LIBXML_COMPACT);
+            if (!$ok) {
+                return ['items' => []];
+            }
+        }
+
+        $xp = new \DOMXPath($dom);
+        $invoiceNumber = trim((string)$xp->evaluate('string(//*[local-name()="ID"][1])'));
+        // Preferir ID de cabecera Invoice/CreditNote
+        $idNode = $xp->query('/*[local-name()="Invoice" or local-name()="CreditNote"]/*[local-name()="ID"]');
+        if ($idNode && $idNode->length > 0) {
+            $invoiceNumber = trim($idNode->item(0)?->textContent ?? $invoiceNumber);
+        }
+        $invoiceDate = $this->normalizeDate(trim((string)$xp->evaluate(
+            'string(/*[local-name()="Invoice" or local-name()="CreditNote"]/*[local-name()="IssueDate"])'
+        )));
+
+        $lineNodes = $xp->query('//*[local-name()="InvoiceLine"]|//*[local-name()="CreditNoteLine"]');
+        $items = [];
+        if ($lineNodes) {
+            foreach ($lineNodes as $line) {
+                if (!$line instanceof \DOMElement) {
+                    continue;
+                }
+                $qty = $this->toNumber($this->domFirstText($xp, $line, './/*[local-name()="InvoicedQuantity"]|.//*[local-name()="CreditedQuantity"]'));
+                $lineTotal = $this->toNumber($this->domFirstText($xp, $line, './/*[local-name()="LineExtensionAmount"]'));
+                $desc = trim($this->domFirstText($xp, $line, './/*[local-name()="Item"]/*[local-name()="Description"]|.//*[local-name()="Item"]/*[local-name()="Name"]'));
+                $sku = trim($this->domFirstText($xp, $line, './/*[local-name()="SellersItemIdentification"]/*[local-name()="ID"]'));
+                if ($sku === '') {
+                    $sku = trim($this->domFirstText($xp, $line, './/*[local-name()="BuyersItemIdentification"]/*[local-name()="ID"]'));
+                }
+                if ($sku === '') {
+                    $sku = trim($this->domFirstText($xp, $line, './/*[local-name()="AdditionalItemIdentification"]/*[local-name()="ID"]'));
+                }
+                $barcode = trim($this->domFirstText($xp, $line, './/*[local-name()="StandardItemIdentification"]/*[local-name()="ID"]'));
+                $barcode = $this->normalizeBarcodeValue($barcode);
+                if ($barcode === '' && preg_match('/\b(77\d{11}|\d{8,14})\b/', $desc . ' ' . $sku, $bm)) {
+                    $barcode = $this->normalizeBarcodeValue($bm[1]);
+                }
+                $priceAmount = $this->toNumber($this->domFirstText($xp, $line, './/*[local-name()="Price"]/*[local-name()="PriceAmount"]'));
+                $taxRate = $this->toNumber($this->domFirstText($xp, $line, './/*[local-name()="TaxCategory"]/*[local-name()="Percent"]'));
+                if ($desc === '' && $qty <= 0 && $lineTotal <= 0) {
+                    continue;
+                }
+                $unitCost = $priceAmount > 0 ? $priceAmount : ($qty > 0 ? round($lineTotal / $qty, 2) : 0.0);
+                $items[] = $this->enrichLineIds([
+                    'supplier_sku' => $sku,
+                    'barcode' => $barcode,
+                    'description' => $desc !== '' ? $desc : ('Ítem ' . (count($items) + 1)),
+                    'quantity' => $qty,
+                    'unit_cost' => $unitCost,
+                    'tax_rate' => $taxRate,
+                    'discount_pct' => 0.0,
+                    'line_total' => $lineTotal,
+                    'lot_code' => '',
+                    'expiry_date' => null,
+                    'sale_price' => 0.0,
+                ]);
+            }
+        }
+
+        return [
+            'invoice_number' => $invoiceNumber,
+            'invoice_date' => $invoiceDate,
+            'items' => $items,
+        ];
+    }
+
+    private function domFirstText(\DOMXPath $xp, \DOMNode $ctx, string $query): string
+    {
+        $nodes = $xp->query($query, $ctx);
+        if (!$nodes || $nodes->length === 0) {
+            return '';
+        }
+        return trim((string)($nodes->item(0)?->textContent ?? ''));
     }
 
     private function defaultMarginPct(): float

@@ -240,7 +240,12 @@ function handleAjaxSubmit(form) {
     
     fetch(form.action, {
         method: form.method || 'POST',
-        body: new FormData(form),
+        body: (function () {
+            if (window.SeriMoney && typeof SeriMoney.normalizeForm === 'function') {
+                SeriMoney.normalizeForm(form);
+            }
+            return new FormData(form);
+        })(),
         headers: {
             'X-Requested-With': 'XMLHttpRequest'
         }
@@ -309,6 +314,22 @@ function handleAjaxSubmit(form) {
             }, data.pdf_url ? 1200 : 700);
         } else {
             showAlert(data.message || 'No se pudo completar la accion', 'error');
+            if (data.suggest_add_lot && data.existing_product && typeof window.openAddLotForProduct === 'function') {
+                var ep = data.existing_product;
+                var ask = 'Este SKU/EAN ya existe: «' + (ep.name || '') + '».\n\n'
+                    + 'Mismo producto con otro vencimiento = Lote N (nueva remesa), no un producto nuevo.\n\n'
+                    + '¿Abrir ingreso de Lote N ahora?';
+                if (window.confirm(ask)) {
+                    if (typeof window.closeInvModal === 'function') {
+                        window.closeInvModal();
+                    }
+                    var pre = Object.assign({}, data.lot_prefill || {}, {
+                        name: ep.name || '',
+                        force_lots: true
+                    });
+                    window.openAddLotForProduct(ep.id, pre);
+                }
+            }
             if (submitBtn) {
                 submitBtn.disabled = false;
                 submitBtn.classList.remove('btn-loading');

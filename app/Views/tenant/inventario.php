@@ -29,6 +29,30 @@ $canExportInv = \SoftNova\Core\TenantMiddleware::canDo('export', 'inventario');
 $inventoryValue = $inventoryValue ?? ['cost' => 0.0, 'sale' => 0.0, 'units' => 0];
 $expirySummary = $expirySummary ?? [];
 $expiryAlerts = (int)($expirySummary['expired_lots'] ?? 0) + (int)($expirySummary['expiring_lots'] ?? 0);
+$offerOptions = $offerOptions ?? \SoftNova\Services\ProductOfferService::formOptions();
+$offerPercents = $offerOptions['percents'] ?? [5, 10, 15, 20, 25, 30, 40, 50];
+$offerReasons = $offerOptions['reasons'] ?? [];
+$offerDurations = $offerOptions['durations'] ?? [];
+$unitOptions = [
+    'UND' => 'UND (unidad)',
+    'UNIDAD' => 'UNIDAD',
+    'DOC' => 'DOC (docena)',
+    'PAR' => 'PAR',
+    'KG' => 'KG',
+    'GR' => 'GR',
+    'LTS' => 'Lts (litros)',
+    'ML' => 'ML',
+    'CM' => 'Cm',
+    'MT' => 'Mt (metros)',
+    'M2' => 'M²',
+    'M3' => 'M³',
+    'CAJA' => 'CAJA',
+    'PAQ' => 'PAQ (paquete)',
+    'ROLLO' => 'ROLLO',
+    'GL' => 'GL (galón)',
+    'LB' => 'LB (libra)',
+    'OZ' => 'OZ',
+];
 
 function fmtI(float $a, array $c): string
 {
@@ -39,29 +63,41 @@ function fmtI(float $a, array $c): string
 <meta name="currency-decimals" content="<?php echo $currency['decimals']; ?>">
 <?php echo flashMessage(); ?>
 
-<div class="stats-grid">
-    <div class="stat-card neumorphic"><h4>Productos</h4><div class="stat-value"><?php echo $totalProducts; ?></div></div>
-    <div class="stat-card neumorphic"><h4>Servicios</h4><div class="stat-value" style="color:#3B82F6;"><?php echo $totalServices; ?></div></div>
-    <div class="stat-card neumorphic"><h4>Stock Bajo</h4><div class="stat-value" style="color:<?php echo $lowStock > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo $lowStock; ?></div></div>
-    <div class="stat-card neumorphic"><h4>Total Ítems</h4><div class="stat-value"><?php echo $totalProducts + $totalServices; ?></div></div>
-    <div class="stat-card neumorphic">
-        <h4>Costo del inventario</h4>
-        <div class="stat-value" style="font-size:1.35rem;"><?php echo fmtI((float)($inventoryValue['cost'] ?? 0), $currency); ?></div>
-        <p style="font-size:12px;color:var(--color-text-secondary);margin:6px 0 0;">
+<div class="inv-kpi-grid">
+    <div class="inv-kpi">
+        <span class="inv-kpi-label">Productos</span>
+        <span class="inv-kpi-value"><?php echo (int)$totalProducts; ?></span>
+    </div>
+    <div class="inv-kpi">
+        <span class="inv-kpi-label">Servicios</span>
+        <span class="inv-kpi-value" style="color:#3B82F6;"><?php echo (int)$totalServices; ?></span>
+    </div>
+    <div class="inv-kpi">
+        <span class="inv-kpi-label">Stock bajo</span>
+        <span class="inv-kpi-value" style="color:<?php echo $lowStock > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo (int)$lowStock; ?></span>
+    </div>
+    <div class="inv-kpi">
+        <span class="inv-kpi-label">Total ítems</span>
+        <span class="inv-kpi-value"><?php echo (int)$totalProducts + (int)$totalServices; ?></span>
+    </div>
+    <div class="inv-kpi inv-kpi--money">
+        <span class="inv-kpi-label">Costo del inventario</span>
+        <span class="inv-kpi-value"><?php echo fmtI((float)($inventoryValue['cost'] ?? 0), $currency); ?></span>
+        <span class="inv-kpi-hint">
             A precio de venta: <strong><?php echo fmtI((float)($inventoryValue['sale'] ?? 0), $currency); ?></strong>
             · <?php echo (int)($inventoryValue['units'] ?? 0); ?> uds
-        </p>
+        </span>
     </div>
-    <a href="<?php echo $viewInstance->route('app/inventario'); ?>?action=vencimientos" class="stat-card neumorphic" style="text-decoration:none;color:inherit;">
-        <h4>Por vencer / vencidos</h4>
-        <div class="stat-value" style="color:<?php echo $expiryAlerts > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo $expiryAlerts; ?></div>
-        <p style="font-size:12px;color:var(--color-text-secondary);margin:4px 0 0;">Ver control de vencimientos</p>
+    <a href="<?php echo $viewInstance->route('app/inventario'); ?>?action=vencimientos" class="inv-kpi inv-kpi--link">
+        <span class="inv-kpi-label">Por vencer / vencidos</span>
+        <span class="inv-kpi-value" style="color:<?php echo $expiryAlerts > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo (int)$expiryAlerts; ?></span>
+        <span class="inv-kpi-hint">Ver control de vencimientos</span>
     </a>
     <?php if ($canViewPrestamos): ?>
-    <a href="<?php echo $viewInstance->route('app/prestamos'); ?>" class="stat-card neumorphic" style="text-decoration:none;color:inherit;">
-        <h4>Préstamos</h4>
-        <div class="stat-value" style="color:var(--color-primary);">→</div>
-        <p style="font-size:12px;color:var(--color-text-secondary);margin:4px 0 0;">Salidas por préstamo y devoluciones</p>
+    <a href="<?php echo $viewInstance->route('app/prestamos'); ?>" class="inv-kpi inv-kpi--link">
+        <span class="inv-kpi-label">Préstamos</span>
+        <span class="inv-kpi-value" style="color:var(--color-primary);">Ir →</span>
+        <span class="inv-kpi-hint">Salidas por préstamo y devoluciones</span>
     </a>
     <?php endif; ?>
 </div>
@@ -248,7 +284,16 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                  data-type="<?php echo $p['product_type'] ?? 'product'; ?>"
                  data-desc="<?php echo htmlspecialchars((string)($p['description'] ?? ''), ENT_QUOTES); ?>"
                  data-notes="<?php echo htmlspecialchars((string)($p['notes'] ?? ''), ENT_QUOTES); ?>"
-                 data-debt="<?php echo (int)($p['stock_debt_qty'] ?? 0); ?>">
+                 data-debt="<?php echo (int)($p['stock_debt_qty'] ?? 0); ?>"
+                 data-supplier-id="<?php echo (int)($p['primary_supplier_id'] ?? 0); ?>"
+                 data-supplier-sku="<?php echo htmlspecialchars((string)($p['primary_supplier_sku'] ?? ''), ENT_QUOTES); ?>"
+                 data-offer="<?php echo !empty($p['offer_active']) ? '1' : '0'; ?>"
+                 data-offer-price="<?php echo htmlspecialchars((string)($p['offer_price'] ?? '')); ?>"
+                 data-offer-original="<?php echo htmlspecialchars((string)($p['offer_original_price'] ?? '')); ?>"
+                 data-offer-percent="<?php echo htmlspecialchars((string)($p['offer_percent'] ?? '')); ?>"
+                 data-offer-reason="<?php echo htmlspecialchars((string)($p['offer_reason'] ?? ''), ENT_QUOTES); ?>"
+                 data-offer-starts="<?php echo htmlspecialchars((string)($p['offer_starts_at'] ?? ''), ENT_QUOTES); ?>"
+                 data-offer-ends="<?php echo htmlspecialchars((string)($p['offer_ends_at'] ?? ''), ENT_QUOTES); ?>">
                 <?php if ($canDeleteProduct): ?>
                 <label class="inv-select-wrap" title="Seleccionar" style="position:absolute;top:10px;right:10px;z-index:2;margin:0;cursor:pointer;">
                     <input type="checkbox" class="inv-product-check" value="<?php echo (int)$p['id']; ?>" style="width:18px;height:18px;">
@@ -285,7 +330,28 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                         <?php endif; ?>
                         <div style="font-size:13px;margin:4px 0;">
                             <span style="color:var(--color-text-secondary);">Venta:</span>
-                            <strong style="color:#10B981;"><?php echo fmtI($p['sale_price'], $currency); ?></strong>
+                            <?php if (!empty($p['offer_active'])): ?>
+                                <?php
+                                $offerScheduled = !empty($p['offer_starts_at']) && strtotime((string)$p['offer_starts_at']) > time();
+                                ?>
+                                <?php if ($offerScheduled): ?>
+                                    <strong style="color:#10B981;"><?php echo fmtI((float)$p['sale_price'], $currency); ?></strong>
+                                    <span class="badge badge-warning" style="margin-left:4px;" title="Inicia <?php echo date('d/m/Y H:i', strtotime((string)$p['offer_starts_at'])); ?>">
+                                        Programada → <?php echo fmtI((float)($p['offer_price'] ?? 0), $currency); ?>
+                                        <?php echo !empty($p['offer_percent']) ? ' (−' . rtrim(rtrim(number_format((float)$p['offer_percent'], 1, '.', ''), '0'), '.') . '%)' : ''; ?>
+                                    </span>
+                                <?php else: ?>
+                                <strong style="color:#DC2626;"><?php echo fmtI((float)$p['sale_price'], $currency); ?></strong>
+                                <span style="text-decoration:line-through;color:var(--color-text-secondary);font-size:12px;margin-left:4px;">
+                                    <?php echo fmtI((float)($p['offer_original_price'] ?? 0), $currency); ?>
+                                </span>
+                                <span class="badge badge-danger" style="margin-left:4px;" title="Hasta <?php echo !empty($p['offer_ends_at']) ? date('d/m/Y H:i', strtotime((string)$p['offer_ends_at'])) : ''; ?>">
+                                    Oferta<?php echo !empty($p['offer_percent']) ? ' −' . rtrim(rtrim(number_format((float)$p['offer_percent'], 1, '.', ''), '0'), '.') . '%' : ''; ?>
+                                </span>
+                                <?php endif; ?>
+                            <?php else: ?>
+                                <strong style="color:#10B981;"><?php echo fmtI((float)$p['sale_price'], $currency); ?></strong>
+                            <?php endif; ?>
                             <?php if ($p['purchase_price'] > 0): ?>
                                 <span style="font-size:11px;color:var(--color-text-secondary);margin-left:5px;">
                                     (Compra: <?php echo fmtI($p['purchase_price'], $currency); ?>)
@@ -336,8 +402,19 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                             <?php endif; ?>
                             <?php if ($canEditProduct): ?>
                                 <button onclick="editProduct(<?php echo $p['id']; ?>)" class="btn btn-sm btn-secondary" title="Editar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg></button>
+                                <?php
+                                $isComodin = strtoupper((string)($p['code'] ?? '')) === \SoftNova\Services\OpenItemProduct::CODE;
+                                if (!$isComodin):
+                                ?>
+                                    <?php if (!empty($p['offer_active'])): ?>
+                                        <button type="button" onclick="openOfferModal(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-warning" title="Editar oferta">Oferta</button>
+                                        <button type="button" onclick="cancelOffer(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-secondary" title="Cancelar oferta">Fin oferta</button>
+                                    <?php else: ?>
+                                        <button type="button" onclick="openOfferModal(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-success" title="Activar oferta">Oferta</button>
+                                    <?php endif; ?>
+                                <?php endif; ?>
                                 <?php if (!$isService): ?>
-                                    <button onclick="addStock(<?php echo $p['id']; ?>)" class="btn btn-sm btn-success" title="Agregar stock"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg></button>
+                                    <button onclick="addStock(<?php echo $p['id']; ?>)" class="btn btn-sm btn-success" title="Ingresar lote / stock">Lote N</button>
                                     <?php if ($canViewPrestamos): ?>
                                     <a href="<?php echo $viewInstance->route('app/prestamos'); ?>?product_id=<?php echo (int)$p['id']; ?>" class="btn btn-sm btn-secondary" title="Salida por préstamo">Préstamo</a>
                                     <?php elseif ($canCreatePrestamos && \SoftNova\Core\TenantMiddleware::canAccess('caja')): ?>
@@ -477,7 +554,15 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                             <?php endif; ?>
                         </td>
                         <td><?php echo fmtI((float)$p['purchase_price'], $currency); ?></td>
-                        <td class="inv-td-price"><?php echo fmtI((float)$p['sale_price'], $currency); ?></td>
+                        <td class="inv-td-price">
+                            <?php if (!empty($p['offer_active'])): ?>
+                                <strong style="color:#DC2626;"><?php echo fmtI((float)$p['sale_price'], $currency); ?></strong>
+                                <br><small style="text-decoration:line-through;color:var(--color-text-secondary);"><?php echo fmtI((float)($p['offer_original_price'] ?? 0), $currency); ?></small>
+                                <br><span class="badge badge-danger">Oferta</span>
+                            <?php else: ?>
+                                <?php echo fmtI((float)$p['sale_price'], $currency); ?>
+                            <?php endif; ?>
+                        </td>
                         <td class="table-actions">
                             <?php if ($isService || ($p['stock'] ?? 0) > 0): ?>
                                 <button type="button" onclick="addToCart(<?php echo (int)$p['id']; ?>,'<?php echo htmlspecialchars(addslashes($p['name'])); ?>',<?php echo (float)$p['sale_price']; ?>, event)" class="btn btn-sm btn-info" title="Carrito">+</button>
@@ -487,8 +572,19 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                             <?php endif; ?>
                             <?php if ($canEditProduct): ?>
                                 <button type="button" onclick="editProduct(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-secondary" title="Editar">Editar</button>
+                                <?php
+                                $isComodinList = strtoupper((string)($p['code'] ?? '')) === \SoftNova\Services\OpenItemProduct::CODE;
+                                if (!$isComodinList):
+                                ?>
+                                    <?php if (!empty($p['offer_active'])): ?>
+                                        <button type="button" onclick="openOfferModal(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-warning" title="Editar oferta">Oferta</button>
+                                        <button type="button" onclick="cancelOffer(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-secondary" title="Cancelar oferta">Fin</button>
+                                    <?php else: ?>
+                                        <button type="button" onclick="openOfferModal(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-success" title="Activar oferta">Oferta</button>
+                                    <?php endif; ?>
+                                <?php endif; ?>
                                 <?php if (!$isService): ?>
-                                    <button type="button" onclick="addStock(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-success" title="Stock">Stock</button>
+                                    <button type="button" onclick="addStock(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-success" title="Ingresar lote / stock">Lote N</button>
                                     <?php if ($canViewPrestamos): ?>
                                     <a href="<?php echo $viewInstance->route('app/prestamos'); ?>?product_id=<?php echo (int)$p['id']; ?>" class="btn btn-sm btn-secondary" title="Salida por préstamo">Préstamo</a>
                                     <?php elseif ($canCreatePrestamos && \SoftNova\Core\TenantMiddleware::canAccess('caja')): ?>
@@ -536,6 +632,11 @@ if (!empty($products)) {
               action="<?php echo $viewInstance->route('app/inventario'); ?>?action=create" data-ajax="true">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="id" id="prodId">
+            <div class="alert alert-info" style="margin:0 0 12px;font-size:13px;">
+                <strong>SKU y EAN son únicos por producto.</strong>
+                Si llega la misma referencia con otro vencimiento o lote, no cree un ítem nuevo:
+                use <strong>Lote N</strong> en el producto existente e indique la fecha de esa remesa.
+            </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;">
                 <div class="form-group">
                     <label>Tipo * <span class="field-tip" data-tip="Producto consume stock; Servicio no maneja inventario físico.">?</span></label>
@@ -545,7 +646,7 @@ if (!empty($products)) {
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>Código / SKU <span class="field-tip" data-tip="Referencia interna del producto (SKU). Distinto del código de barras EAN.">?</span></label>
+                    <label>Código / SKU <span class="field-tip" data-tip="Fórmula de ingreso o creación de SKU= [Categoría]-[Marca / Línea]-[Producto / Subtipo][Atributo / Tamaño].">?</span></label>
                     <input type="text" name="code" id="prodCode" class="form-control" placeholder="SKU interno" maxlength="255" autocomplete="off" inputmode="text">
                 </div>
                 <div class="form-group">
@@ -575,20 +676,26 @@ if (!empty($products)) {
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>Unidad <span class="field-tip" data-tip="Unidad de medida (UNIDAD, KG, LT, etc.).">?</span></label>
-                    <input type="text" name="unit" id="prodUnit" class="form-control" placeholder="UNIDAD">
+                    <label>Unidad <span class="field-tip" data-tip="Unidad de medida del producto (UND, Lts, Cm, Mt, etc.).">?</span></label>
+                    <select name="unit" id="prodUnit" class="form-control">
+                        <?php foreach ($unitOptions as $unitVal => $unitLabel): ?>
+                            <option value="<?php echo htmlspecialchars((string)$unitVal); ?>"<?php echo $unitVal === 'UND' ? ' selected' : ''; ?>>
+                                <?php echo htmlspecialchars((string)$unitLabel); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
                 </div>
                 <div class="form-group">
                     <label>Precio Compra <span class="field-tip" data-tip="Costo de adquisición. Sirve para margen y reportes.">?</span></label>
-                    <input type="number" step="0.01" name="purchase_price" id="prodPcompra" class="form-control" placeholder="0">
+                    <input type="text" inputmode="decimal" name="purchase_price" id="prodPcompra" class="form-control money-input" data-money="1" placeholder="0">
                 </div>
                 <div class="form-group">
                     <label>Precio Venta * <span class="field-tip" data-tip="Precio al público que se usará en ventas.">?</span></label>
-                    <input type="number" step="0.01" name="sale_price" id="prodPventa" required class="form-control" placeholder="0">
+                    <input type="text" inputmode="decimal" name="sale_price" id="prodPventa" required class="form-control money-input" data-money="1" placeholder="0">
                 </div>
                 <div class="form-group">
                     <label>Precio al por mayor <span class="field-tip" data-tip="Precio para ventas al por mayor en Caja.">?</span></label>
-                    <input type="number" step="0.01" name="wholesale_price" id="prodPmayoreo" class="form-control" placeholder="0">
+                    <input type="text" inputmode="decimal" name="wholesale_price" id="prodPmayoreo" class="form-control money-input" data-money="1" placeholder="0">
                 </div>
                 <div class="form-group" id="stockGroup">
                     <label>Stock Inicial <span class="field-tip" data-tip="Cantidad disponible al crear el producto.">?</span></label>
@@ -605,9 +712,12 @@ if (!empty($products)) {
                 <div class="form-group" id="trackLotsGroup" style="grid-column:1/-1;">
                     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
                         <input type="checkbox" name="track_lots" id="prodTrackLots" value="1" onchange="onTrackLotsChange()" style="width:auto;">
-                        Controlar lotes y fecha de vencimiento
-                        <span class="field-tip" data-tip="Al activarlo, cada entrada crea un lote y las ventas descargan primero el lote que vence antes (FEFO).">?</span>
+                        Controlar por lotes y fecha de vencimiento
+                        <span class="field-tip" data-tip="Ideal para perfumes, lociones u otros con caducidad. Cada remesa con distinta fecha es un lote; la caja vende primero lo que vence antes (FEFO).">?</span>
                     </label>
+                    <p style="margin:6px 0 0;font-size:11px;color:var(--color-text-secondary);">
+                        Al activarlo con stock existente se crea un <strong>lote de apertura</strong>. En cada entrada de mercancía indique la fecha de vencimiento de esa remesa.
+                    </p>
                 </div>
                 <div class="form-group lot-field" id="alertDaysGroup" style="display:none;">
                     <label>Días de alerta previa <span class="field-tip" data-tip="Cuántos días antes del vencimiento debe aparecer el lote en el panel de alertas.">?</span></label>
@@ -628,6 +738,25 @@ if (!empty($products)) {
                         <option value="inactive">Inactivo</option>
                     </select>
                 </div>
+            </div>
+            <div class="form-group" id="supplierSection" style="margin-top:8px;padding:12px;border:1px solid var(--color-border);border-radius:10px;background:var(--bg-input);">
+                <label style="font-weight:600;margin-bottom:8px;display:block;">Proveedor <span class="field-tip" data-tip="Proveedor principal del producto. Puede gestionar más proveedores desde el detalle.">?</span></label>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                    <div class="form-group" style="margin:0;">
+                        <label style="font-size:12px;">Proveedor</label>
+                        <select name="supplier_id" id="prodSupplier" class="form-control">
+                            <option value="">Sin proveedor</option>
+                            <?php foreach ($suppliersCatalog ?? [] as $sup): ?>
+                                <option value="<?php echo (int)$sup['id']; ?>"><?php echo htmlspecialchars((string)$sup['name']); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label style="font-size:12px;">SKU del proveedor</label>
+                        <input type="text" name="supplier_sku" id="prodSupplierSku" class="form-control" maxlength="120" placeholder="Código del proveedor">
+                    </div>
+                </div>
+                <p style="margin:8px 0 0;font-size:11px;color:var(--color-text-secondary);">Se marcará como proveedor principal para reposición. Gestione vínculos adicionales desde el detalle del producto.</p>
             </div>
             <div class="form-group">
                 <label>Descripción <span class="field-tip" data-tip="Detalle comercial del producto o servicio.">?</span></label>
@@ -653,7 +782,7 @@ if (!empty($products)) {
 <div id="stockModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:400px;">
         <div class="modal-header">
-            <h3>Ajuste de stock</h3>
+            <h3>Lote N / ingreso de stock</h3>
             <button onclick="document.getElementById('stockModal').style.display='none'" class="modal-close">&times;</button>
         </div>
         <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=add_stock" data-ajax="true">
@@ -676,21 +805,24 @@ if (!empty($products)) {
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                 <div class="form-group">
-                    <label>Vence <span class="field-tip" data-tip="Al indicar una fecha se crea un lote y el producto pasa a control FEFO.">?</span></label>
-                    <input type="date" name="expiry_date" class="form-control">
+                    <label id="stockExpiryLabel">Vence <span class="field-tip" data-tip="Obligatorio si el producto controla lotes. Cada remesa con distinta fecha crea un lote aparte.">?</span></label>
+                    <input type="date" name="expiry_date" id="stockExpiryDate" class="form-control">
                 </div>
                 <div class="form-group">
                     <label>Código de lote</label>
-                    <input type="text" name="lot_code" class="form-control" maxlength="60" placeholder="Automático">
+                    <input type="text" name="lot_code" id="stockLotCode" class="form-control" maxlength="60" placeholder="Automático si vacío">
                 </div>
             </div>
+            <p id="stockLotHint" style="display:none;font-size:12px;color:#92400E;background:#FEF3C7;border:1px solid #F59E0B;border-radius:8px;padding:8px 10px;margin:0 0 12px;">
+                Este producto controla lotes: indique la <strong>fecha de vencimiento</strong> de esta remesa. Si es distinta a lotes previos, se crea un lote nuevo.
+            </p>
             <div class="form-group">
                 <label>Notas</label>
                 <input type="text" name="notes" class="form-control" placeholder="Ej: Conteo físico / corrección">
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('stockModal').style.display='none'">Cancelar</button>
-                <button type="submit" class="btn btn-success">Agregar Stock</button>
+                <button type="submit" class="btn btn-success">Registrar Lote N</button>
             </div>
         </form>
     </div>
@@ -985,10 +1117,13 @@ if (!empty($products)) {
                         <li>Guarde como CSV y súbalo aquí. En Excel: <em>CSV UTF-8</em> o CSV delimitado por <code>;</code>.</li>
                     </ol>
                     <ul style="margin:10px 0 0 18px;padding:0;">
-                        <li>Columnas: <code>SKU; EAN; Nombre; Tipo; Categoria; Costo; Precio; Stock; Min; Unidad; Estado; Ubicacion</code></li>
+                        <li>Columnas: <code>SKU; EAN; Nombre; Tipo; Categoria; Costo; Precio; Stock; Min; Unidad; Estado; Ubicacion; Lote; Vence; Modo_stock</code></li>
+                        <li><strong>Misma SKU + distinto Lote/Vence</strong> = remesa del mismo producto (no cree otro ítem).</li>
+                        <li>Si hay <code>Lote</code> o <code>Vence</code>, <code>Stock</code> es la cantidad de <em>esa remesa</em> (se suma, como una compra).</li>
+                        <li>Sin lote/vence, <code>Stock</code> sincroniza la existencia total (<code>Modo_stock=absoluto</code>).</li>
+                        <li><code>Modo_stock</code>: <code>entrada</code> (suma remesa) o <code>absoluto</code> (fijar total). Vacío: entrada si hay lote/vence; si no, absoluto.</li>
                         <li>Tipo: <code>product</code> o <code>service</code>. Estado: <code>active</code> o <code>inactive</code>.</li>
-                        <li>Si el SKU ya existe se actualiza; si va vacío se genera uno.</li>
-                        <li>Si la categoría no existe, se crea sola.</li>
+                        <li>Cada cambio de stock deja movimiento en Trazabilidad (<code>csv_import</code>) y, si aplica, traza de lote.</li>
                         <li>Máximo 5MB. Archivos &gt;200KB van a cola (Config → Procesar jobs).</li>
                     </ul>
                 </div>
@@ -1006,6 +1141,77 @@ if (!empty($products)) {
 </div>
 
 <!-- Modal Categorías -->
+<div id="offerModal" class="modal-overlay" style="display:none;z-index:1200;">
+    <div class="modal-content neumorphic" style="max-width:520px;">
+        <div class="modal-header">
+            <h3>Activar oferta</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('offerModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $invBase; ?>?action=offer_activate" data-ajax="true" id="offerForm">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="product_id" id="offerProductId" value="">
+            <div class="modal-body">
+                <p id="offerProductLabel" style="margin:0 0 12px;font-size:13px;color:var(--color-text-secondary);"></p>
+                <div class="form-group">
+                    <label>Precio original</label>
+                    <input type="text" id="offerOriginalDisplay" class="form-control" readonly>
+                    <input type="hidden" id="offerOriginalValue" value="0">
+                </div>
+                <div class="form-group">
+                    <label>Descuento predeterminado</label>
+                    <div id="offerPercentBtns" style="display:flex;flex-wrap:wrap;gap:6px;">
+                        <?php foreach ($offerPercents as $pct): ?>
+                            <button type="button" class="btn btn-sm btn-secondary offer-pct-btn" data-pct="<?php echo (int)$pct; ?>"><?php echo (int)$pct; ?>%</button>
+                        <?php endforeach; ?>
+                        <button type="button" class="btn btn-sm btn-secondary offer-pct-btn" data-pct="0">Manual</button>
+                    </div>
+                    <input type="hidden" name="percent" id="offerPercent" value="">
+                </div>
+                <div class="form-group">
+                    <label>Precio de oferta (manual) *</label>
+                    <input type="text" inputmode="decimal" name="offer_price" id="offerPrice" class="form-control money-input" data-money="1" required>
+                    <small id="offerPreview" style="color:var(--color-text-secondary);"></small>
+                </div>
+                <div class="form-group">
+                    <label>Inicio de la oferta</label>
+                    <input type="datetime-local" name="starts_at" id="offerStartsAt" class="form-control">
+                    <small style="color:var(--color-text-secondary);">Vacío = inicia ahora. Si elige una fecha futura, la oferta queda programada y el precio no cambia hasta esa hora.</small>
+                </div>
+                <div class="form-group">
+                    <label>Duración *</label>
+                    <select name="duration" id="offerDuration" class="form-control" required>
+                        <?php foreach ($offerDurations as $code => $label): ?>
+                            <option value="<?php echo htmlspecialchars($code); ?>" <?php echo $code === '24h' ? 'selected' : ''; ?>><?php echo htmlspecialchars($label); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <small style="color:var(--color-text-secondary);">La duración se cuenta desde el inicio (ahora o la fecha programada).</small>
+                </div>
+                <div class="form-group" id="offerEndsWrap" style="display:none;">
+                    <label>Fin de la oferta *</label>
+                    <input type="datetime-local" name="ends_at" id="offerEndsAt" class="form-control">
+                </div>
+                <div class="form-group">
+                    <label>Motivo de oferta *</label>
+                    <select name="reason" id="offerReason" class="form-control" required>
+                        <option value="">Seleccione…</option>
+                        <?php foreach ($offerReasons as $code => $label): ?>
+                            <option value="<?php echo htmlspecialchars($code); ?>"><?php echo htmlspecialchars($label); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group" id="offerReasonNoteWrap" style="display:none;">
+                    <label>Detalle del motivo *</label>
+                    <input type="text" name="reason_note" id="offerReasonNote" class="form-control" maxlength="180" placeholder="Describa el motivo…">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('offerModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-success" id="offerSubmitBtn">Activar / programar oferta</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <div id="categoriesModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:520px;max-height:85vh;overflow-y:auto;">
         <div class="modal-header">
@@ -1058,6 +1264,15 @@ if (!empty($products)) {
     window.invRouteCreate = '<?php echo $viewInstance->route('app/inventario'); ?>?action=create';
     window.invRouteEdit = '<?php echo $viewInstance->route('app/inventario'); ?>?action=edit';
     window.invRouteDetail = '<?php echo $viewInstance->route('app/inventario'); ?>?action=detail';
+    window.invRouteBase = '<?php echo $viewInstance->route('app/inventario'); ?>';
+    window.invRouteOfferCancel = '<?php echo $viewInstance->route('app/inventario'); ?>?action=offer_cancel';
     window.invRouteVentas = '<?php echo $viewInstance->route('app/ventas'); ?>';
     window.invCanEdit = <?php echo $canEditProduct ? 'true' : 'false'; ?>;
+    window.invCsrf = <?php echo json_encode(\SoftNova\Core\csrf_token()); ?>;
+    window.invCurrency = <?php echo json_encode([
+        'symbol' => $currency['symbol'] ?? '$',
+        'decimals' => (int)($currency['decimals'] ?? 0),
+        'decimal' => $currency['decimal'] ?? ',',
+        'thousands' => $currency['thousands'] ?? '.',
+    ]); ?>;
 </script>

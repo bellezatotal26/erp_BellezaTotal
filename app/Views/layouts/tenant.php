@@ -5,6 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="csrf-token" content="<?php echo htmlspecialchars(\SoftNova\Core\csrf_token()); ?>">
     <meta name="theme-color" content="#0F766E">
+    <?php
+    $layoutCurrency = $currency ?? ['symbol' => '$', 'decimals' => 2, 'thousands' => '.', 'decimal' => ','];
+    ?>
+    <meta name="currency-symbol" content="<?php echo htmlspecialchars((string)($layoutCurrency['symbol'] ?? '$')); ?>">
+    <meta name="currency-decimals" content="<?php echo (int)($layoutCurrency['decimals'] ?? 2); ?>">
+    <meta name="currency-thousands" content="<?php echo htmlspecialchars((string)($layoutCurrency['thousands'] ?? '.')); ?>">
+    <meta name="currency-decimal" content="<?php echo htmlspecialchars((string)($layoutCurrency['decimal'] ?? ',')); ?>">
     <title><?php echo htmlspecialchars($title ?? 'Seri ERP'); ?></title>
     <?php echo \SoftNova\Core\og_meta_tags($title ?? null); ?>
     <link rel="stylesheet" href="<?php echo $viewInstance->asset('css/style.css'); ?>">
@@ -467,6 +474,7 @@
             if (savedTheme === 'dark') document.body.classList.add('dark-mode');
         });
     </script>
+    <script src="<?php echo $viewInstance->asset('js/money-input.js'); ?>"></script>
     <script src="<?php echo $viewInstance->asset('js/app.js'); ?>"></script>
     <script src="<?php echo $viewInstance->asset('js/pos-offline.js'); ?>"></script>
     <script>

@@ -450,4 +450,63 @@ function e(?string $text): string
     return htmlspecialchars(utf8_fix((string)$text), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
+/**
+ * Interpreta montos digitados con formato local (1.234.567,50 o 1,234,567.50).
+ * No rompe valores ya normalizados (1234.56).
+ */
+function parse_money(mixed $raw): float
+{
+    if (is_int($raw) || is_float($raw)) {
+        return (float)$raw;
+    }
+    $s = trim((string)$raw);
+    if ($s === '') {
+        return 0.0;
+    }
+    $s = str_replace(["\xc2\xa0", ' '], '', $s);
+    $s = preg_replace('/[^\d,.\-]/u', '', $s) ?? '';
+    if ($s === '' || $s === '-' || $s === '.' || $s === ',') {
+        return 0.0;
+    }
+
+    $neg = str_starts_with($s, '-');
+    $s = ltrim($s, '+-');
+
+    if (str_contains($s, ',') && str_contains($s, '.')) {
+        if (strrpos($s, ',') > strrpos($s, '.')) {
+            // 1.234.567,50
+            $s = str_replace('.', '', $s);
+            $s = str_replace(',', '.', $s);
+        } else {
+            // 1,234,567.50
+            $s = str_replace(',', '', $s);
+        }
+    } elseif (str_contains($s, ',')) {
+        $bits = explode(',', $s);
+        if (count($bits) === 2 && strlen($bits[1]) <= 2) {
+            $s = str_replace('.', '', $bits[0]) . '.' . $bits[1];
+        } else {
+            $s = str_replace(',', '', $s);
+        }
+    } else {
+        // Solo puntos: varios = miles; uno solo con 1–2 decimales = decimal.
+        $parts = explode('.', $s);
+        if (count($parts) > 2) {
+            $s = str_replace('.', '', $s);
+        } elseif (count($parts) === 2) {
+            $decLen = strlen($parts[1]);
+            if ($decLen === 3 && strlen($parts[0]) <= 3) {
+                // Ambiguo 1.234 → miles (COP típico)
+                $s = str_replace('.', '', $s);
+            } elseif ($decLen > 2) {
+                $s = str_replace('.', '', $s);
+            }
+            // si decLen 1–2 se deja como decimal
+        }
+    }
+
+    $n = (float)$s;
+    return $neg ? -$n : $n;
+}
+
 

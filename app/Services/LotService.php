@@ -5,9 +5,14 @@ namespace SoftNova\Services;
 /**
  * Lotes con fecha de vencimiento y consumo FEFO (First-Expired, First-Out).
  *
- * Los lotes son un submayor del stock: `products.stock` sigue siendo la fuente
- * de verdad para la venta, y los lotes explican de qué remesa salió cada unidad.
- * Por eso el consumo tolera faltantes de lote sin bloquear la venta.
+ * Modelo consistente:
+ * - Un producto puede tener varias remesas; cada remesa con distinta caducidad
+ *   es un lote distinto (aunque el SKU del producto sea el mismo).
+ * - `products.stock` = unidades físicas en bodega = suma de lotes active+expired+blocked.
+ * - FEFO solo vende lotes `active` (no vencidos ni bloqueados).
+ * - Un vencido se marca `expired` y deja de venderse; la baja formal (write-off)
+ *   descuenta stock y deja el lote en `depleted`.
+ * - Al activar `track_lots` con saldo previo se siembra un lote de apertura.
  */
 class LotService
 {
@@ -70,11 +75,24 @@ class LotService
         }
         $unitCost = round(max(0, $unitCost), 2);
 
+        // Misma clave de lote + misma caducidad → acumula.
+        // Misma clave con OTRA caducidad → lote nuevo (no mezclar remesas).
         $existing = $this->query(
-            "SELECT id, quantity, initial_quantity, unit_cost FROM product_lots
+            "SELECT id, quantity, initial_quantity, unit_cost, expiry_date, status
+             FROM product_lots
              WHERE product_id = ? AND lot_code = ?",
             [$productId, $lotCode]
         )->fetch();
+
+        if ($existing) {
+            $existingExpiry = $existing['expiry_date'] ?: null;
+            if ($existingExpiry !== $expiry) {
+                // Evita fusionar remesas distintas bajo el mismo código.
+                $lotCode = $lotCode . '-' . ($expiry ? str_replace('-', '', $expiry) : 'SF')
+                    . '-' . strtoupper(substr(uniqid('', false), -3));
+                $existing = false;
+            }
+        }
 
         if ($existing) {
             $lotId = (int)$existing['id'];
@@ -90,16 +108,21 @@ class LotService
                      initial_quantity = initial_quantity + ?,
                      unit_cost = ?,
                      expiry_date = COALESCE(?, expiry_date),
-                     status = 'active'
+                     status = CASE
+                        WHEN status IN ('depleted', 'blocked') THEN 'active'
+                        WHEN ? IS NOT NULL AND ? < CURDATE() THEN 'expired'
+                        ELSE 'active'
+                     END
                  WHERE id = ?",
-                [$quantity, $quantity, $blendedCost, $expiry, $lotId]
+                [$quantity, $quantity, $blendedCost, $expiry, $expiry, $expiry, $lotId]
             );
         } else {
+            $status = ($expiry !== null && $expiry < date('Y-m-d')) ? 'expired' : 'active';
             $this->query(
                 "INSERT INTO product_lots
                     (product_id, lot_code, expiry_date, quantity, initial_quantity, unit_cost,
-                     supplier_id, purchase_order_id, received_date, notes, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     supplier_id, purchase_order_id, received_date, notes, status, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     $productId,
                     $lotCode,
@@ -111,6 +134,7 @@ class LotService
                     $meta['purchase_order_id'] ?? null,
                     $this->normalizeDate($meta['received_date'] ?? null) ?? date('Y-m-d'),
                     ($meta['notes'] ?? '') !== '' ? substr((string)$meta['notes'], 0, 255) : null,
+                    $status,
                     $meta['user_id'] ?? ($_SESSION['tenant_user_id'] ?? null),
                 ]
             );
@@ -123,7 +147,7 @@ class LotService
 
     /**
      * Consume unidades en orden FEFO: primero lo que vence antes; los lotes sin
-     * fecha quedan al final para no retener mercancía perecedera.
+     * fecha quedan al final. Solo lotes `active` (vencidos y bloqueados no se venden).
      *
      * @return array{consumed:int,pending:int,lines:list<array{lot_id:int,lot_code:string,expiry_date:?string,quantity:int,unit_cost:float}>}
      */
@@ -135,10 +159,12 @@ class LotService
             return $result;
         }
 
+        $this->markExpiredLots();
+
         $lots = $this->query(
             "SELECT id, lot_code, expiry_date, quantity, unit_cost
              FROM product_lots
-             WHERE product_id = ? AND status IN ('active', 'expired') AND quantity > 0
+             WHERE product_id = ? AND status = 'active' AND quantity > 0
              ORDER BY (expiry_date IS NULL), expiry_date ASC, id ASC",
             [$productId]
         )->fetchAll();
@@ -238,28 +264,50 @@ class LotService
     }
 
     /**
-     * Ajusta manualmente la cantidad de un lote (mermas, roturas, reconteo).
-     * No toca `products.stock`: eso lo hace el kardex.
+     * Ajusta la cantidad de un lote. Devuelve el delta para sincronizar `products.stock`.
+     *
+     * @return array{ok:bool,product_id:int,lot_code:string,old_qty:int,new_qty:int,delta:int,unit_cost:float}
      */
-    public function adjustLot(int $lotId, int $newQuantity, string $notes = ''): bool
+    public function adjustLot(int $lotId, int $newQuantity, string $notes = ''): array
     {
-        $lot = $this->query("SELECT product_id, initial_quantity FROM product_lots WHERE id = ?", [$lotId])->fetch();
+        $lot = $this->query(
+            "SELECT id, product_id, lot_code, quantity, unit_cost, expiry_date, status
+             FROM product_lots WHERE id = ?",
+            [$lotId]
+        )->fetch();
         if (!$lot) {
-            return false;
+            return ['ok' => false, 'product_id' => 0, 'lot_code' => '', 'old_qty' => 0, 'new_qty' => 0, 'delta' => 0, 'unit_cost' => 0.0];
         }
+
+        $oldQty = (int)$lot['quantity'];
         $newQuantity = max(0, $newQuantity);
+        $expiry = $lot['expiry_date'] ?: null;
+        $status = $newQuantity <= 0
+            ? 'depleted'
+            : (($lot['status'] === 'blocked')
+                ? 'blocked'
+                : (($expiry !== null && $expiry < date('Y-m-d')) ? 'expired' : 'active'));
 
         $this->query(
             "UPDATE product_lots
              SET quantity = ?,
-                 status = CASE WHEN ? <= 0 THEN 'depleted' ELSE 'active' END,
+                 status = ?,
                  notes = COALESCE(NULLIF(?, ''), notes)
              WHERE id = ?",
-            [$newQuantity, $newQuantity, substr($notes, 0, 255), $lotId]
+            [$newQuantity, $status, substr($notes, 0, 255), $lotId]
         );
 
         $this->refreshNextExpiry((int)$lot['product_id']);
-        return true;
+
+        return [
+            'ok' => true,
+            'product_id' => (int)$lot['product_id'],
+            'lot_code' => (string)$lot['lot_code'],
+            'old_qty' => $oldQty,
+            'new_qty' => $newQuantity,
+            'delta' => $newQuantity - $oldQty,
+            'unit_cost' => round((float)$lot['unit_cost'], 2),
+        ];
     }
 
     /** Bloquea un lote para que FEFO no lo consuma (cuarentena, retiro del proveedor). */
@@ -275,6 +323,176 @@ class LotService
         );
         $this->refreshNextExpiry((int)$lot['product_id']);
         return true;
+    }
+
+    /** Reactiva un lote bloqueado (o vencido si la fecha aún no pasó). */
+    public function unblockLot(int $lotId, string $notes = ''): bool
+    {
+        $lot = $this->query(
+            "SELECT product_id, expiry_date, quantity, status FROM product_lots WHERE id = ?",
+            [$lotId]
+        )->fetch();
+        if (!$lot || (int)$lot['quantity'] <= 0) {
+            return false;
+        }
+        $expiry = $lot['expiry_date'] ?: null;
+        $status = ($expiry !== null && $expiry < date('Y-m-d')) ? 'expired' : 'active';
+        $this->query(
+            "UPDATE product_lots
+             SET status = ?, notes = COALESCE(NULLIF(?, ''), notes)
+             WHERE id = ?",
+            [$status, substr($notes, 0, 255), $lotId]
+        );
+        $this->refreshNextExpiry((int)$lot['product_id']);
+        return true;
+    }
+
+    /**
+     * Baja formal por vencimiento/merma: deja el lote en 0 (depleted).
+     * El caller debe descontar `products.stock` con kardex.
+     *
+     * @return array{ok:bool,product_id:int,lot_code:string,quantity:int,unit_cost:float}|null
+     */
+    public function writeOffLot(int $lotId, string $reason = ''): ?array
+    {
+        $lot = $this->query(
+            "SELECT id, product_id, lot_code, quantity, unit_cost FROM product_lots WHERE id = ?",
+            [$lotId]
+        )->fetch();
+        if (!$lot || (int)$lot['quantity'] <= 0) {
+            return null;
+        }
+        $qty = (int)$lot['quantity'];
+        $note = $reason !== '' ? $reason : 'Baja por vencimiento';
+        $this->query(
+            "UPDATE product_lots
+             SET quantity = 0, status = 'depleted', notes = COALESCE(NULLIF(?, ''), notes)
+             WHERE id = ?",
+            [substr($note, 0, 255), $lotId]
+        );
+        $this->refreshNextExpiry((int)$lot['product_id']);
+        return [
+            'ok' => true,
+            'product_id' => (int)$lot['product_id'],
+            'lot_code' => (string)$lot['lot_code'],
+            'quantity' => $qty,
+            'unit_cost' => round((float)$lot['unit_cost'], 2),
+        ];
+    }
+
+    /** Unidades físicas cubiertas por lotes (active + expired + blocked). */
+    public function physicalLotStock(int $productId): int
+    {
+        return (int)$this->query(
+            "SELECT COALESCE(SUM(quantity), 0) FROM product_lots
+             WHERE product_id = ? AND status IN ('active','expired','blocked') AND quantity > 0",
+            [$productId]
+        )->fetchColumn();
+    }
+
+    /** Unidades vendibles (solo active). */
+    public function sellableLotStock(int $productId): int
+    {
+        $this->markExpiredLots();
+        return (int)$this->query(
+            "SELECT COALESCE(SUM(quantity), 0) FROM product_lots
+             WHERE product_id = ? AND status = 'active' AND quantity > 0",
+            [$productId]
+        )->fetchColumn();
+    }
+
+    /**
+     * Si el producto tiene stock sin lotes (o más stock que lotes), siembra un lote de apertura.
+     * @return int Unidades sembradas
+     */
+    public function seedOpeningLot(int $productId, ?float $unitCost = null, ?string $expiryDate = null): int
+    {
+        $product = $this->query(
+            "SELECT id, stock, purchase_price, track_lots FROM products WHERE id = ?",
+            [$productId]
+        )->fetch();
+        if (!$product || empty($product['track_lots'])) {
+            return 0;
+        }
+        $stock = (int)$product['stock'];
+        $lotStock = $this->physicalLotStock($productId);
+        $gap = $stock - $lotStock;
+        if ($gap <= 0) {
+            return 0;
+        }
+        $cost = $unitCost !== null ? round(max(0, $unitCost), 2) : round((float)($product['purchase_price'] ?? 0), 2);
+        $this->registerEntry($productId, $gap, $cost, [
+            'lot_code' => 'APERTURA-' . date('Ymd') . '-' . strtoupper(substr(uniqid('', false), -4)),
+            'expiry_date' => $expiryDate,
+            'notes' => 'Lote de apertura: saldo previo al control por lotes',
+        ]);
+        return $gap;
+    }
+
+    /**
+     * Recorta lotes para que la suma física no supere el stock del producto.
+     * Prioriza vaciar vencidos y bloqueados antes que activos (FEFO inverso de merma).
+     */
+    public function trimPhysicalToStock(int $productId, int $targetStock, ?int $movementId = null): int
+    {
+        $targetStock = max(0, $targetStock);
+        $physical = $this->physicalLotStock($productId);
+        $excess = $physical - $targetStock;
+        if ($excess <= 0) {
+            return 0;
+        }
+
+        $lots = $this->query(
+            "SELECT id, lot_code, expiry_date, quantity, unit_cost, status
+             FROM product_lots
+             WHERE product_id = ? AND quantity > 0
+               AND status IN ('expired', 'blocked', 'active')
+             ORDER BY
+                CASE status WHEN 'expired' THEN 0 WHEN 'blocked' THEN 1 ELSE 2 END,
+                (expiry_date IS NULL), expiry_date ASC, id ASC",
+            [$productId]
+        )->fetchAll();
+
+        $trimmed = 0;
+        foreach ($lots as $lot) {
+            if ($excess <= 0) {
+                break;
+            }
+            $take = min($excess, (int)$lot['quantity']);
+            if ($take <= 0) {
+                continue;
+            }
+            $this->query(
+                "UPDATE product_lots
+                 SET status = CASE WHEN quantity - ? <= 0 THEN 'depleted' ELSE status END,
+                     quantity = quantity - ?
+                 WHERE id = ?",
+                [$take, $take, (int)$lot['id']]
+            );
+            if ($movementId !== null) {
+                try {
+                    $this->query(
+                        "INSERT INTO stock_movement_lots
+                            (movement_id, lot_id, lot_code, expiry_date, quantity, unit_cost)
+                         VALUES (?, ?, ?, ?, ?, ?)",
+                        [
+                            $movementId,
+                            (int)$lot['id'],
+                            (string)$lot['lot_code'],
+                            $lot['expiry_date'] ?: null,
+                            $take,
+                            round((float)$lot['unit_cost'], 2),
+                        ]
+                    );
+                } catch (\Throwable $e) {
+                    // ignore
+                }
+            }
+            $trimmed += $take;
+            $excess -= $take;
+        }
+        $this->refreshNextExpiry($productId);
+        return $trimmed;
     }
 
     /**
@@ -408,7 +626,10 @@ class LotService
         try {
             return $this->query(
                 "SELECT p.id, p.code, p.name, p.stock,
-                        COALESCE(SUM(CASE WHEN l.status IN ('active','expired') THEN l.quantity ELSE 0 END), 0) lot_stock
+                        COALESCE(SUM(CASE WHEN l.status IN ('active','expired','blocked') THEN l.quantity ELSE 0 END), 0) lot_stock,
+                        COALESCE(SUM(CASE WHEN l.status = 'active' THEN l.quantity ELSE 0 END), 0) sellable_stock,
+                        COALESCE(SUM(CASE WHEN l.status = 'expired' THEN l.quantity ELSE 0 END), 0) expired_stock,
+                        COALESCE(SUM(CASE WHEN l.status = 'blocked' THEN l.quantity ELSE 0 END), 0) blocked_stock
                  FROM products p
                  LEFT JOIN product_lots l ON l.product_id = p.id
                  WHERE p.track_lots = 1 AND p.status = 'active'

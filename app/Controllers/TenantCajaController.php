@@ -199,6 +199,7 @@ class TenantCajaController extends TenantController
         $posCustomers = [];
         $paymentMethods = [];
         $recentProducts = [];
+        $offerProducts = [];
         $financialCats = [];
         $operationalCats = [];
         $administrativeCats = [];
@@ -220,7 +221,18 @@ class TenantCajaController extends TenantController
             try {
                 $this->ensureWholesalePriceColumn();
                 $this->repairProductUtf8Names();
+                try {
+                    (new \SoftNova\Services\ProductOfferService($this->db))->expireDueOffers();
+                } catch (\Throwable $e) {
+                    // ignore
+                }
                 $openItem = \SoftNova\Services\OpenItemProduct::ensure($this->db);
+                $offerProducts = [];
+                try {
+                    $offerProducts = (new \SoftNova\Services\ProductOfferService($this->db))->latestActiveOffers(3);
+                } catch (\Throwable $e) {
+                    $offerProducts = [];
+                }
                 // Últimos 5 productos vendidos (por fecha de venta más reciente).
                 $recentProducts = $this->query(
                     "SELECT p.id, p.name, p.code, p.sale_price, COALESCE(p.wholesale_price, 0) AS wholesale_price,
@@ -398,6 +410,7 @@ class TenantCajaController extends TenantController
             'posCustomers' => $posCustomers,
             'paymentMethods' => $paymentMethods,
             'recentProducts' => $recentProducts,
+            'offerProducts' => $offerProducts,
             'financialCats' => $financialCats,
             'operationalCats' => $operationalCats,
             'administrativeCats' => $administrativeCats,
@@ -503,6 +516,11 @@ class TenantCajaController extends TenantController
     {
         TenantMiddleware::authorize('caja');
         $this->ensureWholesalePriceColumn();
+        try {
+            (new \SoftNova\Services\ProductOfferService($this->db))->expireDueOffers();
+        } catch (\Throwable $e) {
+            // ignore
+        }
         $q = trim((string)$this->request->get('q', ''));
         if (mb_strlen($q) < 1) {
             $this->json(['success' => true, 'products' => []]);
@@ -570,6 +588,11 @@ class TenantCajaController extends TenantController
 
         try {
             \SoftNova\Services\OpenItemProduct::ensure($this->db);
+            try {
+                (new \SoftNova\Services\ProductOfferService($this->db))->expireDueOffers();
+            } catch (\Throwable $e) {
+                // ignore
+            }
             $rows = $this->query(
                 "SELECT id, name, code, sale_price, stock, COALESCE(product_type, 'product') AS product_type
                  FROM products
@@ -656,7 +679,7 @@ class TenantCajaController extends TenantController
             return;
         }
         
-        $openingAmount = (float)$this->request->post('opening_amount');
+        $openingAmount = \SoftNova\Core\parse_money($this->request->post('opening_amount'));
         $notes = $this->request->post('notes', '');
         
         if ($openingAmount < 0) {
@@ -680,7 +703,7 @@ class TenantCajaController extends TenantController
         }
 
         $sessionId = (int)$this->request->post('session_id', 0);
-        $closingAmount = (float)$this->request->post('closing_amount', 0);
+        $closingAmount = \SoftNova\Core\parse_money($this->request->post('closing_amount', 0));
         $notes = trim((string)$this->request->post('notes', ''));
 
         if ($sessionId <= 0) {
@@ -913,7 +936,7 @@ class TenantCajaController extends TenantController
         }
 
         $description = trim((string)$this->request->post('description', ''));
-        $amount = (float)$this->request->post('amount', 0);
+        $amount = \SoftNova\Core\parse_money($this->request->post('amount', 0));
         $categoryId = (int)$this->request->post('category_id', 0);
         $expenseDate = trim((string)$this->request->post('expense_date', date('Y-m-d')));
         if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $expenseDate)) {
@@ -1072,7 +1095,7 @@ class TenantCajaController extends TenantController
         
         $sessionId = (int)$this->request->post('session_id');
         $type = $this->request->post('type');
-        $amount = (float)$this->request->post('amount');
+        $amount = \SoftNova\Core\parse_money($this->request->post('amount'));
         $description = $this->request->post('description', '');
         
         if (!in_array($type, ['income', 'expense'], true)) {

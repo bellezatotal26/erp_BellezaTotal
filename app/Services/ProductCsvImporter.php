@@ -359,6 +359,12 @@ class ProductCsvImporter
             'unidad' => ['unidad', 'unit', 'um', 'medida', 'unidade'],
             'estado' => ['estado', 'status', 'activo'],
             'ubicacion' => ['ubicacion', 'location', 'bodega', 'almacen', 'warehouse', 'local'],
+            'lote' => ['lote', 'lot', 'lot_code', 'codigo_lote', 'cod_lote', 'remesa', 'batch'],
+            'vence' => [
+                'vence', 'vencimiento', 'expiry', 'expiry_date', 'fecha_vencimiento',
+                'caducidad', 'fecha_caducidad', 'expira', 'expiration',
+            ],
+            'modo_stock' => ['modo_stock', 'stock_mode', 'modo', 'tipo_stock'],
         ];
         foreach ($aliases as $key => $names) {
             if (in_array($norm, $names, true)) {
@@ -378,6 +384,12 @@ class ProductCsvImporter
         }
         if (str_starts_with($norm, 'costo') || str_starts_with($norm, 'coste')) {
             return 'costo';
+        }
+        if (str_starts_with($norm, 'lote') || str_starts_with($norm, 'remesa') || str_starts_with($norm, 'batch')) {
+            return 'lote';
+        }
+        if (str_starts_with($norm, 'vence') || str_starts_with($norm, 'caduc') || str_contains($norm, 'vencim')) {
+            return 'vence';
         }
         return null;
     }
@@ -404,6 +416,7 @@ class ProductCsvImporter
             'minimo', 'codigo', 'price', 'tipo', 'type', 'clase', 'rubro',
             'grupo', 'unit', 'name', 'item', 'ean', 'upc', 'gtin', 'sku',
             'qty', 'pvp', 'cat', 'cod', 'ref', 'min', 'cost', 'local', 'um',
+            'vencimiento', 'caducidad', 'lote', 'remesa', 'batch', 'vence',
         ];
         $tokens = array_values(array_unique($tokens));
         usort($tokens, static fn ($a, $b) => strlen($b) <=> strlen($a));
@@ -454,6 +467,7 @@ class ProductCsvImporter
             'sku' => null, 'ean' => null, 'nombre' => null, 'tipo' => null, 'categoria' => null,
             'costo' => null, 'precio' => null, 'stock' => null, 'min' => null,
             'unidad' => null, 'estado' => null, 'ubicacion' => null,
+            'lote' => null, 'vence' => null, 'modo_stock' => null,
         ];
 
         foreach ($header as $i => $col) {
@@ -712,7 +726,10 @@ class ProductCsvImporter
     }
 
     /**
-     * @return array{created:int,updated:int,skipped:int,errors:list<string>}
+     * @return array{
+     *   created:int,updated:int,skipped:int,remesas:int,movements:int,
+     *   errors:list<string>
+     * }
      */
     public function importFromFile(string $path, int $userId = 0): array
     {
@@ -732,12 +749,15 @@ class ProductCsvImporter
         $created = 0;
         $updated = 0;
         $skipped = 0;
+        $remesas = 0;
+        $movements = 0;
         $errors = [];
         $categoryCache = [];
+        $touchedIds = [];
         $rowNum = 1;
 
         $cell = static function (array $map, array $row, string $key): string {
-            $i = $map[$key];
+            $i = $map[$key] ?? null;
             if ($i === null || !isset($row[$i])) {
                 return '';
             }
@@ -781,11 +801,16 @@ class ProductCsvImporter
             if ($status !== 'inactive') {
                 $status = 'active';
             }
-            $cost = (float)str_replace(',', '.', $cell($map, $row, 'costo') ?: '0');
-            $price = (float)str_replace(',', '.', $cell($map, $row, 'precio') ?: '0');
-            $stock = $type === 'service' ? 0 : (int)$cell($map, $row, 'stock');
+            $cost = $this->parseMoneyCell($cell($map, $row, 'costo'));
+            $price = $this->parseMoneyCell($cell($map, $row, 'precio'));
+            $stockRaw = $cell($map, $row, 'stock');
+            $stockSpecified = $stockRaw !== '';
+            $stockQty = $type === 'service' ? 0 : $this->parseQtyCell($stockRaw);
+            if ($stockQty < 0) {
+                $stockQty = 0;
+            }
             $minStock = (int)($cell($map, $row, 'min') !== '' ? $cell($map, $row, 'min') : '5');
-            $unit = $cell($map, $row, 'unidad') ?: 'UNIDAD';
+            $unit = $cell($map, $row, 'unidad') ?: 'UND';
             $catName = $this->decodeCsvText($cell($map, $row, 'categoria'));
             $location = $this->decodeCsvText($cell($map, $row, 'ubicacion'));
             if ($location !== '' && mb_strlen($location) > 120) {
@@ -793,6 +818,10 @@ class ProductCsvImporter
             }
             $locationVal = $location !== '' ? $location : null;
             $eanVal = $ean !== '' ? $ean : null;
+            $lotCode = substr(trim($cell($map, $row, 'lote')), 0, 60);
+            $expiryDate = $this->parseExpiryDate($cell($map, $row, 'vence'));
+            $hasLotData = $lotCode !== '' || $expiryDate !== null;
+            $stockMode = $this->resolveStockMode($cell($map, $row, 'modo_stock'), $hasLotData);
 
             $categoryId = null;
             if ($catName !== '') {
@@ -820,85 +849,103 @@ class ProductCsvImporter
                 $existingProduct = null;
                 if ($sku !== '') {
                     $existingProduct = $this->query(
-                        "SELECT id, stock FROM products WHERE code = ? LIMIT 1",
+                        "SELECT id, stock, COALESCE(track_lots, 0) AS track_lots, purchase_price
+                         FROM products WHERE code = ? LIMIT 1",
                         [$sku]
                     )->fetch();
                 }
                 if (!$existingProduct && $eanVal) {
                     $existingProduct = $this->query(
-                        "SELECT id, stock FROM products WHERE barcode = ? LIMIT 1",
+                        "SELECT id, stock, COALESCE(track_lots, 0) AS track_lots, purchase_price
+                         FROM products WHERE barcode = ? LIMIT 1",
                         [$eanVal]
                     )->fetch();
                 }
+
                 if ($existingProduct) {
                     $id = (int)$existingProduct['id'];
-                    $oldStock = (int)$existingProduct['stock'];
+
+                    // Stock/remesa antes del UPDATE de estado (decrease exige producto activo).
+                    if ($type === 'product' && $stockSpecified) {
+                        $stats = $this->applyCsvStockChange(
+                            $id,
+                            $stockQty,
+                            $stockMode,
+                            $cost,
+                            $userId,
+                            $lotCode,
+                            $expiryDate,
+                            $hasLotData,
+                            'Importación CSV · producto existente'
+                        );
+                        $movements += $stats['movements'];
+                        $remesas += $stats['remesas'];
+                    }
+
+                    // Ficha: no tocar stock aquí; el kardex/lotes ya lo sincronizaron.
                     $this->query(
                         "UPDATE products SET name = ?, product_type = ?, category_id = ?,
-                                purchase_price = ?, sale_price = ?, stock = ?, min_stock = ?,
+                                purchase_price = ?, sale_price = ?, min_stock = ?,
                                 unit = ?, status = ?, location = COALESCE(?, location),
                                 barcode = COALESCE(?, barcode) WHERE id = ?",
-                        [$name, $type, $categoryId, $cost, $price, $stock, $minStock, $unit, $status, $locationVal, $eanVal, $id]
+                        [$name, $type, $categoryId, $cost, $price, $minStock, $unit, $status, $locationVal, $eanVal, $id]
                     );
-                    if ($type === 'product' && $stock !== $oldStock) {
-                        $diff = $stock - $oldStock;
-                        $movementId = $this->stock->addMovement(
-                            $id,
-                            $diff > 0 ? 'in' : 'out',
-                            abs($diff),
-                            'csv_import',
-                            null,
-                            \SoftNova\Services\StockService::buildStockMotive(
-                                'adjustment',
-                                $diff,
-                                $oldStock,
-                                $stock,
-                                'Importación CSV sobre producto existente'
-                            ),
-                            $userId ?: null,
-                            $cost,
-                            $stock,
-                            null,
-                            $diff > 0 ? 'equity' : 'loss'
-                        );
-                        $this->postStockAccounting($movementId);
-                    }
+
+                    $touchedIds[$id] = true;
                     $updated++;
                 } else {
                     if ($sku === '') {
                         $sku = 'SKU-' . strtoupper(substr(bin2hex(random_bytes(3)), 0, 6));
                     }
-                    $this->query(
-                        "INSERT INTO products
-                            (code, barcode, name, product_type, category_id, purchase_price, sale_price,
-                             stock, min_stock, unit, status, location, created_by)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        [$sku, $eanVal, $name, $type, $categoryId, $cost, $price, $stock, $minStock, $unit, $status, $locationVal, $userId ?: null]
-                    );
-                    $newId = (int)$this->db->lastInsertId();
-                    if ($stock > 0 && $type === 'product') {
-                        $movementId = $this->stock->addMovement(
-                            $newId,
-                            'in',
-                            $stock,
-                            'csv_import',
-                            null,
-                            \SoftNova\Services\StockService::buildStockMotive(
-                                'new_product',
-                                $stock,
-                                0,
-                                $stock,
-                                'Alta de producto por importación CSV'
-                            ),
-                            $userId ?: null,
-                            $cost,
-                            $stock,
-                            null,
-                            'equity'
+                    $this->db->beginTransaction();
+                    try {
+                        // Alta con stock 0; la entrada va por increase (trazabilidad + lote).
+                        $this->query(
+                            "INSERT INTO products
+                                (code, barcode, name, product_type, category_id, purchase_price, sale_price,
+                                 stock, min_stock, unit, status, location, track_lots, expiry_alert_days, created_by)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 30, ?)",
+                            [
+                                $sku,
+                                $eanVal,
+                                $name,
+                                $type,
+                                $categoryId,
+                                $cost,
+                                $price,
+                                $minStock,
+                                $unit,
+                                $status,
+                                $locationVal,
+                                ($type === 'product' && $hasLotData) ? 1 : 0,
+                                $userId ?: null,
+                            ]
                         );
-                        $this->postStockAccounting($movementId);
+                        $newId = (int)$this->db->lastInsertId();
+                        if ($type === 'product' && $stockQty > 0) {
+                            $stats = $this->applyCsvStockChange(
+                                $newId,
+                                $stockQty,
+                                'entrada',
+                                $cost,
+                                $userId,
+                                $lotCode,
+                                $expiryDate,
+                                $hasLotData,
+                                'Alta de producto por importación CSV'
+                            );
+                            $movements += $stats['movements'];
+                            $remesas += $stats['remesas'];
+                        }
+                        $this->db->commit();
+                        $touchedIds[$newId] = true;
+                        $created++;
+                    } catch (\Throwable $e) {
+                        if ($this->db->inTransaction()) {
+                            $this->db->rollBack();
+                        }
+                        throw $e;
                     }
-                    $created++;
                 }
             } catch (\Throwable $e) {
                 $skipped++;
@@ -907,6 +954,213 @@ class ProductCsvImporter
         }
         fclose($handle);
 
-        return compact('created', 'updated', 'skipped', 'errors');
+        // Cuadre final: productos con lotes y saldo sin remesa (p.ej. sync absoluto previo).
+        foreach (array_keys($touchedIds) as $pid) {
+            try {
+                $lots = $this->stock->lots();
+                if ($lots->tracksLots((int)$pid)) {
+                    $seeded = $lots->seedOpeningLot((int)$pid);
+                    if ($seeded > 0) {
+                        $remesas++;
+                    }
+                }
+            } catch (\Throwable $e) {
+                // no abortar import
+            }
+        }
+
+        return compact('created', 'updated', 'skipped', 'remesas', 'movements', 'errors');
+    }
+
+    /**
+     * Aplica cambio de stock del CSV con kardex + lotes.
+     * - modo entrada/remesa: suma cantidad (como compra)
+     * - modo absoluto: lleva el stock al valor indicado
+     *
+     * @return array{movements:int,remesas:int}
+     */
+    private function applyCsvStockChange(
+        int $productId,
+        int $qtyOrTarget,
+        string $mode,
+        float $unitCost,
+        int $userId,
+        string $lotCode,
+        ?string $expiryDate,
+        bool $hasLotData,
+        string $detail
+    ): array {
+        $out = ['movements' => 0, 'remesas' => 0];
+        if ($productId <= 0) {
+            return $out;
+        }
+
+        $lotMeta = null;
+        if ($hasLotData || $mode === 'entrada') {
+            $lotMeta = [
+                'lot_code' => $lotCode,
+                'expiry_date' => $expiryDate,
+                'alert_days' => 30,
+                'notes' => $detail,
+            ];
+        }
+
+        if ($mode === 'entrada') {
+            if ($qtyOrTarget <= 0) {
+                return $out;
+            }
+            $movementId = $this->stock->increase(
+                $productId,
+                $qtyOrTarget,
+                'csv_import',
+                null,
+                StockService::buildStockMotive('adjustment', $qtyOrTarget, null, null, $detail . ' · remesa'),
+                'in',
+                $unitCost,
+                null,
+                'equity',
+                false,
+                date('Y-m-d'),
+                $lotMeta
+            );
+            if ($movementId > 0) {
+                $this->postStockAccounting($movementId);
+                $out['movements'] = 1;
+                if ($hasLotData || $this->stock->lots()->tracksLots($productId)) {
+                    $out['remesas'] = 1;
+                }
+            }
+            return $out;
+        }
+
+        // Modo absoluto: sincroniza products.stock y el submayor de lotes.
+        $current = (int)$this->query("SELECT stock FROM products WHERE id = ?", [$productId])->fetchColumn();
+        $target = max(0, $qtyOrTarget);
+        $diff = $target - $current;
+        if ($diff === 0) {
+            // Misma existencia + lote/vence: al menos activar control y sembrar si falta.
+            if ($hasLotData) {
+                try {
+                    $lots = $this->stock->lots();
+                    $lots->configureProduct($productId, true, 30);
+                    if ($lots->seedOpeningLot($productId, $unitCost, $expiryDate) > 0) {
+                        $out['remesas'] = 1;
+                    }
+                } catch (\Throwable $e) {
+                    // ignore
+                }
+            }
+            return $out;
+        }
+
+        if ($diff > 0) {
+            $movementId = $this->stock->increase(
+                $productId,
+                $diff,
+                'csv_import',
+                null,
+                StockService::buildStockMotive('adjustment', $diff, $current, $target, $detail . ' · sync absoluto'),
+                'in',
+                $unitCost,
+                null,
+                'equity',
+                false,
+                date('Y-m-d'),
+                $lotMeta
+            );
+            if ($movementId > 0) {
+                $this->postStockAccounting($movementId);
+                $out['movements'] = 1;
+                if ($hasLotData) {
+                    $out['remesas'] = 1;
+                }
+            }
+        } else {
+            $movementId = $this->stock->decrease(
+                $productId,
+                abs($diff),
+                'csv_import',
+                null,
+                StockService::buildStockMotive('adjustment', $diff, $current, $target, $detail . ' · sync absoluto'),
+                $unitCost
+            );
+            if ($movementId > 0) {
+                $this->postStockAccounting($movementId);
+                $out['movements'] = 1;
+                // Tras bajar stock, recortar lotes no vendibles (vencidos/bloqueados) que sobren.
+                try {
+                    $this->stock->lots()->trimPhysicalToStock($productId, $target, $movementId);
+                } catch (\Throwable $e) {
+                    // ignore
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    /** Parsea cantidades con miles (1.234 / 1,234) sin truncar a 1. */
+    private function parseQtyCell(string $raw): int
+    {
+        $raw = trim($raw);
+        if ($raw === '') {
+            return 0;
+        }
+        // Entero puro
+        if (preg_match('/^-?\d+$/', $raw)) {
+            return max(0, (int)$raw);
+        }
+        $n = $this->parseMoneyCell($raw);
+        return max(0, (int)round($n));
+    }
+
+    /** entrada|absoluto */
+    private function resolveStockMode(string $raw, bool $hasLotData): string
+    {
+        $v = mb_strtolower(trim($raw), 'UTF-8');
+        $v = str_replace(['á', 'é', 'í', 'ó', 'ú'], ['a', 'e', 'i', 'o', 'u'], $v);
+        if (in_array($v, ['entrada', 'remesa', 'add', 'suma', 'in', 'purchase', 'compra'], true)) {
+            return 'entrada';
+        }
+        if (in_array($v, ['absoluto', 'total', 'set', 'sync', 'existencia', 'absolute'], true)) {
+            return 'absoluto';
+        }
+        // Con lote/vence: por defecto es remesa (igual que compra).
+        return $hasLotData ? 'entrada' : 'absoluto';
+    }
+
+    private function parseMoneyCell(string $raw): float
+    {
+        if ($raw === '') {
+            return 0.0;
+        }
+        if (function_exists('SoftNova\\Core\\parse_money')) {
+            return round(max(0, \SoftNova\Core\parse_money($raw)), 2);
+        }
+        return round(max(0, (float)str_replace(',', '.', $raw)), 2);
+    }
+
+    private function parseExpiryDate(string $raw): ?string
+    {
+        $raw = trim($raw);
+        if ($raw === '') {
+            return null;
+        }
+        // Excel a veces manda serial; ignorar números puros raros.
+        if (preg_match('/^\d{4}-\d{2}-\d{2}/', $raw)) {
+            $dt = \DateTimeImmutable::createFromFormat('Y-m-d', substr($raw, 0, 10));
+            return ($dt && $dt->format('Y-m-d') === substr($raw, 0, 10)) ? $dt->format('Y-m-d') : null;
+        }
+        foreach (['d/m/Y', 'd-m-Y', 'd/m/y', 'd-m-y', 'm/d/Y'] as $fmt) {
+            $dt = \DateTimeImmutable::createFromFormat($fmt, $raw);
+            if ($dt instanceof \DateTimeImmutable) {
+                $err = \DateTimeImmutable::getLastErrors();
+                if (is_array($err) && (($err['warning_count'] ?? 0) > 0 || ($err['error_count'] ?? 0) > 0)) {
+                    continue;
+                }
+                return $dt->format('Y-m-d');
+            }
+        }
+        return null;
     }
 }

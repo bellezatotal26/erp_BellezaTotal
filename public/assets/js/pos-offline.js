@@ -476,7 +476,10 @@
         return Promise.all(list.map(function (it) {
             return getProduct(it.product_id).then(function (p) {
                 var available = p ? Number(p.stock) : Number(it.stock);
-                var isService = p && p.product_type === 'service';
+                var isService = (p && p.product_type === 'service')
+                    || !!(it.is_open_item)
+                    || (p && (p.is_open_item === 1 || p.is_open_item === true || p.is_open_item === '1'))
+                    || String((p && p.code) || it.code || '').toUpperCase() === 'COMODIN';
                 var hasOversell = !!(it.stock_oversell_reason);
                 if (!isService && available < Number(it.quantity) && !hasOversell) {
                     return {

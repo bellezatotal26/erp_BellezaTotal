@@ -51,9 +51,11 @@ class JobHandlers
             'import:' . time(),
             'Inventario',
             sprintf(
-                'Importación CSV: %d creados, %d actualizados, %d omitidos',
+                'Importación CSV: %d creados, %d actualizados, %d remesas, %d movimientos, %d omitidos',
                 $result['created'],
                 $result['updated'],
+                (int)($result['remesas'] ?? 0),
+                (int)($result['movements'] ?? 0),
                 $result['skipped']
             ),
             '/app/inventario',

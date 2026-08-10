@@ -40,6 +40,11 @@ class SaleService
      */
     public function decreaseItemsStock(array $items, int $saleId, string $invoiceNumber, string $notesPrefix = 'Venta'): void
     {
+        try {
+            (new ProductOfferService($this->db))->expireDueOffers();
+        } catch (\Throwable $e) {
+            // no bloquear venta
+        }
         foreach ($items as $item) {
             $productId = (int)($item['product_id'] ?? 0);
             $quantity = (int)($item['quantity'] ?? 0);

@@ -25,12 +25,12 @@ $searchUrl = $base . '?action=searchProducts';
 </div>
 
 <?php if (($stockAlert['count'] ?? 0) > 0): ?>
-<div class="alert alert-warning" style="margin-bottom:18px;">
+<div class="alert alert-warning alert-stock-pending" style="margin-bottom:18px;">
     <strong>Atención inventario:</strong>
     <?php echo (int)($stockAlert['negative_count'] ?? 0); ?> producto(s) en stock negativo ·
     <?php echo (int)($stockAlert['loan_count'] ?? 0); ?> préstamo(s) abiertos ·
     <?php echo (int)($stockAlert['sale_debt_count'] ?? 0); ?> venta(s) sin stock pendiente(s).
-    <ul style="margin:8px 0 0;padding-left:18px;font-size:13px;">
+    <ul>
         <?php foreach (array_slice($stockAlert['summary_lines'] ?? [], 0, 12) as $line): ?>
             <li><?php echo htmlspecialchars((string)$line); ?></li>
         <?php endforeach; ?>

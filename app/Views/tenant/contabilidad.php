@@ -385,16 +385,16 @@ foreach ($accounts as $account) {
                     <div class="form-group"><label>% Crédito</label><input class="form-control" type="number" step="0.01" name="credit_card_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['credit_card_rate'] ?? 2.8)); ?>"></div>
                     <div class="form-group"><label>% Tarjeta genérica</label><input class="form-control" type="number" step="0.01" name="card_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['card_rate'] ?? 2.8)); ?>"></div>
                 </div>
-                <h4 style="margin:18px 0 10px;">Recargo por crédito largo</h4>
+                <h4 style="margin:18px 0 10px;">Crédito largo (referencia)</h4>
                 <div class="form-grid">
-                    <div class="form-group"><label>Días umbral (por encima se aplica recargo)</label>
+                    <div class="form-group"><label>Días umbral</label>
                         <input class="form-control" type="number" step="1" min="1" max="365" name="credit_over_60_days" value="<?php echo htmlspecialchars((string)($commissionCfg['credit_over_60_days'] ?? 60)); ?>">
                     </div>
-                    <div class="form-group"><label>% recargo sobre subtotal (después de descuento)</label>
+                    <div class="form-group"><label>% referencia (no aumenta el total de venta)</label>
                         <input class="form-control" type="number" step="0.01" min="0" max="100" name="credit_over_60_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['credit_over_60_rate'] ?? 0)); ?>">
                     </div>
                     <p style="grid-column:1/-1;font-size:12px;color:var(--color-text-secondary);margin:0;">
-                        En Caja, si el plazo de crédito supera el umbral (p. ej. 90 días con umbral 60), el total de la venta aumenta con este %.
+                        Este porcentaje ya <strong>no se suma</strong> al total de la venta en Caja. Se conserva solo como referencia de contabilidad/comisiones.
                     </p>
                 </div>
                 <button type="submit" class="btn btn-primary" style="margin-top:12px;">Guardar parámetros</button>

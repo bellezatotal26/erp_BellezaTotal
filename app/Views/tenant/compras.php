@@ -595,82 +595,90 @@ function viewPurchase(id) {
 <?php if ($canCreate): ?>
 <!-- Modal cargar factura de proveedor -->
 <div id="invoiceUploadModal" class="modal-overlay" style="display:none;">
-    <div class="modal-content neumorphic" style="max-width:620px;max-height:88vh;overflow-y:auto;">
+    <div class="modal-content neumorphic invoice-shell-modal" style="max-width:620px;">
         <div class="modal-header">
             <h3>Cargar factura de proveedor</h3>
             <button type="button" class="modal-close" onclick="closeInvoiceUpload()">&times;</button>
         </div>
-        <form method="POST" enctype="multipart/form-data" id="invoiceUploadForm"
+        <form method="POST" enctype="multipart/form-data" id="invoiceUploadForm" class="invoice-shell-form"
               action="<?php echo $viewInstance->route('app/compras'); ?>?action=invoice_import">
             <?php echo \SoftNova\Core\csrf_field(); ?>
-            <p style="margin-top:0;font-size:13px;color:var(--color-text-secondary);">
-                La factura se interpreta y se muestra en un modal de confirmación.
-                <strong>Nada entra al inventario hasta que usted confirme.</strong>
-            </p>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-                <div class="form-group">
-                    <label>Proveedor *</label>
-                    <select name="supplier_id" class="form-control" required>
-                        <option value="">Seleccione…</option>
-                        <?php foreach ($suppliers as $sup): ?>
-                            <option value="<?php echo (int)$sup['id']; ?>"><?php echo htmlspecialchars($sup['name']); ?></option>
-                        <?php endforeach; ?>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Número de factura</label>
-                    <input type="text" name="invoice_number" class="form-control" maxlength="80" placeholder="Se detecta si viene en el archivo">
-                </div>
-                <div class="form-group">
-                    <label>Fecha de factura</label>
-                    <input type="date" name="invoice_date" class="form-control" value="<?php echo date('Y-m-d'); ?>">
-                </div>
-                <div class="form-group">
-                    <label>Vencimiento de pago</label>
-                    <input type="date" name="due_date" class="form-control">
-                </div>
-                <div class="form-group">
-                    <label>Forma de pago</label>
-                    <select name="payment_mode" class="form-control">
-                        <option value="payable">Crédito (cuenta por pagar)</option>
-                        <option value="cash">Efectivo</option>
-                        <option value="transfer">Transferencia</option>
-                        <option value="card">Tarjeta</option>
-                    </select>
-                </div>
-            </div>
-            <div class="form-group">
-                <label>Archivo de la factura</label>
-                <input type="file" name="invoice_file" class="form-control" style="padding:8px;"
-                       accept=".csv,.txt,.pdf,.xml,image/*">
-                <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
-                    <strong>CSV</strong> es lo más confiable.
-                    <strong>PDF con texto</strong> y XML se leen directo.
-                    <strong>PDF solo imagen / foto</strong> (escaneo) requiere marcar «Interpretar con IA».
-                    Columnas CSV: código, descripción, cantidad, costo, IVA, descuento, lote, vencimiento.
-                </small>
-            </div>
-            <div class="form-group">
-                <label>O pegue el texto de la factura</label>
-                <textarea name="pasted_text" rows="5" class="form-control"
-                          placeholder="Pegue aquí las líneas de la factura si no tiene archivo"></textarea>
-            </div>
-            <div class="form-group">
-                <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;<?php echo $aiInvoiceReady ? '' : 'opacity:.55;'; ?>">
-                    <input type="checkbox" name="use_ai" id="invoiceUseAi" value="1" style="width:auto;margin-top:3px;"
-                           <?php echo $aiInvoiceReady ? 'checked' : 'disabled'; ?>>
-                    <span>
-                        Interpretar con IA
-                        <small style="display:block;color:var(--color-text-secondary);font-weight:400;">
-                            Necesario para PDF escaneados o fotos. Si el PDF ya trae texto, también mejora la lectura.
+            <div class="invoice-shell-body">
+                <p style="margin-top:0;font-size:13px;color:var(--color-text-secondary);">
+                    La factura se interpreta y se muestra en un modal de confirmación.
+                    <strong>Nada entra al inventario hasta que usted confirme.</strong>
+                </p>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                    <div class="form-group" style="grid-column:1/-1;">
+                        <label>Proveedor *</label>
+                        <div class="customer-combobox invoice-supplier-combobox" id="invoiceSupplierCombobox" data-required="1">
+                            <input type="hidden" name="supplier_id" id="invoiceSupplierId" value="" required>
+                            <div style="display:flex;gap:8px;align-items:stretch;">
+                                <input type="search" id="invoiceSupplierSearch" class="form-control" autocomplete="off"
+                                       placeholder="Buscar proveedor por nombre, NIT o teléfono…"
+                                       aria-expanded="false" aria-controls="invoiceSupplierList" style="flex:1;">
+                                <button type="button" class="btn btn-secondary" style="white-space:nowrap;"
+                                        onclick="openQuickSupplierModal('upload')" title="Agregar proveedor nuevo">+ Nuevo</button>
+                            </div>
+                            <ul class="combobox-list" id="invoiceSupplierList" hidden></ul>
+                        </div>
+                        <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
+                            Escriba para filtrar. Si no está en la lista, use <strong>+ Nuevo</strong> sin salir de aquí.
                         </small>
-                        <?php if (!$aiInvoiceReady): ?>
-                            <small style="display:block;color:#B45309;">Configure OPENROUTER_API_KEY para habilitarlo.</small>
-                        <?php endif; ?>
-                    </span>
-                </label>
+                    </div>
+                    <div class="form-group">
+                        <label>Número de factura</label>
+                        <input type="text" name="invoice_number" class="form-control" maxlength="80" placeholder="Se detecta si viene en el archivo">
+                    </div>
+                    <div class="form-group">
+                        <label>Fecha de factura</label>
+                        <input type="date" name="invoice_date" class="form-control" value="<?php echo date('Y-m-d'); ?>">
+                    </div>
+                    <div class="form-group">
+                        <label>Vencimiento de pago</label>
+                        <input type="date" name="due_date" class="form-control">
+                    </div>
+                    <div class="form-group">
+                        <label>Forma de pago</label>
+                        <select name="payment_mode" class="form-control">
+                            <option value="payable">Crédito (cuenta por pagar)</option>
+                            <option value="cash">Efectivo</option>
+                            <option value="transfer">Transferencia</option>
+                            <option value="card">Tarjeta</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Archivo de la factura</label>
+                    <input type="file" name="invoice_file" class="form-control" style="padding:8px;"
+                           accept=".csv,.txt,.pdf,.xml,.zip,.xlsx,.xlsm,.xls,.ods,.docx,image/*">
+                    <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
+                        Excel, Word, PDF, XML/ZIP DIAN, CSV y fotos/CamScanner.
+                        Escaneos: marque «Interpretar con IA».
+                    </small>
+                </div>
+                <div class="form-group">
+                    <label>O pegue el texto de la factura</label>
+                    <textarea name="pasted_text" rows="3" class="form-control"
+                              placeholder="Pegue aquí las líneas de la factura si no tiene archivo"></textarea>
+                </div>
+                <div class="form-group" style="margin-bottom:0;">
+                    <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;<?php echo $aiInvoiceReady ? '' : 'opacity:.55;'; ?>">
+                        <input type="checkbox" name="use_ai" id="invoiceUseAi" value="1" style="width:auto;margin-top:3px;"
+                               <?php echo $aiInvoiceReady ? 'checked' : 'disabled'; ?>>
+                        <span>
+                            Interpretar con IA
+                            <small style="display:block;color:var(--color-text-secondary);font-weight:400;">
+                                Necesario para PDF escaneados o fotos. Si el PDF ya trae texto, también mejora la lectura.
+                            </small>
+                            <?php if (!$aiInvoiceReady): ?>
+                                <small style="display:block;color:#B45309;">Configure OPENROUTER_API_KEY para habilitarlo.</small>
+                            <?php endif; ?>
+                        </span>
+                    </label>
+                </div>
             </div>
-            <div class="modal-footer">
+            <div class="modal-footer invoice-shell-footer">
                 <button type="button" class="btn btn-secondary" onclick="closeInvoiceUpload()">Cancelar</button>
                 <button type="submit" class="btn btn-primary">Leer factura</button>
             </div>
@@ -678,19 +686,74 @@ function viewPurchase(id) {
     </div>
 </div>
 
+<!-- Alta rápida de proveedor (sobre el modal de factura) -->
+<div id="quickSupplierModal" class="modal-overlay" style="display:none;z-index:1100;">
+    <div class="modal-content neumorphic" style="max-width:520px;max-height:85vh;overflow-y:auto;">
+        <div class="modal-header">
+            <h3>Nuevo proveedor</h3>
+            <button type="button" class="modal-close" onclick="closeQuickSupplierModal()">&times;</button>
+        </div>
+        <form id="quickSupplierForm" onsubmit="return submitQuickSupplier(event);">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <p style="margin-top:0;font-size:13px;color:var(--color-text-secondary);">
+                Se guardará y quedará seleccionado en la factura. No perderá lo que ya cargó.
+            </p>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                <div class="form-group" style="grid-column:1/-1;">
+                    <label>Nombre de empresa *</label>
+                    <input type="text" name="name" id="qsName" class="form-control" required maxlength="255">
+                </div>
+                <div class="form-group">
+                    <label>Tipo doc.</label>
+                    <select name="document_type" id="qsDocType" class="form-control">
+                        <option value="NIT">NIT</option>
+                        <option value="CC">C.C</option>
+                        <option value="CE">C.E</option>
+                        <option value="OTROS">OTROS</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>N° documento *</label>
+                    <input type="text" name="document_number" id="qsDocNum" class="form-control" required maxlength="60">
+                </div>
+                <div class="form-group">
+                    <label>Contacto</label>
+                    <input type="text" name="contact_name" id="qsContact" class="form-control" maxlength="120">
+                </div>
+                <div class="form-group">
+                    <label>Teléfono *</label>
+                    <input type="text" name="phone" id="qsPhone" class="form-control" required maxlength="60">
+                </div>
+                <div class="form-group" style="grid-column:1/-1;">
+                    <label>Email</label>
+                    <input type="email" name="email" id="qsEmail" class="form-control" maxlength="180">
+                </div>
+                <div class="form-group" style="grid-column:1/-1;">
+                    <label>Dirección</label>
+                    <input type="text" name="address" id="qsAddress" class="form-control" maxlength="255">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeQuickSupplierModal()">Cancelar</button>
+                <button type="submit" class="btn btn-primary" id="qsSubmitBtn">Guardar y seleccionar</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <!-- Modal confirmación previa al inventario -->
 <div id="invoiceReviewModal" class="modal-overlay" style="display:none;">
-    <div class="modal-content neumorphic" style="max-width:1100px;max-height:90vh;overflow-y:auto;">
+    <div class="modal-content neumorphic invoice-shell-modal" style="max-width:1100px;">
         <div class="modal-header">
             <h3>Confirmar ingreso al inventario</h3>
             <button type="button" class="modal-close" onclick="closeInvoiceReview()">&times;</button>
         </div>
-        <form method="POST" id="invoiceReviewForm"
+        <form method="POST" id="invoiceReviewForm" class="invoice-shell-form"
               action="<?php echo $viewInstance->route('app/compras'); ?>?action=invoice_confirm">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="import_id" id="irImportId">
-            <div id="invoiceReviewBody"></div>
-            <div class="modal-footer">
+            <div class="invoice-shell-body" id="invoiceReviewBody"></div>
+            <div class="modal-footer invoice-shell-footer">
                 <button type="button" class="btn btn-secondary" onclick="closeInvoiceReview()">Cerrar sin aplicar</button>
                 <button type="submit" class="btn btn-success"
                         onclick="return confirm('¿Ingresar estas líneas al inventario? Se creará la orden de compra y su asiento contable.')">
@@ -778,14 +841,138 @@ window.poProducts = <?php echo json_encode(array_map(static function ($p) {
 window.poDetailUrl = '<?php echo $viewInstance->route('app/compras'); ?>?action=detail';
 window.poWarehouseKey = 'seri_last_warehouse_date';
 window.poInvoicePreviewUrl = '<?php echo $viewInstance->route('app/compras'); ?>?action=invoice_preview';
+window.poQuickSupplierUrl = '<?php echo $viewInstance->route('app/compras'); ?>?action=quick_supplier';
 window.poSuppliers = <?php echo json_encode(array_map(static fn($s) => [
     'id' => (int)$s['id'],
-    'name' => $s['name'],
+    'name' => (string)$s['name'],
+    'document_type' => (string)($s['document_type'] ?? ''),
+    'document_number' => (string)($s['document_number'] ?? ''),
+    'phone' => (string)($s['phone'] ?? ''),
+    'contact_name' => (string)($s['contact_name'] ?? ''),
 ], $suppliers), JSON_UNESCAPED_UNICODE); ?>;
 window.poCurrency = { symbol: '<?php echo htmlspecialchars($currency['symbol']); ?>', decimals: <?php echo (int)$currency['decimals']; ?> };
+window._quickSupplierTarget = 'upload';
+
+function supplierSearchText(s) {
+    return [s.name, s.document_type, s.document_number, s.phone, s.contact_name]
+        .filter(Boolean).join(' ').toLowerCase();
+}
+
+function supplierLabel(s) {
+    if (!s) return '';
+    var extra = s.document_number ? (' · ' + (s.document_type || 'Doc') + ' ' + s.document_number) : '';
+    return (s.name || '') + extra;
+}
+
+function rebuildSupplierList(listEl) {
+    if (!listEl) return;
+    var html = '';
+    (window.poSuppliers || []).forEach(function(s) {
+        html += '<li class="combobox-option" data-id="' + s.id + '" data-label="' + esc(s.name) + '"' +
+            ' data-search="' + esc(supplierSearchText(s)) + '">' +
+            esc(s.name) +
+            (s.document_number ? '<small>' + esc((s.document_type || 'Doc') + ': ' + s.document_number + (s.phone ? ' · ' + s.phone : '')) + '</small>' : '') +
+            '</li>';
+    });
+    listEl.innerHTML = html;
+}
+
+function upsertPoSupplier(s) {
+    if (!s || !s.id) return;
+    window.poSuppliers = window.poSuppliers || [];
+    var found = false;
+    for (var i = 0; i < window.poSuppliers.length; i++) {
+        if (String(window.poSuppliers[i].id) === String(s.id)) {
+            window.poSuppliers[i] = Object.assign({}, window.poSuppliers[i], s);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        window.poSuppliers.push(s);
+        window.poSuppliers.sort(function(a, b) {
+            return String(a.name || '').localeCompare(String(b.name || ''), 'es', { sensitivity: 'base' });
+        });
+    }
+    rebuildSupplierList(document.getElementById('invoiceSupplierList'));
+    var reviewList = document.getElementById('reviewSupplierList');
+    if (reviewList) rebuildSupplierList(reviewList);
+}
+
+function bindSupplierCombobox(wrapId, hiddenId, searchId, listId) {
+    var wrap = document.getElementById(wrapId);
+    var hidden = document.getElementById(hiddenId);
+    var input = document.getElementById(searchId);
+    var list = document.getElementById(listId);
+    if (!wrap || !hidden || !input || !list || wrap.dataset.ready === '1') return;
+    wrap.dataset.ready = '1';
+    rebuildSupplierList(list);
+
+    function openList() {
+        list.hidden = false;
+        input.setAttribute('aria-expanded', 'true');
+    }
+    function closeList() {
+        list.hidden = true;
+        input.setAttribute('aria-expanded', 'false');
+    }
+    function filterList() {
+        var q = input.value.toLowerCase().trim();
+        var visible = 0;
+        list.querySelectorAll('.combobox-option').forEach(function(li) {
+            var match = !q || (li.getAttribute('data-search') || '').indexOf(q) !== -1;
+            li.style.display = match ? '' : 'none';
+            if (match) visible++;
+        });
+        if (visible > 0) openList(); else closeList();
+    }
+    function selectOption(li) {
+        hidden.value = li.getAttribute('data-id') || '';
+        input.value = li.getAttribute('data-label') || li.textContent.trim();
+        closeList();
+    }
+
+    input.addEventListener('focus', function() { filterList(); openList(); });
+    input.addEventListener('input', function() { hidden.value = ''; filterList(); });
+    list.addEventListener('mousedown', function(e) {
+        var li = e.target.closest('.combobox-option');
+        if (!li) return;
+        e.preventDefault();
+        selectOption(li);
+    });
+    document.addEventListener('click', function(e) {
+        if (!wrap.contains(e.target)) closeList();
+    });
+    input.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') closeList();
+        if (e.key === 'Enter') {
+            var first = list.querySelector('.combobox-option:not([style*="display: none"])');
+            if (first && !list.hidden) {
+                e.preventDefault();
+                selectOption(first);
+            }
+        }
+    });
+}
+
+function setSupplierCombobox(hiddenId, searchId, supplierId) {
+    var hidden = document.getElementById(hiddenId);
+    var input = document.getElementById(searchId);
+    if (!hidden || !input) return;
+    var id = supplierId ? String(supplierId) : '';
+    hidden.value = id;
+    if (!id) {
+        input.value = '';
+        return;
+    }
+    var found = (window.poSuppliers || []).find(function(s) { return String(s.id) === id; });
+    input.value = found ? found.name : ('#' + id);
+}
 
 function openInvoiceUpload() {
     document.getElementById('invoiceUploadForm').reset();
+    setSupplierCombobox('invoiceSupplierId', 'invoiceSupplierSearch', '');
+    rebuildSupplierList(document.getElementById('invoiceSupplierList'));
     document.getElementById('invoiceUploadModal').style.display = 'flex';
 }
 function closeInvoiceUpload() {
@@ -793,6 +980,59 @@ function closeInvoiceUpload() {
 }
 function closeInvoiceReview() {
     document.getElementById('invoiceReviewModal').style.display = 'none';
+}
+
+function openQuickSupplierModal(target) {
+    window._quickSupplierTarget = target || 'upload';
+    var form = document.getElementById('quickSupplierForm');
+    if (form) form.reset();
+    document.getElementById('quickSupplierModal').style.display = 'flex';
+    setTimeout(function() {
+        var n = document.getElementById('qsName');
+        if (n) n.focus();
+    }, 50);
+}
+function closeQuickSupplierModal() {
+    document.getElementById('quickSupplierModal').style.display = 'none';
+}
+
+function submitQuickSupplier(e) {
+    e.preventDefault();
+    var form = document.getElementById('quickSupplierForm');
+    var btn = document.getElementById('qsSubmitBtn');
+    if (!form) return false;
+    var fd = new FormData(form);
+    if (btn) { btn.disabled = true; btn.textContent = 'Guardando…'; }
+    fetch(window.poQuickSupplierUrl, {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        if (!d || !d.success || !d.supplier) {
+            throw new Error((d && d.message) || 'No se pudo crear el proveedor');
+        }
+        upsertPoSupplier(d.supplier);
+        var target = window._quickSupplierTarget || 'upload';
+        if (target === 'review') {
+            setSupplierCombobox('reviewSupplierId', 'reviewSupplierSearch', d.supplier.id);
+        } else {
+            setSupplierCombobox('invoiceSupplierId', 'invoiceSupplierSearch', d.supplier.id);
+        }
+        closeQuickSupplierModal();
+        if (typeof showAlert === 'function') {
+            showAlert(d.message || 'Proveedor listo', 'success');
+        }
+    })
+    .catch(function(err) {
+        if (typeof showAlert === 'function') showAlert(err.message || 'Error', 'error');
+    })
+    .finally(function() {
+        if (btn) { btn.disabled = false; btn.textContent = 'Guardar y seleccionar'; }
+    });
+    return false;
 }
 
 function poMoney(v) {
@@ -806,6 +1046,26 @@ function supplierOptionsHtml(selected) {
     });
     return h;
 }
+
+document.addEventListener('DOMContentLoaded', function() {
+    bindSupplierCombobox('invoiceSupplierCombobox', 'invoiceSupplierId', 'invoiceSupplierSearch', 'invoiceSupplierList');
+    var uploadForm = document.getElementById('invoiceUploadForm');
+    if (uploadForm && uploadForm.dataset.supplierValidateBound !== '1') {
+        uploadForm.dataset.supplierValidateBound = '1';
+        uploadForm.addEventListener('submit', function(ev) {
+            var hid = document.getElementById('invoiceSupplierId');
+            if (!hid || !hid.value) {
+                ev.preventDefault();
+                if (typeof showAlert === 'function') {
+                    showAlert('Seleccione un proveedor de la lista (o cree uno con + Nuevo)', 'warning');
+                }
+                var search = document.getElementById('invoiceSupplierSearch');
+                if (search) search.focus();
+                return false;
+            }
+        });
+    }
+});
 
 function openInvoiceReview(importId) {
     fetch(window.poInvoicePreviewUrl + '&id=' + importId, {
@@ -823,8 +1083,13 @@ function renderInvoiceReview(imp, items) {
     document.getElementById('irImportId').value = imp.id;
 
     var h = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px;">';
-    h += '<div class="form-group" style="margin:0;"><label>Proveedor *</label>' +
-         '<select name="supplier_id" class="form-control" required>' + supplierOptionsHtml(imp.supplier_id) + '</select></div>';
+    h += '<div class="form-group" style="margin:0;grid-column:1/-1;"><label>Proveedor *</label>' +
+         '<div class="customer-combobox invoice-supplier-combobox" id="reviewSupplierCombobox">' +
+         '<input type="hidden" name="supplier_id" id="reviewSupplierId" value="' + esc(imp.supplier_id || '') + '" required>' +
+         '<div style="display:flex;gap:8px;align-items:stretch;">' +
+         '<input type="search" id="reviewSupplierSearch" class="form-control" autocomplete="off" placeholder="Buscar proveedor…" style="flex:1;">' +
+         '<button type="button" class="btn btn-secondary" style="white-space:nowrap;" onclick="openQuickSupplierModal(\'review\')">+ Nuevo</button>' +
+         '</div><ul class="combobox-list" id="reviewSupplierList" hidden></ul></div></div>';
     h += '<div class="form-group" style="margin:0;"><label>N.º factura</label>' +
          '<input type="text" name="invoice_number" class="form-control" maxlength="80" value="' + esc(imp.invoice_number || '') + '"></div>';
     h += '<div class="form-group" style="margin:0;"><label>Fecha factura</label>' +
@@ -857,9 +1122,11 @@ function renderInvoiceReview(imp, items) {
     }
 
     h += '<div class="table-container" style="max-height:44vh;overflow:auto;"><table><thead><tr>' +
-         '<th>Acción</th><th>Descripción</th><th>SKU prov.</th><th>Producto en catálogo</th>' +
+         '<th>Acción</th><th>Descripción</th><th>SKU / ID</th><th>EAN</th><th>Producto en catálogo</th>' +
          '<th>Cant.</th><th>Costo u.</th><th>IVA %</th><th>Dcto %</th><th>Lote</th><th>Vence</th><th>P. venta</th><th>Total</th>' +
          '</tr></thead><tbody>';
+
+    var matchLabels = { ean: 'EAN', supplier_sku: 'SKU proveedor', code: 'Código', name: 'Nombre' };
 
     items.forEach(function(it) {
         var base = 'items[' + it.id + ']';
@@ -874,11 +1141,12 @@ function renderInvoiceReview(imp, items) {
              '<option value="skip"' + (it.row_action === 'skip' ? ' selected' : '') + '>Omitir</option>' +
              '</select></td>';
         h += '<td><input type="text" name="' + base + '[description]" class="form-control" style="min-width:190px;" value="' + esc(it.description || '') + '"></td>';
-        h += '<td><input type="text" name="' + base + '[supplier_sku]" class="form-control" style="min-width:100px;" value="' + esc(it.supplier_sku || '') + '"></td>';
+        h += '<td><input type="text" name="' + base + '[supplier_sku]" class="form-control" style="min-width:95px;" value="' + esc(it.supplier_sku || '') + '" placeholder="SKU / ID"></td>';
+        h += '<td><input type="text" name="' + base + '[barcode]" class="form-control" style="min-width:110px;" value="' + esc(it.barcode || '') + '" placeholder="EAN"></td>';
         h += '<td><select name="' + base + '[matched_product_id]" class="form-control" style="min-width:210px;">' + productOptionsHtml(it.matched_product_id || '') + '</select>' +
              (it.match_type && it.match_type !== 'none'
-                ? '<div style="font-size:11px;color:var(--color-text-secondary);">Coincidencia: ' + esc(it.match_type) + ' (' + (parseInt(it.confidence,10) || 0) + '%)</div>'
-                : '') +
+                ? '<div style="font-size:11px;color:var(--color-text-secondary);">Coincidencia: ' + esc(matchLabels[it.match_type] || it.match_type) + ' (' + (parseInt(it.confidence,10) || 0) + '%)</div>'
+                : '<div style="font-size:11px;color:var(--color-text-secondary);">Sin EAN coincidente: elija producto o cree uno nuevo</div>') +
              '</td>';
         h += '<td><input type="number" step="0.001" min="0" name="' + base + '[quantity]" class="form-control" style="min-width:80px;" value="' + qty + '"' + (bad && qty <= 0 ? ' required' : '') + '></td>';
         h += '<td><input type="number" step="0.01" min="0" name="' + base + '[unit_cost]" class="form-control" style="min-width:95px;" value="' + cost + '"' + (bad && cost <= 0 && total <= 0 ? ' required' : '') + '></td>';
@@ -898,6 +1166,10 @@ function renderInvoiceReview(imp, items) {
          '<span>Total: ' + poMoney(imp.total) + '</span></div>';
 
     document.getElementById('invoiceReviewBody').innerHTML = h;
+    var reviewWrap = document.getElementById('reviewSupplierCombobox');
+    if (reviewWrap) delete reviewWrap.dataset.ready;
+    bindSupplierCombobox('reviewSupplierCombobox', 'reviewSupplierId', 'reviewSupplierSearch', 'reviewSupplierList');
+    setSupplierCombobox('reviewSupplierId', 'reviewSupplierSearch', imp.supplier_id || '');
     document.getElementById('invoiceReviewModal').style.display = 'flex';
 }
 
@@ -921,9 +1193,10 @@ function poRemember(v) {
 function productOptionsHtml(selected) {
     var h = '<option value="">Seleccionar producto</option>';
     (window.poProducts || []).forEach(function(p) {
-        h += '<option value="' + p.id + '" data-cost="' + p.purchase_price + '" data-code="' + esc(p.code || '') + '"' +
+        var label = (p.code ? p.code + ' — ' : '') + p.name + (p.barcode ? ' · EAN ' + p.barcode : '');
+        h += '<option value="' + p.id + '" data-cost="' + p.purchase_price + '" data-code="' + esc(p.code || '') + '" data-barcode="' + esc(p.barcode || '') + '"' +
             (String(selected) === String(p.id) ? ' selected' : '') + '>' +
-            esc((p.code ? p.code + ' — ' : '') + p.name) + '</option>';
+            esc(label) + '</option>';
     });
     return h;
 }

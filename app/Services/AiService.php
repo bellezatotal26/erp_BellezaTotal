@@ -430,7 +430,8 @@ Estructura exacta:
   "total": 0,
   "items": [
     {
-      "supplier_sku": "codigo del proveedor o vacio",
+      "supplier_sku": "SKU, ID o codigo interno del proveedor (NO el EAN)",
+      "barcode": "codigo de barras EAN/UPC/GTIN o vacio",
       "description": "nombre del producto",
       "quantity": 0,
       "unit_cost": 0,
@@ -444,6 +445,10 @@ Estructura exacta:
 }
 
 Reglas: usa punto decimal; no inventes datos ausentes (deja vacío o 0);
+separa SIEMPRE barcode/EAN de supplier_sku/ID.
+Si el texto trae "ID: 048391 / EAN: 7702113048391", supplier_sku=048391 y barcode=7702113048391.
+No uses como cantidad los números del nombre (ej. 5.0, 6.35, 60 gr); la cantidad es CANT./unidades facturadas.
+Si hay BONIF y CANT=0, quantity = BONIF.
 si el texto no es una factura devuelve {"items": []}.
 PROMPT;
 
@@ -515,7 +520,8 @@ Estructura exacta:
   "total": 0,
   "items": [
     {
-      "supplier_sku": "codigo del proveedor o vacio",
+      "supplier_sku": "SKU, ID o codigo interno del proveedor (NO el EAN)",
+      "barcode": "codigo de barras EAN/UPC/GTIN o vacio",
       "description": "nombre del producto",
       "quantity": 0,
       "unit_cost": 0,
@@ -529,7 +535,9 @@ Estructura exacta:
 }
 
 Reglas: usa punto decimal; no inventes datos ausentes (deja vacío o 0);
-incluye todas las líneas de producto visibles; si no es una factura devuelve {"items": []}.
+separa SIEMPRE barcode/EAN de supplier_sku/ID (formato frecuente: "ID: 048391 / EAN: 7702113048391");
+no uses como cantidad los números del nombre del producto; incluye todas las líneas visibles;
+si no es una factura devuelve {"items": []}.
 PROMPT
         ]];
 

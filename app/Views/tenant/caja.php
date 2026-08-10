@@ -29,7 +29,7 @@ if (!function_exists('hoursOpen')) {
 
 <?php if (!$openSession): ?>
 <?php if (($stockAlert['count'] ?? 0) > 0): ?>
-<div class="alert alert-warning" style="margin-bottom:16px;text-align:left;">
+<div class="alert alert-warning alert-stock-pending" style="margin-bottom:16px;text-align:left;">
     <strong>Pendiente del día anterior:</strong>
     hay <?php echo (int)$stockAlert['count']; ?> producto(s) con stock negativo o unidades pendientes
     (<?php echo (int)($stockAlert['negative_count'] ?? 0); ?> en negativo ·
@@ -39,7 +39,7 @@ if (!function_exists('hoursOpen')) {
     <?php if (!$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('prestamos')): ?>
         <a href="<?php echo $viewInstance->route('app/prestamos'); ?>" style="margin-left:8px;">Ver préstamos / trazabilidad</a>
     <?php endif; ?>
-    <ul style="margin:8px 0 0;padding-left:18px;font-size:13px;max-height:160px;overflow:auto;">
+    <ul style="max-height:160px;overflow:auto;">
         <?php foreach (array_slice($stockAlert['summary_lines'] ?? [], 0, 15) as $line): ?>
             <li><?php echo htmlspecialchars((string)$line); ?></li>
         <?php endforeach; ?>
@@ -69,7 +69,7 @@ if (!function_exists('hoursOpen')) {
                     </ul>
                 </div>
                 <?php endif; ?>
-                <div class="form-group"><label>Monto de Apertura (<?php echo $currency['symbol']; ?>) *</label><input type="number" name="opening_amount" class="form-control" step="0.01" min="0" placeholder="0" required autofocus></div>
+                <div class="form-group"><label>Monto de Apertura (<?php echo $currency['symbol']; ?>) *</label><input type="text" inputmode="decimal" name="opening_amount" class="form-control money-input" data-money="1" placeholder="0" required autofocus></div>
                 <div class="form-group"><label>Notas</label><textarea name="notes" class="form-control" rows="2" placeholder="Observaciones..."></textarea></div>
             </div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('openCashModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-primary">Abrir Caja</button></div>
@@ -90,7 +90,7 @@ $canCompras = !$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('compras
 ?>
 <!-- CAJA ABIERTA -->
 <?php if (($stockAlert['count'] ?? 0) > 0): ?>
-<div class="alert alert-warning" style="margin-bottom:14px;">
+<div class="alert alert-warning alert-stock-pending" style="margin-bottom:14px;">
     <strong>Inventario pendiente:</strong>
     <?php echo (int)$stockAlert['count']; ?> producto(s) con stock negativo o unidades por reponer/devolver
     (negativos: <?php echo (int)($stockAlert['negative_count'] ?? 0); ?> ·
@@ -187,6 +187,8 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
          data-csrf="<?php echo htmlspecialchars($csrfPos); ?>"
          data-symbol="<?php echo htmlspecialchars($currency['symbol'] ?? '$'); ?>"
          data-decimals="<?php echo (int)($currency['decimals'] ?? 0); ?>"
+         data-thousands="<?php echo htmlspecialchars($currency['thousands'] ?? '.'); ?>"
+         data-decimal="<?php echo htmlspecialchars($currency['decimal'] ?? ','); ?>"
          data-prefix="<?php echo htmlspecialchars((string)$invoicePrefix); ?>"
          data-user="<?php echo htmlspecialchars($userName); ?>">
     <div class="pos-sale card neumorphic">
@@ -198,7 +200,7 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                         <input type="hidden" id="posCustomer" value="">
                         <input type="text" id="posCustomerSearch" class="form-control" placeholder="Buscar cliente..." autocomplete="off">
                         <ul class="combobox-list" id="posCustomerList" hidden style="max-height:220px;overflow:auto;">
-                            <li class="combobox-option" data-id="" data-label="Cliente general" data-search="cliente general consumidor">Cliente general</li>
+                            <li class="combobox-option" data-id="" data-label="Cliente Final" data-search="cliente final consumidor">Cliente Final</li>
                             <?php foreach ($posCustomers as $c):
                                 $cname = trim((string)($c['name'] ?? ''));
                                 if ($cname === '') {
@@ -373,16 +375,97 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
             <input type="text" id="posProductSearch" class="pos-search-input" placeholder="Código de barras o nombre…" autocomplete="off" autofocus data-barcode-input="true">
             <button type="button" class="pos-search-clear" id="posSearchClear" title="Limpiar">&times;</button>
         </div>
-        <div class="pos-search-results" id="posSearchResults">
-            <?php
-            $recentProducts = $recentProducts ?? [];
-            if (!empty($recentProducts)):
+        <?php
+        $recentProducts = $recentProducts ?? [];
+        $openItemQuick = null;
+        $recentWithoutOpen = [];
+        foreach ($recentProducts as $rp) {
+            $isOpenRp = !empty($rp['is_open_item'])
+                || strtoupper((string)($rp['code'] ?? '')) === \SoftNova\Services\OpenItemProduct::CODE;
+            if ($isOpenRp && $openItemQuick === null) {
+                $openItemQuick = $rp;
+                continue;
+            }
+            if (!$isOpenRp) {
+                $recentWithoutOpen[] = $rp;
+            }
+        }
+        if ($openItemQuick === null) {
+            try {
+                $ensured = \SoftNova\Services\OpenItemProduct::ensure(\SoftNova\Core\TenantMiddleware::getDb());
+                $openItemQuick = [
+                    'id' => (int)$ensured['id'],
+                    'name' => (string)($ensured['name'] ?? 'Producto comodín'),
+                    'code' => \SoftNova\Services\OpenItemProduct::CODE,
+                    'product_type' => 'service',
+                    'is_open_item' => 1,
+                ];
+            } catch (\Throwable $e) {
+                $openItemQuick = null;
+            }
+        }
+        ?>
+        <?php if ($openItemQuick): ?>
+        <div class="pos-open-item-bar">
+            <button type="button"
+                    class="btn btn-success pos-open-item-btn"
+                    id="posOpenItemBtn"
+                    data-id="<?php echo (int)$openItemQuick['id']; ?>"
+                    data-name="<?php echo \SoftNova\Core\e((string)($openItemQuick['name'] ?? 'Producto comodín')); ?>"
+                    data-code="<?php echo \SoftNova\Core\e(\SoftNova\Services\OpenItemProduct::CODE); ?>"
+                    data-type="service"
+                    data-open-item="1"
+                    title="Venta libre: pide nombre y precio, no descuenta stock">
+                Nuevo P. Comodin
+            </button>
+            <span style="font-size:12px;color:var(--color-text-secondary);">Ítem libre · nombre y precio al vender · sin stock</span>
+        </div>
+        <?php endif; ?>
+        <?php
+        $offerProducts = $offerProducts ?? [];
+        if (!empty($offerProducts)):
+        ?>
+        <div class="pos-offer-suggestions" id="posOfferSuggestions">
+            <p class="pos-search-hint" style="margin:8px 0 6px;">Ofertas recientes</p>
+            <?php foreach ($offerProducts as $op):
+                $offerPrice = (float)($op['offer_price'] ?? $op['sale_price'] ?? 0);
+                $origPrice = (float)($op['offer_original_price'] ?? 0);
+                $pct = (int)($op['offer_percent'] ?? 0);
+                $reason = (string)($op['offer_reason_label'] ?? '');
             ?>
-                <p class="pos-search-hint" style="margin-bottom:8px;">Últimos 5 vendidos</p>
-                <?php foreach ($recentProducts as $rp):
-                    $isOpen = !empty($rp['is_open_item'])
-                        || strtoupper((string)($rp['code'] ?? '')) === \SoftNova\Services\OpenItemProduct::CODE;
-                ?>
+            <div class="pos-result-row pos-recent-product pos-offer-product"
+                 data-id="<?php echo (int)$op['id']; ?>"
+                 data-name="<?php echo \SoftNova\Core\e((string)$op['name']); ?>"
+                 data-code="<?php echo \SoftNova\Core\e((string)($op['code'] ?? '')); ?>"
+                 data-price="<?php echo $offerPrice; ?>"
+                 data-stock="<?php echo (int)($op['stock'] ?? 0); ?>"
+                 data-type="<?php echo htmlspecialchars((string)($op['product_type'] ?? 'product')); ?>"
+                 data-open-item="0">
+                <div class="pos-result-info">
+                    <div class="pos-result-title">
+                        <span class="pos-offer-badge">Oferta<?php echo $pct > 0 ? (' -' . $pct . '%') : ''; ?></span>
+                        <?php echo \SoftNova\Core\e((($op['code'] ?? '') !== '' ? ($op['code'] . ' — ') : '') . $op['name']); ?>
+                    </div>
+                    <div class="pos-result-meta">
+                        Stock: <?php echo (int)($op['stock'] ?? 0); ?> ·
+                        <?php if ($origPrice > $offerPrice && $origPrice > 0): ?>
+                            <span class="pos-offer-old"><?php echo fmt($origPrice, $currency); ?></span>
+                        <?php endif; ?>
+                        <strong class="pos-offer-now"><?php echo fmt($offerPrice, $currency); ?></strong>
+                        <?php if ($reason !== ''): ?>
+                            <span class="pos-offer-reason">· <?php echo \SoftNova\Core\e($reason); ?></span>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                <button type="button" class="pos-result-add" title="Agregar">+</button>
+            </div>
+            <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+        <div class="pos-search-results" id="posSearchResults">
+            <?php if (!empty($recentWithoutOpen)): ?>
+                <p class="pos-search-hint" style="margin-bottom:8px;">Últimos vendidos</p>
+                <?php foreach ($recentWithoutOpen as $rp): ?>
                     <div class="pos-result-row pos-recent-product"
                          data-id="<?php echo (int)$rp['id']; ?>"
                          data-name="<?php echo \SoftNova\Core\e((string)$rp['name']); ?>"
@@ -390,15 +473,11 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                          data-price="<?php echo (float)$rp['sale_price']; ?>"
                          data-stock="<?php echo (int)$rp['stock']; ?>"
                          data-type="<?php echo htmlspecialchars((string)($rp['product_type'] ?? 'product')); ?>"
-                         data-open-item="<?php echo $isOpen ? '1' : '0'; ?>">
+                         data-open-item="0">
                         <div class="pos-result-info">
                             <div class="pos-result-title"><?php echo \SoftNova\Core\e((($rp['code'] ?? '') !== '' ? ($rp['code'] . ' — ') : '') . $rp['name']); ?></div>
                             <div class="pos-result-meta">
-                                <?php if ($isOpen): ?>
-                                    Ítem libre · nombre y precio al vender
-                                <?php else: ?>
-                                    Stock: <?php echo (int)$rp['stock']; ?> · <?php echo fmt((float)$rp['sale_price'], $currency); ?>
-                                <?php endif; ?>
+                                Stock: <?php echo (int)$rp['stock']; ?> · <?php echo fmt((float)$rp['sale_price'], $currency); ?>
                             </div>
                         </div>
                         <button type="button" class="pos-result-add" title="Agregar">+</button>
@@ -432,7 +511,7 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                 <?php foreach ($todaySales as $sale): ?>
                     <tr>
                         <td><strong><?php echo htmlspecialchars($sale['invoice_number']); ?></strong></td>
-                        <td><?php echo htmlspecialchars($sale['customer_name'] ?? 'Cliente general'); ?></td>
+                        <td><?php echo htmlspecialchars($sale['customer_name'] ?? 'Cliente Final'); ?></td>
                         <td><?php echo date('d/m/Y H:i', strtotime($sale['sale_date'])); ?></td>
                         <td style="font-weight:600;"><?php echo fmt((float)$sale['total'], $currency); ?></td>
                         <td><?php echo ($sale['payment_status'] ?? '') === 'paid' ? fmt((float)$sale['total'], $currency) : fmt((float)($sale['paid_amount'] ?? 0), $currency); ?></td>
@@ -643,7 +722,7 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
                     <div style="display:flex;justify-content:space-between;border-top:1px solid var(--color-border);padding-top:8px;margin-top:4px;"><span>Efectivo esperado en cajón</span><strong id="closeSumBalance" style="color:#10B981;">—</strong></div>
                 </div>
                 <p style="margin-bottom:12px;font-size:12px;color:var(--color-text-secondary);">Al cerrar se descargara el reporte PDF. Si no abre, use el historial de reportes.</p>
-                <div class="form-group"><label>Monto Final Contado (<?php echo $currency['symbol'];?>) *</label><input type="number" name="closing_amount" id="closingAmountInput" class="form-control" step="0.01" min="0" placeholder="0" required></div>
+                <div class="form-group"><label>Monto Final Contado (<?php echo $currency['symbol'];?>) *</label><input type="text" inputmode="decimal" name="closing_amount" id="closingAmountInput" class="form-control money-input" data-money="1" placeholder="0" required></div>
                 <div class="form-group"><label>Notas de cierre</label><textarea name="notes" class="form-control" rows="2" placeholder="Observaciones..."></textarea></div>
             </div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('closeCashModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-danger">Cerrar Caja</button></div>

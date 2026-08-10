@@ -48,7 +48,11 @@ class ReceiptShareService
         if (!empty($sale['due_date'])) {
             $lines[] = 'Vence: ' . date('d/m/Y', strtotime((string)$sale['due_date']));
         }
-        $lines[] = 'Cliente: ' . ($sale['customer_name'] ?? 'Consumidor final');
+        $lines[] = 'Cliente: ' . ($sale['customer_name'] ?? 'Cliente Final');
+        $delivery = max(0.0, (float)($sale['delivery_fee'] ?? 0));
+        if ($delivery > 0.009) {
+            $lines[] = 'Domicilio: ' . $sym . ' ' . number_format($delivery, $dec, ',', '.');
+        }
         $lines[] = 'Total: ' . $sym . ' ' . number_format((float)$sale['total'], $dec, ',', '.');
         $lines[] = 'Estado: ' . ($sale['payment_status'] ?? '');
         if (!empty($sale['items'])) {
@@ -61,18 +65,30 @@ class ReceiptShareService
         return implode("\n", $lines);
     }
 
-    public function whatsappUrl(array $sale, ?string $phone = null): string
+    public function whatsappUrl(array $sale, ?string $phone = null, ?string $ticketPdfUrl = null): string
     {
         $phone = preg_replace('/\D+/', '', (string)($phone ?: ($sale['customer_phone'] ?? '')));
         // Colombia: si viene 10 dígitos, anteponer 57
         if (strlen($phone) === 10) {
             $phone = '57' . $phone;
         }
-        $text = rawurlencode($this->buildText($sale));
-        if ($phone !== '') {
-            return 'https://wa.me/' . $phone . '?text=' . $text;
+        $text = $this->buildText($sale);
+        if ($ticketPdfUrl) {
+            $text .= "\n\nTicket 58mm (PDF):\n" . $ticketPdfUrl;
+        } else {
+            $text .= "\n\nAdjunto/enlace del ticket 58mm en PDF.";
         }
-        return 'https://wa.me/?text=' . $text;
+        $encoded = rawurlencode($text);
+        if ($phone !== '') {
+            return 'https://wa.me/' . $phone . '?text=' . $encoded;
+        }
+        return 'https://wa.me/?text=' . $encoded;
+    }
+
+    /** URL pública del ticket 58mm para compartir. */
+    public function ticketPdfUrl(int $saleId): string
+    {
+        return \SoftNova\Core\base_url('/app/ventas?action=pdf&format=ticket&id=' . $saleId);
     }
 
     /** @return array{success:bool,message:string} */

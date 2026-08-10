@@ -295,6 +295,9 @@ class SupplyChainSchema
             ['cash_sessions', 'closing_entry_id', 'BIGINT UNSIGNED NULL'],
             ['cash_movements', 'accounting_entry_id', 'BIGINT UNSIGNED NULL'],
             ['stock_movement_lots', 'restored_at', 'DATETIME NULL'],
+
+            // EAN/código de barras en líneas de factura importada (distinto del SKU proveedor)
+            ['purchase_invoice_import_items', 'barcode', 'VARCHAR(64) NULL AFTER supplier_sku'],
         ] as [$table, $column, $definition]) {
             self::addColumnIfMissing($db, $table, $column, $definition);
         }

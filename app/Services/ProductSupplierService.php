@@ -177,14 +177,31 @@ class ProductSupplierService
 
     /**
      * Busca el producto que corresponde a una línea de factura del proveedor.
-     * Prioriza el SKU del proveedor porque es el único identificador confiable.
+     * Prioridad: EAN/barcode → SKU proveedor → código interno → nombre exacto.
      *
      * @return array{product_id:int,match_type:string,confidence:int}|null
      */
-    public function matchInvoiceLine(?int $supplierId, string $supplierSku, string $description): ?array
-    {
+    public function matchInvoiceLine(
+        ?int $supplierId,
+        string $supplierSku,
+        string $description,
+        string $barcode = ''
+    ): ?array {
         $sku = trim($supplierSku);
         $description = trim($description);
+        $barcode = $this->normalizeBarcode($barcode);
+
+        if ($barcode !== '') {
+            $row = $this->query(
+                "SELECT id FROM products
+                 WHERE barcode = ? OR code = ?
+                 LIMIT 1",
+                [$barcode, $barcode]
+            )->fetch();
+            if ($row) {
+                return ['product_id' => (int)$row['id'], 'match_type' => 'ean', 'confidence' => 100];
+            }
+        }
 
         if ($supplierId && $sku !== '') {
             $row = $this->query(
@@ -199,7 +216,10 @@ class ProductSupplierService
         }
 
         if ($sku !== '') {
-            $row = $this->query("SELECT id FROM products WHERE code = ? LIMIT 1", [$sku])->fetch();
+            $row = $this->query(
+                "SELECT id FROM products WHERE code = ? OR barcode = ? LIMIT 1",
+                [$sku, $sku]
+            )->fetch();
             if ($row) {
                 return ['product_id' => (int)$row['id'], 'match_type' => 'code', 'confidence' => 95];
             }
@@ -213,20 +233,19 @@ class ProductSupplierService
             if ($row) {
                 return ['product_id' => (int)$row['id'], 'match_type' => 'name', 'confidence' => 80];
             }
-
-            // Coincidencia parcial: útil cuando el proveedor abrevia la descripción.
-            $row = $this->query(
-                "SELECT id FROM products
-                 WHERE status = 'active' AND (name LIKE ? OR ? LIKE CONCAT('%', name, '%'))
-                 ORDER BY CHAR_LENGTH(name) DESC LIMIT 1",
-                ['%' . $description . '%', $description]
-            )->fetch();
-            if ($row) {
-                return ['product_id' => (int)$row['id'], 'match_type' => 'name_partial', 'confidence' => 55];
-            }
         }
 
         return null;
+    }
+
+    private function normalizeBarcode(string $value): string
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return '';
+        }
+        $compact = preg_replace('/[\s\-]/', '', $value) ?? $value;
+        return substr($compact, 0, 64);
     }
 
     /**

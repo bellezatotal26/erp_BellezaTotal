@@ -691,25 +691,8 @@ class TenantVentasController extends TenantController
         $tax = round($taxable * ($taxRate / 100), 2);
 
         $creditSurcharge = 0.0;
-        $creditSurchargeRate = 0.0;
-        $threshold = 60;
-        if ($paymentType === 'credit') {
-            $termDays = \SoftNova\Services\SalesDocumentService::termDays($paymentTerms);
-            try {
-                $commCfg = (new \SoftNova\Services\CommissionService($this->db))->config();
-                $threshold = (int)($commCfg['credit_over_60_days'] ?? 60);
-                $creditSurchargeRate = (float)($commCfg['credit_over_60_rate'] ?? 0);
-                if ($threshold < 1) {
-                    $threshold = 60;
-                }
-                if ($termDays > $threshold && $creditSurchargeRate > 0) {
-                    $creditSurcharge = round($taxable * ($creditSurchargeRate / 100), 2);
-                }
-            } catch (\Throwable $e) {
-            }
-        }
-        // Domicilio completo en el total de la venta.
-        $total = $taxable + $tax + $creditSurcharge + $deliveryFee;
+        // El % de crédito largo en Contabilidad es solo referencia: no aumenta el total de venta.
+        $total = $taxable + $tax + $deliveryFee;
 
         if ($discountPercent > 0) {
             $discountNote = 'Descuento ' . rtrim(rtrim(number_format($discountPercent, 2, '.', ''), '0'), '.') . '%';
@@ -717,12 +700,6 @@ class TenantVentasController extends TenantController
         }
         if ($saleChannel === 'wholesale') {
             $notes = $notes !== '' ? ($notes . ' · Venta al por mayor') : 'Venta al por mayor';
-        }
-        if ($creditSurcharge > 0.009) {
-            $sNote = 'Recargo crédito >' . (int)$threshold . 'd '
-                . number_format($creditSurchargeRate, 2, '.', '') . '%: '
-                . number_format($creditSurcharge, 2, '.', '');
-            $notes = $notes !== '' ? ($notes . ' · ' . $sNote) : $sNote;
         }
         $deliveryClientShare = $deliveryFee;
         $deliveryTotalNote = isset($deliveryTotal) && $deliveryTotal > 0.009
@@ -1533,9 +1510,11 @@ class TenantVentasController extends TenantController
             $this->json(['success' => false, 'message' => 'Venta no encontrada']);
             return;
         }
+        $ticketUrl = $share->ticketPdfUrl($id);
         $this->json([
             'success' => true,
-            'whatsapp_url' => $share->whatsappUrl($sale),
+            'whatsapp_url' => $share->whatsappUrl($sale, null, $ticketUrl),
+            'ticket_pdf_url' => $ticketUrl,
             'text' => $share->buildText($sale),
             'customer_email' => $sale['customer_email'] ?? '',
             'customer_phone' => $sale['customer_phone'] ?? '',

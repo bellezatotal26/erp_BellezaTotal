@@ -12,6 +12,8 @@
     var csrf = panel.getAttribute('data-csrf');
     var symbol = panel.getAttribute('data-symbol') || '$';
     var decimals = parseInt(panel.getAttribute('data-decimals') || '0', 10);
+    var thousands = panel.getAttribute('data-thousands') || '.';
+    var decimalSep = panel.getAttribute('data-decimal') || ',';
     var prefix = panel.getAttribute('data-prefix') || 'FAC-';
     var Offline = window.SeriPosOffline || null;
 
@@ -259,6 +261,20 @@
     var elPayBar = document.getElementById('posPayBar');
     var elClock = document.getElementById('posClock');
     var elClear = document.getElementById('posSearchClear');
+    var elOpenItemBtn = document.getElementById('posOpenItemBtn');
+    if (elOpenItemBtn) {
+        elOpenItemBtn.addEventListener('click', function () {
+            addProduct({
+                id: parseInt(elOpenItemBtn.getAttribute('data-id') || '0', 10),
+                name: elOpenItemBtn.getAttribute('data-name') || 'Producto comodín',
+                code: elOpenItemBtn.getAttribute('data-code') || 'COMODIN',
+                sale_price: 0,
+                stock: 0,
+                product_type: 'service',
+                is_open_item: 1
+            }, 1);
+        });
+    }
     var elDiscount = document.getElementById('posDiscountPercent');
     var elDelivery = document.getElementById('posDeliveryTotal') || document.getElementById('posDeliveryFee');
     var elDeliveryClient = document.getElementById('posDeliveryClient');
@@ -302,14 +318,20 @@
     var paying = false;
 
     function money(n) {
+        if (window.SeriMoney && typeof SeriMoney.format === 'function') {
+            return symbol + ' ' + SeriMoney.format(n, { decimals: decimals, thousands: thousands, decimal: decimalSep });
+        }
         var x = Number(n) || 0;
         var fixed = x.toFixed(decimals);
         var parts = fixed.split('.');
-        parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-        return symbol + ' ' + (decimals > 0 ? parts.join('.') : parts[0]);
+        parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, thousands);
+        return symbol + ' ' + (decimals > 0 ? parts.join(decimalSep) : parts[0]);
     }
 
     function parseMoneyInput(raw) {
+        if (window.SeriMoney && typeof SeriMoney.parse === 'function') {
+            return SeriMoney.parse(raw);
+        }
         var s = String(raw == null ? '' : raw).trim().replace(/\s/g, '');
         if (!s) return 0;
         // Acepta 20000, 20.000, 20,000.50, 20000.50
@@ -476,13 +498,9 @@
     }
 
     function creditSurchargeAmount(baseAfterDiscount) {
-        var days = creditTermsDays();
-        var threshold = Number(window.cajaCreditSurchargeDays || 60);
-        if (isNaN(threshold) || threshold < 1) threshold = 60;
-        if (days <= threshold) return 0;
-        var rate = creditSurchargeRate();
-        if (rate <= 0) return 0;
-        return roundMoney((Number(baseAfterDiscount) || 0) * (rate / 100));
+        // El % de crédito largo en Contabilidad es informativo/comisiones:
+        // no debe aumentar el total que paga el cliente.
+        return 0;
     }
 
     function isWholesaleMode() {
@@ -885,7 +903,7 @@
         var list = document.getElementById('posCustomerList');
         if (!input || !hidden || !list || input._posReady) return;
         input._posReady = true;
-        input.value = 'Cliente general';
+        input.value = 'Cliente Final';
         input.addEventListener('focus', function () {
             list.hidden = false;
             filterPosCustomers('');
@@ -898,7 +916,7 @@
             var li = e.target.closest('.combobox-option');
             if (!li) return;
             hidden.value = li.getAttribute('data-id') || '';
-            input.value = li.getAttribute('data-label') || 'Cliente general';
+            input.value = li.getAttribute('data-label') || 'Cliente Final';
             list.hidden = true;
         });
         document.addEventListener('click', function (e) {
@@ -920,7 +938,7 @@
         var input = document.getElementById('posCustomerSearch');
         var list = document.getElementById('posCustomerList');
         if (hidden) hidden.value = id || '';
-        if (input) input.value = label || 'Cliente general';
+        if (input) input.value = label || 'Cliente Final';
         if (list && id) {
             var exists = list.querySelector('.combobox-option[data-id="' + id + '"]');
             if (!exists) {
@@ -1639,6 +1657,9 @@
             fd.append('items[' + i + '][unit_price]', it.unit_price);
             fd.append('items[' + i + '][product_name]', it.product_name);
             fd.append('items[' + i + '][subtotal]', it.subtotal);
+            if (it.is_open_item) {
+                fd.append('items[' + i + '][is_open_item]', '1');
+            }
             if (it.stock_oversell_reason) {
                 fd.append('items[' + i + '][stock_oversell_reason]', it.stock_oversell_reason);
                 fd.append('items[' + i + '][stock_oversell_note]', it.stock_oversell_note || '');
@@ -1735,8 +1756,8 @@
             });
     });
 
-    // Últimos productos (click)
-    elResults.addEventListener('click', function (e) {
+    // Últimos productos / ofertas sugeridas (click)
+    function onSuggestedProductClick(e) {
         var row = e.target.closest('.pos-recent-product');
         var addBtn = e.target.closest('.pos-result-add');
         if (!row && !addBtn) return;
@@ -1753,7 +1774,10 @@
             is_open_item: target.getAttribute('data-open-item') === '1' ? 1 : 0
         };
         if (addProduct(p, 1)) { /* aviso de restante lo muestra addProduct */ }
-    });
+    }
+    elResults.addEventListener('click', onSuggestedProductClick);
+    var elOffers = document.getElementById('posOfferSuggestions');
+    if (elOffers) elOffers.addEventListener('click', onSuggestedProductClick);
 
     // Cerrar menú gasto al click fuera
     document.addEventListener('click', function (e) {

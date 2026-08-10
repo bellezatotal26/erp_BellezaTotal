@@ -83,6 +83,11 @@ class TenantComprasController extends TenantController
             $this->invoiceImport();
             return;
         }
+        if ($action === 'quick_supplier' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('compras', 'create');
+            $this->quickSupplier();
+            return;
+        }
         if ($action === 'invoice_preview' && $this->request->method() === 'GET') {
             $this->invoicePreview();
             return;
@@ -141,7 +146,8 @@ class TenantComprasController extends TenantController
              ORDER BY name"
         )->fetchAll();
         $suppliers = $this->query(
-            "SELECT id, name FROM suppliers WHERE status = 'active' ORDER BY name"
+            "SELECT id, name, document_type, document_number, phone, contact_name
+             FROM suppliers WHERE status = 'active' ORDER BY name"
         )->fetchAll();
 
         $openTotal = (float)$this->query(
@@ -219,6 +225,111 @@ class TenantComprasController extends TenantController
         }
 
         $this->respond(true, $mensaje, '/app/compras?import_id=' . $resultado['import_id']);
+    }
+
+    /**
+     * Alta rápida de proveedor desde el modal de carga de factura (AJAX).
+     * No abandona Compras: devuelve el proveedor creado para seleccionarlo al instante.
+     */
+    private function quickSupplier(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/compras')) {
+            return;
+        }
+
+        $name = trim((string)$this->request->post('name', ''));
+        $documentNumber = trim((string)$this->request->post('document_number', ''));
+        $phone = trim((string)$this->request->post('phone', ''));
+        if ($name === '') {
+            $this->json(['success' => false, 'message' => 'El nombre del proveedor es obligatorio']);
+            return;
+        }
+        if ($documentNumber === '' || $phone === '') {
+            $this->json(['success' => false, 'message' => 'Documento y teléfono son obligatorios']);
+            return;
+        }
+
+        $documentType = (string)$this->request->post('document_type', 'NIT');
+        if (!in_array($documentType, ['NIT', 'CC', 'CE', 'OTROS'], true)) {
+            $documentType = 'NIT';
+        }
+
+        $dup = $this->query(
+            "SELECT id, name FROM suppliers
+             WHERE status = 'active' AND document_number = ?
+             LIMIT 1",
+            [$documentNumber]
+        )->fetch();
+        if ($dup) {
+            $this->json([
+                'success' => true,
+                'message' => 'Ya existía un proveedor con ese documento; se seleccionó',
+                'supplier' => [
+                    'id' => (int)$dup['id'],
+                    'name' => (string)$dup['name'],
+                    'document_type' => $documentType,
+                    'document_number' => $documentNumber,
+                    'phone' => $phone,
+                    'contact_name' => '',
+                ],
+                'existing' => true,
+            ]);
+            return;
+        }
+
+        try {
+            $this->query(
+                "INSERT INTO suppliers
+                    (name, document_type, document_number, contact_name, email, phone, address, notes, is_ally, discount_percent, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'active')",
+                [
+                    substr($name, 0, 255),
+                    $documentType,
+                    substr($documentNumber, 0, 60),
+                    substr(trim((string)$this->request->post('contact_name', '')), 0, 120) ?: null,
+                    substr(trim((string)$this->request->post('email', '')), 0, 180) ?: null,
+                    substr($phone, 0, 60),
+                    substr(trim((string)$this->request->post('address', '')), 0, 255) ?: null,
+                    substr(trim((string)$this->request->post('notes', '')), 0, 255) ?: null,
+                ]
+            );
+        } catch (\Throwable $e) {
+            // Instalaciones sin algunas columnas opcionales
+            try {
+                $this->query(
+                    "INSERT INTO suppliers (name, document_type, document_number, contact_name, email, phone, address, notes)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        substr($name, 0, 255),
+                        $documentType,
+                        substr($documentNumber, 0, 60),
+                        substr(trim((string)$this->request->post('contact_name', '')), 0, 120) ?: null,
+                        substr(trim((string)$this->request->post('email', '')), 0, 180) ?: null,
+                        substr($phone, 0, 60),
+                        substr(trim((string)$this->request->post('address', '')), 0, 255) ?: null,
+                        substr(trim((string)$this->request->post('notes', '')), 0, 255) ?: null,
+                    ]
+                );
+            } catch (\Throwable $e2) {
+                $this->json(['success' => false, 'message' => 'No se pudo crear el proveedor']);
+                return;
+            }
+        }
+
+        $id = (int)$this->db->lastInsertId();
+        $this->json([
+            'success' => true,
+            'message' => 'Proveedor creado',
+            'supplier' => [
+                'id' => $id,
+                'name' => $name,
+                'document_type' => $documentType,
+                'document_number' => $documentNumber,
+                'phone' => $phone,
+                'contact_name' => trim((string)$this->request->post('contact_name', '')),
+            ],
+            'existing' => false,
+        ]);
     }
 
     /** Datos del borrador para el modal de confirmación. */
