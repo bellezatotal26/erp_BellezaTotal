@@ -52,7 +52,8 @@ $tabs = [
     'dashboard' => 'Resumen',
     'compras' => 'Compras',
     'gastos' => 'Gastos',
-    'trace' => 'Trazabilidad',
+    'invoice-trace' => 'Trazabilidad facturas',
+    'trace' => 'Inventario',
     'entries' => 'Libro diario',
     'ledger' => 'Libro mayor',
     'trial' => 'Balance de prueba',
@@ -61,6 +62,14 @@ $tabs = [
     'commissions' => 'Comisiones',
     'periods' => 'Periodos',
     'integrations' => 'Integraciones',
+];
+$invoiceTraceOrders = $invoiceTraceOrders ?? [];
+$invoiceTraceQ = $invoiceTraceQ ?? '';
+$statusLabelsPo = [
+    'draft' => 'Borrador',
+    'ordered' => 'Ordenada',
+    'received' => 'Recibida',
+    'cancelled' => 'Cancelada',
 ];
 $commissionCfg = $commissionCfg ?? [];
 $commissionList = $commissionList ?? ['rows' => [], 'pending' => 0, 'paid' => 0, 'cancelled' => 0];
@@ -122,6 +131,12 @@ foreach ($accounts as $account) {
             <?php endif; ?>
             <div class="form-group" style="margin:0;"><label>Desde</label><input class="form-control" type="date" name="from" value="<?php echo htmlspecialchars($dateFrom); ?>"></div>
             <div class="form-group" style="margin:0;"><label>Hasta</label><input class="form-control" type="date" name="to" value="<?php echo htmlspecialchars($dateTo); ?>"></div>
+            <?php if ($tab === 'invoice-trace'): ?>
+                <div class="form-group" style="margin:0;min-width:220px;flex:1;">
+                    <label>Buscar</label>
+                    <input class="form-control" type="search" name="q" value="<?php echo htmlspecialchars($invoiceTraceQ); ?>" placeholder="OC, factura o proveedor">
+                </div>
+            <?php endif; ?>
             <button class="btn btn-primary" type="submit">Aplicar</button>
         </form>
     </div>
@@ -521,6 +536,151 @@ foreach ($accounts as $account) {
             </tr><?php endforeach; ?>
         </tbody></table></div>
     </div></div>
+
+<?php elseif ($tab === 'invoice-trace'): ?>
+    <div class="card neumorphic" style="margin-bottom:16px;">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+            <h3 style="margin:0;">Trazabilidad de facturas de compra</h3>
+            <a class="btn btn-sm btn-secondary"
+               href="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=export&report=invoice-trace&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>&q=<?php echo urlencode($invoiceTraceQ); ?>">
+                Exportar CSV
+            </a>
+        </div>
+        <div class="card-body">
+            <p style="color:var(--color-text-secondary);margin-top:0;">
+                Ciclo de vida de cada factura/OC: creación, recepción, asiento, abonos y notas de crédito.
+            </p>
+            <?php if (empty($invoiceTraceOrders)): ?>
+                <p style="color:var(--color-text-secondary);">No hay facturas/OC en el periodo.</p>
+            <?php else: ?>
+                <div class="invoice-trace-layout">
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>OC / Factura</th>
+                                    <th>Proveedor</th>
+                                    <th>Fechas</th>
+                                    <th>Total</th>
+                                    <th>Estado</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                            <?php foreach ($invoiceTraceOrders as $o): ?>
+                                <?php
+                                $bal = round(
+                                    (float)$o['total']
+                                    - (float)($o['paid_total'] ?? 0)
+                                    - (float)($o['credit_total'] ?? 0),
+                                    2
+                                );
+                                ?>
+                                <tr>
+                                    <td>
+                                        <strong><?php echo htmlspecialchars($o['order_number'] ?? ''); ?></strong>
+                                        <div style="font-size:12px;color:var(--color-text-secondary);">
+                                            <?php echo htmlspecialchars($o['invoice_number'] ?? 'Sin factura'); ?>
+                                        </div>
+                                    </td>
+                                    <td><?php echo htmlspecialchars($o['supplier_name'] ?? '—'); ?></td>
+                                    <td style="font-size:12px;">
+                                        Fact: <?php echo !empty($o['invoice_date']) ? date('d/m/Y', strtotime((string)$o['invoice_date'])) : '—'; ?><br>
+                                        Bodega: <?php echo !empty($o['warehouse_date']) ? date('d/m/Y', strtotime((string)$o['warehouse_date'])) : '—'; ?>
+                                    </td>
+                                    <td>
+                                        <?php echo acctFmt((float)$o['total'], $currency); ?>
+                                        <?php if ($bal > 0.009): ?>
+                                            <div style="font-size:11px;color:#DC2626;">Saldo <?php echo acctFmt($bal, $currency); ?></div>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td>
+                                        <span class="badge badge-secondary"><?php echo htmlspecialchars($statusLabelsPo[$o['status'] ?? ''] ?? ($o['status'] ?? '')); ?></span>
+                                        <div style="font-size:11px;color:var(--color-text-secondary);margin-top:4px;">
+                                            <?php echo (int)($o['payments_count'] ?? 0); ?> abono(s)
+                                            · <?php echo (int)($o['credit_notes_count'] ?? 0); ?> NC
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <button type="button" class="btn btn-sm btn-primary"
+                                                onclick="openInvoiceTimeline(<?php echo (int)$o['id']; ?>)">Timeline</button>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <div id="invoiceTimelineModal" class="modal-overlay" style="display:none;">
+        <div class="modal-content neumorphic" style="max-width:720px;max-height:90vh;overflow:auto;">
+            <div class="modal-header">
+                <h3 id="invoiceTimelineTitle">Timeline de factura</h3>
+                <button type="button" class="modal-close" onclick="document.getElementById('invoiceTimelineModal').style.display='none'">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="invoiceTimelineMeta" style="margin-bottom:14px;font-size:13px;color:var(--color-text-secondary);"></div>
+                <ol id="invoiceTimelineList" class="invoice-timeline"></ol>
+            </div>
+        </div>
+    </div>
+    <script>
+    window.invoiceTimelineUrl = <?php echo json_encode($viewInstance->route('app/contabilidad') . '?action=invoice-timeline'); ?>;
+    function openInvoiceTimeline(id) {
+        fetch(window.invoiceTimelineUrl + '&id=' + id, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (!d.success) return showAlert(d.message || 'No se pudo cargar', 'error');
+                var o = d.order || {};
+                var events = d.events || [];
+                document.getElementById('invoiceTimelineTitle').textContent =
+                    'Timeline · ' + (o.order_number || ('#' + id));
+                var sym = document.querySelector('meta[name="currency-symbol"]')?.content || '$';
+                var dec = parseInt(document.querySelector('meta[name="currency-decimals"]')?.content || '0', 10);
+                document.getElementById('invoiceTimelineMeta').innerHTML =
+                    '<strong>' + esc(o.supplier_name || 'Sin proveedor') + '</strong>'
+                    + ' · Factura ' + esc(o.invoice_number || '—')
+                    + ' · Total ' + sym + parseFloat(o.total || 0).toFixed(dec)
+                    + (o.balance != null ? (' · Saldo ' + sym + parseFloat(o.balance || 0).toFixed(dec)) : '');
+                var list = document.getElementById('invoiceTimelineList');
+                list.innerHTML = '';
+                if (!events.length) {
+                    list.innerHTML = '<li class="invoice-timeline-empty">Sin eventos registrados</li>';
+                } else {
+                    events.forEach(function(ev) {
+                        var li = document.createElement('li');
+                        li.className = 'invoice-timeline-item type-' + esc(ev.type || '');
+                        var amt = (ev.amount != null && Math.abs(parseFloat(ev.amount)) > 0.009)
+                            ? ('<span class="invoice-timeline-amt">' + sym + parseFloat(ev.amount).toFixed(dec) + '</span>')
+                            : '';
+                        li.innerHTML =
+                            '<div class="invoice-timeline-dot"></div>'
+                            + '<div class="invoice-timeline-body">'
+                            + '<div class="invoice-timeline-when">' + esc(formatTimelineAt(ev.at)) + '</div>'
+                            + '<div class="invoice-timeline-label">' + esc(ev.label || '') + amt + '</div>'
+                            + (ev.detail ? ('<div class="invoice-timeline-detail">' + esc(ev.detail) + '</div>') : '')
+                            + '</div>';
+                        list.appendChild(li);
+                    });
+                }
+                document.getElementById('invoiceTimelineModal').style.display = 'flex';
+            })
+            .catch(function() { showAlert('Error al cargar timeline', 'error'); });
+    }
+    function formatTimelineAt(v) {
+        if (!v) return '—';
+        var s = String(v).replace('T', ' ');
+        if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+            var d = s.substr(0, 10).split('-');
+            var t = s.length > 10 ? s.substr(11, 5) : '';
+            return d[2] + '/' + d[1] + '/' + d[0] + (t ? (' ' + t) : '');
+        }
+        return s;
+    }
+    </script>
 
 <?php elseif ($tab === 'compras'): ?>
     <div class="card neumorphic" style="margin-bottom:16px;">

@@ -322,6 +322,9 @@ function viewPurchase(id) {
                         <td style="font-size:12px;"><?php echo htmlspecialchars($o['accounting_entry_id'] ? ('#' . $o['accounting_entry_id']) : '—'); ?></td>
                         <td class="table-actions" style="white-space:nowrap;">
                             <button type="button" class="btn btn-sm btn-secondary" onclick="viewPurchase(<?php echo (int)$o['id']; ?>)" title="Ver">Ver</button>
+                            <?php if ($canCreate): ?>
+                                <button type="button" class="btn btn-sm btn-secondary" onclick="duplicatePurchase(<?php echo (int)$o['id']; ?>)" title="Duplicar para editar fechas/productos">Duplicar</button>
+                            <?php endif; ?>
                             <?php if ($canEdit && in_array($st, ['draft', 'ordered'], true)): ?>
                                 <button type="button" class="btn btn-sm btn-success" onclick="openReceiveModal(<?php echo (int)$o['id']; ?>, '<?php echo htmlspecialchars($o['order_number'], ENT_QUOTES); ?>')" title="Recibir">Recibir</button>
                             <?php endif; ?>
@@ -363,16 +366,20 @@ function viewPurchase(id) {
 <div id="purchaseModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:820px;max-height:90vh;overflow-y:auto;">
         <div class="modal-header">
-            <h3>Nueva orden de compra</h3>
+            <h3 id="purchaseModalTitle">Nueva orden de compra</h3>
             <button type="button" class="modal-close" onclick="document.getElementById('purchaseModal').style.display='none'">&times;</button>
         </div>
         <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=create" data-ajax="true" id="purchaseForm" enctype="multipart/form-data">
             <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="duplicated_from_id" id="poDuplicatedFromId" value="">
             <div class="modal-body">
+                <p id="purchaseModalHint" style="display:none;font-size:13px;color:var(--color-text-secondary);margin:0 0 12px;">
+                    Copia editable: ajuste fechas, factura e ítems. No se copia el adjunto ni pagos de la OC original.
+                </p>
                 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
                     <div class="form-group" style="margin:0;">
                         <label>Proveedor</label>
-                        <select name="supplier_id" class="form-control">
+                        <select name="supplier_id" id="poSupplierId" class="form-control">
                             <option value="">Sin proveedor</option>
                             <?php foreach ($suppliers as $s): ?>
                                 <option value="<?php echo (int)$s['id']; ?>"><?php echo htmlspecialchars($s['name']); ?></option>
@@ -390,7 +397,7 @@ function viewPurchase(id) {
                 </div>
                 <div class="form-group">
                     <label>Notas</label>
-                    <input type="text" name="notes" class="form-control" placeholder="Observaciones de la compra">
+                    <input type="text" name="notes" id="poNotes" class="form-control" placeholder="Observaciones de la compra">
                 </div>
                 <div class="form-group">
                     <label>Foto / PDF factura proveedor</label>
@@ -400,15 +407,15 @@ function viewPurchase(id) {
                 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
                     <div class="form-group" style="margin:0;">
                         <label>Fecha factura</label>
-                        <input type="date" name="invoice_date" class="form-control">
+                        <input type="date" name="invoice_date" id="poInvoiceDate" class="form-control">
                     </div>
                     <div class="form-group" style="margin:0;">
                         <label>Fecha vencimiento</label>
-                        <input type="date" name="due_date" class="form-control">
+                        <input type="date" name="due_date" id="poDueDate" class="form-control">
                     </div>
                     <div class="form-group" style="margin:0;">
                         <label>Desc. pronto pago %</label>
-                        <input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" class="form-control" value="" placeholder="Vacío = auto aliado">
+                        <input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" id="poEarlyDiscount" class="form-control" value="" placeholder="Vacío = auto aliado">
                         <small class="text-muted">Deje vacío para aplicar el descuento del aliado; 0 = sin descuento.</small>
                     </div>
                 </div>
@@ -1234,16 +1241,77 @@ function toggleReceiveNow() {
     document.getElementById('poReceiveNowFields').style.display = on ? 'grid' : 'none';
 }
 
-function openPurchaseModal() {
+function resetPurchaseModal() {
+    var form = document.getElementById('purchaseForm');
+    if (form) form.reset();
     document.getElementById('poItems').innerHTML = '';
-    addPoItem();
+    var from = document.getElementById('poDuplicatedFromId');
+    if (from) from.value = '';
+    var title = document.getElementById('purchaseModalTitle');
+    if (title) title.textContent = 'Nueva orden de compra';
+    var hint = document.getElementById('purchaseModalHint');
+    if (hint) hint.style.display = 'none';
     document.getElementById('poOrderDate').value = poToday();
     var wh = document.getElementById('poWarehouseDate');
     wh.value = poRememberedDate();
     wh.onchange = function() { poRemember(wh.value); };
     document.getElementById('poReceiveNow').checked = false;
     toggleReceiveNow();
+}
+
+function openPurchaseModal() {
+    resetPurchaseModal();
+    addPoItem();
     document.getElementById('purchaseModal').style.display = 'flex';
+}
+
+function duplicatePurchase(id) {
+    fetch(window.poDetailUrl + '&id=' + id, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (!d.success) return showAlert(d.message || 'No encontrada', 'error');
+            var o = d.order || {};
+            var items = o.items || [];
+            resetPurchaseModal();
+            var title = document.getElementById('purchaseModalTitle');
+            if (title) title.textContent = 'Duplicar orden de compra';
+            var hint = document.getElementById('purchaseModalHint');
+            if (hint) hint.style.display = 'block';
+            var from = document.getElementById('poDuplicatedFromId');
+            if (from) from.value = String(o.id || id);
+            var supplier = document.getElementById('poSupplierId');
+            if (supplier && o.supplier_id) supplier.value = String(o.supplier_id);
+            document.getElementById('poOrderDate').value = poToday();
+            var invDate = document.getElementById('poInvoiceDate');
+            if (invDate) invDate.value = '';
+            var due = document.getElementById('poDueDate');
+            if (due) due.value = '';
+            var disc = document.getElementById('poEarlyDiscount');
+            if (disc) {
+                var pct = parseFloat(o.early_payment_discount_pct);
+                disc.value = (!isNaN(pct) && pct > 0) ? String(pct) : '';
+            }
+            var notes = document.getElementById('poNotes');
+            if (notes) {
+                var base = (o.notes || '').trim();
+                var prefix = 'Copia de ' + (o.order_number || ('#' + id));
+                notes.value = base ? (prefix + ' · ' + base) : prefix;
+            }
+            if (!items.length) {
+                addPoItem();
+            } else {
+                items.forEach(function(it) {
+                    addPoItem({
+                        product_id: it.product_id || '',
+                        quantity: it.quantity || 1,
+                        unit_cost: it.unit_cost || 0,
+                        tax_rate: it.tax_rate != null ? it.tax_rate : 19
+                    });
+                });
+            }
+            document.getElementById('purchaseModal').style.display = 'flex';
+        })
+        .catch(function() { showAlert('No se pudo cargar la OC para duplicar', 'error'); });
 }
 
 function openReceiveModal(id, number) {

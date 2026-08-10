@@ -76,6 +76,10 @@ class TenantContabilidadController extends TenantController
             $this->exportReport();
             return;
         }
+        if ($action === 'invoice-timeline') {
+            $this->invoiceTimeline();
+            return;
+        }
 
         $from = $this->validDate((string)$this->request->get('from', date('Y-m-01')), date('Y-m-01'));
         $to = $this->validDate((string)$this->request->get('to', date('Y-m-d')), date('Y-m-d'));
@@ -89,8 +93,10 @@ class TenantContabilidadController extends TenantController
         \SoftNova\Services\TenantOpsSchema::ensure($this->db);
 
         $purchaseSummary = ['cnt' => 0, 'total' => 0.0];
+        $invoiceTraceOrders = [];
+        $invoiceTraceQ = trim((string)$this->request->get('q', ''));
         try {
-            (new \SoftNova\Services\PurchasingService($this->db));
+            $purchasing = new \SoftNova\Services\PurchasingService($this->db);
             $purchaseSummary = $this->query(
                 "SELECT COUNT(*) cnt, COALESCE(SUM(total),0) total
                  FROM purchase_orders
@@ -98,6 +104,9 @@ class TenantContabilidadController extends TenantController
                    AND DATE(COALESCE(warehouse_date, order_date)) BETWEEN ? AND ?",
                 [$from, $to]
             )->fetch() ?: ['cnt'=>0,'total'=>0];
+            if ($tab === 'invoice-trace') {
+                $invoiceTraceOrders = $purchasing->listInvoiceTrace($from, $to, $invoiceTraceQ, 100);
+            }
         } catch (\Throwable $e) {
             // schema aún no migrado
         }
@@ -163,6 +172,8 @@ class TenantContabilidadController extends TenantController
             'purchaseSummary' => $purchaseSummary,
             'expenseByType' => $expenseByType,
             'traceMovements' => $trace['rows'],
+            'invoiceTraceOrders' => $invoiceTraceOrders,
+            'invoiceTraceQ' => $invoiceTraceQ,
             'accountAudit' => $accountAudit,
             'reconciliation' => $reconciliation,
             'pendingSync' => $pendingSync,
@@ -534,11 +545,67 @@ class TenantContabilidadController extends TenantController
         $this->json(['success' => true, 'entry' => $entry]);
     }
 
+    private function invoiceTimeline(): void
+    {
+        $id = (int)$this->request->get('id', 0);
+        try {
+            $purchasing = new \SoftNova\Services\PurchasingService($this->db);
+            $data = $purchasing->invoiceTimeline($id);
+            if (empty($data['order'])) {
+                $this->json(['success' => false, 'message' => 'Factura / OC no encontrada']);
+                return;
+            }
+            $this->json(['success' => true, 'order' => $data['order'], 'events' => $data['events']]);
+        } catch (\Throwable $e) {
+            $this->json(['success' => false, 'message' => $e->getMessage()]);
+        }
+    }
+
     private function exportReport(): void
     {
         $from = $this->validDate((string)$this->request->get('from', date('Y-m-01')), date('Y-m-01'));
         $to = $this->validDate((string)$this->request->get('to', date('Y-m-d')), date('Y-m-d'));
         $report = (string)$this->request->get('report', 'trial-balance');
+
+        if ($report === 'invoice-trace') {
+            $q = trim((string)$this->request->get('q', ''));
+            $purchasing = new \SoftNova\Services\PurchasingService($this->db);
+            $rows = [];
+            foreach ($purchasing->listInvoiceTrace($from, $to, $q, 500) as $o) {
+                $balance = round(
+                    (float)$o['total']
+                    - (float)($o['paid_total'] ?? 0)
+                    - (float)($o['credit_total'] ?? 0),
+                    2
+                );
+                $rows[] = [
+                    $o['order_number'] ?? '',
+                    $o['invoice_number'] ?? '',
+                    $o['supplier_name'] ?? '',
+                    substr((string)($o['invoice_date'] ?? $o['order_date'] ?? ''), 0, 10),
+                    substr((string)($o['warehouse_date'] ?? ''), 0, 10),
+                    substr((string)($o['due_date'] ?? ''), 0, 10),
+                    $o['status'] ?? '',
+                    $o['total'] ?? 0,
+                    $o['paid_total'] ?? 0,
+                    $o['credit_total'] ?? 0,
+                    $balance,
+                    $o['accounting_entry_number'] ?? ($o['accounting_entry_id'] ? ('#' . $o['accounting_entry_id']) : ''),
+                    $o['payments_count'] ?? 0,
+                    $o['credit_notes_count'] ?? 0,
+                    $o['origin'] ?? '',
+                ];
+            }
+            $this->exportCsv(
+                'trazabilidad_facturas_' . $from . '_' . $to . '.csv',
+                [
+                    'OC', 'Factura', 'Proveedor', 'Fecha factura', 'Fecha bodega', 'Vence',
+                    'Estado', 'Total', 'Pagado', 'NC', 'Saldo', 'Asiento', 'Abonos', 'Notas crédito', 'Origen',
+                ],
+                $rows
+            );
+            return;
+        }
 
         if ($report === 'journal') {
             $rows = [];

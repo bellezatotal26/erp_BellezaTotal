@@ -101,7 +101,9 @@ body {
     position: fixed;
     height: 100vh;
     overflow-y: auto;
-    transition: width 0.3s ease;
+    -webkit-overflow-scrolling: touch;
+    transition: width 0.3s ease, transform 0.28s ease, box-shadow 0.28s ease;
+    z-index: 200;
 }
 
 .sidebar.collapsed {
@@ -188,6 +190,52 @@ body {
     opacity: 0.8;
 }
 
+/* Botón hamburguesa (móvil) + overlay del drawer */
+.mobile-menu-btn {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    background: var(--bg-card, var(--color-white));
+    color: var(--color-primary);
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.mobile-menu-btn:hover {
+    background: var(--color-secondary);
+}
+
+.mobile-menu-btn svg {
+    display: block;
+}
+
+.sidebar-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.48);
+    z-index: 1090;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+}
+
+.sidebar-overlay.is-visible {
+    display: block;
+    opacity: 1;
+}
+
+body.sidebar-open {
+    overflow: hidden;
+}
+
 /* Dark mode sidebar overrides via variables */
 body.dark-mode .sidebar {
     background-color: var(--bg-card);
@@ -259,11 +307,20 @@ body.dark-mode .sidebar-toggle {
     flex-wrap: wrap;
 }
 
+.header-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
 .header-left h2 {
     font-size: 20px;
     font-weight: 600;
     color: var(--color-primary);
     white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* Header Search */
@@ -1769,32 +1826,14 @@ body.dark-mode .form-loading::before {
     text-align: center;
 }
 
-/* Responsive */
+/* Responsive (tablet+) — sin tocar el sidebar; el drawer móvil va más abajo */
 @media (max-width: 768px) {
-    .sidebar {
-        width: 200px;
-    }
-    
-    .main-content {
-        margin-left: 200px;
-    }
-    
     .stats-grid {
         grid-template-columns: 1fr;
     }
 }
 
 @media (max-width: 576px) {
-    .sidebar {
-        width: 100%;
-        position: relative;
-        height: auto;
-    }
-    
-    .main-content {
-        margin-left: 0;
-    }
-    
     .header {
         padding: 15px;
     }
@@ -2397,27 +2436,166 @@ body.dark-mode .card-rose .card-icon { background: linear-gradient(135deg, #8813
 }
 
 /* ============================================
-   Responsive Mobile
+   Responsive Mobile — drawer de módulos
    ============================================ */
-@media (max-width: 768px) {
-    .sidebar { width: 60px; }
-    .sidebar .sidebar-header h1 { display: none; }
-    .sidebar .sidebar-nav a .nav-text { display: none; }
-    .sidebar .nav-icon { margin: 0; }
-    .main-content { margin-left: 60px; }
-    .header { padding: 10px 15px; flex-wrap: wrap; gap: 8px; }
-    .header-search { max-width: 100%; order: 3; margin: 0; }
-    .stats-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
-    .stat-card { padding: 12px; }
-    .stat-card .stat-value { font-size: 24px; }
-    .modal-content { max-width: 95vw !important; margin: 10px; padding: 20px; }
-    .card-body .table-container { overflow-x: auto; }
-    .header-right { gap: 10px; }
-    .datetime-info { display: none; }
+@media (max-width: 900px) {
+    .mobile-menu-btn {
+        display: inline-flex;
+    }
+
+    .sidebar {
+        width: min(280px, 88vw) !important;
+        max-width: 280px;
+        transform: translateX(-105%);
+        z-index: 1200;
+        box-shadow: none;
+        transition: transform 0.28s ease, box-shadow 0.28s ease;
+    }
+
+    .sidebar.collapsed {
+        width: min(280px, 88vw) !important;
+    }
+
+    .sidebar.mobile-open {
+        transform: translateX(0);
+        box-shadow: 10px 0 28px rgba(15, 23, 42, 0.28);
+    }
+
+    /* En móvil el menú abierto siempre muestra textos */
+    .sidebar .sidebar-header h1,
+    .sidebar.collapsed .sidebar-header h1 {
+        display: block;
+    }
+
+    .sidebar .sidebar-nav a .nav-text,
+    .sidebar.collapsed .sidebar-nav a .nav-text {
+        display: inline;
+    }
+
+    .sidebar .sidebar-nav a,
+    .sidebar.collapsed .sidebar-nav a {
+        justify-content: flex-start;
+        padding: 12px 20px;
+        gap: 12px;
+    }
+
+    .sidebar .nav-icon,
+    .sidebar.collapsed .nav-icon {
+        margin: 0;
+    }
+
+    .sidebar-toggle {
+        display: none;
+    }
+
+    .main-content,
+    .main-content.expanded {
+        margin-left: 0 !important;
+        width: 100%;
+        max-width: 100vw;
+        overflow-x: hidden;
+    }
+
+    .header {
+        padding: 10px 14px;
+        flex-wrap: wrap;
+        gap: 8px;
+        position: sticky;
+        top: 0;
+        z-index: 100;
+    }
+
+    .header-left h2 {
+        font-size: 16px;
+        max-width: min(46vw, 200px);
+    }
+
+    .header-search {
+        max-width: 100%;
+        flex: 1 1 100%;
+        order: 3;
+        margin: 0;
+    }
+
+    .header-right {
+        gap: 6px;
+        margin-left: auto;
+    }
+
+    .header-icon-label,
+    .datetime-info,
+    .user-name {
+        display: none !important;
+    }
+
+    .content {
+        padding: 14px;
+        overflow-x: hidden;
+    }
+
+    .stats-grid {
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+    }
+
+    .stat-card {
+        padding: 12px;
+    }
+
+    .stat-card .stat-value {
+        font-size: 24px;
+    }
+
+    .modal-content {
+        max-width: 95vw !important;
+        margin: 10px;
+        padding: 20px;
+    }
+
+    .card-body .table-container,
+    .table-container {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .form-grid,
+    .filters-bar,
+    .page-actions {
+        flex-wrap: wrap;
+    }
 
     /* Tenant cards */
-    [style*="grid-template-columns:repeat(3,1fr)"] { grid-template-columns: 1fr 1fr !important; }
-    [style*="grid-template-columns:repeat(auto-fill"] { grid-template-columns: 1fr !important; }
+    [style*="grid-template-columns:repeat(3,1fr)"] {
+        grid-template-columns: 1fr 1fr !important;
+    }
+
+    [style*="grid-template-columns:repeat(auto-fill"] {
+        grid-template-columns: 1fr !important;
+    }
+
+    .inv-products-grid {
+        grid-template-columns: 1fr 1fr !important;
+        gap: 12px;
+    }
+}
+
+@media (max-width: 576px) {
+    .stats-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .inv-products-grid {
+        grid-template-columns: 1fr !important;
+    }
+
+    .header-left h2 {
+        max-width: min(42vw, 160px);
+    }
+
+    .btn,
+    .btn-sm {
+        white-space: nowrap;
+    }
 }
 
 /* ============================================
@@ -3633,4 +3811,60 @@ body.dark-mode .invoice-shell-footer {
     .inv-view-toggle .inv-view-btn {
         flex: 1;
     }
+}
+
+/* Trazabilidad facturas (Contabilidad) */
+.invoice-timeline {
+    list-style: none;
+    margin: 0;
+    padding: 0 0 0 8px;
+    border-left: 2px solid var(--color-border);
+}
+.invoice-timeline-item {
+    position: relative;
+    padding: 0 0 18px 18px;
+}
+.invoice-timeline-item:last-child { padding-bottom: 0; }
+.invoice-timeline-dot {
+    position: absolute;
+    left: -7px;
+    top: 4px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--color-primary);
+    border: 2px solid var(--bg-card, #fff);
+    box-shadow: 0 0 0 1px var(--color-border);
+}
+.invoice-timeline-item.type-payment .invoice-timeline-dot { background: #2563EB; }
+.invoice-timeline-item.type-credit_note .invoice-timeline-dot { background: #B45309; }
+.invoice-timeline-item.type-cancelled .invoice-timeline-dot { background: #DC2626; }
+.invoice-timeline-item.type-received .invoice-timeline-dot,
+.invoice-timeline-item.type-accounting .invoice-timeline-dot { background: #059669; }
+.invoice-timeline-when {
+    font-size: 11px;
+    color: var(--color-text-secondary);
+    margin-bottom: 2px;
+}
+.invoice-timeline-label {
+    font-weight: 600;
+    color: var(--color-text-primary);
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    flex-wrap: wrap;
+}
+.invoice-timeline-amt {
+    font-weight: 600;
+    color: var(--color-primary);
+    font-size: 13px;
+}
+.invoice-timeline-detail {
+    font-size: 12px;
+    color: var(--color-text-secondary);
+    margin-top: 2px;
+}
+.invoice-timeline-empty {
+    color: var(--color-text-secondary);
+    padding-left: 12px;
 }

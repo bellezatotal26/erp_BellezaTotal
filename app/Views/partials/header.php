@@ -15,6 +15,13 @@ if ($isSuperAdmin) {
 
 <header class="header <?php echo $isSuperAdmin ? 'superadmin-header' : ''; ?>">
     <div class="header-left">
+        <button type="button" class="mobile-menu-btn" id="mobileMenuBtn" onclick="toggleSidebar()" aria-label="Abrir menú" aria-controls="sidebar" aria-expanded="false">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <line x1="3" y1="6" x2="21" y2="6"></line>
+                <line x1="3" y1="12" x2="21" y2="12"></line>
+                <line x1="3" y1="18" x2="21" y2="18"></line>
+            </svg>
+        </button>
         <h2><?php echo $viewInstance->escape($pageTitle ?? 'Dashboard'); ?></h2>
     </div>
     

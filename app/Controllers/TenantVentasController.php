@@ -917,9 +917,11 @@ class TenantVentasController extends TenantController
 
             // Contabilización fuera de la transacción: un periodo cerrado u otro
             // problema contable NO debe impedir registrar la venta.
+            $accountingOk = true;
             try {
                 $this->accounting->postSaleCascade($saleId);
             } catch (\Throwable $e) {
+                $accountingOk = false;
                 error_log('Contabilidad venta ' . $saleId . ': ' . $e->getMessage());
             }
 
@@ -991,6 +993,9 @@ class TenantVentasController extends TenantController
             $msg = $paymentType === 'credit' && $paymentStatus !== 'paid'
                 ? 'Venta a credito creada: ' . $invoiceNumber . ' (Pendiente: ' . $this->formatMoney($total - $initialPayment) . ')'
                 : 'Venta creada: ' . $invoiceNumber;
+            if (!$accountingOk) {
+                $msg .= ' · Asiento contable pendiente: use «Sincronizar» en Contabilidad';
+            }
 
             try {
                 (new \SoftNova\Services\TenantAuditService($this->db))->log(

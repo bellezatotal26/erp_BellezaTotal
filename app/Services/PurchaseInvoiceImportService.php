@@ -1922,9 +1922,11 @@ class PurchaseInvoiceImportService
             'Ingreso por factura importada'
         );
 
+        $accountingOk = true;
         try {
             (new AccountingService($this->db))->postPurchaseOrder($orderId);
         } catch (\Throwable $e) {
+            $accountingOk = false;
             error_log('Contabilidad OC ' . $orderId . ' desde factura ' . $importId . ': ' . $e->getMessage());
         }
 
@@ -1948,6 +1950,10 @@ class PurchaseInvoiceImportService
             'received_items' => count($lineas),
             'skipped' => $omitidos,
             'cash_note' => $cashNote,
+            'accounting_ok' => $accountingOk,
+            'accounting_note' => $accountingOk
+                ? ''
+                : 'Asiento contable pendiente: use «Sincronizar» en Contabilidad.',
         ];
     }
 

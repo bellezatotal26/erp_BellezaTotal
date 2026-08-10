@@ -396,6 +396,9 @@ class TenantComprasController extends TenantController
         if (!empty($resultado['cash_note'])) {
             $mensaje .= ' ' . $resultado['cash_note'];
         }
+        if (isset($resultado['accounting_ok']) && !$resultado['accounting_ok']) {
+            $mensaje .= ' ' . ($resultado['accounting_note'] ?: 'Asiento contable pendiente: use «Sincronizar» en Contabilidad.');
+        }
 
         $this->respond(true, $mensaje, '/app/compras');
     }
@@ -718,7 +721,9 @@ class TenantComprasController extends TenantController
 
             try {
                 $this->accounting->postPurchaseCreditNote($result['credit_note_id']);
+                $accountingOk = true;
             } catch (\Throwable $e) {
+                $accountingOk = false;
                 error_log('Contabilidad nota crédito compra ' . $result['credit_note_id'] . ': ' . $e->getMessage());
             }
 
@@ -736,6 +741,9 @@ class TenantComprasController extends TenantController
             }
             if ($cashNote !== '') {
                 $message .= ' ' . $cashNote;
+            }
+            if (!$accountingOk) {
+                $message .= ' Asiento contable pendiente: use «Sincronizar» en Contabilidad.';
             }
 
             $pdfUrl = base_url('/app/compras?action=credit_note_pdf&id=' . (int)$result['credit_note_id']);
@@ -826,7 +834,9 @@ class TenantComprasController extends TenantController
 
             try {
                 $this->accounting->postSupplierPayment($result['payment_id']);
+                $accountingOk = true;
             } catch (\Throwable $e) {
+                $accountingOk = false;
                 error_log('Contabilidad abono proveedor ' . $result['payment_id'] . ': ' . $e->getMessage());
             }
 
@@ -838,6 +848,9 @@ class TenantComprasController extends TenantController
                 : 'Saldo pendiente: ' . $this->formatMoney($result['balance']) . '.';
             if ($cashNote !== '') {
                 $message .= ' ' . $cashNote;
+            }
+            if (!$accountingOk) {
+                $message .= ' Asiento contable pendiente: use «Sincronizar» en Contabilidad.';
             }
 
             $this->respond(true, $message, '/app/compras');
@@ -901,6 +914,11 @@ class TenantComprasController extends TenantController
                 $autoApplyAllyDiscount
             );
 
+            $duplicatedFrom = (int)$this->request->post('duplicated_from_id', 0);
+            if ($duplicatedFrom > 0) {
+                $this->purchasing->markDuplicatedFrom($orderId, $duplicatedFrom);
+            }
+
             $invoiceFile = $this->storeInvoiceUpload();
             if ($invoiceFile === false) {
                 $this->respond(false, 'No se pudo subir la foto/PDF de la factura (máx 5MB: JPG, PNG, WEBP o PDF)', '/app/compras');
@@ -918,12 +936,17 @@ class TenantComprasController extends TenantController
                     (string)$this->request->post('payment_mode', 'payable'),
                     $notes
                 );
-                $msg = 'Orden creada y mercancía recibida/contabilizada';
+                $msg = !empty($recv['accounting_ok'])
+                    ? 'Orden creada y mercancía recibida/contabilizada'
+                    : 'Orden creada y mercancía recibida (asiento pendiente)';
                 if (!empty($recv['debt_alerts'])) {
                     $msg .= '. ' . implode(' ', $recv['debt_alerts']);
                 }
                 if (!empty($recv['cash_note'])) {
                     $msg .= ' ' . $recv['cash_note'];
+                }
+                if (!empty($recv['accounting_note'])) {
+                    $msg .= ' ' . $recv['accounting_note'];
                 }
                 $this->respond(true, $msg, '/app/compras');
                 return;
@@ -962,12 +985,17 @@ class TenantComprasController extends TenantController
             if ($invoiceFile !== null) {
                 $this->purchasing->attachInvoiceFile($orderId, $invoiceFile);
             }
-            $msg = 'Mercancía recibida, inventario y contabilidad actualizados';
+            $msg = !empty($recv['accounting_ok'])
+                ? 'Mercancía recibida, inventario y contabilidad actualizados'
+                : 'Mercancía recibida e inventario actualizado';
             if (!empty($recv['debt_alerts'])) {
                 $msg .= '. ' . implode(' ', $recv['debt_alerts']);
             }
             if (!empty($recv['cash_note'])) {
                 $msg .= ' ' . $recv['cash_note'];
+            }
+            if (!empty($recv['accounting_note'])) {
+                $msg .= ' ' . $recv['accounting_note'];
             }
             $this->respond(true, $msg, '/app/compras');
         } catch (\Throwable $e) {
@@ -983,14 +1011,18 @@ class TenantComprasController extends TenantController
         string $notes
     ): array {
         $result = $this->purchasing->receiveOrder($orderId, $warehouseDate, $invoiceNumber, $paymentMode, $notes);
+        $out = is_array($result) ? $result : [];
+        $out['accounting_ok'] = true;
         try {
             $this->accounting->postPurchaseOrder($orderId);
         } catch (\Throwable $e) {
+            $out['accounting_ok'] = false;
+            $out['accounting_note'] = 'Inventario actualizado, pero el asiento contable quedó pendiente ('
+                . $e->getMessage() . '). Use «Sincronizar» en Contabilidad.';
             error_log('Contabilidad OC ' . $orderId . ': ' . $e->getMessage());
         }
 
         // Compra al contado en efectivo → egreso en caja física.
-        $out = is_array($result) ? $result : [];
         $cashNote = $this->purchasing->syncCashForReceivedOrder($orderId);
         if ($cashNote !== '') {
             $out['cash_note'] = $cashNote;

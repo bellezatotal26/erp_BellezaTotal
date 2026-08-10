@@ -124,7 +124,8 @@ class OfflineSaleSyncService
         $openCash = $this->query(
             "SELECT id FROM cash_sessions WHERE status = 'open' ORDER BY id DESC LIMIT 1"
         )->fetch();
-        if (!$openCash) {
+        $needsCashDrawer = $this->payloadNeedsCashDrawer($payload);
+        if ($needsCashDrawer && !$openCash) {
             return [
                 'status' => 'retry',
                 'message' => 'No hay caja abierta; abra caja e intente de nuevo',
@@ -277,6 +278,27 @@ class OfflineSaleSyncService
         } catch (\Throwable $e) {
             return null;
         }
+    }
+
+    /** Alineado con ventas online: caja abierta solo si hay efectivo a registrar. */
+    private function payloadNeedsCashDrawer(array $payload): bool
+    {
+        $method = PaymentMethodCatalog::normalize($payload['payment_method'] ?? 'cash');
+        if ($method === 'cash') {
+            return true;
+        }
+        $splits = is_array($payload['payment_splits'] ?? null) ? $payload['payment_splits'] : [];
+        foreach ($splits as $split) {
+            if (!is_array($split)) {
+                continue;
+            }
+            $m = PaymentMethodCatalog::normalize($split['method'] ?? ($split['payment_method'] ?? ''));
+            if ($m === 'cash' && (float)($split['amount'] ?? 0) > 0.009) {
+                return true;
+            }
+        }
+        // Mixto sin splits explícitos: asumir que puede incluir efectivo.
+        return $method === 'mixed' && empty($splits);
     }
 
     /**

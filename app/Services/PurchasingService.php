@@ -1002,7 +1002,16 @@ class PurchasingService
 
         $subtotal = round($subtotal, 2);
         $tax = round($tax, 2);
-        $total = round($subtotal + $tax, 2);
+        $gross = round($subtotal + $tax, 2);
+        // Misma base que la OC: si hubo descuento pronto pago / aliado, prorratearlo en la NC.
+        $discountPct = max(0, min(100, (float)($order['early_payment_discount_pct'] ?? 0)));
+        $discountAmt = round($gross * ($discountPct / 100), 2);
+        $total = round($gross - $discountAmt, 2);
+        if ($discountAmt > 0.009) {
+            $reason = trim($reason);
+            $discNote = 'Desc. OC ' . rtrim(rtrim(number_format($discountPct, 2, '.', ''), '0'), '.') . '%';
+            $reason = $reason !== '' ? ($reason . ' · ' . $discNote) : $discNote;
+        }
         $creditNumber = $this->nextCreditNumber($creditDate);
 
         $this->db->beginTransaction();
@@ -1248,5 +1257,259 @@ class PurchasingService
         } catch (\Throwable $e) {
             return 0.0;
         }
+    }
+
+    /** Marca una OC como copia de otra (trazabilidad). */
+    public function markDuplicatedFrom(int $orderId, int $sourceOrderId): void
+    {
+        if ($orderId <= 0 || $sourceOrderId <= 0 || $orderId === $sourceOrderId) {
+            return;
+        }
+        $this->ensureSchema();
+        try {
+            $this->query(
+                "UPDATE purchase_orders
+                 SET duplicated_from_id = ?, origin = CASE WHEN origin = 'manual' OR origin IS NULL OR origin = '' THEN 'duplicate' ELSE origin END
+                 WHERE id = ?",
+                [$sourceOrderId, $orderId]
+            );
+        } catch (\Throwable $e) {
+            error_log('markDuplicatedFrom OC ' . $orderId . ': ' . $e->getMessage());
+            throw new \RuntimeException(
+                'La orden se creó, pero no se pudo registrar el vínculo de duplicado. Revise el esquema de compras.'
+            );
+        }
+    }
+
+    /**
+     * Listado para trazabilidad de facturas/OC en Contabilidad.
+     * @return list<array<string,mixed>>
+     */
+    public function listInvoiceTrace(string $from, string $to, string $q = '', int $limit = 80): array
+    {
+        $this->ensureSchema();
+        $limit = max(1, min(200, $limit));
+        $params = [$from, $to];
+        $where = "DATE(COALESCE(po.invoice_date, po.warehouse_date, po.order_date, po.created_at)) BETWEEN ? AND ?
+                  AND po.status <> 'cancelled'";
+        $q = trim($q);
+        if ($q !== '') {
+            $where .= " AND (po.order_number LIKE ? OR po.invoice_number LIKE ? OR s.name LIKE ?)";
+            $like = '%' . $q . '%';
+            $params[] = $like;
+            $params[] = $like;
+            $params[] = $like;
+        }
+        $params[] = $limit;
+        return $this->query(
+            "SELECT po.id, po.order_number, po.invoice_number, po.invoice_date, po.order_date,
+                    po.warehouse_date, po.due_date, po.status, po.total, po.paid_total, po.credit_total,
+                    po.payment_status, po.accounting_entry_id, po.origin, po.duplicated_from_id,
+                    po.received_at, po.created_at, po.sent_at, po.sent_via,
+                    s.name supplier_name,
+                    e.entry_number accounting_entry_number,
+                    (SELECT COUNT(*) FROM supplier_payments sp
+                      WHERE sp.purchase_order_id = po.id AND sp.status = 'applied') payments_count,
+                    (SELECT COUNT(*) FROM purchase_credit_notes cn
+                      WHERE cn.purchase_order_id = po.id AND cn.status = 'posted') credit_notes_count
+             FROM purchase_orders po
+             LEFT JOIN suppliers s ON s.id = po.supplier_id
+             LEFT JOIN accounting_entries e ON e.id = po.accounting_entry_id
+             WHERE {$where}
+             ORDER BY COALESCE(po.invoice_date, po.warehouse_date, po.order_date) DESC, po.id DESC
+             LIMIT ?",
+            $params
+        )->fetchAll();
+    }
+
+    /**
+     * Timeline de hitos de una factura/OC (sin tabla nueva).
+     * @return array{order:?array,events:list<array<string,mixed>>}
+     */
+    public function invoiceTimeline(int $orderId): array
+    {
+        $order = $this->getOrder($orderId);
+        if (!$order) {
+            return ['order' => null, 'events' => []];
+        }
+        $events = [];
+
+        $push = static function (array &$events, string $at, string $type, string $label, string $detail = '', ?float $amount = null, array $meta = []): void {
+            if ($at === '' || $at === '0000-00-00' || $at === '0000-00-00 00:00:00') {
+                return;
+            }
+            $events[] = [
+                'at' => $at,
+                'type' => $type,
+                'label' => $label,
+                'detail' => $detail,
+                'amount' => $amount,
+                'meta' => $meta,
+            ];
+        };
+
+        $createdAt = (string)($order['created_at'] ?? $order['order_date'] ?? '');
+        $push(
+            $events,
+            $createdAt,
+            'created',
+            'Orden creada',
+            trim(($order['order_number'] ?? '') . ' · ' . ($order['created_by_name'] ?? 'Usuario')),
+            (float)($order['total'] ?? 0),
+            ['origin' => $order['origin'] ?? 'manual']
+        );
+
+        if (!empty($order['duplicated_from_id'])) {
+            $src = $this->query(
+                "SELECT order_number FROM purchase_orders WHERE id = ?",
+                [(int)$order['duplicated_from_id']]
+            )->fetchColumn();
+            $push(
+                $events,
+                $createdAt,
+                'duplicated',
+                'Duplicada desde otra OC',
+                $src ? ('Origen: ' . $src) : ('OC #' . (int)$order['duplicated_from_id'])
+            );
+        }
+
+        if (!empty($order['invoice_import_id'])) {
+            try {
+                $imp = $this->query(
+                    "SELECT id, invoice_number, status, created_at, confirmed_at
+                     FROM purchase_invoice_imports WHERE id = ?",
+                    [(int)$order['invoice_import_id']]
+                )->fetch();
+                if ($imp) {
+                    $push(
+                        $events,
+                        (string)($imp['created_at'] ?? $createdAt),
+                        'invoice_import',
+                        'Factura importada / OCR',
+                        trim(($imp['invoice_number'] ?? '') . ' · estado ' . ($imp['status'] ?? '')),
+                        null,
+                        ['import_id' => (int)$imp['id']]
+                    );
+                    if (!empty($imp['confirmed_at'])) {
+                        $push($events, (string)$imp['confirmed_at'], 'invoice_confirm', 'Importación confirmada', 'Se generó la OC desde el borrador');
+                    }
+                }
+            } catch (\Throwable $e) {
+            }
+        }
+
+        if (!empty($order['sent_at'])) {
+            $push(
+                $events,
+                (string)$order['sent_at'],
+                'sent',
+                'OC enviada al proveedor',
+                trim(($order['sent_via'] ?? '') . ' ' . ($order['sent_to'] ?? ''))
+            );
+        }
+
+        if (!empty($order['invoice_number']) || !empty($order['invoice_date']) || !empty($order['invoice_path'])) {
+            $push(
+                $events,
+                (string)($order['invoice_date'] ?? $order['received_at'] ?? $order['warehouse_date'] ?? $createdAt),
+                'invoice',
+                'Factura proveedor registrada',
+                trim(($order['invoice_number'] ?? 'Sin número') . (!empty($order['invoice_path']) ? ' · con adjunto' : ''))
+            );
+        }
+
+        if (!empty($order['received_at']) || ($order['status'] ?? '') === 'received') {
+            $push(
+                $events,
+                (string)($order['received_at'] ?? $order['warehouse_date'] ?? $order['order_date']),
+                'received',
+                'Mercancía recibida',
+                'Fecha bodega: ' . substr((string)($order['warehouse_date'] ?? '—'), 0, 10),
+                (float)($order['total'] ?? 0)
+            );
+        }
+
+        if (!empty($order['accounting_entry_id'])) {
+            $push(
+                $events,
+                (string)($order['received_at'] ?? $order['warehouse_date'] ?? $createdAt),
+                'accounting',
+                'Asiento de compra',
+                (string)($order['accounting_entry_number'] ?? ('#' . $order['accounting_entry_id'])),
+                (float)($order['total'] ?? 0),
+                ['entry_id' => (int)$order['accounting_entry_id']]
+            );
+        }
+
+        try {
+            $stock = $this->query(
+                "SELECT movement_date, created_at, type, quantity, notes
+                 FROM stock_movements
+                 WHERE reference_type = 'purchase_order' AND reference_id = ?
+                 ORDER BY COALESCE(movement_date, created_at), id",
+                [$orderId]
+            )->fetchAll();
+            foreach ($stock as $sm) {
+                $push(
+                    $events,
+                    (string)($sm['movement_date'] ?? $sm['created_at']),
+                    'stock',
+                    'Movimiento de inventario',
+                    trim(($sm['type'] ?? '') . ' · cant. ' . (int)($sm['quantity'] ?? 0) . ' ' . ($sm['notes'] ?? ''))
+                );
+            }
+        } catch (\Throwable $e) {
+        }
+
+        foreach ($this->orderPayments($orderId) as $p) {
+            $payStatus = (string)($p['status'] ?? 'applied');
+            if ($payStatus !== '' && $payStatus !== 'applied') {
+                continue;
+            }
+            $push(
+                $events,
+                (string)($p['payment_date'] ?? $p['created_at'] ?? ''),
+                'payment',
+                'Abono a proveedor',
+                trim(($p['payment_method'] ?? '') . ' ' . ($p['reference'] ?? '') . ' · ' . ($p['accounting_entry_number'] ?? '')),
+                (float)($p['amount'] ?? 0),
+                ['payment_id' => (int)($p['id'] ?? 0)]
+            );
+        }
+
+        foreach ($this->orderCreditNotes($orderId) as $n) {
+            if (($n['status'] ?? 'posted') !== 'posted') {
+                continue;
+            }
+            $push(
+                $events,
+                (string)($n['credit_date'] ?? $n['created_at'] ?? ''),
+                'credit_note',
+                'Nota de crédito',
+                trim(($n['credit_number'] ?? '') . ' · ' . ($n['reason'] ?? '')),
+                (float)($n['total'] ?? 0),
+                ['credit_note_id' => (int)($n['id'] ?? 0)]
+            );
+        }
+
+        if (($order['status'] ?? '') === 'cancelled') {
+            $push(
+                $events,
+                (string)($order['updated_at'] ?? $createdAt),
+                'cancelled',
+                'Orden cancelada',
+                ''
+            );
+        }
+
+        usort($events, static function ($a, $b) {
+            return strcmp((string)$a['at'], (string)$b['at']);
+        });
+
+        $order['payments'] = $this->orderPayments($orderId);
+        $order['credit_notes'] = $this->orderCreditNotes($orderId);
+        $order['balance'] = $this->orderBalance($orderId);
+
+        return ['order' => $order, 'events' => $events];
     }
 }

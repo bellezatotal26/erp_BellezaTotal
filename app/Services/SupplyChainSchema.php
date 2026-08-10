@@ -285,6 +285,7 @@ class SupplyChainSchema
             ['purchase_orders', 'sent_at', 'DATETIME NULL'],
             ['purchase_orders', 'sent_via', 'VARCHAR(20) NULL'],
             ['purchase_orders', 'sent_to', 'VARCHAR(180) NULL'],
+            ['purchase_orders', 'duplicated_from_id', 'INT UNSIGNED NULL'],
             ['purchase_order_items', 'lot_code', 'VARCHAR(60) NULL'],
             ['purchase_order_items', 'expiry_date', 'DATE NULL'],
 
@@ -303,6 +304,7 @@ class SupplyChainSchema
         }
 
         self::addIndexIfMissing($db, 'purchase_orders', 'idx_po_payment_status', '(payment_status)');
+        self::addIndexIfMissing($db, 'purchase_orders', 'idx_po_duplicated_from', '(duplicated_from_id)');
         self::addIndexIfMissing($db, 'products', 'idx_products_next_expiry', '(next_expiry_date)');
         self::addIndexIfMissing($db, 'products', 'idx_products_barcode', '(barcode)');
         self::addIndexIfMissing($db, 'cash_movements', 'idx_cm_accounting', '(accounting_entry_id)');
