@@ -1,7 +1,10 @@
 /**
- * Formato de montos al digitar (miles con punto / decimal con coma para COP).
- * - Visual: 1.234.567,50
- * - Al enviar formularios: normaliza a 1234567.50 (sin romper el backend)
+ * Formato de montos al digitar (COP: miles con punto, decimal con coma).
+ * Visual: 20.000 ó 1.234.567,50
+ * Envío de formularios: 20000 / 1234567.50 (neutro para el backend)
+ *
+ * Importante: el separador de miles NO debe tratarse como decimal al tipear
+ * (bug previo: "20.000" se convertía en "20,00").
  */
 (function (global) {
     'use strict';
@@ -12,13 +15,23 @@
         var metaSep = document.querySelector('meta[name="currency-decimal"]');
         var decimals = parseInt(metaDec && metaDec.content ? metaDec.content : '2', 10);
         if (isNaN(decimals) || decimals < 0) decimals = 2;
-        return {
-            decimals: decimals,
-            thousands: (metaTh && metaTh.content) ? metaTh.content : '.',
-            decimal: (metaSep && metaSep.content) ? metaSep.content : ','
-        };
+        var thousands = (metaTh && metaTh.content) ? metaTh.content : '.';
+        var decimal = (metaSep && metaSep.content) ? metaSep.content : ',';
+        // Evitar configuración inválida (mismo carácter para miles y decimal)
+        if (thousands === decimal) {
+            thousands = decimal === ',' ? '.' : ',';
+        }
+        return { decimals: decimals, thousands: thousands, decimal: decimal };
     }
 
+    function escapeRegExp(s) {
+        return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    /**
+     * Interpreta montos locales o neutros.
+     * 20.000 → 20000 | 20.000,50 → 20000.5 | 20000.50 → 20000.5
+     */
     function parse(raw) {
         var s = String(raw == null ? '' : raw).trim().replace(/\s/g, '').replace(/\u00a0/g, '');
         if (!s) return 0;
@@ -27,28 +40,44 @@
         var neg = s.charAt(0) === '-';
         s = s.replace(/^[-+]/, '');
         var c = cfg();
+        var th = c.thousands;
+        var dec = c.decimal;
 
-        if (s.indexOf(',') >= 0 && s.indexOf('.') >= 0) {
-            if (s.lastIndexOf(',') > s.lastIndexOf('.')) {
-                s = s.replace(/\./g, '').replace(',', '.');
+        if (th && dec && s.indexOf(th) >= 0 && s.indexOf(dec) >= 0) {
+            s = s.split(th).join('').replace(dec, '.');
+        } else if (dec && s.indexOf(dec) >= 0) {
+            var bits = s.split(dec);
+            if (bits.length === 2) {
+                s = bits[0].replace(new RegExp(escapeRegExp(th), 'g'), '').replace(/\./g, '') + '.' + bits[1].replace(/\D/g, '');
             } else {
-                s = s.replace(/,/g, '');
+                s = s.split(dec).join('');
             }
-        } else if (s.indexOf(',') >= 0) {
-            var bits = s.split(',');
-            s = (bits.length === 2 && bits[1].length <= 2)
-                ? bits[0].replace(/\./g, '') + '.' + bits[1]
-                : s.replace(/,/g, '');
-        } else {
+        } else if (th && s.indexOf(th) >= 0) {
+            var parts = s.split(th);
+            if (parts.length > 2) {
+                // Varios separadores → miles: 1.234.567
+                s = parts.join('');
+            } else if (parts.length === 2) {
+                var right = parts[1];
+                if (right.length === 3) {
+                    // 20.000 → miles
+                    s = parts[0] + right;
+                } else if (right.length > 0 && right.length <= 2) {
+                    // Alinear con parse_money PHP: un solo separador con 1–2 dígitos = decimal
+                    // (aunque currency.decimals sea 0).
+                    s = parts[0].replace(/\D/g, '') + '.' + right.replace(/\D/g, '');
+                } else {
+                    s = parts.join('');
+                }
+            }
+        } else if (s.indexOf('.') >= 0 && s.indexOf(',') < 0) {
+            // Neutro o US: 20000.50
             var dots = s.split('.');
             if (dots.length > 2) {
-                s = s.replace(/\./g, '');
-            } else if (dots.length === 2) {
-                var decLen = dots[1].length;
-                if (decLen === 3 && c.decimals !== 3) s = s.replace(/\./g, '');
-                else if (decLen > 2) s = s.replace(/\./g, '');
+                s = dots.join('');
             }
         }
+
         var n = parseFloat(s);
         if (isNaN(n)) return 0;
         return neg ? -n : n;
@@ -65,52 +94,62 @@
         return (num < 0 ? '-' : '') + out;
     }
 
+    /**
+     * Formato en vivo: solo el separador decimal configurado abre decimales.
+     * Los puntos/comas de miles se ignoran al rearmar el entero.
+     */
     function formatTyping(raw) {
         var c = cfg();
         var s = String(raw == null ? '' : raw);
         var neg = /^\s*-/.test(s);
-        // Solo dígitos y separador decimal local mientras escribe
         s = s.replace(/[^\d.,]/g, '');
-        // Unificar: si hay coma y punto, respetar el último como decimal
-        var lastComma = s.lastIndexOf(',');
-        var lastDot = s.lastIndexOf('.');
-        var decChar = c.decimal;
+
+        var dec = c.decimal;
+        var th = c.thousands;
         var intPart = s;
         var decPart = '';
+        var hasDec = false;
 
-        if (c.decimals > 0) {
-            if (lastComma >= 0 || lastDot >= 0) {
-                var cut = Math.max(lastComma, lastDot);
-                intPart = s.slice(0, cut).replace(/[.,]/g, '');
-                decPart = s.slice(cut + 1).replace(/[.,]/g, '').slice(0, c.decimals);
-            } else {
-                intPart = s.replace(/[.,]/g, '');
+        if (c.decimals > 0 && dec) {
+            var cut = s.lastIndexOf(dec);
+            if (cut >= 0) {
+                hasDec = true;
+                intPart = s.slice(0, cut);
+                decPart = s.slice(cut + 1);
             }
-        } else {
-            intPart = s.replace(/[.,]/g, '');
         }
 
+        // Quitar cualquier separador del entero (miles o basura)
+        intPart = intPart.replace(/[.,]/g, '').replace(/\D/g, '');
+        decPart = decPart.replace(/[.,]/g, '').replace(/\D/g, '').slice(0, c.decimals);
+
         intPart = intPart.replace(/^0+(?=\d)/, '');
+        if (intPart === '') intPart = hasDec ? '0' : '';
+        if (intPart === '' && !hasDec) {
+            return neg ? '-' : '';
+        }
         if (intPart === '') intPart = '0';
-        intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, c.thousands);
+
+        intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, th);
         var out = intPart;
-        if (c.decimals > 0 && (lastComma >= 0 || lastDot >= 0 || (raw && String(raw).indexOf(decChar) >= 0))) {
-            out += decChar + decPart;
+        if (hasDec && c.decimals > 0) {
+            out += dec + decPart;
         }
         return (neg ? '-' : '') + out;
     }
 
-    var MONEY_NAME_RE = /^(purchase_price|sale_price|wholesale_price|offer_price|opening_amount|closing_amount|expected_amount|amount|paid_amount|unit_price|price|unit_cost|delivery_fee|delivery_client|delivery_company|discount_amount|discount|last_cost|credit_amount|cash_amount|transfer_amount|card_amount)$/i;
+    var MONEY_NAME_RE = /^(purchase_price|sale_price|wholesale_price|offer_price|opening_amount|closing_amount|expected_amount|amount|paid_amount|unit_price|price|unit_cost|delivery_fee|delivery_client|delivery_company|delivery_total|discount_amount|discount|last_cost|credit_amount|cash_amount|transfer_amount|card_amount|cash_received|initial_payment)(\[\])?$/i;
+    var MONEY_ID_RE = /^(posCashReceived|posDeliveryTotal|posDeliveryClient|posDeliveryCompany|posInitialPayment|openItemPrice|payAmount|closingAmountInput|offerPrice|prodPcompra|prodPventa|prodPmayoreo)$/i;
 
     function isMoneyInput(el) {
         if (!el || el.tagName !== 'INPUT' || el.disabled || el.readOnly) return false;
         if (el.type === 'hidden' || el.type === 'checkbox' || el.type === 'radio' || el.type === 'file') return false;
         if (el.getAttribute('data-money') === '0') return false;
-        if (el.getAttribute('data-money') === '1' || el.classList.contains('money-input')) return true;
-        var name = el.getAttribute('name') || el.id || '';
-        if (MONEY_NAME_RE.test(name)) return true;
-        // Evitar cantidades / stock / %
-        if (/qty|quantity|stock|percent|min_|max_|days|id$/i.test(name)) return false;
+        if (el.getAttribute('data-money') === '1' || el.classList.contains('money-input') || el.classList.contains('pos-mixed-amount')) return true;
+        var name = el.getAttribute('name') || '';
+        var id = el.id || '';
+        if (MONEY_NAME_RE.test(name) || MONEY_ID_RE.test(id)) return true;
+        if (/qty|quantity|stock|percent|min_|max_|days|_id$|^id$/i.test(name) || /qty|quantity|percent|stock/i.test(id)) return false;
         return false;
     }
 
@@ -121,17 +160,14 @@
         el.setAttribute('data-money', '1');
         if (el.type === 'number') {
             el.type = 'text';
-            el.setAttribute('inputmode', 'decimal');
             el.removeAttribute('step');
             el.removeAttribute('min');
             el.removeAttribute('max');
-        } else if (!el.getAttribute('inputmode')) {
-            el.setAttribute('inputmode', 'decimal');
         }
+        el.setAttribute('inputmode', 'decimal');
         el.classList.add('money-input');
         el.setAttribute('autocomplete', 'off');
 
-        // Formatear valor inicial si es numérico puro
         var initial = el.value;
         if (initial !== '' && /^-?\d+(\.\d+)?$/.test(String(initial).trim())) {
             el.value = format(parseFloat(initial));
@@ -140,19 +176,21 @@
         }
 
         el.addEventListener('focus', function () {
-            // Seleccionar todo facilita reescribir
             try { el.select(); } catch (e) {}
         });
 
         el.addEventListener('input', function () {
-            var caretAtEnd = el.selectionStart === el.value.length;
-            var next = formatTyping(el.value);
-            if (next !== el.value) {
-                el.value = next;
-                if (caretAtEnd) {
-                    try { el.setSelectionRange(el.value.length, el.value.length); } catch (e) {}
-                }
-            }
+            var start = el.selectionStart;
+            var before = el.value;
+            var next = formatTyping(before);
+            if (next === before) return;
+            // Preservar caret relativo al final cuando se insertan puntos de miles
+            var fromEnd = before.length - (start == null ? before.length : start);
+            el.value = next;
+            try {
+                var pos = Math.max(0, next.length - fromEnd);
+                el.setSelectionRange(pos, pos);
+            } catch (e) {}
         });
 
         el.addEventListener('blur', function () {
@@ -163,8 +201,7 @@
 
     function enhanceAll(root) {
         var scope = root || document;
-        var nodes = scope.querySelectorAll('input');
-        nodes.forEach(enhance);
+        scope.querySelectorAll('input').forEach(enhance);
     }
 
     function normalizeForm(form) {
@@ -172,7 +209,6 @@
         form.querySelectorAll('input[data-money="1"], input.money-input').forEach(function (el) {
             if (el.value === '') return;
             var n = parse(el.value);
-            // Envío en formato neutro con punto decimal
             var c = cfg();
             el.value = c.decimals > 0 ? n.toFixed(c.decimals) : String(Math.round(n));
         });
@@ -186,18 +222,15 @@
         });
     }
 
-    // Antes de enviar cualquier formulario
     document.addEventListener('submit', function (e) {
         var form = e.target;
         if (!(form instanceof HTMLFormElement)) return;
         normalizeForm(form);
-        // Si el submit AJAX falla, re-formatear tras un tick
         setTimeout(function () { restoreForm(form); }, 0);
     }, true);
 
     document.addEventListener('DOMContentLoaded', function () {
         enhanceAll(document);
-        // Modales / HTML dinámico
         var obs = new MutationObserver(function (mutations) {
             mutations.forEach(function (m) {
                 m.addedNodes.forEach(function (node) {
@@ -213,6 +246,7 @@
     global.SeriMoney = {
         parse: parse,
         format: format,
+        formatTyping: formatTyping,
         enhance: enhance,
         enhanceAll: enhanceAll,
         normalizeForm: normalizeForm,

@@ -255,7 +255,9 @@ function removeItem(idx) { saleItems.splice(idx, 1); renderItems(); updateStockH
 function setSaleItemPrice(idx, value) {
     var it = saleItems[idx];
     if (!it) return;
-    var price = parseFloat(String(value).replace(',', '.'));
+    var price = (window.SeriMoney && typeof SeriMoney.parse === 'function')
+        ? SeriMoney.parse(value)
+        : parseFloat(String(value).replace(/\./g, '').replace(',', '.'));
     if (isNaN(price) || price < 0) price = 0;
     it.unit_price = Math.round(price * 100) / 100;
     it.subtotal = it.quantity * it.unit_price;
@@ -291,7 +293,7 @@ function renderItems() {
         tb.innerHTML += '<tr>' +
             '<td>' + esc(it.product_name) + oversellBadge + '</td>' +
             '<td>' + it.quantity + '</td>' +
-            '<td><input type="number" min="0" step="any" class="form-control" style="width:110px;padding:4px 8px;" value="' + it.unit_price + '" onchange="setSaleItemPrice(' + i + ', this.value)" title="Editar precio de venta"></td>' +
+            '<td><input type="text" inputmode="decimal" class="form-control money-input" data-money="1" style="width:110px;padding:4px 8px;" value="' + (window.SeriMoney ? SeriMoney.format(it.unit_price) : it.unit_price) + '" onchange="setSaleItemPrice(' + i + ', this.value)" title="Editar precio de venta"></td>' +
             stockCell +
             '<td>' + curSym + ' ' + it.subtotal.toFixed(curDec) + '</td>' +
             '<td><button type="button" class="btn btn-sm btn-danger" onclick="removeItem(' + i + ')">X</button></td>' +
@@ -396,7 +398,10 @@ function submitQuickCustomer(form) {
 
 function openPaymentModal(id, total, paid) {
     document.getElementById('paySaleId').value = id;
-    document.getElementById('payAmount').value = (total - paid).toFixed(curDec);
+    var bal = (total - paid);
+    var payEl = document.getElementById('payAmount');
+    payEl.value = window.SeriMoney ? SeriMoney.format(bal) : bal.toFixed(curDec);
+    if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(payEl);
     document.getElementById('payInfo').textContent = 'Total: ' + curSym + ' ' + total.toFixed(curDec) + ' | Pagado: ' + curSym + ' ' + paid.toFixed(curDec) + ' | Pendiente: ' + curSym + ' ' + (total - paid).toFixed(curDec);
     document.getElementById('paymentModal').style.display = 'flex';
 }
@@ -446,6 +451,15 @@ function openEditPaymentMethodModal(id, invoice, currentMethod) {
     var editPayTarget = 0;
     var editMixedSyncing = false;
 
+    function parseEditMoney(raw) {
+        if (window.SeriMoney && typeof SeriMoney.parse === 'function') return SeriMoney.parse(raw);
+        return parseFloat(String(raw == null ? '' : raw).replace(/\./g, '').replace(',', '.')) || 0;
+    }
+    function formatEditMoney(n) {
+        if (window.SeriMoney && typeof SeriMoney.format === 'function') return SeriMoney.format(n);
+        return String(Math.round((Number(n) || 0) * 100) / 100);
+    }
+
     function syncEditMixedRemainder(changedInput) {
         if (editMixedSyncing || !rowsWrap) return;
         var inputs = rowsWrap.querySelectorAll('.edit-pay-amount');
@@ -458,22 +472,28 @@ function openEditPaymentMethodModal(id, invoice, currentMethod) {
         if (inputs.length === 2) {
             var edited = (changedInput === inputs[1]) ? inputs[1] : inputs[0];
             var other = edited === inputs[0] ? inputs[1] : inputs[0];
-            var val = parseFloat(edited.value) || 0;
+            var val = parseEditMoney(edited.value);
             if (val < 0) val = 0;
             if (val > need) val = need;
             var rest = Math.round(Math.max(0, need - val) * 100) / 100;
-            edited.value = String(Math.round(val * 100) / 100);
-            other.value = String(rest);
+            edited.value = formatEditMoney(Math.round(val * 100) / 100);
+            other.value = formatEditMoney(rest);
+            if (window.SeriMoney && typeof SeriMoney.enhance === 'function') {
+                SeriMoney.enhance(edited);
+                SeriMoney.enhance(other);
+            }
         } else {
             var last = inputs[inputs.length - 1];
             var sum = 0;
             var i;
             if (changedInput !== last) {
-                for (i = 0; i < inputs.length - 1; i++) sum += parseFloat(inputs[i].value) || 0;
-                last.value = String(Math.round(Math.max(0, need - sum) * 100) / 100);
+                for (i = 0; i < inputs.length - 1; i++) sum += parseEditMoney(inputs[i].value);
+                last.value = formatEditMoney(Math.round(Math.max(0, need - sum) * 100) / 100);
+                if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(last);
             } else {
-                for (i = 1; i < inputs.length; i++) sum += parseFloat(inputs[i].value) || 0;
-                inputs[0].value = String(Math.round(Math.max(0, need - sum) * 100) / 100);
+                for (i = 1; i < inputs.length; i++) sum += parseEditMoney(inputs[i].value);
+                inputs[0].value = formatEditMoney(Math.round(Math.max(0, need - sum) * 100) / 100);
+                if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(inputs[0]);
             }
         }
         editMixedSyncing = false;
@@ -492,7 +512,7 @@ function openEditPaymentMethodModal(id, invoice, currentMethod) {
             optsHtml(method || 'cash') + '</select></div>' +
             '<div class="form-group" style="width:120px;margin:0;">' +
             '<label style="font-size:12px;">Monto</label>' +
-            '<input type="number" class="form-control edit-pay-amount" name="payment_splits[' + (rowsWrap.children.length) + '][amount]" min="0" step="0.01" value="' + (amount != null ? amount : '') + '"></div>' +
+            '<input type="text" inputmode="decimal" class="form-control money-input edit-pay-amount" data-money="1" name="payment_splits[' + (rowsWrap.children.length) + '][amount]" value="' + (amount != null ? (window.SeriMoney ? SeriMoney.format(amount) : amount) : '') + '"></div>' +
             '<button type="button" class="btn btn-sm btn-danger edit-pay-remove" title="Quitar">&times;</button>';
         rowsWrap.appendChild(row);
         reindexMixedRows();
@@ -513,7 +533,7 @@ function openEditPaymentMethodModal(id, invoice, currentMethod) {
         var sum = 0;
         if (rowsWrap) {
             rowsWrap.querySelectorAll('.edit-pay-amount').forEach(function (inp) {
-                sum += parseFloat(inp.value) || 0;
+                sum += parseEditMoney(inp.value);
             });
         }
         var el = document.getElementById('editPayMixedSummary');
@@ -601,7 +621,7 @@ function openEditPaymentMethodModal(id, invoice, currentMethod) {
             var sum = 0;
             if (rowsWrap) {
                 rowsWrap.querySelectorAll('.edit-pay-amount').forEach(function (inp) {
-                    sum += parseFloat(inp.value) || 0;
+                    sum += parseEditMoney(inp.value);
                 });
             }
             var left = Math.round((editPayTarget - sum) * 100) / 100;
@@ -641,30 +661,137 @@ function viewDetail(id) {
     .then(function(d) {
         if (d.error) return;
         var s = d.sale;
+        function moneyVal(n) {
+            return curSym + ' ' + (parseFloat(n) || 0).toFixed(curDec);
+        }
         var h = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:15px;">';
         h += '<div><strong>Factura:</strong> ' + esc(s.invoice_number) + '</div>';
         h += '<div><strong>Fecha:</strong> ' + (s.sale_date || '').substr(0, 16) + '</div>';
         h += '<div><strong>Cliente:</strong> ' + esc(s.customer_name || 'General') + '</div>';
         h += '<div><strong>Estado:</strong> ' + s.payment_status + '</div>';
-        h += '<div><strong>Total:</strong> <span style="color:#10B981;font-size:18px;">' + curSym + ' ' + parseFloat(s.total).toFixed(curDec) + '</span></div>';
+        h += '<div><strong>Subtotal:</strong> ' + moneyVal(s.subtotal) + '</div>';
+        if (parseFloat(s.discount || 0) > 0.009) {
+            h += '<div><strong>Descuento:</strong> ' + moneyVal(s.discount) + '</div>';
+        }
+        if (parseFloat(s.tax || 0) > 0.009) {
+            h += '<div><strong>Impuesto:</strong> ' + moneyVal(s.tax) + '</div>';
+        }
+        var delivery = parseFloat(s.delivery_fee || 0);
+        if (delivery > 0.009) {
+            h += '<div><strong>Domicilio (cliente):</strong> ' + moneyVal(delivery) + '</div>';
+        }
+        var deliveryCo = parseFloat(s.delivery_company_fee || 0);
+        if (deliveryCo > 0.009) {
+            h += '<div><strong>Domicilio (empresa):</strong> ' + moneyVal(deliveryCo) + '</div>';
+        }
+        h += '<div><strong>Total:</strong> <span style="color:#10B981;font-size:18px;">' + moneyVal(s.total) + '</span></div>';
+        var cashRecv = parseFloat(s.cash_received || 0);
+        var cashChange = parseFloat(s.cash_change || 0);
+        if (cashRecv > 0.009) {
+            h += '<div><strong>Billete / recibido:</strong> ' + moneyVal(cashRecv) + '</div>';
+            h += '<div><strong>Vueltas / cambio:</strong> ' + moneyVal(cashChange) + '</div>';
+        }
         h += '</div>';
         if (d.items) {
             h += '<h4>Productos</h4><table><thead><tr><th>Producto</th><th>Cant</th><th>P.Unit</th><th>Subtotal</th></tr></thead><tbody>';
             d.items.forEach(function(i) {
-                h += '<tr><td>' + esc(i.product_name) + '</td><td>' + i.quantity + '</td><td>' + curSym + ' ' + parseFloat(i.unit_price).toFixed(curDec) + '</td><td>' + curSym + ' ' + parseFloat(i.subtotal).toFixed(curDec) + '</td></tr>';
+                h += '<tr><td>' + esc(i.product_name) + '</td><td>' + i.quantity + '</td><td>' + moneyVal(i.unit_price) + '</td><td>' + moneyVal(i.subtotal) + '</td></tr>';
             });
             h += '</tbody></table>';
         }
         if (d.payments && d.payments.length > 0) {
             h += '<h4>Pagos / abonos</h4><table><thead><tr><th>Fecha</th><th>Monto</th><th>Método</th><th>Notas</th></tr></thead><tbody>';
             d.payments.forEach(function(p) {
-                h += '<tr><td>' + (p.payment_date || '').substr(0, 16) + '</td><td>' + curSym + ' ' + parseFloat(p.amount).toFixed(curDec) + '</td><td>' + esc(p.payment_method) + '</td><td>' + esc(p.notes || '') + '</td></tr>';
+                h += '<tr><td>' + (p.payment_date || '').substr(0, 16) + '</td><td>' + moneyVal(p.amount) + '</td><td>' + esc(p.payment_method) + '</td><td>' + esc(p.notes || '') + '</td></tr>';
             });
             h += '</tbody></table>';
+        }
+        if (d.credit_notes && d.credit_notes.length > 0) {
+            h += '<h4>Notas de crédito</h4><table><thead><tr><th>Número</th><th>Fecha</th><th>Motivo</th><th>Stock</th><th>Total</th><th></th></tr></thead><tbody>';
+            d.credit_notes.forEach(function(n) {
+                h += '<tr><td>' + esc(n.credit_number || '') + '</td>';
+                h += '<td>' + esc((n.credit_date || '').toString().substr(0, 10)) + '</td>';
+                h += '<td>' + esc(n.reason || '—') + '</td>';
+                h += '<td>' + (parseInt(n.affects_stock, 10) === 1 ? 'Reingreso' : 'No') + '</td>';
+                h += '<td>' + moneyVal(n.total) + '</td>';
+                h += '<td><a class="btn btn-sm btn-primary" href="' + (window.ventasBase || '/app/ventas') +
+                    '?action=credit_note_pdf&id=' + n.id + '" target="_blank" rel="noopener">PDF</a></td></tr>';
+            });
+            h += '</tbody></table>';
+        }
+        if ((s.status || '') !== 'cancelled') {
+            h += '<div style="margin-top:12px;"><button type="button" class="btn btn-sm btn-warning" onclick="document.getElementById(\'saleDetailModal\').style.display=\'none\';openSaleCreditNoteModal(' + s.id + ')">Emitir nota de crédito</button></div>';
         }
         document.getElementById('saleDetailContent').innerHTML = h;
         document.getElementById('saleDetailModal').style.display = 'flex';
     });
+}
+
+function onScnReasonChange() {
+    var code = document.getElementById('scnReasonCode');
+    var reason = document.getElementById('scnReason');
+    var stock = document.getElementById('scnAffectsStock');
+    if (!code || !reason || !stock) return;
+    var map = {
+        expired: 'Producto vencido',
+        broken: 'Producto roto / dañado',
+        wrong: 'Producto equivocado',
+        other: ''
+    };
+    var label = map[code.value] || '';
+    if (label && !reason.value) reason.value = label;
+    // Vencido/roto: no reingresar por defecto.
+    stock.checked = !(code.value === 'expired' || code.value === 'broken');
+}
+
+function openSaleCreditNoteModal(id) {
+    fetch(window.invRouteVentasDetail + '&id=' + id, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (d.error || !d.sale) {
+                return showAlert(d.error || 'Venta no encontrada', 'error');
+            }
+            var s = d.sale;
+            var items = d.items || [];
+            if ((s.status || '') === 'cancelled') {
+                return showAlert('No se puede emitir NC sobre una venta cancelada', 'warning');
+            }
+            document.getElementById('scnSaleId').value = s.id;
+            document.getElementById('scnSaleLabel').textContent =
+                'Venta ' + (s.invoice_number || ('#' + s.id)) + (s.customer_name ? ' — ' + s.customer_name : '');
+            var today = new Date();
+            document.getElementById('scnDate').value =
+                today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
+            document.getElementById('scnReasonCode').value = '';
+            document.getElementById('scnReason').value = '';
+            document.getElementById('scnRefundMethod').value = 'auto';
+            document.getElementById('scnAffectsStock').checked = true;
+
+            var body = document.getElementById('scnItemsBody');
+            body.innerHTML = '';
+            var hasAvail = false;
+            items.forEach(function(it) {
+                var sold = parseInt(it.quantity, 10) || 0;
+                var credited = parseInt(it.credited_qty || 0, 10) || 0;
+                var avail = Math.max(0, sold - credited);
+                if (avail > 0) hasAvail = true;
+                var tr = document.createElement('tr');
+                tr.innerHTML =
+                    '<td>' + esc(it.product_name) +
+                    '<input type="hidden" name="item_id[]" value="' + it.id + '"></td>' +
+                    '<td>' + sold + '</td>' +
+                    '<td>' + credited + '</td>' +
+                    '<td>' + avail + '</td>' +
+                    '<td><input type="number" name="quantity[]" class="form-control" min="0" max="' + avail +
+                    '" value="0" ' + (avail <= 0 ? 'disabled' : '') + ' style="width:90px;"></td>';
+                body.appendChild(tr);
+            });
+            if (!hasAvail) {
+                return showAlert('No hay cantidades disponibles para acreditar en esta venta', 'warning');
+            }
+            document.getElementById('saleCreditNoteModal').style.display = 'flex';
+        })
+        .catch(function() { showAlert('No se pudo cargar la venta', 'error'); });
 }
 
 function printInvoice(id) {

@@ -10,6 +10,21 @@ class ProductCsvImporter
     public function __construct(private \PDO $db)
     {
         $this->stock = new StockService($db);
+        $this->ensureWholesalePriceColumn();
+    }
+
+    private function ensureWholesalePriceColumn(): void
+    {
+        try {
+            $col = $this->db->query("SHOW COLUMNS FROM products LIKE 'wholesale_price'")->fetch();
+            if (!$col) {
+                $this->db->exec(
+                    "ALTER TABLE products ADD COLUMN wholesale_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER sale_price"
+                );
+            }
+        } catch (\Throwable $e) {
+            // No bloquear importación si no se puede alterar el esquema.
+        }
     }
 
     private StockService $stock;
@@ -354,6 +369,10 @@ class ProductCsvImporter
             'categoria' => ['categoria', 'category', 'cat', 'rubro', 'grupo'],
             'costo' => ['costo', 'cost', 'purchase_price', 'precio_compra', 'coste'],
             'precio' => ['precio', 'price', 'sale_price', 'precio_venta', 'pvp'],
+            'precio_mayor' => [
+                'precio_mayor', 'preciomayor', 'precio_al_mayor', 'precioalmayor',
+                'wholesale', 'wholesale_price', 'pmayoreo', 'mayoreo', 'precio_mayoreo',
+            ],
             'stock' => ['stock', 'cantidad', 'qty', 'existencia', 'inventario'],
             'min' => ['min', 'min_stock', 'stock_min', 'minimo', 'stock_minimo'],
             'unidad' => ['unidad', 'unit', 'um', 'medida', 'unidade'],
@@ -378,6 +397,13 @@ class ProductCsvImporter
             || str_contains($norm, 'product_name')
         ) {
             return 'nombre';
+        }
+        if (
+            str_contains($norm, 'mayor')
+            || str_contains($norm, 'mayoreo')
+            || str_contains($norm, 'wholesale')
+        ) {
+            return 'precio_mayor';
         }
         if (str_starts_with($norm, 'precio')) {
             return 'precio';
@@ -416,6 +442,7 @@ class ProductCsvImporter
             'minimo', 'codigo', 'price', 'tipo', 'type', 'clase', 'rubro',
             'grupo', 'unit', 'name', 'item', 'ean', 'upc', 'gtin', 'sku',
             'qty', 'pvp', 'cat', 'cod', 'ref', 'min', 'cost', 'local', 'um',
+            'preciomayor', 'mayoreo', 'wholesale',
             'vencimiento', 'caducidad', 'lote', 'remesa', 'batch', 'vence',
         ];
         $tokens = array_values(array_unique($tokens));
@@ -465,7 +492,7 @@ class ProductCsvImporter
     {
         $map = [
             'sku' => null, 'ean' => null, 'nombre' => null, 'tipo' => null, 'categoria' => null,
-            'costo' => null, 'precio' => null, 'stock' => null, 'min' => null,
+            'costo' => null, 'precio' => null, 'precio_mayor' => null, 'stock' => null, 'min' => null,
             'unidad' => null, 'estado' => null, 'ubicacion' => null,
             'lote' => null, 'vence' => null, 'modo_stock' => null,
         ];
@@ -803,6 +830,7 @@ class ProductCsvImporter
             }
             $cost = $this->parseMoneyCell($cell($map, $row, 'costo'));
             $price = $this->parseMoneyCell($cell($map, $row, 'precio'));
+            $wholesale = $this->parseMoneyCell($cell($map, $row, 'precio_mayor'));
             $stockRaw = $cell($map, $row, 'stock');
             $stockSpecified = $stockRaw !== '';
             $stockQty = $type === 'service' ? 0 : $this->parseQtyCell($stockRaw);
@@ -811,6 +839,9 @@ class ProductCsvImporter
             }
             $minStock = (int)($cell($map, $row, 'min') !== '' ? $cell($map, $row, 'min') : '5');
             $unit = $cell($map, $row, 'unidad') ?: 'UND';
+            if (mb_strlen($unit) > 20) {
+                $unit = mb_substr($unit, 0, 20);
+            }
             $catName = $this->decodeCsvText($cell($map, $row, 'categoria'));
             $location = $this->decodeCsvText($cell($map, $row, 'ubicacion'));
             if ($location !== '' && mb_strlen($location) > 120) {
@@ -885,10 +916,10 @@ class ProductCsvImporter
                     // Ficha: no tocar stock aquí; el kardex/lotes ya lo sincronizaron.
                     $this->query(
                         "UPDATE products SET name = ?, product_type = ?, category_id = ?,
-                                purchase_price = ?, sale_price = ?, min_stock = ?,
+                                purchase_price = ?, sale_price = ?, wholesale_price = ?, min_stock = ?,
                                 unit = ?, status = ?, location = COALESCE(?, location),
                                 barcode = COALESCE(?, barcode) WHERE id = ?",
-                        [$name, $type, $categoryId, $cost, $price, $minStock, $unit, $status, $locationVal, $eanVal, $id]
+                        [$name, $type, $categoryId, $cost, $price, $wholesale, $minStock, $unit, $status, $locationVal, $eanVal, $id]
                     );
 
                     $touchedIds[$id] = true;
@@ -902,9 +933,9 @@ class ProductCsvImporter
                         // Alta con stock 0; la entrada va por increase (trazabilidad + lote).
                         $this->query(
                             "INSERT INTO products
-                                (code, barcode, name, product_type, category_id, purchase_price, sale_price,
+                                (code, barcode, name, product_type, category_id, purchase_price, sale_price, wholesale_price,
                                  stock, min_stock, unit, status, location, track_lots, expiry_alert_days, created_by)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 30, ?)",
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 30, ?)",
                             [
                                 $sku,
                                 $eanVal,
@@ -913,6 +944,7 @@ class ProductCsvImporter
                                 $categoryId,
                                 $cost,
                                 $price,
+                                $wholesale,
                                 $minStock,
                                 $unit,
                                 $status,

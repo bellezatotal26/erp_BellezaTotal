@@ -1313,7 +1313,7 @@ class AccountingService
                                AND COALESCE(p.product_type, 'product') = 'product'
                           WHERE sm.accounting_entry_id IS NULL
                             AND COALESCE(sm.total_cost, 0) > 0
-                            AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'purchase_order', 'purchase_credit_note')
+                            AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note')
                           ORDER BY sm.id",
                 'post' => fn(int $id): ?int => $this->postStockMovement($id),
             ],
@@ -1789,6 +1789,9 @@ class AccountingService
         if ($total <= 0) {
             throw new \RuntimeException('La nota de crédito no tiene total contable');
         }
+        // Misma lógica que la OC: total = bruto − descuento pronto pago / aliado.
+        $gross = round($subtotal + $tax, 2);
+        $discount = round(max(0, $gross - $total), 2);
 
         $date = date('Y-m-d', strtotime((string)$note['credit_date']));
         $paymentMode = (string)($note['payment_mode'] ?? 'payable');
@@ -1817,6 +1820,19 @@ class AccountingService
             $note['supplier_id'] ?? $note['po_supplier_id'] ?? null,
             $note['supplier_name'] ?? null
         );
+
+        // Reverso del ingreso por descuento de la OC (si aplica).
+        if ($discount > 0.009) {
+            $lines[] = $this->line(
+                $this->setting('purchase_discount_account', '421040'),
+                $discount,
+                0,
+                'Reverso descuento pronto pago / aliado ' . $label,
+                'supplier',
+                $note['supplier_id'] ?? $note['po_supplier_id'] ?? null,
+                $note['supplier_name'] ?? null
+            );
+        }
 
         if ($affectsStock) {
             if ($subtotal > 0) {
@@ -1889,6 +1905,147 @@ class AccountingService
     }
 
     /**
+     * Contabiliza una nota de crédito de venta (devolución de cliente).
+     * Débito devoluciones en ventas + reverso IVA; crédito CxC/caja/banco;
+     * si reingresa stock, revierte CMV/inventario.
+     */
+    public function postSaleCreditNote(int $creditNoteId): ?int
+    {
+        $svc = new SalesCreditNoteService($this->db);
+        $note = $svc->getCreditNote($creditNoteId);
+        if (!$note || ($note['status'] ?? '') !== 'posted') {
+            throw new \RuntimeException('Nota de crédito de venta no encontrada');
+        }
+        if (!empty($note['accounting_entry_id'])) {
+            return (int)$note['accounting_entry_id'];
+        }
+
+        $subtotal = round((float)$note['subtotal'], 2);
+        $tax = round((float)$note['tax'], 2);
+        $total = round((float)$note['total'], 2);
+        if ($total <= 0) {
+            throw new \RuntimeException('La nota de crédito no tiene total contable');
+        }
+
+        $date = date('Y-m-d', strtotime((string)$note['credit_date']));
+        $refundMethod = $svc->resolveRefundMethod($note);
+        $creditCode = match ($refundMethod) {
+            'cash' => $this->setting('cash_account', '110505'),
+            'transfer' => $this->setting('bank_account', '111005'),
+            default => $this->setting('receivable_account', '130505'),
+        };
+        $creditLabel = match ($refundMethod) {
+            'cash' => 'Reembolso en efectivo',
+            'transfer' => 'Reembolso transferencia/banco',
+            default => 'Reduce cuenta por cobrar',
+        };
+
+        $label = 'NCV ' . $note['credit_number']
+            . (!empty($note['invoice_number']) ? ' / ' . $note['invoice_number'] : '');
+        $affectsStock = (int)($note['affects_stock'] ?? 1) === 1;
+        $lines = [];
+
+        // Débito: devoluciones en ventas (contra-ingreso).
+        if ($subtotal > 0.009) {
+            $lines[] = $this->line(
+                $this->setting('sales_returns_account', '417501'),
+                $subtotal,
+                0,
+                'Devolución en ventas ' . $label,
+                'customer',
+                $note['customer_id'] ?? null,
+                $note['customer_name'] ?? null
+            );
+        }
+        if ($tax > 0.009) {
+            $lines[] = $this->line(
+                $this->setting('vat_generated_account', '240801'),
+                $tax,
+                0,
+                'Reverso IVA generado ' . $label,
+                'customer',
+                $note['customer_id'] ?? null,
+                $note['customer_name'] ?? null
+            );
+        }
+        if ($subtotal <= 0.009 && $tax <= 0.009) {
+            $lines[] = $this->line(
+                $this->setting('sales_returns_account', '417501'),
+                $total,
+                0,
+                'Devolución en ventas ' . $label,
+                'customer',
+                $note['customer_id'] ?? null,
+                $note['customer_name'] ?? null
+            );
+        }
+
+        // Crédito: CxC o reembolso caja/banco.
+        $lines[] = $this->line(
+            $creditCode,
+            0,
+            $total,
+            $creditLabel . ' ' . $label,
+            'customer',
+            $note['customer_id'] ?? null,
+            $note['customer_name'] ?? null
+        );
+
+        // Reverso CMV / inventario si el producto reingresa.
+        if ($affectsStock) {
+            $cost = 0.0;
+            foreach ($note['items'] ?? [] as $it) {
+                $unitCost = (float)($it['unit_cost'] ?? 0);
+                $qty = (int)($it['quantity'] ?? 0);
+                if ($unitCost <= 0 && !empty($it['product_id'])) {
+                    $unitCost = (float)$this->query(
+                        "SELECT COALESCE(purchase_price, 0) FROM products WHERE id = ?",
+                        [(int)$it['product_id']]
+                    )->fetchColumn();
+                }
+                $cost += round($unitCost * $qty, 2);
+            }
+            $cost = round($cost, 2);
+            if ($cost > 0.009) {
+                $lines[] = $this->line(
+                    $this->setting('inventory_account', '143501'),
+                    $cost,
+                    0,
+                    'Reingreso inventario ' . $label
+                );
+                $lines[] = $this->line(
+                    $this->setting('cost_of_sales_account', '613501'),
+                    0,
+                    $cost,
+                    'Reverso CMV ' . $label
+                );
+            }
+        }
+
+        $entryId = $this->postEntry(
+            $date,
+            'Nota crédito venta ' . $label,
+            $lines,
+            'sale_credit_note',
+            $creditNoteId,
+            'posted'
+        );
+
+        $this->query(
+            "UPDATE sale_credit_notes SET accounting_entry_id = ? WHERE id = ?",
+            [$entryId, $creditNoteId]
+        );
+        $this->query(
+            "UPDATE stock_movements
+             SET accounting_entry_id = ?
+             WHERE reference_type = 'sale_credit_note' AND reference_id = ?",
+            [$entryId, $creditNoteId]
+        );
+
+        return $entryId;
+    }
+
+    /**
      * Contabiliza un movimiento de inventario (compra, apertura o ajuste).
      * Las salidas por venta/devolución se omiten: ya van en postSale / reverseSale.
      */
@@ -1915,8 +2072,8 @@ class AccountingService
         }
 
         $referenceType = (string)($movement['reference_type'] ?? '');
-        if (in_array($referenceType, ['sale', 'return', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return'], true)) {
-            // sale/return: asiento de venta. purchase_order / NCC: asiento propio.
+        if (in_array($referenceType, ['sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return'], true)) {
+            // sale/return/NCV: asiento de venta. purchase_order / NCC: asiento propio.
             // loan / loan_return: no son pérdida (se espera devolución).
             return null;
         }

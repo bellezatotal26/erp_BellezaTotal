@@ -1024,7 +1024,7 @@ if (!empty($products)) {
                 </div>
                 <div class="form-group">
                     <label>Último costo</label>
-                    <input type="number" step="0.01" min="0" name="last_cost" class="form-control" placeholder="0">
+                    <input type="text" inputmode="decimal" name="last_cost" class="form-control money-input" data-money="1" placeholder="0">
                 </div>
                 <div class="form-group">
                     <label>Días de entrega</label>
@@ -1117,7 +1117,8 @@ if (!empty($products)) {
                         <li>Guarde como CSV y súbalo aquí. En Excel: <em>CSV UTF-8</em> o CSV delimitado por <code>;</code>.</li>
                     </ol>
                     <ul style="margin:10px 0 0 18px;padding:0;">
-                        <li>Columnas: <code>SKU; EAN; Nombre; Tipo; Categoria; Costo; Precio; Stock; Min; Unidad; Estado; Ubicacion; Lote; Vence; Modo_stock</code></li>
+                        <li>Columnas: <code>SKU; EAN; Nombre; Tipo; Categoria; Costo; Precio; Precio_mayor; Stock; Min; Unidad; Estado; Ubicacion; Lote; Vence; Modo_stock</code></li>
+                        <li><code>Precio_mayor</code>: precio al por mayor (opcional). <code>Unidad</code>: UND, Lts, Mt, etc.</li>
                         <li><strong>Misma SKU + distinto Lote/Vence</strong> = remesa del mismo producto (no cree otro ítem).</li>
                         <li>Si hay <code>Lote</code> o <code>Vence</code>, <code>Stock</code> es la cantidad de <em>esa remesa</em> (se suma, como una compra).</li>
                         <li>Sin lote/vence, <code>Stock</code> sincroniza la existencia total (<code>Modo_stock=absoluto</code>).</li>

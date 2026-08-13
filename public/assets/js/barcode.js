@@ -254,10 +254,14 @@
         // Modal Compras/OC
         onScan(function (code, product) {
             if (!modalVisible('purchaseModal') || !product) return false;
+            if (typeof addOrBumpPoProduct === 'function') {
+                addOrBumpPoProduct(product);
+                return true;
+            }
             var rows = document.querySelectorAll('#poItems .po-item-row');
             var found = null;
             Array.prototype.some.call(rows, function (row) {
-                var sel = row.querySelector('select[name="product_id[]"]');
+                var sel = row.querySelector('input[name="product_id[]"], select[name="product_id[]"]');
                 if (sel && String(sel.value) === String(product.id)) {
                     found = row;
                     return true;

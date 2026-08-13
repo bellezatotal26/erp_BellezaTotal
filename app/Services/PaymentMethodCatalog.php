@@ -62,6 +62,12 @@ class PaymentMethodCatalog
                 'affects_cash' => false,
                 'group' => 'bank',
             ],
+            'daviplata' => [
+                'label' => 'Daviplata',
+                'account' => 'bank',
+                'affects_cash' => false,
+                'group' => 'bank',
+            ],
             'mixed' => [
                 'label' => 'Pago mixto',
                 'account' => 'cash',

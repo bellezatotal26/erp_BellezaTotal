@@ -1698,6 +1698,8 @@ class StockService
             $lines[] = 'Entrada por compra a proveedor';
         } elseif ($ref === 'purchase_credit_note') {
             $lines[] = 'Ajuste por nota de crédito de compra';
+        } elseif ($ref === 'sale_credit_note') {
+            $lines[] = 'Reingreso por nota de crédito de venta (devolución cliente)';
         } elseif ($ref === 'loan') {
             $lines[] = 'Salida por préstamo de producto';
         } elseif ($ref === 'loan_return') {
@@ -2157,7 +2159,7 @@ class StockService
              JOIN products p ON p.id = sm.product_id AND COALESCE(p.product_type, 'product') = 'product'
              WHERE sm.accounting_entry_id IS NULL
                AND COALESCE(sm.total_cost, 0) > 0
-               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return')
+               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return')
                AND (
                     sm.type = 'in'
                     OR sm.type = 'out'
@@ -2177,7 +2179,7 @@ class StockService
              JOIN products p ON p.id = sm.product_id AND COALESCE(p.product_type, 'product') = 'product'
              WHERE sm.accounting_entry_id IS NULL
                AND COALESCE(sm.total_cost, 0) > 0
-               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return')
+               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return')
                AND (
                     sm.type = 'in'
                     OR sm.type = 'out'

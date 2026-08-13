@@ -141,7 +141,9 @@ function requestOpenItemDetails(onOk) {
     }
     function confirm() {
         var name = String(nameEl.value || '').trim();
-        var price = parseFloat(String(priceEl.value || '').replace(',', '.'));
+        var price = (window.SeriMoney && typeof SeriMoney.parse === 'function')
+            ? SeriMoney.parse(priceEl.value || '')
+            : parseFloat(String(priceEl.value || '').replace(/\./g, '').replace(',', '.'));
         if (!name) {
             if (typeof showAlert === 'function') showAlert('Indique el nombre del producto', 'error');
             nameEl.focus();
@@ -313,6 +315,9 @@ function handleAjaxSubmit(form) {
                 navigateAfterAjaxSuccess(data.redirect || '');
             }, data.pdf_url ? 1200 : 700);
         } else {
+            if (window.SeriMoney && typeof SeriMoney.restoreForm === 'function') {
+                SeriMoney.restoreForm(form);
+            }
             showAlert(data.message || 'No se pudo completar la accion', 'error');
             if (data.suggest_add_lot && data.existing_product && typeof window.openAddLotForProduct === 'function') {
                 var ep = data.existing_product;
@@ -339,6 +344,9 @@ function handleAjaxSubmit(form) {
     .catch(error => {
         hideLoadingOverlay(overlay);
         form.dataset.submitting = '0';
+        if (window.SeriMoney && typeof SeriMoney.restoreForm === 'function') {
+            SeriMoney.restoreForm(form);
+        }
         console.error('Error:', error);
         var msg = (error && error.payload && error.payload.message)
             ? error.payload.message

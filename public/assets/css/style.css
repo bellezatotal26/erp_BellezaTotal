@@ -1141,7 +1141,8 @@ table tr:hover {
     display: flex;
     justify-content: center;
     align-items: center;
-    z-index: 1000;
+    /* Por encima del drawer móvil (sidebar z-index 1200) */
+    z-index: 1300;
     animation: fadeIn 0.3s ease;
 }
 
@@ -2960,7 +2961,9 @@ a.stat-card-link:hover {
 .customer-combobox {
     position: relative;
 }
-.customer-combobox .combobox-list {
+.customer-combobox .combobox-list,
+.form-group .combobox-list,
+.po-item-row .combobox-list {
     position: absolute;
     left: 0;
     right: 0;
@@ -2976,19 +2979,25 @@ a.stat-card-link:hover {
     box-shadow: 0 8px 20px rgba(0,0,0,0.12);
     z-index: 50;
 }
-.customer-combobox .combobox-option {
+.customer-combobox .combobox-option,
+.form-group .combobox-option,
+.po-item-row .combobox-option {
     padding: 8px 12px;
     cursor: pointer;
     font-size: 14px;
     color: var(--color-text-primary);
 }
-.customer-combobox .combobox-option small {
+.customer-combobox .combobox-option small,
+.form-group .combobox-option small,
+.po-item-row .combobox-option small {
     display: block;
     color: var(--color-text-secondary);
     font-size: 11px;
     margin-top: 2px;
 }
-.customer-combobox .combobox-option:hover {
+.customer-combobox .combobox-option:hover,
+.form-group .combobox-option:hover,
+.po-item-row .combobox-option:hover {
     background: rgba(13, 124, 74, 0.08);
 }
 .invoice-supplier-combobox .combobox-list {

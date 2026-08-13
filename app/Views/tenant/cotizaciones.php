@@ -181,7 +181,7 @@ function fmtQ(float $a, array $c): string { return $c['symbol'].' '.number_forma
             <p id="convertInfo" style="margin-bottom:10px;"></p>
             <div class="form-group"><label>Tipo de Pago <span class="field-tip" data-tip="Totalidad cobra todo ahora. A Crédito deja saldo pendiente.">?</span></label><select name="payment_type" class="form-control" onchange="toggleConvertCredit()"><option value="full">Totalidad</option><option value="credit">A Crédito</option></select></div>
             <div class="form-group"><label>Método <span class="field-tip" data-tip="Medio de pago de la venta generada.">?</span></label><select name="payment_method" class="form-control"><?php echo \SoftNova\Core\payment_method_options('cash'); ?></select></div>
-            <div class="form-group" id="convertInitialGroup" style="display:none;"><label>Abono Inicial <span class="field-tip" data-tip="Monto pagado al convertir; el resto queda por cobrar.">?</span></label><input type="number" name="initial_payment" class="form-control" step="0.01" min="0" placeholder="0"></div>
+            <div class="form-group" id="convertInitialGroup" style="display:none;"><label>Abono Inicial <span class="field-tip" data-tip="Monto pagado al convertir; el resto queda por cobrar.">?</span></label><input type="text" name="initial_payment" class="form-control money-input" data-money="1" inputmode="decimal" placeholder="0"></div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('convertModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-success">Convertir a Venta</button></div>
         </form>
     </div>

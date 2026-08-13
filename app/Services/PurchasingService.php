@@ -415,6 +415,57 @@ class PurchasingService
     /**
      * Recibe mercancía: inventaría, actualiza costos y deja lista para asiento.
      */
+    /**
+     * Actualiza metadatos de factura/pago sobre una OC aún no recibida
+     * (vencimiento, fecha factura, descuento pronto pago).
+     *
+     * @param array{due_date?:?string,invoice_date?:?string,invoice_number?:?string,early_payment_discount_pct?:float|string|null} $meta
+     */
+    public function applyInvoiceMeta(int $orderId, array $meta): void
+    {
+        $order = $this->getOrder($orderId);
+        if (!$order) {
+            throw new \RuntimeException('Orden de compra no encontrada');
+        }
+        if (!in_array($order['status'], ['draft', 'ordered'], true)) {
+            throw new \RuntimeException('Solo se puede editar factura en OC pendientes de recibir');
+        }
+
+        $dueDate = array_key_exists('due_date', $meta)
+            ? $this->validExpiry($meta['due_date'] ?? null)
+            : ($order['due_date'] ?? null);
+        $invoiceDate = array_key_exists('invoice_date', $meta)
+            ? $this->validExpiry($meta['invoice_date'] ?? null)
+            : ($order['invoice_date'] ?? null);
+        $invoiceNumber = array_key_exists('invoice_number', $meta)
+            ? (trim((string)($meta['invoice_number'] ?? '')) ?: null)
+            : ($order['invoice_number'] ?? null);
+
+        $earlyPct = array_key_exists('early_payment_discount_pct', $meta)
+            && $meta['early_payment_discount_pct'] !== ''
+            && $meta['early_payment_discount_pct'] !== null
+            ? max(0, min(100, round((float)$meta['early_payment_discount_pct'], 2)))
+            : (float)($order['early_payment_discount_pct'] ?? 0);
+
+        $subtotal = (float)($order['subtotal'] ?? 0);
+        $tax = (float)($order['tax'] ?? 0);
+        $gross = round($subtotal + $tax, 2);
+        $discountAmt = round($gross * ($earlyPct / 100), 2);
+        $total = round($gross - $discountAmt, 2);
+
+        $this->query(
+            "UPDATE purchase_orders SET
+                due_date = ?,
+                invoice_date = ?,
+                invoice_number = COALESCE(?, invoice_number),
+                early_payment_discount_pct = ?,
+                early_payment_discount_amount = ?,
+                total = ?
+             WHERE id = ?",
+            [$dueDate, $invoiceDate, $invoiceNumber, $earlyPct, $discountAmt, $total, $orderId]
+        );
+    }
+
     public function receiveOrder(
         int $orderId,
         string $warehouseDate,

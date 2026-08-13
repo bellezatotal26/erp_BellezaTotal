@@ -268,7 +268,7 @@ class TenantCotizacionesController extends TenantController
         $id = (int)$this->request->post('id');
         $paymentMethod = $this->request->post('payment_method', 'cash');
         $paymentType = $this->request->post('payment_type', 'full');
-        $initialPayment = (float)$this->request->post('initial_payment', 0);
+        $initialPayment = \SoftNova\Core\parse_money($this->request->post('initial_payment', 0));
         
         $quote = $this->query(
             "SELECT * FROM quotes WHERE id = ? AND status IN ('pending', 'accepted')",

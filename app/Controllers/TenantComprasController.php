@@ -199,6 +199,7 @@ class TenantComprasController extends TenantController
                     'invoice_date' => (string)$this->request->post('invoice_date', ''),
                     'due_date' => (string)$this->request->post('due_date', ''),
                     'payment_mode' => (string)$this->request->post('payment_mode', 'payable'),
+                    'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
                     'use_ai' => (string)$this->request->post('use_ai', '') !== '',
                 ],
                 $_FILES['invoice_file'] ?? null,
@@ -369,6 +370,7 @@ class TenantComprasController extends TenantController
                 'invoice_date' => (string)$this->request->post('invoice_date', ''),
                 'due_date' => (string)$this->request->post('due_date', ''),
                 'payment_mode' => (string)$this->request->post('payment_mode', 'payable'),
+                'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
             ]);
 
             $filas = $this->request->post('items', []);
@@ -815,7 +817,7 @@ class TenantComprasController extends TenantController
         }
 
         $orderId = (int)$this->request->post('id', 0);
-        $amount = (float)str_replace([',', ' '], ['.', ''], (string)$this->request->post('amount', '0'));
+        $amount = \SoftNova\Core\parse_money($this->request->post('amount', '0'));
         $paymentDate = trim((string)$this->request->post('payment_date', date('Y-m-d')));
         $method = trim((string)$this->request->post('payment_method', 'cash'));
         $reference = trim((string)$this->request->post('reference', ''));
@@ -867,16 +869,8 @@ class TenantComprasController extends TenantController
 
         $supplierId = (int)$this->request->post('supplier_id', 0) ?: null;
         $orderDate = (string)$this->request->post('order_date', date('Y-m-d'));
-        $warehouseDate = trim((string)$this->request->post('warehouse_date', ''));
         $expectedDate = trim((string)$this->request->post('expected_date', ''));
         $notes = trim((string)$this->request->post('notes', ''));
-        $receiveNow = $this->request->post('receive_now') === '1';
-        $rawEarlyDiscount = $this->request->post('early_payment_discount_pct', null);
-        $autoApplyAllyDiscount = ($rawEarlyDiscount === null || $rawEarlyDiscount === '');
-        $earlyDiscount = $autoApplyAllyDiscount ? 0.0 : (float)$rawEarlyDiscount;
-        $dueDate = trim((string)$this->request->post('due_date', ''));
-        $invoiceDate = trim((string)$this->request->post('invoice_date', ''));
-        $invoiceNumberCreate = trim((string)$this->request->post('invoice_number', ''));
 
         $productIds = (array)$this->request->post('product_id', []);
         $quantities = (array)$this->request->post('quantity', []);
@@ -893,7 +887,7 @@ class TenantComprasController extends TenantController
             $items[] = [
                 'product_id' => $pid,
                 'quantity' => (int)($quantities[$i] ?? 0),
-                'unit_cost' => (float)($unitCosts[$i] ?? 0),
+                'unit_cost' => \SoftNova\Core\parse_money($unitCosts[$i] ?? 0),
                 'tax_rate' => (float)($taxRates[$i] ?? 19),
             ];
         }
@@ -902,16 +896,16 @@ class TenantComprasController extends TenantController
             $orderId = $this->purchasing->createOrder(
                 $supplierId,
                 $orderDate !== '' ? $orderDate : date('Y-m-d'),
-                $warehouseDate !== '' ? $warehouseDate : null,
+                null,
                 $expectedDate !== '' ? $expectedDate : null,
                 $notes,
                 $items,
                 'ordered',
-                $earlyDiscount,
-                $dueDate !== '' ? $dueDate : null,
-                $invoiceDate !== '' ? $invoiceDate : null,
-                $invoiceNumberCreate !== '' ? $invoiceNumberCreate : null,
-                $autoApplyAllyDiscount
+                0.0,
+                null,
+                null,
+                null,
+                false // OC pura: sin dsto pronto pago ni auto-aliado
             );
 
             $duplicatedFrom = (int)$this->request->post('duplicated_from_id', 0);
@@ -919,43 +913,10 @@ class TenantComprasController extends TenantController
                 $this->purchasing->markDuplicatedFrom($orderId, $duplicatedFrom);
             }
 
-            $invoiceFile = $this->storeInvoiceUpload();
-            if ($invoiceFile === false) {
-                $this->respond(false, 'No se pudo subir la foto/PDF de la factura (máx 5MB: JPG, PNG, WEBP o PDF)', '/app/compras');
-                return;
-            }
-            if ($invoiceFile !== null) {
-                $this->purchasing->attachInvoiceFile($orderId, $invoiceFile);
-            }
-
-            if ($receiveNow) {
-                $recv = $this->doReceive(
-                    $orderId,
-                    $warehouseDate !== '' ? $warehouseDate : $orderDate,
-                    trim((string)$this->request->post('invoice_number', '')),
-                    (string)$this->request->post('payment_mode', 'payable'),
-                    $notes
-                );
-                $msg = !empty($recv['accounting_ok'])
-                    ? 'Orden creada y mercancía recibida/contabilizada'
-                    : 'Orden creada y mercancía recibida (asiento pendiente)';
-                if (!empty($recv['debt_alerts'])) {
-                    $msg .= '. ' . implode(' ', $recv['debt_alerts']);
-                }
-                if (!empty($recv['cash_note'])) {
-                    $msg .= ' ' . $recv['cash_note'];
-                }
-                if (!empty($recv['accounting_note'])) {
-                    $msg .= ' ' . $recv['accounting_note'];
-                }
-                $this->respond(true, $msg, '/app/compras');
-                return;
-            }
-
             $order = $this->purchasing->getOrder($orderId);
             $this->respond(
                 true,
-                'Orden creada: ' . ($order['order_number'] ?? ('#' . $orderId)),
+                'Orden creada: ' . ($order['order_number'] ?? ('#' . $orderId)) . '. Envíela al proveedor; la factura y recepción se cargan aparte.',
                 '/app/compras'
             );
         } catch (\Throwable $e) {
@@ -970,6 +931,12 @@ class TenantComprasController extends TenantController
         }
         try {
             $orderId = (int)$this->request->post('id', 0);
+            $this->purchasing->applyInvoiceMeta($orderId, [
+                'due_date' => trim((string)$this->request->post('due_date', '')),
+                'invoice_date' => trim((string)$this->request->post('invoice_date', '')),
+                'invoice_number' => trim((string)$this->request->post('invoice_number', '')),
+                'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
+            ]);
             $recv = $this->doReceive(
                 $orderId,
                 (string)$this->request->post('warehouse_date', date('Y-m-d')),

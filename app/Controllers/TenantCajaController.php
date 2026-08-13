@@ -366,10 +366,12 @@ class TenantCajaController extends TenantController
 
         $creditSurchargeRate = 0.0;
         $creditSurchargeDays = 60;
+        $creditSurchargeTiers = [];
         try {
             $commCfg = (new \SoftNova\Services\CommissionService($this->db))->config();
             $creditSurchargeRate = (float)($commCfg['credit_over_60_rate'] ?? 0);
             $creditSurchargeDays = (int)($commCfg['credit_over_60_days'] ?? 60);
+            $creditSurchargeTiers = $commCfg['credit_surcharge_tiers'] ?? [];
             if ($creditSurchargeDays < 1) {
                 $creditSurchargeDays = 60;
             }
@@ -427,6 +429,7 @@ class TenantCajaController extends TenantController
             'cajaReportEmail' => $this->resolveCajaReportEmail((string)($company['company_email'] ?? '')),
             'creditSurchargeRate' => $creditSurchargeRate,
             'creditSurchargeDays' => $creditSurchargeDays,
+            'creditSurchargeTiers' => $creditSurchargeTiers,
             'invoicePrefix' => $this->query(
                 "SELECT setting_value FROM settings WHERE setting_key = 'invoice_prefix' LIMIT 1"
             )->fetchColumn() ?: 'FAC-',
@@ -1411,8 +1414,22 @@ class TenantCajaController extends TenantController
             'Cierre $: ' . $this->formatMoney((float)($session['closing_amount'] ?? 0)),
             'Ventas: ' . (int)($totals['sales_count'] ?? 0) . ' · ' . $this->formatMoney((float)($totals['sales_total'] ?? 0)),
         ];
+        $payBreak = $totals['payment_breakdown'] ?? [];
+        if (is_array($payBreak) && $payBreak !== []) {
+            uasort($payBreak, static function ($a, $b) {
+                return ((float)($b['total'] ?? 0) <=> (float)($a['total'] ?? 0));
+            });
+            $lines[] = '';
+            $lines[] = '*Totales por medio de pago:*';
+            foreach ($payBreak as $code => $pb) {
+                $label = (string)($pb['label'] ?? $code);
+                $lines[] = '• ' . $label . ': ' . $this->formatMoney((float)($pb['total'] ?? 0))
+                    . ' (' . (int)($pb['count'] ?? 0) . ')';
+            }
+        }
         if (isset($totals['expected_cash'])) {
-            $lines[] = 'Efectivo esperado: ' . $this->formatMoney((float)$totals['expected_cash']);
+            $lines[] = '';
+            $lines[] = 'Efectivo esperado en cajón: ' . $this->formatMoney((float)$totals['expected_cash']);
         }
         if (isset($totals['difference']) && abs((float)$totals['difference']) >= 0.01) {
             $diff = (float)$totals['difference'];
@@ -1527,7 +1544,7 @@ class TenantCajaController extends TenantController
                 $methodCode = \SoftNova\Services\PaymentMethodCatalog::normalize((string)($pr['payment_method'] ?? 'cash'));
                 if (!isset($paymentBreakdown[$methodCode])) {
                     $paymentBreakdown[$methodCode] = [
-                        'label' => \SoftNova\Services\PaymentMethodCatalog::label($methodCode),
+                        'label' => \SoftNova\Services\PaymentMethodCatalog::label($methodCode, $this->db),
                         'total' => 0.0,
                         'count' => 0,
                     ];
@@ -1544,7 +1561,7 @@ class TenantCajaController extends TenantController
                 $methodCode = \SoftNova\Services\PaymentMethodCatalog::normalize((string)($sale['payment_method'] ?? 'cash'));
                 if (!isset($paymentBreakdown[$methodCode])) {
                     $paymentBreakdown[$methodCode] = [
-                        'label' => \SoftNova\Services\PaymentMethodCatalog::label($methodCode),
+                        'label' => \SoftNova\Services\PaymentMethodCatalog::label($methodCode, $this->db),
                         'total' => 0.0,
                         'count' => 0,
                     ];
@@ -1553,6 +1570,26 @@ class TenantCajaController extends TenantController
                 $paymentBreakdown[$methodCode]['count']++;
             }
         }
+
+        // Redondear totales y orden preferido (efectivo / billeteras / tarjetas primero).
+        $preferred = [
+            'cash', 'nequi', 'daviplata', 'transfer',
+            'credit_card', 'debit_card', 'card', 'dataphone', 'payment_link',
+        ];
+        foreach ($paymentBreakdown as $code => &$row) {
+            $row['total'] = round((float)$row['total'], 2);
+        }
+        unset($row);
+        uksort($paymentBreakdown, static function (string $a, string $b) use ($preferred, $paymentBreakdown): int {
+            $ia = array_search($a, $preferred, true);
+            $ib = array_search($b, $preferred, true);
+            $ia = $ia === false ? 1000 : $ia;
+            $ib = $ib === false ? 1000 : $ib;
+            if ($ia !== $ib) {
+                return $ia <=> $ib;
+            }
+            return ((float)($paymentBreakdown[$b]['total'] ?? 0) <=> (float)($paymentBreakdown[$a]['total'] ?? 0));
+        });
 
         return [
             'incomes' => $incomes,

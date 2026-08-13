@@ -209,6 +209,18 @@ class SupplyChainSchema
         } catch (\Throwable $e) {
             // ya migrado
         }
+        try {
+            $col = $db->query("SHOW COLUMNS FROM purchase_invoice_imports LIKE 'early_payment_discount_pct'")->fetch();
+            if (!$col) {
+                $db->exec(
+                    "ALTER TABLE purchase_invoice_imports
+                     ADD COLUMN early_payment_discount_pct DECIMAL(5,2) NOT NULL DEFAULT 0.00
+                     AFTER payment_mode"
+                );
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
 
         $db->exec(
             "CREATE TABLE IF NOT EXISTS purchase_invoice_import_items (

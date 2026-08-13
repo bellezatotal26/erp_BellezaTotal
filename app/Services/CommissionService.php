@@ -122,9 +122,109 @@ class CommissionService
             'credit_card_rate' => (float)$this->setting('credit_card_commission_rate', '2.8'),
             'credit_over_60_rate' => (float)$this->setting('credit_over_60_surcharge_rate', '0'),
             'credit_over_60_days' => (int)$this->setting('credit_over_60_surcharge_days', '60'),
+            'credit_surcharge_tiers' => $this->creditSurchargeTiers(),
             'seller_account' => $this->setting('seller_commission_account', '510508'),
             'gateway_account' => $this->setting('gateway_commission_account', '530505'),
         ];
+    }
+
+    /**
+     * Tramos de recargo por plazo de crédito.
+     * Cada tramo: min_days + rate (%). Se aplica el tramo con mayor min_days
+     * tal que días_del_plazo > min_days.
+     *
+     * @return list<array{min_days:int,rate:float}>
+     */
+    public function creditSurchargeTiers(): array
+    {
+        $raw = trim($this->setting('credit_surcharge_tiers', ''));
+        $tiers = [];
+        if ($raw !== '') {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                foreach ($decoded as $row) {
+                    if (!is_array($row)) {
+                        continue;
+                    }
+                    $days = (int)($row['min_days'] ?? $row['days'] ?? 0);
+                    $rate = (float)($row['rate'] ?? 0);
+                    if ($days < 1 || $rate < 0) {
+                        continue;
+                    }
+                    $tiers[] = [
+                        'min_days' => min(3650, $days),
+                        'rate' => min(100.0, $rate),
+                    ];
+                }
+            }
+        }
+
+        // Compat: un solo umbral legado → un tramo.
+        if ($tiers === []) {
+            $legacyDays = (int)$this->setting('credit_over_60_surcharge_days', '60');
+            $legacyRate = (float)$this->setting('credit_over_60_surcharge_rate', '0');
+            if ($legacyDays < 1) {
+                $legacyDays = 60;
+            }
+            if ($legacyRate > 0) {
+                $tiers[] = ['min_days' => $legacyDays, 'rate' => min(100.0, $legacyRate)];
+            }
+        }
+
+        usort($tiers, static fn($a, $b) => $a['min_days'] <=> $b['min_days']);
+        // Deduplicar por min_days (gana el último rate definido).
+        $uniq = [];
+        foreach ($tiers as $t) {
+            $uniq[(int)$t['min_days']] = $t;
+        }
+        return array_values($uniq);
+    }
+
+    /**
+     * Resuelve el recargo aplicable para un plazo en días.
+     *
+     * @return array{rate:float,min_days:int,matched:bool}
+     */
+    public function resolveCreditSurcharge(int $termDays): array
+    {
+        $best = ['rate' => 0.0, 'min_days' => 0, 'matched' => false];
+        foreach ($this->creditSurchargeTiers() as $tier) {
+            $min = (int)$tier['min_days'];
+            $rate = (float)$tier['rate'];
+            if ($termDays > $min && $rate > 0 && $min >= (int)$best['min_days']) {
+                $best = ['rate' => $rate, 'min_days' => $min, 'matched' => true];
+            }
+        }
+        return $best;
+    }
+
+    /**
+     * @param list<array<string,mixed>>|string|null $raw
+     * @return list<array{min_days:int,rate:float}>
+     */
+    public static function normalizeCreditSurchargeTiers(mixed $raw): array
+    {
+        if (is_string($raw)) {
+            $decoded = json_decode($raw, true);
+            $raw = is_array($decoded) ? $decoded : [];
+        }
+        if (!is_array($raw)) {
+            return [];
+        }
+        $out = [];
+        foreach ($raw as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $days = (int)($row['min_days'] ?? $row['days'] ?? 0);
+            $rate = (float)($row['rate'] ?? 0);
+            if ($days < 1 || $rate < 0) {
+                continue;
+            }
+            $out[$days] = ['min_days' => min(3650, $days), 'rate' => min(100.0, $rate)];
+        }
+        ksort($out);
+        return array_values($out);
     }
 
     public function saveConfig(array $input): void
@@ -146,6 +246,40 @@ class CommissionService
             'credit_over_60_surcharge_rate' => (string)max(0, min(100, (float)($input['credit_over_60_rate'] ?? 0))),
             'credit_over_60_surcharge_days' => (string)max(1, min(365, (int)($input['credit_over_60_days'] ?? 60))),
         ];
+
+        $tiers = self::normalizeCreditSurchargeTiers($input['credit_surcharge_tiers'] ?? null);
+        // Si el formulario envía arrays paralelos days[] / rate[]
+        if ($tiers === [] && isset($input['credit_tier_days'], $input['credit_tier_rates'])
+            && is_array($input['credit_tier_days']) && is_array($input['credit_tier_rates'])) {
+            $built = [];
+            $daysArr = array_values($input['credit_tier_days']);
+            $ratesArr = array_values($input['credit_tier_rates']);
+            $n = max(count($daysArr), count($ratesArr));
+            for ($i = 0; $i < $n; $i++) {
+                $built[] = [
+                    'min_days' => (int)($daysArr[$i] ?? 0),
+                    'rate' => (float)($ratesArr[$i] ?? 0),
+                ];
+            }
+            $tiers = self::normalizeCreditSurchargeTiers($built);
+        }
+        $map['credit_surcharge_tiers'] = json_encode($tiers, JSON_UNESCAPED_UNICODE);
+
+        // Mantener legado = primer / mayor tramo para clientes viejos del POS.
+        if ($tiers !== []) {
+            $last = $tiers[count($tiers) - 1];
+            $map['credit_over_60_surcharge_days'] = (string)$last['min_days'];
+            $map['credit_over_60_surcharge_rate'] = (string)$last['rate'];
+            // Si hay un tramo típico 60, usarlo como "principal" en legacy fields.
+            foreach ($tiers as $t) {
+                if ((int)$t['min_days'] === 60) {
+                    $map['credit_over_60_surcharge_days'] = '60';
+                    $map['credit_over_60_surcharge_rate'] = (string)$t['rate'];
+                    break;
+                }
+            }
+        }
+
         $stmt = $this->db->prepare(
             "INSERT INTO accounting_settings (setting_key, setting_value) VALUES (?, ?)
              ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)"

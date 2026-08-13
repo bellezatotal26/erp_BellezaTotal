@@ -136,7 +136,7 @@ $canExportExpense = \SoftNova\Core\TenantMiddleware::canDo('export', 'gastos');
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                     <div class="form-group">
                         <label>Monto *</label>
-                        <input type="number" step="0.01" min="0.01" name="amount" class="form-control" required>
+                        <input type="text" inputmode="decimal" name="amount" class="form-control money-input" data-money="1" required placeholder="0">
                     </div>
                     <div class="form-group">
                         <label>Fecha</label>

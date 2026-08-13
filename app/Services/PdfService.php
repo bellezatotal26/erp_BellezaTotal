@@ -118,6 +118,13 @@ class PdfService
                 <td style="text-align:right;border-top:2px solid ' . $color . ';padding-top:8px;"><strong>TOTAL:</strong></td>
                 <td style="text-align:right;border-top:2px solid ' . $color . ';padding-top:8px;color:' . $color . ';">' . $fmt($saleTotal) . '</td>
             </tr>';
+        $cashInfo = $this->saleCashInfo($sale, $saleTotal);
+        if ($cashInfo['received'] > 0.009) {
+            $totalsHtml .= '<tr><td style="text-align:right;"><strong>Billete / recibido:</strong></td>'
+                . '<td style="text-align:right;">' . $fmt($cashInfo['received']) . '</td></tr>';
+            $totalsHtml .= '<tr><td style="text-align:right;"><strong>Vueltas / cambio:</strong></td>'
+                . '<td style="text-align:right;">' . $fmt($cashInfo['change']) . '</td></tr>';
+        }
         if (!empty($cfg['show_balance_due']) && $remaining > 0.009) {
             $totalsHtml .= '<tr><td style="text-align:right;color:#DC2626;"><strong>Saldo Pendiente:</strong></td>'
                 . '<td style="text-align:right;color:#DC2626;">' . $fmt($remaining) . '</td></tr>';
@@ -323,25 +330,25 @@ class PdfService
         $footer = '<div class="muted foot">' . nl2br($esc($footerText)) . '</div>';
 
         $html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
-            @page { margin: 3mm; }
+            @page { margin: 2mm; }
             body { font-family: DejaVu Sans, Helvetica, sans-serif; font-size: 10px; color:#111; margin:0; padding:0; }
-            .co { font-size: 14px; font-weight: bold; text-align:center; margin: 0 0 3px; }
+            .co { font-size: 14px; font-weight: bold; text-align:center; margin: 0 0 2px; }
             .muted { color:#444; text-align:center; font-size:9px; margin: 1px 0; line-height:1.25; }
-            .dash { border-top: 1px dashed #999; margin: 6px 0; }
-            .inv { font-size: 16px; font-weight: bold; text-align:center; margin: 6px 0 2px; }
-            .box { background:#f0f0f0; padding:6px 7px; margin: 6px 0; font-size:9px; }
+            .dash { border-top: 1px dashed #999; margin: 4px 0; }
+            .inv { font-size: 15px; font-weight: bold; text-align:center; margin: 4px 0 2px; }
+            .box { background:#f0f0f0; padding:5px 6px; margin: 4px 0; font-size:9px; }
             .box.totals { font-size:10px; }
-            .grand { font-size:13px; font-weight:bold; margin-top:3px; }
-            table.items { width:100%; border-collapse:collapse; margin-top:4px; }
+            .grand { font-size:13px; font-weight:bold; margin-top:2px; }
+            table.items { width:100%; border-collapse:collapse; margin-top:3px; }
             table.items th { font-size:8px; text-align:left; border-bottom:1px solid #bbb; padding:2px 0; color:#555; }
             table.items th.cant, table.items td.cant { text-align:center; width:14%; }
             table.items th.valor, table.items td.valor { text-align:right; width:28%; }
-            table.items td { padding:3px 0; vertical-align:top; font-size:9px; }
+            table.items td { padding:2px 0; vertical-align:top; font-size:9px; }
             table.items td.desc { width:58%; }
             table.items td.unit { font-size:8px; color:#666; padding-top:0; }
-            .pay { margin-top:6px; font-size:9px; }
-            .notes { margin-top:6px; font-size:8px; color:#555; }
-            .foot { margin-top:10px; }
+            .pay { margin-top:4px; font-size:9px; }
+            .notes { margin-top:4px; font-size:8px; color:#555; }
+            .foot { margin-top:6px; }
         </style></head><body>
             ' . $header . '
             ' . $meta . '
@@ -356,8 +363,63 @@ class PdfService
             ' . $footer . '
         </body></html>';
 
-        // Ancho ~58mm; alto generoso para evitar “corte” visual / segunda página fantasma.
-        return $this->generate($html, [0.0, 0.0, 164.41, 2000.0]);
+        // Ancho 58mm; alto = contenido real (2 pasadas Dompdf).
+        return $this->generateTicketPdf($html, count($items));
+    }
+
+    /**
+     * PDF térmico 58mm con alto ajustado al contenido (evita rollo vacío).
+     */
+    private function generateTicketPdf(string $html, int $itemCount = 1): string
+    {
+        if (!class_exists(Dompdf::class) || !class_exists(Options::class)) {
+            throw new \RuntimeException('Dompdf no está instalado. Ejecute composer install en el servidor.');
+        }
+
+        $widthPt = 164.41; // 58mm
+        $probeHeight = 3200.0;
+        $options = new Options();
+        $options->set('isRemoteEnabled', true);
+        $options->set('defaultFont', 'DejaVu Sans');
+        $options->set('isHtml5ParserEnabled', true);
+        $options->set('dpi', 72);
+
+        $bodyHeight = 0.0;
+        $measure = new Dompdf($options);
+        $measure->loadHtml($html, 'UTF-8');
+        $measure->setPaper([0.0, 0.0, $widthPt, $probeHeight], 'portrait');
+        $measure->setCallbacks([
+            [
+                'event' => 'end_frame',
+                'f' => static function ($frame, $canvas = null, $fontMetrics = null) use (&$bodyHeight): void {
+                    $node = $frame->get_node();
+                    if (!$node || strtolower((string)$node->nodeName) !== 'body') {
+                        return;
+                    }
+                    $box = $frame->get_padding_box();
+                    $h = (float)($box['h'] ?? 0);
+                    if ($h > $bodyHeight) {
+                        $bodyHeight = $h;
+                    }
+                },
+            ],
+        ]);
+        $measure->render();
+        unset($measure);
+
+        // Fallback si el callback no midió (versión Dompdf distinta).
+        if ($bodyHeight < 40.0) {
+            $bodyHeight = 150.0 + max(1, $itemCount) * 22.0;
+        }
+
+        // Márgenes @page (~2mm×2) + holgura mínima de corte.
+        $heightPt = max(100.0, min($probeHeight, $bodyHeight + 14.0));
+
+        $dompdf = new Dompdf($options);
+        $dompdf->loadHtml($html, 'UTF-8');
+        $dompdf->setPaper([0.0, 0.0, $widthPt, $heightPt], 'portrait');
+        $dompdf->render();
+        return $dompdf->output();
     }
 
     /** @param list<array<string,mixed>> $items */
@@ -407,18 +469,48 @@ class PdfService
         }
 
         $received = null;
-        if (isset($sale['cash_received']) && (float)$sale['cash_received'] > 0) {
-            $received = (float)$sale['cash_received'];
-        } else {
-            $notes = (string)($sale['notes'] ?? '');
-            if (preg_match('/Recibido:\s*([\d.,]+)/i', $notes, $m)) {
-                $received = (float)str_replace(',', '.', preg_replace('/[^\d.,]/', '', $m[1]) ?? '0');
-            }
+        $change = null;
+        $cashInfo = $this->saleCashInfo($sale, (float)($sale['total'] ?? 0));
+        if ($cashInfo['received'] > 0.009) {
+            $received = $cashInfo['received'];
+            $change = $cashInfo['change'];
         }
         if ($received !== null && $received > 0.009) {
-            $html .= '<div>Recibido: ' . $fmt($received) . '</div>';
+            $html .= '<div>Billete / Recibido: ' . $fmt($received) . '</div>';
+            $html .= '<div>Vueltas / Cambio: ' . $fmt($change) . '</div>';
         }
         return $html;
+    }
+
+    /**
+     * @param array<string,mixed> $sale
+     * @return array{received:float,change:float}
+     */
+    private function saleCashInfo(array $sale, float $saleTotal = 0.0): array
+    {
+        $received = max(0.0, (float)($sale['cash_received'] ?? 0));
+        $change = max(0.0, (float)($sale['cash_change'] ?? 0));
+        $notes = (string)($sale['notes'] ?? '');
+        if ($received <= 0.009 && preg_match('/Recibido(?:\s+efectivo)?:\s*([\d.,]+)/i', $notes, $m)) {
+            $raw = preg_replace('/[^\d.,]/', '', $m[1]) ?? '0';
+            if (function_exists('\\SoftNova\\Core\\parse_money')) {
+                $received = max(0.0, \SoftNova\Core\parse_money($raw));
+            } else {
+                $received = max(0.0, (float)str_replace(',', '.', $raw));
+            }
+        }
+        if ($change <= 0.009 && preg_match('/(?:Cambio|Vueltas):\s*([\d.,]+)/i', $notes, $m)) {
+            $raw = preg_replace('/[^\d.,]/', '', $m[1]) ?? '0';
+            if (function_exists('\\SoftNova\\Core\\parse_money')) {
+                $change = max(0.0, \SoftNova\Core\parse_money($raw));
+            } else {
+                $change = max(0.0, (float)str_replace(',', '.', $raw));
+            }
+        }
+        if ($received > 0.009 && $change <= 0.009 && $saleTotal > 0) {
+            $change = max(0.0, round($received - $saleTotal, 2));
+        }
+        return ['received' => $received, 'change' => $change];
     }
 
     private function ticketCleanNotes(string $notes): string
@@ -832,6 +924,105 @@ class PdfService
     }
 
     /**
+     * PDF de nota de crédito de venta (devolución de cliente).
+     */
+    public function generateSaleCreditNote(array $note, array $items = [], array $customer = []): string
+    {
+        $currency = $this->currency['symbol'] ?? '$';
+        $decimals = $this->currency['decimals'] ?? 0;
+        $thousands = $this->currency['thousands'] ?? '.';
+        $decimal = $this->currency['decimal'] ?? ',';
+
+        $fmt = fn($n) => $currency . ' ' . number_format((float)$n, $decimals, $decimal, $thousands);
+        $companyName = htmlspecialchars($this->company['company_name'] ?? 'Mi Empresa');
+        $taxName = htmlspecialchars($this->company['tax_name'] ?? 'IVA');
+        $items = $items ?: ($note['items'] ?? []);
+
+        $itemsHtml = '';
+        foreach ($items as $item) {
+            $itemsHtml .= '<tr>
+                <td>' . htmlspecialchars((string)($item['product_name'] ?? '')) . '</td>
+                <td style="text-align:center;">' . (int)($item['quantity'] ?? 0) . '</td>
+                <td style="text-align:right;">' . $fmt($item['unit_price'] ?? 0) . '</td>
+                <td style="text-align:center;">' . number_format((float)($item['tax_rate'] ?? 0), 2, $decimal, $thousands) . '%</td>
+                <td style="text-align:right;">' . $fmt($item['tax_amount'] ?? 0) . '</td>
+                <td style="text-align:right;">' . $fmt($item['line_total'] ?? 0) . '</td>
+            </tr>';
+        }
+        if ($itemsHtml === '') {
+            $itemsHtml = '<tr><td colspan="6" style="text-align:center;color:#666;">Sin líneas</td></tr>';
+        }
+
+        $customerName = (string)($customer['name'] ?? $note['customer_name'] ?? 'Consumidor final');
+        $customerDoc = (string)($customer['document_number'] ?? $note['customer_document'] ?? '—');
+        $affectsStock = (int)($note['affects_stock'] ?? 0) === 1
+            ? 'Sí (reingreso a inventario)'
+            : 'No (producto no reingresa)';
+
+        $html = $this->wrapHtml('NOTA DE CRÉDITO VENTA', $companyName, '
+            <div style="margin-bottom:20px;">
+                <table width="100%" cellpadding="4" cellspacing="0">
+                    <tr>
+                        <td width="50%">
+                            <strong>NC #:</strong> ' . htmlspecialchars((string)($note['credit_number'] ?? '')) . '<br>
+                            <strong>Fecha:</strong> ' . date('d/m/Y', strtotime((string)($note['credit_date'] ?? 'now'))) . '<br>
+                            <strong>Venta relacionada:</strong> ' . htmlspecialchars((string)($note['invoice_number'] ?? '—')) . '
+                        </td>
+                        <td width="50%" style="text-align:right;">
+                            <strong>Cliente:</strong> ' . htmlspecialchars($customerName) . '<br>
+                            <strong>Documento:</strong> ' . htmlspecialchars($customerDoc) . '<br>
+                            <strong>Afecta stock:</strong> ' . $affectsStock . '<br>
+                            <strong>Estado:</strong> ' . htmlspecialchars((string)($note['status'] ?? 'posted')) . '
+                        </td>
+                    </tr>
+                </table>
+            </div>
+
+            <table width="100%" cellpadding="8" cellspacing="0" style="border-collapse:collapse;">
+                <tr style="background:#0D7C4A;color:#fff;">
+                    <th style="text-align:left;padding:10px;">Producto</th>
+                    <th style="text-align:center;padding:10px;">Cant.</th>
+                    <th style="text-align:right;padding:10px;">P. Unit.</th>
+                    <th style="text-align:center;padding:10px;">' . $taxName . '%</th>
+                    <th style="text-align:right;padding:10px;">' . $taxName . '</th>
+                    <th style="text-align:right;padding:10px;">Total</th>
+                </tr>
+                ' . $itemsHtml . '
+            </table>
+
+            <table width="100%" cellpadding="6" cellspacing="0" style="margin-top:15px;">
+                <tr>
+                    <td width="70%" style="text-align:right;"><strong>Subtotal:</strong></td>
+                    <td width="30%" style="text-align:right;">' . $fmt($note['subtotal'] ?? 0) . '</td>
+                </tr>
+                <tr>
+                    <td style="text-align:right;"><strong>' . $taxName . ':</strong></td>
+                    <td style="text-align:right;">' . $fmt($note['tax'] ?? 0) . '</td>
+                </tr>
+                <tr style="font-size:16px;font-weight:bold;">
+                    <td style="text-align:right;border-top:2px solid #0D7C4A;padding-top:8px;"><strong>TOTAL NC:</strong></td>
+                    <td style="text-align:right;border-top:2px solid #0D7C4A;padding-top:8px;color:#0D7C4A;">' . $fmt($note['total'] ?? 0) . '</td>
+                </tr>
+            </table>
+
+            ' . (!empty($note['reason'])
+                ? '<p style="margin-top:18px;color:#666;"><strong>Motivo:</strong> ' . htmlspecialchars((string)$note['reason']) . '</p>'
+                : '') . '
+            ' . (!empty($note['accounting_entry_number'])
+                ? '<p style="margin-top:6px;color:#666;"><strong>Asiento contable:</strong> ' . htmlspecialchars((string)$note['accounting_entry_number']) . '</p>'
+                : '') . '
+
+            <p style="margin-top:22px;font-size:12px;color:#666;">
+                Documento interno de nota de crédito por devolución de cliente.
+                Reduce la cuenta por cobrar o genera reembolso'
+                . ((int)($note['affects_stock'] ?? 0) === 1 ? ' y reingresa el producto al inventario.' : '.') . '
+            </p>
+        ');
+
+        return $this->generate($html);
+    }
+
+    /**
      * Generar PDF de cierre de caja
      */
     public function generateCashClosing(array $session, array $movements, array $totals, array $sales = []): string
@@ -905,11 +1096,12 @@ class PdfService
             uasort($paymentBreakdown, static function ($a, $b) {
                 return ((float)($b['total'] ?? 0) <=> (float)($a['total'] ?? 0));
             });
-            foreach ($paymentBreakdown as $row) {
-                $paymentHtml .= '<tr>
-                    <td>' . htmlspecialchars((string)($row['label'] ?? '')) . '</td>
+            foreach ($paymentBreakdown as $code => $row) {
+                $isCash = ($code === 'cash');
+                $paymentHtml .= '<tr' . ($isCash ? ' style="background:#ECFDF5;"' : '') . '>
+                    <td>' . htmlspecialchars((string)($row['label'] ?? '')) . ($isCash ? ' <strong>(cajón)</strong>' : '') . '</td>
                     <td style="text-align:center;">' . (int)($row['count'] ?? 0) . '</td>
-                    <td style="text-align:right;">' . $fmt($row['total'] ?? 0) . '</td>
+                    <td style="text-align:right;' . ($isCash ? 'font-weight:bold;color:#059669;' : '') . '">' . $fmt($row['total'] ?? 0) . '</td>
                 </tr>';
             }
         }
@@ -930,6 +1122,22 @@ class PdfService
                 </table>
             </div>
             
+            ' . ($paymentHtml !== '' ? '
+            <h3 style="margin:0 0 8px;background:#ECFDF5;border:1px solid #10B981;padding:8px 10px;border-radius:4px;">
+                Totales cobrados por medio de pago
+            </h3>
+            <p style="margin:0 0 10px;font-size:11px;color:#555;">
+                Resumen de cuánto se cobró en efectivo, Nequi, Daviplata, tarjeta y demás medios.
+            </p>
+            <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:12px;margin-bottom:16px;">
+                <tr style="background:#f5f5f5;">
+                    <th style="text-align:left;border-bottom:1px solid #ddd;">Medio de pago</th>
+                    <th style="text-align:center;border-bottom:1px solid #ddd;">Cobros</th>
+                    <th style="text-align:right;border-bottom:1px solid #ddd;">Total cobrado</th>
+                </tr>
+                ' . $paymentHtml . '
+            </table>' : '') . '
+
             <table width="100%" cellpadding="8" cellspacing="0" style="border-collapse:collapse;margin-bottom:20px;">
                 <tr style="background:#f5f5f5;">
                     <th style="text-align:left;padding:10px;border-bottom:2px solid #ddd;">Concepto</th>
@@ -968,22 +1176,6 @@ class PdfService
                     <td style="text-align:right;border-top:2px solid #333;padding-top:8px;color:' . ($diff == 0 ? '#10B981' : '#DC2626') . ';">' . ($diff >= 0 ? '+' : '') . $fmt($diff) . '</td>
                 </tr>
             </table>
-
-            ' . ($paymentHtml !== '' ? '
-            <h3 style="margin-top:8px;">Desglose por tipo de pago</h3>
-            <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:11px;margin-bottom:16px;">
-                <tr style="background:#f5f5f5;">
-                    <th style="text-align:left;border-bottom:1px solid #ddd;">Método</th>
-                    <th style="text-align:center;border-bottom:1px solid #ddd;">Cant. ventas</th>
-                    <th style="text-align:right;border-bottom:1px solid #ddd;">Total</th>
-                </tr>
-                ' . $paymentHtml . '
-                <tr style="font-weight:bold;">
-                    <td style="border-top:1px solid #333;padding-top:6px;">Total ventas</td>
-                    <td style="text-align:center;border-top:1px solid #333;padding-top:6px;">' . count(array_filter($sales, static fn($s) => ($s['status'] ?? '') !== 'cancelled')) . '</td>
-                    <td style="text-align:right;border-top:1px solid #333;padding-top:6px;">' . $fmt($salesTotal) . '</td>
-                </tr>
-            </table>' : '') . '
             
             ' . (!empty($salesHtml) ? '
             <h3 style="margin-top:20px;">Ventas del dia</h3>

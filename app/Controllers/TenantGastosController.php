@@ -149,7 +149,7 @@ class TenantGastosController extends TenantController
         }
 
         $description = trim($this->request->post('description', ''));
-        $amount = (float)$this->request->post('amount', 0);
+        $amount = \SoftNova\Core\parse_money($this->request->post('amount', 0));
         $rawCategory = trim((string)$this->request->post('category_id', ''));
         $categoryId = (int)$rawCategory;
         $expenseDate = $this->request->post('expense_date') ?: date('Y-m-d');
@@ -245,7 +245,7 @@ class TenantGastosController extends TenantController
 
         $id = (int)$this->request->post('id');
         $description = trim($this->request->post('description', ''));
-        $amount = (float)$this->request->post('amount', 0);
+        $amount = \SoftNova\Core\parse_money($this->request->post('amount', 0));
 
         if ($id <= 0 || $description === '' || $amount <= 0) {
             $this->respond(false, 'Datos invalidos', '/app/gastos');

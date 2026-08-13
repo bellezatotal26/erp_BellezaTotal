@@ -250,19 +250,19 @@ class OfflineSaleSyncService
             'sale_date' => $saleDate,
             'due_date' => trim((string)($raw['due_date'] ?? '')),
             'received_date' => trim((string)($raw['received_date'] ?? '')),
-            'initial_payment' => (float)($raw['initial_payment'] ?? 0),
+            'initial_payment' => \SoftNova\Core\parse_money($raw['initial_payment'] ?? 0),
             'discount_percent' => max(0, min(100, (float)($raw['discount_percent'] ?? 0))),
-            'delivery_fee' => max(0, round((float)($raw['delivery_fee'] ?? 0), 2)),
-            'delivery_company_fee' => max(0, round((float)($raw['delivery_company_fee'] ?? 0), 2)),
-            'delivery_total' => max(0, round((float)($raw['delivery_total'] ?? 0), 2)),
+            'delivery_fee' => max(0, round(\SoftNova\Core\parse_money($raw['delivery_fee'] ?? 0), 2)),
+            'delivery_company_fee' => max(0, round(\SoftNova\Core\parse_money($raw['delivery_company_fee'] ?? 0), 2)),
+            'delivery_total' => max(0, round(\SoftNova\Core\parse_money($raw['delivery_total'] ?? 0), 2)),
             'sale_channel' => in_array(strtolower(trim((string)($raw['sale_channel'] ?? 'retail'))), ['retail', 'wholesale'], true)
                 ? strtolower(trim((string)($raw['sale_channel'] ?? 'retail')))
                 : 'retail',
             'notes' => trim((string)($raw['notes'] ?? '')),
             'items' => $normalizedItems,
             'payment_splits' => SalePaymentSplitter::extractFromArray($raw),
-            'cash_received' => isset($raw['cash_received']) ? (float)$raw['cash_received'] : null,
-            'cash_change' => isset($raw['cash_change']) ? (float)$raw['cash_change'] : null,
+            'cash_received' => isset($raw['cash_received']) ? \SoftNova\Core\parse_money($raw['cash_received']) : null,
+            'cash_change' => isset($raw['cash_change']) ? \SoftNova\Core\parse_money($raw['cash_change']) : null,
         ];
     }
 
@@ -551,13 +551,10 @@ class OfflineSaleSyncService
         if ($paymentType === 'credit') {
             $termDays = SalesDocumentService::termDays($paymentTerms);
             try {
-                $commCfg = (new CommissionService($this->db))->config();
-                $threshold = (int)($commCfg['credit_over_60_days'] ?? 60);
-                $creditSurchargeRate = (float)($commCfg['credit_over_60_rate'] ?? 0);
-                if ($threshold < 1) {
-                    $threshold = 60;
-                }
-                if ($termDays > $threshold && $creditSurchargeRate > 0) {
+                $resolved = (new CommissionService($this->db))->resolveCreditSurcharge($termDays);
+                if (!empty($resolved['matched'])) {
+                    $threshold = (int)$resolved['min_days'];
+                    $creditSurchargeRate = (float)$resolved['rate'];
                     $creditSurcharge = round($taxable * ($creditSurchargeRate / 100), 2);
                 }
             } catch (\Throwable $e) {
@@ -637,9 +634,10 @@ class OfflineSaleSyncService
             $this->query(
                 "INSERT INTO sales
                     (invoice_number, document_type, customer_id, user_id, sale_date, due_date, received_date,
-                     subtotal, tax, discount, delivery_fee, delivery_company_fee, total, payment_method, payment_terms, payment_status, notes,
+                     subtotal, tax, discount, delivery_fee, delivery_company_fee, cash_received, cash_change,
+                     total, payment_method, payment_terms, payment_status, notes,
                      client_sale_uuid, status)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     $invoiceNumber,
                     $documentType,
@@ -653,6 +651,8 @@ class OfflineSaleSyncService
                     $discount,
                     $deliveryFee,
                     $deliveryCompanyFee,
+                    isset($payload['cash_received']) ? max(0, round((float)$payload['cash_received'], 2)) : null,
+                    isset($payload['cash_change']) ? max(0, round((float)$payload['cash_change'], 2)) : null,
                     $total,
                     $paymentMethod,
                     $paymentTerms,

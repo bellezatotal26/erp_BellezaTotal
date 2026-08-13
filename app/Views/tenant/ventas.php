@@ -22,6 +22,9 @@ $ventasBase = $viewInstance->route('app/ventas');
 $filterQuery = http_build_query($filters['query'] ?? []);
 $needBarcode = true;
 $pageScripts = ['ventas.js'];
+$creditNotesPanel = !empty($creditNotesPanel);
+$creditNotes = $creditNotes ?? [];
+$creditNotesQ = $creditNotesQ ?? '';
 
 function fmtV(float $a, array $c): string
 {
@@ -32,6 +35,71 @@ function fmtV(float $a, array $c): string
 <meta name="currency-decimals" content="<?php echo $currency['decimals']; ?>">
 <?php echo flashMessage(); ?>
 
+<?php if ($creditNotesPanel): ?>
+<div style="display:flex;gap:12px;margin-bottom:18px;flex-wrap:wrap;align-items:center;">
+    <a href="<?php echo $ventasBase; ?>" class="btn btn-secondary">← Volver a ventas</a>
+    <span style="font-size:13px;color:var(--color-text-secondary);">
+        Emite una NC desde el botón <strong>NC</strong> de una venta (devolución por vencido, roto u otros).
+    </span>
+    <form method="GET" action="<?php echo $ventasBase; ?>" style="display:flex;gap:8px;align-items:center;margin-left:auto;">
+        <input type="hidden" name="action" value="notas_credito">
+        <input type="search" name="q" value="<?php echo htmlspecialchars($creditNotesQ); ?>" class="form-control" placeholder="Buscar NC, factura, cliente…" style="min-width:220px;">
+        <button type="submit" class="btn btn-primary">Buscar</button>
+    </form>
+</div>
+
+<div class="card neumorphic">
+    <div class="card-header"><h3>Notas de crédito de venta</h3></div>
+    <div class="card-body">
+        <?php if (empty($creditNotes)): ?>
+            <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">
+                Aún no hay notas de crédito de venta. Use el botón <strong>NC</strong> en una venta activa.
+            </p>
+        <?php else: ?>
+            <div class="table-container"><table>
+                <thead>
+                    <tr>
+                        <th>Número</th><th>Fecha</th><th>Cliente</th><th>Venta</th>
+                        <th>Motivo</th><th>Stock</th><th>Asiento</th><th>Total</th><th>Acciones</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($creditNotes as $n): ?>
+                    <tr>
+                        <td><strong><?php echo htmlspecialchars((string)$n['credit_number']); ?></strong></td>
+                        <td><?php echo htmlspecialchars(substr((string)($n['credit_date'] ?? ''), 0, 10)); ?></td>
+                        <td><?php echo htmlspecialchars((string)($n['customer_name'] ?? '—')); ?></td>
+                        <td><?php echo htmlspecialchars((string)($n['invoice_number'] ?? '—')); ?></td>
+                        <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="<?php echo htmlspecialchars((string)($n['reason'] ?? '')); ?>">
+                            <?php echo htmlspecialchars((string)($n['reason'] ?: '—')); ?>
+                        </td>
+                        <td><?php echo (int)($n['affects_stock'] ?? 0) === 1 ? 'Reingreso' : 'No'; ?></td>
+                        <td><?php echo htmlspecialchars((string)($n['accounting_entry_number'] ?? '—')); ?></td>
+                        <td><?php echo fmtV((float)$n['total'], $currency); ?></td>
+                        <td class="table-actions" style="white-space:nowrap;">
+                            <a class="btn btn-sm btn-primary"
+                               href="<?php echo $ventasBase; ?>?action=credit_note_pdf&amp;id=<?php echo (int)$n['id']; ?>"
+                               target="_blank" rel="noopener">PDF</a>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table></div>
+            <?php if (!empty($pagination) && ($pagination['totalPages'] ?? 1) > 1): ?>
+                <?php
+                $paginationBaseUrl = $ventasBase;
+                $paginationQuery = array_filter([
+                    'action' => 'notas_credito',
+                    'q' => $creditNotesQ !== '' ? $creditNotesQ : null,
+                ]);
+                $viewInstance->partial('pagination', compact('pagination', 'paginationBaseUrl', 'paginationQuery'));
+                ?>
+            <?php endif; ?>
+        <?php endif; ?>
+    </div>
+</div>
+<?php return; endif; ?>
+
 <div class="stats-grid">
     <div class="stat-card neumorphic"><h4>Ventas Hoy</h4><div class="stat-value"><?php echo (int)$todayCount; ?></div></div>
     <div class="stat-card neumorphic"><h4>Total Hoy</h4><div class="stat-value" style="color:#10B981;"><?php echo fmtV($todayTotal, $currency); ?></div></div>
@@ -41,6 +109,7 @@ function fmtV(float $a, array $c): string
     <?php if ($canCreateSale): ?>
         <button onclick="openSaleModal()" class="btn btn-primary neumorphic-btn" title="Nueva venta">Nueva Venta</button>
     <?php endif; ?>
+    <a href="<?php echo $ventasBase; ?>?action=notas_credito" class="btn btn-secondary" title="Panel de notas de crédito">Notas de crédito</a>
     <?php if ($canExportSale): ?>
         <a href="<?php echo $ventasBase; ?>?action=export<?php echo $filterQuery !== '' ? '&' . $filterQuery : ''; ?>" class="btn btn-secondary" title="Exportar CSV filtrado">Exportar CSV</a>
         <a href="<?php echo $ventasBase; ?>?action=report_pdf<?php echo $filterQuery !== '' ? '&' . $filterQuery : ''; ?>" class="btn btn-secondary" target="_blank" title="Descargar PDF filtrado">Reporte PDF</a>
@@ -153,6 +222,10 @@ function fmtV(float $a, array $c): string
                                     onclick="openEditPaymentMethodModal(<?php echo (int)$sale['id']; ?>, '<?php echo htmlspecialchars((string)($sale['invoice_number'] ?? ''), ENT_QUOTES); ?>', '<?php echo htmlspecialchars((string)($sale['payment_method'] ?? 'cash'), ENT_QUOTES); ?>')">
                                     Pago
                                 </button>
+                            <?php endif; ?>
+                            <?php if ($canCreateSale && ($sale['status'] ?? '') !== 'cancelled'): ?>
+                                <button type="button" class="btn btn-sm btn-warning" title="Nota de crédito / devolución"
+                                    onclick="openSaleCreditNoteModal(<?php echo (int)$sale['id']; ?>)">NC</button>
                             <?php endif; ?>
                             <?php if (in_array($sale['payment_status'], ['pending', 'partial'])): ?>
                                 <button onclick="openPaymentModal(<?php echo $sale['id']; ?>,<?php echo $sale['total']; ?>,<?php echo ($sale['paid_amount'] ?? 0); ?>)" class="btn btn-sm btn-success" title="Registrar abono"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></button>
@@ -286,7 +359,7 @@ function fmtV(float $a, array $c): string
                 </div>
                 <div class="form-group" id="initialPaymentGroup" style="display:none;">
                     <label>Abono Inicial <span class="field-tip" data-tip="Monto que el cliente paga hoy. El resto queda como cuenta por cobrar.">?</span></label>
-                    <input type="number" name="initial_payment" class="form-control" step="0.01" min="0" placeholder="0">
+                    <input type="text" name="initial_payment" class="form-control money-input" data-money="1" inputmode="decimal" placeholder="0">
                 </div>
             </div>
             <div class="modal-footer">
@@ -298,7 +371,7 @@ function fmtV(float $a, array $c): string
 </div>
 
 <!-- Modal Quick Customer (encima del modal de venta) -->
-<div id="quickCustomerModal" class="modal-overlay" style="display:none;z-index:1100;">
+<div id="quickCustomerModal" class="modal-overlay" style="display:none;z-index:1400;">
     <div class="modal-content neumorphic" style="max-width:450px;">
         <div class="modal-header">
             <h3>Nuevo Cliente</h3>
@@ -372,7 +445,7 @@ function fmtV(float $a, array $c): string
             </div>
             <div class="form-group">
                 <label>Precio de venta *</label>
-                <input type="number" id="openItemPrice" class="form-control" min="0.01" step="any" placeholder="0">
+                <input type="text" id="openItemPrice" class="form-control money-input" data-money="1" inputmode="decimal" placeholder="0">
             </div>
         </div>
         <div class="modal-footer">
@@ -390,7 +463,7 @@ function fmtV(float $a, array $c): string
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="sale_id" id="paySaleId">
             <p id="payInfo" style="margin-bottom:10px;"></p>
-            <div class="form-group"><label>Monto * <span class="field-tip" data-tip="Cantidad que el cliente abona ahora. No puede superar el saldo pendiente.">?</span></label><input type="number" name="amount" id="payAmount" class="form-control" step="0.01" min="0.01" required></div>
+            <div class="form-group"><label>Monto * <span class="field-tip" data-tip="Cantidad que el cliente abona ahora. No puede superar el saldo pendiente.">?</span></label><input type="text" name="amount" id="payAmount" class="form-control money-input" data-money="1" inputmode="decimal" required placeholder="0"></div>
             <div class="form-group"><label>Método <span class="field-tip" data-tip="Medio de pago de este abono.">?</span></label><select name="payment_method" class="form-control" data-custom-other="payment_method"><?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?></select></div>
             <div class="form-group"><label>Notas <span class="field-tip" data-tip="Referencia del abono (número de transferencia, recibo, etc.).">?</span></label><input type="text" name="notes" class="form-control" placeholder="Abono"></div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('paymentModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-success">Registrar Abono</button></div>
@@ -498,7 +571,81 @@ function fmtV(float $a, array $c): string
     </div>
 </div>
 
+<!-- Modal Nota de crédito venta -->
+<div id="saleCreditNoteModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:720px;max-height:90vh;overflow-y:auto;">
+        <div class="modal-header">
+            <h3>Nota de crédito / devolución</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('saleCreditNoteModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $ventasBase; ?>?action=credit_note" data-ajax="true" id="saleCreditNoteForm">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="id" id="scnSaleId" value="">
+            <div class="modal-body">
+                <p id="scnSaleLabel" style="font-weight:600;margin:0 0 8px;"></p>
+                <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 12px;">
+                    Use esto cuando el cliente devuelve producto(s) ya vendidos (vencido, roto, cambio de opinión, etc.).
+                    Se genera la NC y, si aplica, el producto reingresa al inventario.
+                </p>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                    <div class="form-group" style="margin:0;">
+                        <label>Fecha NC *</label>
+                        <input type="date" name="credit_date" id="scnDate" class="form-control" required>
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label>Motivo *</label>
+                        <select name="reason_code" id="scnReasonCode" class="form-control" required onchange="onScnReasonChange()">
+                            <option value="">Seleccione…</option>
+                            <option value="expired">Producto vencido</option>
+                            <option value="broken">Producto roto / dañado</option>
+                            <option value="wrong">Producto equivocado</option>
+                            <option value="other">Otro</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Detalle del motivo</label>
+                    <input type="text" name="reason" id="scnReason" class="form-control" maxlength="255" placeholder="Ej. Lote vencido 2026-03">
+                </div>
+                <div class="form-group">
+                    <label>Reembolso / contrapartida</label>
+                    <select name="refund_method" id="scnRefundMethod" class="form-control">
+                        <option value="auto">Automático (según cómo se cobró)</option>
+                        <option value="receivable">Reducir cuenta por cobrar</option>
+                        <option value="cash">Reembolso en efectivo (sale del cajón)</option>
+                        <option value="transfer">Reembolso transferencia/banco</option>
+                    </select>
+                </div>
+                <label style="display:flex;gap:8px;align-items:flex-start;margin:10px 0 14px;">
+                    <input type="checkbox" name="affects_stock" id="scnAffectsStock" value="1" style="margin-top:3px;">
+                    <span>
+                        Reingresar producto(s) al inventario
+                        <small style="display:block;color:var(--color-text-secondary);font-weight:400;">
+                            Desmarque si está vencido o roto (no vuelve a bodega vendible).
+                        </small>
+                    </span>
+                </label>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Producto</th><th>Vendido</th><th>Ya NC</th><th>Disponible</th><th>Devolver</th>
+                            </tr>
+                        </thead>
+                        <tbody id="scnItemsBody"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('saleCreditNoteModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-primary">Emitir nota de crédito</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <script>
     window.invRouteVentasDetail = '<?php echo $viewInstance->route('app/ventas'); ?>?action=detail';
     window.invRouteVentasShare = '<?php echo $viewInstance->route('app/ventas'); ?>?action=share';
+    window.ventasBase = <?php echo json_encode($ventasBase); ?>;
 </script>

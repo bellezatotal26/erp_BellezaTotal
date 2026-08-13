@@ -253,7 +253,7 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                             <input type="number" id="posDiscountPercent" class="form-control" min="0" max="100" step="0.01" value="0" style="width:90px;" placeholder="Otro %" title="Porcentaje manual">
                         </span>
                         <label class="pos-label" for="posDeliveryTotal" style="margin:0 0 0 6px;">Domicilio</label>
-                        <input type="number" id="posDeliveryTotal" class="form-control" min="0" step="0.01" value="0" style="width:110px;" placeholder="Total" inputmode="decimal" title="Costo total del domicilio / envío">
+                        <input type="text" id="posDeliveryTotal" class="form-control money-input" data-money="1" value="0" style="width:110px;" placeholder="Total" inputmode="decimal" title="Costo total del domicilio / envío">
                     </div>
                     <div class="pos-meta-side">
                         <div class="pos-attendant">
@@ -269,9 +269,9 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                 <div id="posDeliverySplit" class="pos-delivery-split" style="display:none;width:100%;margin:0 0 8px;gap:8px;align-items:center;flex-wrap:wrap;">
                     <span class="pos-label" style="margin:0;">División domicilio (sugerido 50/50)</span>
                         <label class="pos-label" for="posDeliveryClient" style="margin:0;">Cliente</label>
-                        <input type="number" id="posDeliveryClient" class="form-control" min="0" step="0.01" value="0" style="width:100px;" placeholder="0" inputmode="decimal" title="Parte del cliente que suma al total de la venta">
+                        <input type="text" id="posDeliveryClient" class="form-control money-input" data-money="1" value="0" style="width:100px;" placeholder="0" inputmode="decimal" title="Parte del cliente que suma al total de la venta">
                         <label class="pos-label" for="posDeliveryCompany" style="margin:0;">Empresa</label>
-                        <input type="number" id="posDeliveryCompany" class="form-control" min="0" step="0.01" value="0" style="width:100px;" placeholder="0" inputmode="decimal" title="Parte empresa → gasto Transporte (no suma al total de la venta)">
+                        <input type="text" id="posDeliveryCompany" class="form-control money-input" data-money="1" value="0" style="width:100px;" placeholder="0" inputmode="decimal" title="Parte empresa → gasto Transporte (no suma al total de la venta)">
                         <span id="posDeliverySplitHint" class="pos-label" style="margin:0;opacity:.75;font-weight:400;">Cliente → total venta · Empresa → gasto Transporte</span>
                 </div>
                 <div class="pos-ticket-meta">
@@ -283,13 +283,13 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                 <div id="posDeliveryLine" class="pos-sub-line" style="display:none;color:#1D4ED8;">Domicilio: <span id="posDeliveryAmt"><?php echo fmt(0, $currency); ?></span></div>
                 <div id="posDeliveryCompanyLine" class="pos-sub-line" style="display:none;color:#7C3AED;">Empresa (transporte): <span id="posDeliveryCompanyAmt"><?php echo fmt(0, $currency); ?></span></div>
                 <div id="posTaxLine" class="pos-sub-line" style="display:none;color:#0F766E;">Impuesto: <span id="posTaxAmt"><?php echo fmt(0, $currency); ?></span></div>
-                <div id="posCreditSurchargeLine" class="pos-sub-line" style="display:none;color:#B45309;">Recargo crédito &gt;<?php echo (int)($creditSurchargeDays ?? 60); ?> días: <span id="posCreditSurchargeAmt"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posCreditSurchargeLine" class="pos-sub-line" style="display:none;color:#B45309;">Recargo crédito: <span id="posCreditSurchargeAmt"><?php echo fmt(0, $currency); ?></span></div>
                 <div class="pos-total-block">
                     <div class="pos-total-line">TOTAL: <span id="posTotal"><?php echo fmt(0, $currency); ?></span></div>
                     <div class="pos-cash-change" id="posCashChangeBlock">
                         <div class="pos-cash-field">
                             <label class="pos-label" for="posCashReceived">Billete / recibido</label>
-                            <input type="number" id="posCashReceived" class="form-control" min="0" step="0.01" placeholder="0" inputmode="decimal"
+                            <input type="text" id="posCashReceived" class="form-control money-input" data-money="1" placeholder="0" inputmode="decimal"
                                    oninput="if(window.SoftNovaPos&amp;&amp;SoftNovaPos.updateCashChange)SoftNovaPos.updateCashChange()"
                                    onkeyup="if(window.SoftNovaPos&amp;&amp;SoftNovaPos.updateCashChange)SoftNovaPos.updateCashChange()"
                                    onchange="if(window.SoftNovaPos&amp;&amp;SoftNovaPos.updateCashChange)SoftNovaPos.updateCashChange()">
@@ -335,7 +335,7 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                 </div>
                 <div class="form-group" id="posInitialGroup" style="margin:0;min-width:110px;display:none;">
                     <label style="font-size:12px;">Abono inicial</label>
-                    <input type="number" id="posInitialPayment" class="form-control" step="0.01" min="0" value="0">
+                    <input type="text" id="posInitialPayment" class="form-control money-input" data-money="1" inputmode="decimal" value="0">
                 </div>
                 <label class="pos-mixed-toggle" for="posWholesaleMode" style="display:inline-flex;align-items:center;gap:6px;margin:0 4px 2px;font-size:13px;cursor:pointer;user-select:none;padding:6px 10px;border:1px solid var(--color-border);border-radius:8px;background:var(--bg-input,#f8fafc);" title="Usa el precio al por mayor del producto">
                     <input type="checkbox" id="posWholesaleMode" style="width:16px;height:16px;">
@@ -570,6 +570,51 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
 </div>
 
 <?php
+$payBreakDashboard = $totals['payment_breakdown'] ?? [];
+$payBreakTotalSum = 0.0;
+foreach ($payBreakDashboard as $pbRow) {
+    $payBreakTotalSum += (float)($pbRow['total'] ?? 0);
+}
+?>
+<?php if (!empty($payBreakDashboard)): ?>
+<div class="card neumorphic" style="margin-bottom:20px;padding:14px 16px;">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
+        <h3 style="margin:0;font-size:15px;color:var(--color-primary);">Totales cobrados por medio de pago</h3>
+        <span style="font-size:12px;color:var(--color-text-secondary);">
+            Suma de cobros de la sesión · Total <?php echo fmt($payBreakTotalSum, $currency); ?>
+        </span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;">
+        <?php foreach ($payBreakDashboard as $code => $pb): ?>
+            <?php
+            $isCash = ($code === 'cash');
+            $cardBg = $isCash ? 'rgba(16,185,129,.08)' : 'var(--bg-body,#f8f8f8)';
+            $cardBorder = $isCash ? '#10B981' : 'var(--color-border)';
+            ?>
+            <div style="background:<?php echo $cardBg; ?>;border:1px solid <?php echo $cardBorder; ?>;border-radius:8px;padding:10px 12px;">
+                <div style="font-size:12px;color:var(--color-text-secondary);margin-bottom:4px;">
+                    <?php echo htmlspecialchars((string)($pb['label'] ?? $code)); ?>
+                </div>
+                <div style="font-size:18px;font-weight:700;line-height:1.2;">
+                    <?php echo fmt((float)($pb['total'] ?? 0), $currency); ?>
+                </div>
+                <div style="font-size:11px;color:var(--color-text-secondary);margin-top:4px;">
+                    <?php echo (int)($pb['count'] ?? 0); ?> cobro(s)
+                </div>
+            </div>
+        <?php endforeach; ?>
+    </div>
+    <?php if (isset($totals['expected_cash'])): ?>
+    <p style="margin:12px 0 0;font-size:12px;color:var(--color-text-secondary);">
+        Efectivo esperado en cajón (apertura + ingresos en efectivo − egresos):
+        <strong style="color:#10B981;"><?php echo fmt((float)$totals['expected_cash'], $currency); ?></strong>
+        — los demás medios no van al cajón físico.
+    </p>
+    <?php endif; ?>
+</div>
+<?php endif; ?>
+
+<?php
 $todayExpensesByUser = $todayExpensesByUser ?? [];
 $todayExpensesTotal = (float)($todayExpensesTotal ?? 0);
 $todayExpensesCount = (int)($todayExpensesCount ?? 0);
@@ -664,7 +709,7 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
             <div class="modal-body">
                 <div class="form-group"><label>Tipo *</label><select name="type" class="form-control" required><option value="income">Ingreso (+)</option><option value="expense">Egreso (-)</option></select></div>
                 <div class="form-group"><label>Descripción *</label><input type="text" name="description" class="form-control" placeholder="Ej: Pago proveedor..." required></div>
-                <div class="form-group"><label>Monto (<?php echo $currency['symbol']; ?>) *</label><input type="number" name="amount" class="form-control" step="0.01" min="0.01" placeholder="0" required></div>
+                <div class="form-group"><label>Monto (<?php echo $currency['symbol']; ?>) *</label><input type="text" name="amount" class="form-control money-input" data-money="1" inputmode="decimal" placeholder="0" required></div>
             </div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('movementModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-primary">Registrar</button></div>
         </form>
@@ -700,26 +745,43 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Ingresos</span><strong id="closeSumIncomes" style="color:#10B981;">—</strong></div>
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Egresos</span><strong id="closeSumExpenses" style="color:#DC2626;">—</strong></div>
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Ventas del dia</span><strong id="closeSumSales">—</strong></div>
-                    <div id="closeSumPayments" style="margin:8px 0;padding:8px;border:1px dashed var(--color-border);border-radius:6px;font-size:12px;">
+                    <div id="closeSumPayments" style="margin:10px 0;padding:12px;border:1px solid var(--color-border);border-radius:8px;background:#fff;font-size:13px;">
                         <?php
                         $payBreak = $totals['payment_breakdown'] ?? [];
+                        $payBreakSum = 0.0;
+                        foreach ($payBreak as $pbTmp) {
+                            $payBreakSum += (float)($pbTmp['total'] ?? 0);
+                        }
                         if (!empty($payBreak)):
-                            uasort($payBreak, static function ($a, $b) {
-                                return ((float)($b['total'] ?? 0) <=> (float)($a['total'] ?? 0));
-                            });
                         ?>
-                            <div style="font-weight:600;margin-bottom:6px;">Desglose por tipo de pago</div>
-                            <?php foreach ($payBreak as $pb): ?>
-                                <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
-                                    <span><?php echo htmlspecialchars((string)($pb['label'] ?? '')); ?> (<?php echo (int)($pb['count'] ?? 0); ?>)</span>
-                                    <strong><?php echo fmt((float)($pb['total'] ?? 0), $currency); ?></strong>
+                            <div style="font-weight:700;margin-bottom:8px;font-size:14px;">Totales cobrados por medio de pago</div>
+                            <p style="margin:0 0 10px;font-size:12px;color:var(--color-text-secondary);">
+                                Aquí ve cuánto entró en cada medio (efectivo, Nequi, Daviplata, tarjeta, etc.).
+                            </p>
+                            <?php foreach ($payBreak as $code => $pb): ?>
+                                <?php $isCashMethod = ($code === 'cash'); ?>
+                                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;padding:8px 10px;border-radius:6px;background:<?php echo $isCashMethod ? 'rgba(16,185,129,.1)' : 'var(--bg-body,#f5f5f5)'; ?>;">
+                                    <span>
+                                        <strong><?php echo htmlspecialchars((string)($pb['label'] ?? '')); ?></strong>
+                                        <span style="color:var(--color-text-secondary);font-size:11px;"> · <?php echo (int)($pb['count'] ?? 0); ?> cobro(s)</span>
+                                    </span>
+                                    <strong style="font-size:15px;<?php echo $isCashMethod ? 'color:#059669;' : ''; ?>">
+                                        <?php echo fmt((float)($pb['total'] ?? 0), $currency); ?>
+                                    </strong>
                                 </div>
                             <?php endforeach; ?>
+                            <div style="display:flex;justify-content:space-between;border-top:1px dashed var(--color-border);padding-top:8px;margin-top:4px;font-size:12px;">
+                                <span>Suma de todos los medios</span>
+                                <strong><?php echo fmt($payBreakSum, $currency); ?></strong>
+                            </div>
                         <?php else: ?>
-                            <div style="color:var(--color-text-secondary);">Sin ventas por método de pago en esta sesión.</div>
+                            <div style="color:var(--color-text-secondary);">Sin cobros por medio de pago en esta sesión.</div>
                         <?php endif; ?>
                     </div>
-                    <div style="display:flex;justify-content:space-between;border-top:1px solid var(--color-border);padding-top:8px;margin-top:4px;"><span>Efectivo esperado en cajón</span><strong id="closeSumBalance" style="color:#10B981;">—</strong></div>
+                    <div style="display:flex;justify-content:space-between;border-top:1px solid var(--color-border);padding-top:8px;margin-top:4px;">
+                        <span><strong>Efectivo esperado en cajón</strong><br><span style="font-size:11px;color:var(--color-text-secondary);">Solo efectivo físico a contar</span></span>
+                        <strong id="closeSumBalance" style="color:#10B981;font-size:16px;">—</strong>
+                    </div>
                 </div>
                 <p style="margin-bottom:12px;font-size:12px;color:var(--color-text-secondary);">Al cerrar se descargara el reporte PDF. Si no abre, use el historial de reportes.</p>
                 <div class="form-group"><label>Monto Final Contado (<?php echo $currency['symbol'];?>) *</label><input type="text" inputmode="decimal" name="closing_amount" id="closingAmountInput" class="form-control money-input" data-money="1" placeholder="0" required></div>
@@ -816,7 +878,7 @@ if ($canExpense):
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                     <div class="form-group">
                         <label>Monto *</label>
-                        <input type="number" step="0.01" min="0.01" name="amount" class="form-control" required>
+                        <input type="text" inputmode="decimal" name="amount" class="form-control money-input" data-money="1" required placeholder="0">
                     </div>
                     <div class="form-group">
                         <label>Fecha</label>
@@ -1200,7 +1262,7 @@ if ($canLoanFromCaja):
             </div>
             <div class="form-group">
                 <label>Precio de venta *</label>
-                <input type="number" id="openItemPrice" class="form-control" min="0.01" step="any" placeholder="0">
+                <input type="text" id="openItemPrice" class="form-control money-input" data-money="1" inputmode="decimal" placeholder="0">
             </div>
         </div>
         <div class="modal-footer">
@@ -1218,7 +1280,7 @@ if ($canLoanFromCaja):
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="sale_id" id="paySaleId">
             <p id="payInfo" style="margin-bottom:10px;"></p>
-            <div class="form-group"><label>Monto *</label><input type="number" name="amount" id="payAmount" class="form-control" step="0.01" min="0.01" required></div>
+            <div class="form-group"><label>Monto *</label><input type="text" name="amount" id="payAmount" class="form-control money-input" data-money="1" inputmode="decimal" required placeholder="0"></div>
             <div class="form-group"><label>Método</label><select name="payment_method" class="form-control" data-custom-other="payment_method"><?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?></select></div>
             <div class="form-group"><label>Notas</label><input type="text" name="notes" class="form-control" placeholder="Abono"></div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('paymentModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-success">Registrar Abono</button></div>
@@ -1455,6 +1517,7 @@ $cajaBase = $viewInstance->route('app/caja');
     window.cajaBase = <?php echo json_encode($cajaBase); ?>;
     window.cajaCreditSurchargeRate = <?php echo json_encode((float)($creditSurchargeRate ?? 0)); ?>;
     window.cajaCreditSurchargeDays = <?php echo json_encode((int)($creditSurchargeDays ?? 60)); ?>;
+    window.cajaCreditSurchargeTiers = <?php echo json_encode(array_values($creditSurchargeTiers ?? []), JSON_UNESCAPED_UNICODE); ?>;
     window.cajaTaxRate = <?php echo json_encode((float)($taxRate ?? 0)); ?>;
 
     function cajaShareWhatsapp(sessionId) {

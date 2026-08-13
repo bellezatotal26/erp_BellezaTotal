@@ -105,6 +105,19 @@ class TenantVentasController extends TenantController
             $this->exportSales();
             return;
         }
+        if ($action === 'credit_note' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('ventas', 'create');
+            $this->creditNote();
+            return;
+        }
+        if ($action === 'credit_note_pdf' && $this->request->method() === 'GET') {
+            $this->creditNotePdf();
+            return;
+        }
+        if ($action === 'notas_credito') {
+            $this->creditNotesPanel();
+            return;
+        }
 
         (new \SoftNova\Services\SalesDocumentService($this->db));
 
@@ -308,14 +321,187 @@ class TenantVentasController extends TenantController
             $this->json(['error' => 'Venta no encontrada']);
             return;
         }
+
+        // Completar billete/vueltas desde notas si la venta es anterior a las columnas.
+        $cashReceived = isset($sale['cash_received']) ? (float)$sale['cash_received'] : 0.0;
+        $cashChange = isset($sale['cash_change']) ? (float)$sale['cash_change'] : 0.0;
+        $notes = (string)($sale['notes'] ?? '');
+        if ($cashReceived <= 0.009 && preg_match('/Recibido(?:\s+efectivo)?:\s*([\d.,]+)/i', $notes, $m)) {
+            $cashReceived = \SoftNova\Core\parse_money($m[1]);
+            $sale['cash_received'] = $cashReceived;
+        }
+        if ($cashChange <= 0.009 && preg_match('/(?:Cambio|Vueltas):\s*([\d.,]+)/i', $notes, $m)) {
+            $cashChange = \SoftNova\Core\parse_money($m[1]);
+            $sale['cash_change'] = $cashChange;
+        }
+        if ($cashReceived > 0.009 && $cashChange <= 0.009) {
+            $cashChange = max(0, round($cashReceived - (float)($sale['total'] ?? 0), 2));
+            $sale['cash_change'] = $cashChange;
+        }
         
-        $items = $this->query("SELECT * FROM sale_items WHERE sale_id = ?", [$id])->fetchAll();
+        $items = [];
+        try {
+            $items = $this->query(
+                "SELECT si.*,
+                        COALESCE((
+                            SELECT SUM(ci.quantity)
+                            FROM sale_credit_note_items ci
+                            INNER JOIN sale_credit_notes cn ON cn.id = ci.credit_note_id
+                            WHERE ci.sale_item_id = si.id AND cn.status = 'posted'
+                        ), 0) AS credited_qty
+                 FROM sale_items si
+                 WHERE si.sale_id = ?
+                 ORDER BY si.id",
+                [$id]
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $items = $this->query("SELECT * FROM sale_items WHERE sale_id = ?", [$id])->fetchAll();
+        }
         $payments = $this->query(
             "SELECT * FROM sale_payments WHERE sale_id = ? ORDER BY payment_date DESC",
             [$id]
         )->fetchAll();
-        
-        $this->json(['sale' => $sale, 'items' => $items, 'payments' => $payments]);
+
+        $creditNotes = [];
+        try {
+            $creditNotes = (new \SoftNova\Services\SalesCreditNoteService($this->db))
+                ->getSaleForCredit($id)['credit_notes'] ?? [];
+        } catch (\Throwable $e) {
+            $creditNotes = [];
+        }
+
+        $this->json([
+            'sale' => $sale,
+            'items' => $items,
+            'payments' => $payments,
+            'credit_notes' => $creditNotes,
+        ]);
+    }
+
+    /** Emite NC de venta (devolución parcial o total de productos). */
+    private function creditNote(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/ventas')) {
+            return;
+        }
+
+        $saleId = (int)$this->request->post('id', 0);
+        $reason = trim((string)$this->request->post('reason', ''));
+        $reasonCode = trim((string)$this->request->post('reason_code', ''));
+        $creditDate = trim((string)$this->request->post('credit_date', date('Y-m-d')));
+        $affectsStock = $this->request->post('affects_stock') === '1';
+        $refundMethod = (string)$this->request->post('refund_method', 'auto');
+
+        $itemIds = (array)$this->request->post('item_id', []);
+        $quantities = (array)$this->request->post('quantity', []);
+        $lines = [];
+        $count = max(count($itemIds), count($quantities));
+        for ($i = 0; $i < $count; $i++) {
+            $itemId = (int)($itemIds[$i] ?? 0);
+            $qty = (int)($quantities[$i] ?? 0);
+            if ($itemId <= 0 || $qty <= 0) {
+                continue;
+            }
+            $lines[] = [
+                'sale_item_id' => $itemId,
+                'quantity' => $qty,
+            ];
+        }
+
+        try {
+            $svc = new \SoftNova\Services\SalesCreditNoteService($this->db);
+            $result = $svc->create(
+                $saleId,
+                $lines,
+                $reason,
+                $reasonCode,
+                $affectsStock,
+                $creditDate !== '' ? $creditDate : date('Y-m-d'),
+                $refundMethod
+            );
+
+            try {
+                (new \SoftNova\Services\AccountingService($this->db))
+                    ->postSaleCreditNote($result['credit_note_id']);
+                $accountingOk = true;
+            } catch (\Throwable $e) {
+                $accountingOk = false;
+                error_log('Contabilidad NC venta ' . $result['credit_note_id'] . ': ' . $e->getMessage());
+            }
+
+            $cashNote = $svc->syncCash((int)$result['credit_note_id']);
+
+            $message = 'Nota de crédito ' . $result['credit_number']
+                . ' por ' . $this->formatMoney($result['total']) . '.';
+            if ($affectsStock) {
+                $message .= ' Producto(s) reingresados al inventario.';
+            } else {
+                $message .= ' Sin reingreso de inventario (p. ej. vencido/roto).';
+            }
+            if ($cashNote !== '') {
+                $message .= ' ' . $cashNote;
+            }
+            if (!$accountingOk) {
+                $message .= ' Asiento contable pendiente: use «Sincronizar» en Contabilidad.';
+            }
+
+            $pdfUrl = base_url('/app/ventas?action=credit_note_pdf&id=' . (int)$result['credit_note_id']);
+            $this->respond(true, $message, '/app/ventas?action=notas_credito', [
+                'pdf_url' => $pdfUrl,
+                'credit_note_id' => (int)$result['credit_note_id'],
+                'credit_number' => $result['credit_number'],
+            ]);
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/ventas');
+        }
+    }
+
+    private function creditNotePdf(): void
+    {
+        $id = (int)$this->request->get('id', 0);
+        $svc = new \SoftNova\Services\SalesCreditNoteService($this->db);
+        $note = $svc->getCreditNote($id);
+        if (!$note) {
+            $this->respond(false, 'Nota de crédito no encontrada', '/app/ventas?action=notas_credito');
+            return;
+        }
+
+        $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
+        $content = $pdf->generateSaleCreditNote($note, $note['items'] ?? [], [
+            'name' => $note['customer_name'] ?? '',
+            'document_number' => $note['customer_document'] ?? '',
+        ]);
+        $filename = 'NC_venta_' . preg_replace('/[^A-Za-z0-9_\-]/', '_', (string)($note['credit_number'] ?? $note['id'])) . '.pdf';
+        $pdf->download($content, $filename);
+    }
+
+    private function creditNotesPanel(): void
+    {
+        $svc = new \SoftNova\Services\SalesCreditNoteService($this->db);
+        $q = trim((string)$this->request->get('q', ''));
+        $total = $svc->countCreditNotes($q);
+        $pagination = $this->paginate($total);
+        $notes = $svc->listCreditNotes($pagination['perPage'], $pagination['offset'], $q);
+
+        $this->view('tenant.ventas', $this->tenantViewData([
+            'creditNotesPanel' => true,
+            'creditNotes' => $notes,
+            'creditNotesQ' => $q,
+            'pagination' => $pagination,
+            'pageTitle' => 'Notas de crédito de venta',
+            'sales' => [],
+            'todayTotal' => 0,
+            'todayCount' => 0,
+            'products' => [],
+            'customers' => [],
+            'filters' => [
+                'q' => '', 'from' => '', 'to' => '', 'status' => '', 'customer_id' => '',
+                'payment_method' => '', 'record_status' => 'active', 'sort' => 'date', 'dir' => 'desc', 'query' => [],
+            ],
+            'cancelReasons' => [],
+            'paymentMethodOptionsHtml' => '',
+            'paymentMethodFilterHtml' => '',
+        ]));
     }
     
     /**
@@ -535,7 +721,7 @@ class TenantVentasController extends TenantController
         if ($receivedDate !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $receivedDate)) {
             $receivedDate = '';
         }
-        $initialPayment = (float)$this->request->post('initial_payment', 0);
+        $initialPayment = \SoftNova\Core\parse_money($this->request->post('initial_payment', 0));
         $items = $this->request->post('items', []);
         $notes = trim((string)$this->request->post('notes', ''));
         $discountPercent = (float)$this->request->post('discount_percent', 0);
@@ -545,15 +731,15 @@ class TenantVentasController extends TenantController
         if ($discountPercent > 100) {
             $discountPercent = 100;
         }
-        $deliveryFee = round((float)$this->request->post('delivery_fee', 0), 2);
+        $deliveryFee = round(\SoftNova\Core\parse_money($this->request->post('delivery_fee', 0)), 2);
         if ($deliveryFee < 0) {
             $deliveryFee = 0.0;
         }
-        $deliveryCompanyFee = round((float)$this->request->post('delivery_company_fee', 0), 2);
+        $deliveryCompanyFee = round(\SoftNova\Core\parse_money($this->request->post('delivery_company_fee', 0)), 2);
         if ($deliveryCompanyFee < 0) {
             $deliveryCompanyFee = 0.0;
         }
-        $deliveryTotalPosted = round((float)$this->request->post('delivery_total', 0), 2);
+        $deliveryTotalPosted = round(\SoftNova\Core\parse_money($this->request->post('delivery_total', 0)), 2);
         if ($deliveryTotalPosted < 0) {
             $deliveryTotalPosted = 0.0;
         }
@@ -587,6 +773,14 @@ class TenantVentasController extends TenantController
         if (!in_array($saleChannel, ['retail', 'wholesale'], true)) {
             $saleChannel = 'retail';
         }
+        $cashReceivedRaw = $this->request->post('cash_received', null);
+        $cashChangeRaw = $this->request->post('cash_change', null);
+        $cashReceived = ($cashReceivedRaw !== null && $cashReceivedRaw !== '')
+            ? max(0, round(\SoftNova\Core\parse_money($cashReceivedRaw), 2))
+            : null;
+        $cashChange = ($cashChangeRaw !== null && $cashChangeRaw !== '')
+            ? max(0, round(\SoftNova\Core\parse_money($cashChangeRaw), 2))
+            : null;
         
         if (empty($items) || !is_array($items)) {
             $this->respond(false, 'Debe agregar al menos un producto', '/app/ventas');
@@ -696,13 +890,11 @@ class TenantVentasController extends TenantController
         if ($paymentType === 'credit') {
             $termDays = \SoftNova\Services\SalesDocumentService::termDays($paymentTerms);
             try {
-                $commCfg = (new \SoftNova\Services\CommissionService($this->db))->config();
-                $threshold = (int)($commCfg['credit_over_60_days'] ?? 60);
-                $creditSurchargeRate = (float)($commCfg['credit_over_60_rate'] ?? 0);
-                if ($threshold < 1) {
-                    $threshold = 60;
-                }
-                if ($termDays > $threshold && $creditSurchargeRate > 0) {
+                $comm = new \SoftNova\Services\CommissionService($this->db);
+                $resolved = $comm->resolveCreditSurcharge($termDays);
+                if (!empty($resolved['matched'])) {
+                    $threshold = (int)$resolved['min_days'];
+                    $creditSurchargeRate = (float)$resolved['rate'];
                     $creditSurcharge = round($taxable * ($creditSurchargeRate / 100), 2);
                 }
             } catch (\Throwable $e) {
@@ -780,9 +972,10 @@ class TenantVentasController extends TenantController
                 $this->query(
                     "INSERT INTO sales
                         (invoice_number, document_type, customer_id, user_id, sale_date, due_date, received_date,
-                         subtotal, tax, discount, delivery_fee, delivery_company_fee, total, payment_method, payment_terms, payment_status, notes,
+                         subtotal, tax, discount, delivery_fee, delivery_company_fee, cash_received, cash_change,
+                         total, payment_method, payment_terms, payment_status, notes,
                          client_sale_uuid, status)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         $invoiceNumber,
                         $documentType,
@@ -796,6 +989,8 @@ class TenantVentasController extends TenantController
                         $discount,
                         $deliveryFee,
                         $deliveryCompanyFee,
+                        $cashReceived,
+                        $cashChange,
                         $total,
                         $paymentMethod,
                         $paymentTerms,
@@ -1037,7 +1232,7 @@ class TenantVentasController extends TenantController
         }
         
         $saleId = (int)$this->request->post('sale_id');
-        $amount = (float)$this->request->post('amount');
+        $amount = \SoftNova\Core\parse_money($this->request->post('amount'));
         $method = \SoftNova\Services\PaymentMethodCatalog::normalize($this->request->post('payment_method', 'cash'));
         $notes = $this->request->post('notes', 'Abono');
         

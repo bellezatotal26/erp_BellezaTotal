@@ -328,13 +328,19 @@
         return symbol + ' ' + (decimals > 0 ? parts.join(decimalSep) : parts[0]);
     }
 
+    function moneyPlain(n) {
+        if (window.SeriMoney && typeof SeriMoney.format === 'function') {
+            return SeriMoney.format(n, { decimals: decimals, thousands: thousands, decimal: decimalSep });
+        }
+        return String(Number(n) || 0);
+    }
+
     function parseMoneyInput(raw) {
         if (window.SeriMoney && typeof SeriMoney.parse === 'function') {
             return SeriMoney.parse(raw);
         }
         var s = String(raw == null ? '' : raw).trim().replace(/\s/g, '');
         if (!s) return 0;
-        // Acepta 20000, 20.000, 20,000.50, 20000.50
         if (s.indexOf(',') >= 0 && s.indexOf('.') >= 0) {
             if (s.lastIndexOf(',') > s.lastIndexOf('.')) {
                 s = s.replace(/\./g, '').replace(',', '.');
@@ -343,11 +349,10 @@
             }
         } else if (s.indexOf(',') >= 0) {
             var bits = s.split(',');
-            s = bits.length === 2 && bits[1].length <= 2
+            s = bits.length === 2
                 ? bits[0].replace(/\./g, '') + '.' + bits[1]
                 : s.replace(/,/g, '');
         } else {
-            // solo puntos: si hay más de uno, son miles
             var dots = s.split('.');
             if (dots.length > 2) s = s.replace(/\./g, '');
             else if (dots.length === 2 && dots[1].length === 3 && decimals !== 3) s = s.replace(/\./g, '');
@@ -492,19 +497,36 @@
         return 30;
     }
 
+    function creditSurchargeMatch(days) {
+        var tiers = Array.isArray(window.cajaCreditSurchargeTiers) ? window.cajaCreditSurchargeTiers.slice() : [];
+        if (!tiers.length) {
+            var legacyDays = Number(window.cajaCreditSurchargeDays || 60);
+            var legacyRate = Number(window.cajaCreditSurchargeRate || 0);
+            if (!isNaN(legacyDays) && legacyDays >= 1 && legacyRate > 0) {
+                tiers = [{ min_days: legacyDays, rate: legacyRate }];
+            }
+        }
+        var best = null;
+        tiers.forEach(function (t) {
+            var min = Number(t.min_days != null ? t.min_days : t.days);
+            var rate = Number(t.rate);
+            if (isNaN(min) || isNaN(rate) || min < 1 || rate <= 0) return;
+            if (days > min && (!best || min >= best.min_days)) {
+                best = { min_days: min, rate: rate };
+            }
+        });
+        return best;
+    }
+
     function creditSurchargeRate() {
-        var rate = Number(window.cajaCreditSurchargeRate || 0);
-        return isNaN(rate) || rate < 0 ? 0 : rate;
+        var match = creditSurchargeMatch(creditTermsDays());
+        return match ? match.rate : 0;
     }
 
     function creditSurchargeAmount(baseAfterDiscount) {
-        var days = creditTermsDays();
-        var threshold = Number(window.cajaCreditSurchargeDays || 60);
-        if (isNaN(threshold) || threshold < 1) threshold = 60;
-        if (days <= threshold) return 0;
-        var rate = creditSurchargeRate();
-        if (rate <= 0) return 0;
-        return roundMoney((Number(baseAfterDiscount) || 0) * (rate / 100));
+        var match = creditSurchargeMatch(creditTermsDays());
+        if (!match) return 0;
+        return roundMoney((Number(baseAfterDiscount) || 0) * (match.rate / 100));
     }
 
     function isWholesaleMode() {
@@ -610,8 +632,8 @@
             if (isNaN(val) || val < 0) val = 0;
             if (val > need) val = need;
             var rest = roundMoney(Math.max(0, need - val));
-            if (Math.abs(parseMoneyInput(edited.value) - val) > 0.001) edited.value = String(val);
-            other.value = String(rest);
+            if (Math.abs(parseMoneyInput(edited.value) - val) > 0.001) edited.value = moneyPlain(val);
+            other.value = moneyPlain(rest);
         } else {
             var last = inputs[inputs.length - 1];
             var sum = 0;
@@ -620,12 +642,12 @@
                 for (i = 0; i < inputs.length - 1; i++) {
                     sum += parseMoneyInput(inputs[i].value);
                 }
-                last.value = String(roundMoney(Math.max(0, need - sum)));
+                last.value = moneyPlain(roundMoney(Math.max(0, need - sum)));
             } else {
                 for (i = 1; i < inputs.length; i++) {
                     sum += parseMoneyInput(inputs[i].value);
                 }
-                inputs[0].value = String(roundMoney(Math.max(0, need - sum)));
+                inputs[0].value = moneyPlain(roundMoney(Math.max(0, need - sum)));
             }
         }
         mixedAmountSyncing = false;
@@ -645,10 +667,14 @@
             '</div>' +
             '<div class="form-group">' +
             '<label style="font-size:12px;">Monto</label>' +
-            '<input type="number" class="form-control pos-mixed-amount" min="0" step="0.01" value="' + (amount != null ? amount : '') + '" placeholder="0">' +
+            '<input type="text" inputmode="decimal" class="form-control pos-mixed-amount money-input" data-money="1" value="' + (amount != null && amount !== '' ? moneyPlain(amount) : '') + '" placeholder="0">' +
             '</div>' +
             '<button type="button" class="btn btn-sm btn-danger pos-mixed-remove" title="Quitar">&times;</button>';
         elMixedRows.appendChild(row);
+        var amtInput = row.querySelector('.pos-mixed-amount');
+        if (amtInput && window.SeriMoney && typeof SeriMoney.enhance === 'function') {
+            SeriMoney.enhance(amtInput);
+        }
         var sel = row.querySelector('.pos-mixed-method');
         if (sel) sel.value = method;
         updateMixedSummary();
@@ -1311,8 +1337,10 @@
         var elCreditAmt = document.getElementById('posCreditSurchargeAmt');
         if (elCreditLine && elCreditAmt) {
             if (creditSurcharge > 0.009) {
+                var match = creditSurchargeMatch(creditTermsDays());
                 elCreditLine.style.display = '';
-                elCreditAmt.textContent = '+' + money(creditSurcharge) + ' (' + creditSurchargeRate() + '%)';
+                elCreditAmt.textContent = '+' + money(creditSurcharge)
+                    + (match ? (' (>' + match.min_days + 'd · ' + match.rate + '%)') : '');
             } else {
                 elCreditLine.style.display = 'none';
             }
@@ -1606,7 +1634,7 @@
             : 'cash');
         fd.append('sale_date', new Date().toISOString().slice(0, 10));
         if (payType === 'credit' && elInitialPay) {
-            fd.append('initial_payment', elInitialPay.value || '0');
+            fd.append('initial_payment', String(parseMoneyInput(elInitialPay.value || '0')));
         }
         var notes = 'Venta rápida desde caja';
         if (!online) notes += ' | Offline';

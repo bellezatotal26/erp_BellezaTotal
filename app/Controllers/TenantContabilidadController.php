@@ -314,6 +314,8 @@ class TenantContabilidadController extends TenantController
                 'credit_card_rate' => $this->request->post('credit_card_rate', '2.8'),
                 'credit_over_60_rate' => $this->request->post('credit_over_60_rate', '0'),
                 'credit_over_60_days' => $this->request->post('credit_over_60_days', '60'),
+                'credit_tier_days' => $this->request->post('credit_tier_days', []),
+                'credit_tier_rates' => $this->request->post('credit_tier_rates', []),
             ]);
             $this->respond(true, 'Parámetros de comisiones guardados', '/app/contabilidad?tab=commissions');
         } catch (\Throwable $e) {

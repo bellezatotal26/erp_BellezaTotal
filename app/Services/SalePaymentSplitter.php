@@ -134,7 +134,7 @@ class SalePaymentSplitter
                 continue;
             }
             $method = PaymentMethodCatalog::normalize($method);
-            $amount = round((float)($row['amount'] ?? 0), 2);
+            $amount = round(\SoftNova\Core\parse_money($row['amount'] ?? 0), 2);
             if ($amount <= 0) {
                 continue;
             }

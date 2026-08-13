@@ -50,6 +50,12 @@ class SalesDocumentService
         if (!isset($cols['delivery_company_fee'])) {
             $alters[] = "ADD COLUMN delivery_company_fee DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER delivery_fee";
         }
+        if (!isset($cols['cash_received'])) {
+            $alters[] = "ADD COLUMN cash_received DECIMAL(12,2) NULL DEFAULT NULL AFTER delivery_company_fee";
+        }
+        if (!isset($cols['cash_change'])) {
+            $alters[] = "ADD COLUMN cash_change DECIMAL(12,2) NULL DEFAULT NULL AFTER cash_received";
+        }
         if ($alters) {
             try {
                 $this->db->exec('ALTER TABLE sales ' . implode(', ', $alters));

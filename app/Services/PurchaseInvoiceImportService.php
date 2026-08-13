@@ -202,12 +202,15 @@ class PurchaseInvoiceImportService
         $paymentMode = in_array($meta['payment_mode'] ?? '', ['payable', 'cash', 'transfer', 'card'], true)
             ? (string)$meta['payment_mode']
             : 'payable';
+        $earlyPct = isset($meta['early_payment_discount_pct']) && $meta['early_payment_discount_pct'] !== ''
+            ? max(0, min(100, round((float)$meta['early_payment_discount_pct'], 2)))
+            : 0.0;
 
         $this->query(
             "INSERT INTO purchase_invoice_imports
                 (supplier_id, invoice_number, invoice_date, due_date, source, file_path, file_mime,
-                 original_name, raw_text, parse_notes, payment_mode, created_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 original_name, raw_text, parse_notes, payment_mode, early_payment_discount_pct, created_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 !empty($meta['supplier_id']) ? (int)$meta['supplier_id'] : null,
                 $invoiceNumber !== '' ? substr($invoiceNumber, 0, 80) : null,
@@ -220,6 +223,7 @@ class PurchaseInvoiceImportService
                 $rawText !== '' ? mb_substr($rawText, 0, 60000) : null,
                 substr(implode('. ', $notas), 0, 255) ?: null,
                 $paymentMode,
+                $earlyPct,
                 $_SESSION['tenant_user_id'] ?? null,
             ]
         );
@@ -1651,7 +1655,9 @@ class PurchaseInvoiceImportService
                 $accion,
                 substr(trim((string)($row['lot_code'] ?? '')), 0, 60) ?: null,
                 $this->normalizeDate($row['expiry_date'] ?? null),
-                isset($row['sale_price']) && (float)$row['sale_price'] > 0 ? round((float)$row['sale_price'], 2) : null,
+                isset($row['sale_price']) && $this->toNumber((string)($row['sale_price'] ?? '')) > 0
+                    ? round($this->toNumber((string)$row['sale_price']), 2)
+                    : null,
                 substr(trim((string)($row['supplier_sku'] ?? '')), 0, 120) ?: null,
                 $this->normalizeBarcodeValue((string)($row['barcode'] ?? '')) ?: null,
                 $itemId,
@@ -1671,7 +1677,8 @@ class PurchaseInvoiceImportService
                 invoice_number = COALESCE(NULLIF(?, ''), invoice_number),
                 invoice_date = COALESCE(?, invoice_date),
                 due_date = COALESCE(?, due_date),
-                payment_mode = ?
+                payment_mode = ?,
+                early_payment_discount_pct = ?
              WHERE id = ? AND status = 'pending'",
             [
                 !empty($meta['supplier_id']) ? (int)$meta['supplier_id'] : null,
@@ -1681,6 +1688,9 @@ class PurchaseInvoiceImportService
                 in_array($meta['payment_mode'] ?? '', ['payable', 'cash', 'transfer', 'card'], true)
                     ? (string)$meta['payment_mode']
                     : 'payable',
+                isset($meta['early_payment_discount_pct']) && $meta['early_payment_discount_pct'] !== ''
+                    ? max(0, min(100, round((float)$meta['early_payment_discount_pct'], 2)))
+                    : 0.0,
                 $importId,
             ]
         );
@@ -1902,7 +1912,7 @@ class PurchaseInvoiceImportService
             'Factura importada #' . $importId,
             $lineas,
             'ordered',
-            0.0,
+            (float)($import['early_payment_discount_pct'] ?? 0),
             $import['due_date'] ?? null,
             $fechaFactura,
             $import['invoice_number'] ?? null,

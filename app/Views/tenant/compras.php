@@ -123,7 +123,7 @@ if ($creditNotesPanel) {
 </div>
 
 <div id="purchaseDetailModal" class="modal-overlay" style="display:none;">
-    <div class="modal-content" style="max-width:860px;">
+    <div class="modal-content neumorphic" style="max-width:720px;max-height:85vh;overflow-y:auto;">
         <div class="modal-header">
             <h3>Detalle de compra</h3>
             <button type="button" class="modal-close" onclick="document.getElementById('purchaseDetailModal').style.display='none'">&times;</button>
@@ -139,17 +139,34 @@ function esc(s) {
     });
 }
 function viewPurchase(id) {
-    var sym = document.querySelector('meta[name="currency-symbol"]')?.content || '$';
-    var dec = parseInt(document.querySelector('meta[name="currency-decimals"]')?.content || '0', 10);
     fetch(comprasBase + '?action=detail&id=' + id, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
         .then(function(r) { return r.json(); })
-        .then(function(data) {
-            if (!data.success || !data.order) return showAlert(data.message || 'No se pudo cargar', 'error');
-            var o = data.order;
-            var h = '<p><strong>OC:</strong> ' + esc(o.order_number) + ' · <strong>Proveedor:</strong> ' + esc(o.supplier_name || '—') + '</p>';
+        .then(function(d) {
+            if (!d.success || !d.order) return showAlert(d.message || 'No se pudo cargar', 'error');
+            var o = d.order, items = o.items || [];
+            var sym = document.querySelector('meta[name="currency-symbol"]')?.content || '$';
+            var dec = parseInt(document.querySelector('meta[name="currency-decimals"]')?.content || '0', 10);
+            var h = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">';
+            h += '<div><strong>OC:</strong> ' + esc(o.order_number) + '</div>';
+            h += '<div><strong>Estado:</strong> ' + esc(o.status) + '</div>';
+            h += '<div><strong>Proveedor:</strong> ' + esc(o.supplier_name || '—') + '</div>';
+            h += '<div><strong>Factura:</strong> ' + esc(o.invoice_number || '—') + '</div>';
+            h += '<div><strong>Total:</strong> ' + sym + parseFloat(o.total||0).toFixed(dec) + '</div>';
+            h += '<div><strong>Notas crédito:</strong> ' + sym + parseFloat(o.credit_total||0).toFixed(dec) + '</div>';
+            h += '<div><strong>Asiento:</strong> ' + esc(o.accounting_entry_number || (o.accounting_entry_id ? ('#'+o.accounting_entry_id) : 'pendiente')) + '</div>';
+            h += '</div>';
+            if (items.length) {
+                h += '<table><thead><tr><th>Producto</th><th>Cant</th><th>Costo</th><th>Total</th></tr></thead><tbody>';
+                items.forEach(function(it) {
+                    h += '<tr><td>' + esc(it.product_name) + '</td><td>' + it.quantity + '</td>';
+                    h += '<td>' + sym + parseFloat(it.unit_cost||0).toFixed(dec) + '</td>';
+                    h += '<td>' + sym + parseFloat(it.line_total||0).toFixed(dec) + '</td></tr>';
+                });
+                h += '</tbody></table>';
+            }
             var notes = o.credit_notes || [];
             if (notes.length) {
-                h += '<h4 style="margin-top:12px;">Notas de crédito</h4>';
+                h += '<h4 style="margin-top:16px;">Notas de crédito</h4>';
                 h += '<table><thead><tr><th>Número</th><th>Fecha</th><th>Motivo</th><th>Stock</th><th>Asiento</th><th>Total</th><th></th></tr></thead><tbody>';
                 notes.forEach(function(n) {
                     h += '<tr><td>' + esc(n.credit_number || '') + '</td>';
@@ -203,9 +220,10 @@ function viewPurchase(id) {
 </div>
 
 <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 14px;">
-    Flujo: <strong>OC → Recepción/Factura</strong> (ingresa a bodega) → asiento automático
-    <em>Inventarios + IVA descontable / Proveedores o Caja</em>.
-    El costo del producto se actualiza con <strong>promedio ponderado</strong>.
+    Flujo: <strong>OC</strong> (pedido al proveedor) →
+    <strong>Cargar factura / Recibir</strong> (bodega, vencimiento, dsto. pronto pago) →
+    asiento <em>Inventarios + IVA / Proveedores o Caja</em>.
+    El costo se actualiza con <strong>promedio ponderado</strong>.
 </p>
 
 <?php if (!empty($pendingInvoices)): ?>
@@ -362,19 +380,23 @@ function viewPurchase(id) {
     </div>
 </div>
 
-<!-- Modal Nueva OC -->
+<!-- Modal Nueva OC (solo documento de pedido) -->
 <div id="purchaseModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:820px;max-height:90vh;overflow-y:auto;">
         <div class="modal-header">
             <h3 id="purchaseModalTitle">Nueva orden de compra</h3>
             <button type="button" class="modal-close" onclick="document.getElementById('purchaseModal').style.display='none'">&times;</button>
         </div>
-        <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=create" data-ajax="true" id="purchaseForm" enctype="multipart/form-data">
+        <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=create" data-ajax="true" data-prepare="purchaseItems" id="purchaseForm">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="duplicated_from_id" id="poDuplicatedFromId" value="">
             <div class="modal-body">
                 <p id="purchaseModalHint" style="display:none;font-size:13px;color:var(--color-text-secondary);margin:0 0 12px;">
-                    Copia editable: ajuste fechas, factura e ítems. No se copia el adjunto ni pagos de la OC original.
+                    Copia editable: ajuste proveedor, fechas e ítems. La factura y recepción se hacen aparte.
+                </p>
+                <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 12px;">
+                    La OC es solo el pedido para enviar al proveedor.
+                    Foto, vencimiento, dsto. pronto pago y recepción van en <strong>Cargar factura</strong> o al <strong>Recibir</strong>.
                 </p>
                 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
                     <div class="form-group" style="margin:0;">
@@ -391,66 +413,29 @@ function viewPurchase(id) {
                         <input type="date" name="order_date" id="poOrderDate" class="form-control" required>
                     </div>
                     <div class="form-group" style="margin:0;">
-                        <label>Fecha bodega (si recibe ya)</label>
-                        <input type="date" name="warehouse_date" id="poWarehouseDate" class="form-control">
+                        <label>Entrega estimada</label>
+                        <input type="date" name="expected_date" id="poExpectedDate" class="form-control">
                     </div>
                 </div>
                 <div class="form-group">
                     <label>Notas</label>
-                    <input type="text" name="notes" id="poNotes" class="form-control" placeholder="Observaciones de la compra">
-                </div>
-                <div class="form-group">
-                    <label>Foto / PDF factura proveedor</label>
-                    <input type="file" name="invoice_file" class="form-control" accept="image/jpeg,image/png,image/webp,application/pdf">
-                    <small style="color:var(--color-text-secondary);">Opcional. También puedes adjuntarla al recibir.</small>
-                </div>
-                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
-                    <div class="form-group" style="margin:0;">
-                        <label>Fecha factura</label>
-                        <input type="date" name="invoice_date" id="poInvoiceDate" class="form-control">
-                    </div>
-                    <div class="form-group" style="margin:0;">
-                        <label>Fecha vencimiento</label>
-                        <input type="date" name="due_date" id="poDueDate" class="form-control">
-                    </div>
-                    <div class="form-group" style="margin:0;">
-                        <label>Desc. pronto pago %</label>
-                        <input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" id="poEarlyDiscount" class="form-control" value="" placeholder="Vacío = auto aliado">
-                        <small class="text-muted">Deje vacío para aplicar el descuento del aliado; 0 = sin descuento.</small>
-                    </div>
+                    <input type="text" name="notes" id="poNotes" class="form-control" placeholder="Observaciones del pedido">
                 </div>
 
                 <h4 style="margin:12px 0 8px;">Ítems</h4>
-                <div class="form-group" style="margin-bottom:8px;">
-                    <input type="text" id="poBarcodeScan" class="form-control" placeholder="Escanear…" autocomplete="off" data-barcode-input="true" title="Pistola de códigos de barras">
+                <div class="form-group" style="margin-bottom:8px;position:relative;">
+                    <label>Buscar / escanear producto</label>
+                    <input type="search" id="poProductSearch" class="form-control" placeholder="Nombre, SKU o EAN… Enter para agregar"
+                           autocomplete="off" data-barcode-input="true" title="Escriba para buscar o use la pistola de códigos">
+                    <ul class="combobox-list" id="poProductSuggest" hidden style="z-index:30;"></ul>
+                    <small style="color:var(--color-text-secondary);">Escriba el nombre o escanee el código. Enter agrega el producto a la orden.</small>
                 </div>
                 <div id="poItems"></div>
-                <button type="button" class="btn btn-secondary" onclick="addPoItem()" style="margin-top:8px;">+ Agregar producto</button>
-
-                <div style="margin-top:16px;padding:12px;border:1px solid var(--color-border);border-radius:8px;background:var(--bg-input);">
-                    <label style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
-                        <input type="checkbox" name="receive_now" value="1" id="poReceiveNow" onchange="toggleReceiveNow()">
-                        Recibir y contabilizar ahora (factura proveedor)
-                    </label>
-                    <div id="poReceiveNowFields" style="display:none;grid-template-columns:1fr 1fr;gap:12px;">
-                        <div class="form-group" style="margin:0;">
-                            <label>N° factura proveedor</label>
-                            <input type="text" name="invoice_number" class="form-control" placeholder="FV-001">
-                        </div>
-                        <div class="form-group" style="margin:0;">
-                            <label>Pago / contrapartida</label>
-                            <select name="payment_mode" class="form-control">
-                                <option value="payable">Por pagar (Proveedores + IVA descontable)</option>
-                                <option value="cash">Efectivo (sale del cajón)</option>
-                                <option value="transfer">Transferencia/tarjeta</option>
-                            </select>
-                        </div>
-                    </div>
-                </div>
+                <button type="button" class="btn btn-secondary" onclick="addPoItem()" style="margin-top:8px;">+ Agregar línea vacía</button>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('purchaseModal').style.display='none'">Cancelar</button>
-                <button type="submit" class="btn btn-primary">Guardar OC</button>
+                <button type="submit" class="btn btn-primary">Guardar y generar OC</button>
             </div>
         </form>
     </div>
@@ -458,40 +443,55 @@ function viewPurchase(id) {
 
 <!-- Modal Recibir -->
 <div id="receiveModal" class="modal-overlay" style="display:none;">
-    <div class="modal-content neumorphic" style="max-width:480px;">
+    <div class="modal-content neumorphic" style="max-width:520px;max-height:90vh;overflow-y:auto;">
         <div class="modal-header">
-            <h3>Recibir mercancía</h3>
+            <h3>Recibir mercancía / factura</h3>
             <button type="button" class="modal-close" onclick="document.getElementById('receiveModal').style.display='none'">&times;</button>
         </div>
         <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=receive" data-ajax="true" enctype="multipart/form-data">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="id" id="receiveOrderId">
             <p id="receiveOrderLabel" style="font-weight:600;margin-bottom:10px;"></p>
-            <div class="form-group">
-                <label>Fecha ingreso a bodega *</label>
-                <input type="date" name="warehouse_date" id="receiveWarehouseDate" class="form-control" required>
-            </div>
-            <div class="form-group">
-                <label>N° factura proveedor</label>
-                <input type="text" name="invoice_number" class="form-control" placeholder="FV-001">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                <div class="form-group" style="margin:0;">
+                    <label>Fecha ingreso a bodega *</label>
+                    <input type="date" name="warehouse_date" id="receiveWarehouseDate" class="form-control" required>
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>Fecha factura</label>
+                    <input type="date" name="invoice_date" id="receiveInvoiceDate" class="form-control">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>N° factura proveedor</label>
+                    <input type="text" name="invoice_number" class="form-control" placeholder="FV-001">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>Vencimiento de pago</label>
+                    <input type="date" name="due_date" id="receiveDueDate" class="form-control">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>Desc. pronto pago %</label>
+                    <input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" id="receiveEarlyDiscount" class="form-control" value="" placeholder="0">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>Pago / contrapartida *</label>
+                    <select name="payment_mode" class="form-control" required>
+                        <option value="payable">Por pagar (220505) + IVA descontable</option>
+                        <option value="cash">Efectivo (sale del cajón)</option>
+                        <option value="transfer">Transferencia</option>
+                        <option value="card">Tarjeta</option>
+                    </select>
+                </div>
             </div>
             <div class="form-group">
                 <label>Foto / PDF factura</label>
                 <input type="file" name="invoice_file" class="form-control" accept="image/jpeg,image/png,image/webp,application/pdf">
             </div>
             <div class="form-group">
-                <label>Pago / contrapartida *</label>
-                <select name="payment_mode" class="form-control" required>
-                    <option value="payable">Por pagar (220505) + IVA descontable (240802)</option>
-                    <option value="cash">Efectivo (110505) · sale del cajón de caja</option>
-                    <option value="transfer">Transferencia (111005)</option>
-                </select>
-                <p style="font-size:12px;color:var(--color-text-secondary);margin:6px 0 0;">Si elige <strong>Efectivo</strong>, debe haber una caja abierta: el total se registra como egreso en Caja.</p>
-            </div>
-            <div class="form-group">
                 <label>Notas</label>
                 <input type="text" name="notes" class="form-control">
             </div>
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 8px;">Si elige <strong>Efectivo</strong>, debe haber una caja abierta: el total se registra como egreso en Caja.</p>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('receiveModal').style.display='none'">Cancelar</button>
                 <button type="submit" class="btn btn-success">Recibir y contabilizar</button>
@@ -514,7 +514,7 @@ function viewPurchase(id) {
             <p id="payBalanceLabel" style="font-size:13px;color:var(--color-text-secondary);margin-bottom:12px;"></p>
             <div class="form-group">
                 <label>Valor del abono *</label>
-                <input type="number" step="0.01" min="0.01" name="amount" id="payAmount" class="form-control" required>
+                <input type="text" inputmode="decimal" name="amount" id="payAmount" class="form-control money-input" data-money="1" required placeholder="0">
             </div>
             <div class="form-group">
                 <label>Fecha del pago *</label>
@@ -653,6 +653,11 @@ function viewPurchase(id) {
                             <option value="transfer">Transferencia</option>
                             <option value="card">Tarjeta</option>
                         </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Desc. pronto pago %</label>
+                        <input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" class="form-control" value="" placeholder="0">
+                        <small style="color:var(--color-text-secondary);">Opcional. Se confirmará al revisar la factura.</small>
                     </div>
                 </div>
                 <div class="form-group">
@@ -1103,8 +1108,12 @@ function renderInvoiceReview(imp, items) {
          '<input type="date" name="invoice_date" class="form-control" value="' + (imp.invoice_date || '') + '"></div>';
     h += '<div class="form-group" style="margin:0;"><label>Vencimiento pago</label>' +
          '<input type="date" name="due_date" class="form-control" value="' + (imp.due_date || '') + '"></div>';
-    h += '<div class="form-group" style="margin:0;"><label>Fecha a bodega</label>' +
-         '<input type="date" name="warehouse_date" class="form-control" value="' + (imp.invoice_date || poToday()) + '"></div>';
+    h += '<div class="form-group" style="margin:0;"><label>Fecha a bodega *</label>' +
+         '<input type="date" name="warehouse_date" class="form-control" value="' + (imp.invoice_date || poToday()) + '" required></div>';
+    h += '<div class="form-group" style="margin:0;"><label>Desc. pronto pago %</label>' +
+         '<input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" class="form-control" value="' +
+         (imp.early_payment_discount_pct != null && imp.early_payment_discount_pct !== '' ? esc(imp.early_payment_discount_pct) : '0') +
+         '" placeholder="0"></div>';
     h += '<div class="form-group" style="margin:0;"><label>Forma de pago</label><select name="payment_mode" class="form-control">';
     [['payable','Crédito (CxP)'],['cash','Efectivo (sale del cajón)'],['transfer','Transferencia'],['card','Tarjeta']].forEach(function(o) {
         h += '<option value="' + o[0] + '"' + (imp.payment_mode === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
@@ -1156,12 +1165,12 @@ function renderInvoiceReview(imp, items) {
                 : '<div style="font-size:11px;color:var(--color-text-secondary);">Sin EAN coincidente: elija producto o cree uno nuevo</div>') +
              '</td>';
         h += '<td><input type="number" step="0.001" min="0" name="' + base + '[quantity]" class="form-control" style="min-width:80px;" value="' + qty + '"' + (bad && qty <= 0 ? ' required' : '') + '></td>';
-        h += '<td><input type="number" step="0.01" min="0" name="' + base + '[unit_cost]" class="form-control" style="min-width:95px;" value="' + cost + '"' + (bad && cost <= 0 && total <= 0 ? ' required' : '') + '></td>';
+        h += '<td><input type="text" inputmode="decimal" name="' + base + '[unit_cost]" class="form-control money-input" data-money="1" style="min-width:95px;" value="' + (window.SeriMoney ? SeriMoney.format(cost) : cost) + '"' + (bad && cost <= 0 && total <= 0 ? ' required' : '') + '></td>';
         h += '<td><input type="number" step="0.01" min="0" name="' + base + '[tax_rate]" class="form-control" style="min-width:70px;" value="' + (parseFloat(it.tax_rate) || 0) + '"></td>';
         h += '<td><input type="number" step="0.01" min="0" name="' + base + '[discount_pct]" class="form-control" style="min-width:70px;" value="' + (parseFloat(it.discount_pct) || 0) + '"></td>';
         h += '<td><input type="text" maxlength="60" name="' + base + '[lot_code]" class="form-control" style="min-width:90px;" value="' + esc(it.lot_code || '') + '"></td>';
         h += '<td><input type="date" name="' + base + '[expiry_date]" class="form-control" style="min-width:130px;" value="' + (it.expiry_date || '') + '"></td>';
-        h += '<td><input type="number" step="0.01" min="0" name="' + base + '[sale_price]" class="form-control" style="min-width:95px;" value="' + (it.sale_price != null ? parseFloat(it.sale_price) : '') + '"></td>';
+        h += '<td><input type="text" inputmode="decimal" name="' + base + '[sale_price]" class="form-control money-input" data-money="1" style="min-width:95px;" value="' + (it.sale_price != null && it.sale_price !== '' ? (window.SeriMoney ? SeriMoney.format(it.sale_price) : parseFloat(it.sale_price)) : '') + '"></td>';
         h += '<td style="white-space:nowrap;">' + poMoney(total) + '</td>';
         h += '</tr>';
     });
@@ -1208,22 +1217,156 @@ function productOptionsHtml(selected) {
     return h;
 }
 
+function poProductSearchText(p) {
+    return [p.code, p.barcode, p.name].filter(Boolean).join(' ').toLowerCase();
+}
+
+function poFindExactProduct(code) {
+    var codeLc = String(code || '').trim().toLowerCase();
+    if (!codeLc) return null;
+    var found = null;
+    (window.poProducts || []).some(function(p) {
+        if (String(p.code || '').toLowerCase() === codeLc || String(p.barcode || '').toLowerCase() === codeLc) {
+            found = p;
+            return true;
+        }
+        return false;
+    });
+    return found;
+}
+
+function poFilterProducts(q) {
+    q = String(q || '').trim().toLowerCase();
+    if (!q) return [];
+    var out = [];
+    (window.poProducts || []).forEach(function(p) {
+        if (poProductSearchText(p).indexOf(q) !== -1) out.push(p);
+    });
+    return out.slice(0, 40);
+}
+
+function preparePurchaseItems() {
+    var rows = document.querySelectorAll('#poItems .po-item-row');
+    if (!rows.length) {
+        if (typeof showAlert === 'function') showAlert('Agregue al menos un producto a la orden', 'error');
+        return false;
+    }
+    var ok = false;
+    rows.forEach(function(row) {
+        var pid = row.querySelector('input[name="product_id[]"], select[name="product_id[]"]');
+        var qty = row.querySelector('input[name="quantity[]"]');
+        var val = pid ? (pid.value || '') : '';
+        if (parseInt(val, 10) > 0 && qty && parseFloat(qty.value) > 0) ok = true;
+    });
+    if (!ok) {
+        if (typeof showAlert === 'function') showAlert('Seleccione producto y cantidad válidos', 'error');
+        return false;
+    }
+    return true;
+}
+
 function addPoItem(prefill) {
     prefill = prefill || {};
     var wrap = document.createElement('div');
     wrap.className = 'po-item-row';
-    wrap.style.cssText = 'display:grid;grid-template-columns:2fr 0.7fr 0.9fr 0.7fr auto;gap:8px;margin-bottom:8px;align-items:end;';
+    wrap.style.cssText = 'display:grid;grid-template-columns:2.2fr 0.7fr 0.9fr 0.7fr auto;gap:8px;margin-bottom:8px;align-items:end;';
+    var selectedId = prefill.product_id || '';
+    var selectedLabel = '';
+    if (selectedId) {
+        var found = (window.poProducts || []).find(function(p) { return String(p.id) === String(selectedId); });
+        if (found) {
+            selectedLabel = (found.code ? found.code + ' — ' : '') + found.name;
+        }
+    }
     wrap.innerHTML =
-        '<div class="form-group" style="margin:0;"><label>Producto</label>' +
-        '<select name="product_id[]" class="form-control" onchange="onPoProductChange(this)" required>' + productOptionsHtml(prefill.product_id || '') + '</select></div>' +
+        '<div class="form-group" style="margin:0;position:relative;"><label>Producto</label>' +
+        '<input type="hidden" name="product_id[]" class="po-product-id" value="' + esc(selectedId) + '" required>' +
+        '<input type="search" class="form-control po-product-search" autocomplete="off" placeholder="Buscar producto…" value="' + esc(selectedLabel) + '">' +
+        '<ul class="combobox-list po-row-suggest" hidden></ul></div>' +
         '<div class="form-group" style="margin:0;"><label>Cant.</label>' +
         '<input type="number" name="quantity[]" class="form-control" min="1" value="' + (prefill.quantity || 1) + '" required></div>' +
         '<div class="form-group" style="margin:0;"><label>Costo u.</label>' +
-        '<input type="number" step="0.01" name="unit_cost[]" class="form-control" min="0" value="' + (prefill.unit_cost || 0) + '" required></div>' +
+        '<input type="text" inputmode="decimal" name="unit_cost[]" class="form-control money-input" data-money="1" value="' + (prefill.unit_cost != null ? (window.SeriMoney ? SeriMoney.format(prefill.unit_cost) : prefill.unit_cost) : '0') + '" required></div>' +
         '<div class="form-group" style="margin:0;"><label>IVA %</label>' +
         '<input type="number" step="0.01" name="tax_rate[]" class="form-control" min="0" value="' + (prefill.tax_rate != null ? prefill.tax_rate : 19) + '"></div>' +
         '<button type="button" class="btn btn-sm btn-danger" onclick="this.parentElement.remove()">✕</button>';
     document.getElementById('poItems').appendChild(wrap);
+    bindPoRowSearch(wrap);
+    if (window.SeriMoney && typeof SeriMoney.enhanceAll === 'function') {
+        SeriMoney.enhanceAll(wrap);
+    } else if (window.SeriMoney && typeof SeriMoney.enhance === 'function') {
+        var costEl = wrap.querySelector('input[name="unit_cost[]"]');
+        if (costEl) SeriMoney.enhance(costEl);
+    }
+}
+
+function bindPoRowSearch(wrap) {
+    var hidden = wrap.querySelector('.po-product-id');
+    var input = wrap.querySelector('.po-product-search');
+    var list = wrap.querySelector('.po-row-suggest');
+    if (!hidden || !input || !list || input.dataset.bound === '1') return;
+    input.dataset.bound = '1';
+
+    function closeList() { list.hidden = true; }
+    function openList() { list.hidden = false; }
+    function render(q) {
+        var matches = poFilterProducts(q);
+        if (!matches.length) {
+            list.innerHTML = '<li class="combobox-option" style="opacity:.7;cursor:default;">Sin coincidencias</li>';
+            openList();
+            return;
+        }
+        list.innerHTML = matches.map(function(p) {
+            var label = (p.code ? p.code + ' — ' : '') + p.name + (p.barcode ? ' · ' + p.barcode : '');
+            return '<li class="combobox-option" data-id="' + p.id + '" data-cost="' + p.purchase_price + '" data-label="' + esc(label) + '">' +
+                esc(p.name) +
+                '<small>' + esc((p.code || '') + (p.barcode ? ' · EAN ' + p.barcode : '')) + '</small></li>';
+        }).join('');
+        openList();
+    }
+    function pick(li) {
+        if (!li || !li.getAttribute('data-id')) return;
+        hidden.value = li.getAttribute('data-id') || '';
+        input.value = li.getAttribute('data-label') || '';
+        var cost = li.getAttribute('data-cost') || '0';
+        var costInput = wrap.querySelector('input[name="unit_cost[]"]');
+        if (costInput) {
+            costInput.value = window.SeriMoney ? SeriMoney.format(cost) : cost;
+        }
+        closeList();
+    }
+
+    input.addEventListener('focus', function() { render(input.value); });
+    input.addEventListener('input', function() {
+        hidden.value = '';
+        render(input.value);
+    });
+    list.addEventListener('mousedown', function(e) {
+        var li = e.target.closest('.combobox-option');
+        if (!li || !li.getAttribute('data-id')) return;
+        e.preventDefault();
+        pick(li);
+    });
+    input.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') { closeList(); return; }
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            var exact = poFindExactProduct(input.value);
+            if (exact) {
+                hidden.value = String(exact.id);
+                input.value = (exact.code ? exact.code + ' — ' : '') + exact.name;
+                var costInput = wrap.querySelector('input[name="unit_cost[]"]');
+                if (costInput) costInput.value = window.SeriMoney ? SeriMoney.format(exact.purchase_price || 0) : (exact.purchase_price || 0);
+                closeList();
+                return;
+            }
+            var first = list.querySelector('.combobox-option[data-id]');
+            if (first && !list.hidden) pick(first);
+        }
+    });
+    document.addEventListener('click', function(e) {
+        if (!wrap.contains(e.target)) closeList();
+    });
 }
 
 function onPoProductChange(sel) {
@@ -1232,13 +1375,11 @@ function onPoProductChange(sel) {
     var row = sel.closest('.po-item-row');
     if (row) {
         var costInput = row.querySelector('input[name="unit_cost[]"]');
-        if (costInput) costInput.value = cost || 0;
+        if (costInput) {
+            var c = cost || 0;
+            costInput.value = window.SeriMoney ? SeriMoney.format(c) : c;
+        }
     }
-}
-
-function toggleReceiveNow() {
-    var on = document.getElementById('poReceiveNow').checked;
-    document.getElementById('poReceiveNowFields').style.display = on ? 'grid' : 'none';
 }
 
 function resetPurchaseModal() {
@@ -1252,17 +1393,21 @@ function resetPurchaseModal() {
     var hint = document.getElementById('purchaseModalHint');
     if (hint) hint.style.display = 'none';
     document.getElementById('poOrderDate').value = poToday();
-    var wh = document.getElementById('poWarehouseDate');
-    wh.value = poRememberedDate();
-    wh.onchange = function() { poRemember(wh.value); };
-    document.getElementById('poReceiveNow').checked = false;
-    toggleReceiveNow();
+    var exp = document.getElementById('poExpectedDate');
+    if (exp) exp.value = '';
+    var search = document.getElementById('poProductSearch');
+    if (search) search.value = '';
+    var suggest = document.getElementById('poProductSuggest');
+    if (suggest) { suggest.hidden = true; suggest.innerHTML = ''; }
 }
 
 function openPurchaseModal() {
     resetPurchaseModal();
-    addPoItem();
     document.getElementById('purchaseModal').style.display = 'flex';
+    setTimeout(function() {
+        var search = document.getElementById('poProductSearch');
+        if (search) search.focus();
+    }, 80);
 }
 
 function duplicatePurchase(id) {
@@ -1282,15 +1427,8 @@ function duplicatePurchase(id) {
             var supplier = document.getElementById('poSupplierId');
             if (supplier && o.supplier_id) supplier.value = String(o.supplier_id);
             document.getElementById('poOrderDate').value = poToday();
-            var invDate = document.getElementById('poInvoiceDate');
-            if (invDate) invDate.value = '';
-            var due = document.getElementById('poDueDate');
-            if (due) due.value = '';
-            var disc = document.getElementById('poEarlyDiscount');
-            if (disc) {
-                var pct = parseFloat(o.early_payment_discount_pct);
-                disc.value = (!isNaN(pct) && pct > 0) ? String(pct) : '';
-            }
+            var exp = document.getElementById('poExpectedDate');
+            if (exp) exp.value = (o.expected_date || '').toString().substr(0, 10);
             var notes = document.getElementById('poNotes');
             if (notes) {
                 var base = (o.notes || '').trim();
@@ -1320,6 +1458,12 @@ function openReceiveModal(id, number) {
     var wh = document.getElementById('receiveWarehouseDate');
     wh.value = poRememberedDate();
     wh.onchange = function() { poRemember(wh.value); };
+    var invDate = document.getElementById('receiveInvoiceDate');
+    if (invDate) invDate.value = poToday();
+    var due = document.getElementById('receiveDueDate');
+    if (due) due.value = '';
+    var disc = document.getElementById('receiveEarlyDiscount');
+    if (disc) disc.value = '';
     document.getElementById('receiveModal').style.display = 'flex';
 }
 
@@ -1331,9 +1475,10 @@ function openPayModal(id, number, balance, supplier) {
     document.getElementById('payBalanceLabel').textContent =
         'Saldo pendiente: ' + sym + ' ' + parseFloat(balance || 0).toFixed(dec);
     var amount = document.getElementById('payAmount');
-    amount.value = parseFloat(balance || 0).toFixed(2);
-    amount.max = parseFloat(balance || 0).toFixed(2);
+    amount.value = window.SeriMoney ? SeriMoney.format(balance || 0) : parseFloat(balance || 0).toFixed(2);
+    amount.removeAttribute('max');
     document.getElementById('payDate').value = poToday();
+    if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(amount);
     document.getElementById('payModal').style.display = 'flex';
 }
 
@@ -1464,45 +1609,112 @@ document.addEventListener('DOMContentLoaded', function() {
         openInvoiceReview(importId);
     }
 
-    var scan = document.getElementById('poBarcodeScan');
-    if (!scan) return;
-    scan.addEventListener('keydown', function(e) {
-        if (e.key !== 'Enter') return;
-        e.preventDefault();
-        var code = (scan.value || '').trim();
-        if (!code) return;
-        var product = null;
-        (window.poProducts || []).some(function(p) {
-            var codeLc = code.toLowerCase();
-            if (String(p.code || '').toLowerCase() === codeLc || String(p.barcode || '').toLowerCase() === codeLc) {
-                product = p;
-                return true;
-            }
-            return false;
-        });
-        scan.value = '';
-        if (!product) {
-            if (window.SoftNovaBarcode) {
-                SoftNovaBarcode.lookup(code).then(function(d) {
-                    if (!d || !d.success || !d.product) {
-                        return showAlert('Producto no encontrado: ' + code, 'warning');
-                    }
-                    addOrBumpPoProduct(d.product);
-                });
-            } else {
-                showAlert('Producto no encontrado: ' + code, 'warning');
-            }
-            return;
-        }
-        addOrBumpPoProduct(product);
-    });
+    bindPoTopSearch();
 });
 
+function bindPoTopSearch() {
+    var search = document.getElementById('poProductSearch');
+    var suggest = document.getElementById('poProductSuggest');
+    if (!search || !suggest || search.dataset.bound === '1') return;
+    search.dataset.bound = '1';
+
+    function closeSuggest() { suggest.hidden = true; }
+    function renderSuggest(q) {
+        var matches = poFilterProducts(q);
+        if (!String(q || '').trim()) {
+            closeSuggest();
+            return;
+        }
+        if (!matches.length) {
+            suggest.innerHTML = '<li class="combobox-option" style="opacity:.7;cursor:default;">Sin coincidencias — pruebe SKU/EAN exacto</li>';
+            suggest.hidden = false;
+            return;
+        }
+        suggest.innerHTML = matches.map(function(p) {
+            var label = (p.code ? p.code + ' — ' : '') + p.name;
+            return '<li class="combobox-option" data-id="' + p.id + '">' +
+                esc(p.name) +
+                '<small>' + esc((p.code || '') + (p.barcode ? ' · EAN ' + p.barcode : '') + ' · costo ' + (p.purchase_price || 0)) + '</small></li>';
+        }).join('');
+        suggest.hidden = false;
+    }
+
+    function commitQuery(raw) {
+        var code = String(raw || '').trim();
+        if (!code) return;
+        var product = poFindExactProduct(code);
+        if (!product) {
+            var matches = poFilterProducts(code);
+            if (matches.length === 1) product = matches[0];
+        }
+        search.value = '';
+        closeSuggest();
+        if (product) {
+            addOrBumpPoProduct(product);
+            return;
+        }
+        if (window.SoftNovaBarcode) {
+            SoftNovaBarcode.lookup(code).then(function(d) {
+                if (!d || !d.success || !d.product) {
+                    return showAlert('Producto no encontrado: ' + code, 'warning');
+                }
+                addOrBumpPoProduct(d.product);
+            });
+        } else {
+            showAlert('Producto no encontrado: ' + code, 'warning');
+        }
+    }
+
+    search.addEventListener('input', function() { renderSuggest(search.value); });
+    search.addEventListener('focus', function() { if (search.value.trim()) renderSuggest(search.value); });
+    suggest.addEventListener('mousedown', function(e) {
+        var li = e.target.closest('.combobox-option[data-id]');
+        if (!li) return;
+        e.preventDefault();
+        var id = li.getAttribute('data-id');
+        var product = (window.poProducts || []).find(function(p) { return String(p.id) === String(id); });
+        search.value = '';
+        closeSuggest();
+        if (product) addOrBumpPoProduct(product);
+    });
+    search.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') { closeSuggest(); return; }
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        var first = suggest.querySelector('.combobox-option[data-id]');
+        if (first && !suggest.hidden && !poFindExactProduct(search.value)) {
+            var id = first.getAttribute('data-id');
+            var product = (window.poProducts || []).find(function(p) { return String(p.id) === String(id); });
+            search.value = '';
+            closeSuggest();
+            if (product) addOrBumpPoProduct(product);
+            return;
+        }
+        commitQuery(search.value);
+    });
+    document.addEventListener('click', function(e) {
+        if (!search.contains(e.target) && !suggest.contains(e.target)) closeSuggest();
+    });
+}
+
 function addOrBumpPoProduct(product) {
+    if (!product || !product.id) return;
+    // Asegurar que esté en el catálogo local (lookup remoto).
+    var exists = (window.poProducts || []).some(function(p) { return String(p.id) === String(product.id); });
+    if (!exists) {
+        window.poProducts = window.poProducts || [];
+        window.poProducts.push({
+            id: product.id,
+            code: product.code || '',
+            barcode: product.barcode || '',
+            name: product.name || ('#' + product.id),
+            purchase_price: parseFloat(product.purchase_price) || 0
+        });
+    }
     var rows = document.querySelectorAll('#poItems .po-item-row');
     var found = null;
     Array.prototype.some.call(rows, function(row) {
-        var sel = row.querySelector('select[name="product_id[]"]');
+        var sel = row.querySelector('input[name="product_id[]"], select[name="product_id[]"]');
         if (sel && String(sel.value) === String(product.id)) {
             found = row;
             return true;

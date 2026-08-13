@@ -604,7 +604,7 @@ class TenantInventarioController extends TenantController
             (new ProductSupplierService($this->db))->link($productId, $supplierId, [
                 'supplier_sku' => (string)$this->request->post('supplier_sku', ''),
                 'supplier_product_name' => (string)$this->request->post('supplier_product_name', ''),
-                'last_cost' => (float)$this->request->post('last_cost', 0),
+                'last_cost' => \SoftNova\Core\parse_money($this->request->post('last_cost', 0)),
                 'lead_time_days' => (int)$this->request->post('lead_time_days', 0),
                 'min_order_qty' => (int)$this->request->post('min_order_qty', 1),
                 'is_primary' => (string)$this->request->post('is_primary', '') !== '',
@@ -1565,7 +1565,8 @@ class TenantInventarioController extends TenantController
 
         $rows = $this->query(
             "SELECT p.id, p.code, p.barcode, p.name, p.product_type, c.name as category_name, p.purchase_price,
-                    p.sale_price, p.stock, p.min_stock, p.unit, p.status, p.location
+                    p.sale_price, COALESCE(p.wholesale_price, 0) AS wholesale_price,
+                    p.stock, p.min_stock, p.unit, p.status, p.location
              FROM products p
              LEFT JOIN categories c ON p.category_id = c.id
              {$whereSql}
@@ -1593,6 +1594,7 @@ class TenantInventarioController extends TenantController
                 $r['category_name'],
                 $r['purchase_price'],
                 $r['sale_price'],
+                $r['wholesale_price'] ?? 0,
                 $r['stock'],
                 $r['min_stock'],
                 $r['unit'],
@@ -1622,7 +1624,7 @@ class TenantInventarioController extends TenantController
         
         $this->exportCsv(
             'inventario_' . date('Ymd_His') . '.csv',
-            ['SKU', 'EAN', 'Nombre', 'Tipo', 'Categoria', 'Costo', 'Precio', 'Stock', 'Min', 'Unidad', 'Estado', 'Ubicacion'],
+            ['SKU', 'EAN', 'Nombre', 'Tipo', 'Categoria', 'Costo', 'Precio', 'Precio_mayor', 'Stock', 'Min', 'Unidad', 'Estado', 'Ubicacion'],
             $csvRows
         );
     }
@@ -1970,7 +1972,7 @@ class TenantInventarioController extends TenantController
     private function downloadImportTemplate(): void
     {
         $headers = [
-            'SKU', 'EAN', 'Nombre', 'Tipo', 'Categoria', 'Costo', 'Precio',
+            'SKU', 'EAN', 'Nombre', 'Tipo', 'Categoria', 'Costo', 'Precio', 'Precio_mayor',
             'Stock', 'Min', 'Unidad', 'Estado', 'Ubicacion', 'Lote', 'Vence', 'Modo_stock',
         ];
         // Ejemplos: borre o reemplace. Con Lote/Vence, Stock = cantidad de esa remesa (suma).
@@ -1983,6 +1985,7 @@ class TenantInventarioController extends TenantController
                 'Cuidado personal',
                 '1500',
                 '2500',
+                '2000',
                 '50',
                 '5',
                 'UNIDAD',
@@ -2000,6 +2003,7 @@ class TenantInventarioController extends TenantController
                 'Perfumería',
                 '18000',
                 '32000',
+                '28000',
                 '12',
                 '3',
                 'UNIDAD',
@@ -2017,6 +2021,7 @@ class TenantInventarioController extends TenantController
                 'Perfumería',
                 '18000',
                 '32000',
+                '28000',
                 '8',
                 '3',
                 'UNIDAD',
@@ -2034,6 +2039,7 @@ class TenantInventarioController extends TenantController
                 'Servicios',
                 '0',
                 '5000',
+                '0',
                 '0',
                 '0',
                 'UNIDAD',
