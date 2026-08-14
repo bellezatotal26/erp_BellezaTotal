@@ -175,6 +175,13 @@ class PurchaseInvoiceImportService
         // Enriquecer ID/EAN si quedaron dentro de la descripción.
         $items = array_map(fn(array $it) => $this->enrichLineIds($it), $items);
 
+        if ($items === [] && !$stored && $rawText === '') {
+            $notas[] = 'Borrador manual sin archivo: agregue productos en la revisión (buscar / escanear)';
+            $source = 'manual';
+        } elseif ($items === [] && empty($notas)) {
+            $notas[] = 'Sin líneas detectadas: puede agregar productos manualmente en la revisión';
+        }
+
         $importId = $this->createImport($meta, $header, $source, $stored, $rawText, $notas);
         $this->saveItems($importId, $items, $meta['supplier_id'] ?? null);
         $this->refreshTotals($importId);
@@ -1668,9 +1675,310 @@ class PurchaseInvoiceImportService
         $this->refreshTotals($importId);
     }
 
+    /**
+     * Agrega una línea manual (producto del catálogo) al borrador de factura.
+     * Permite escanear o buscar por nombre además de lo leído del archivo.
+     *
+     * @return array<string,mixed> Línea creada
+     */
+    public function addManualItem(
+        int $importId,
+        int $productId,
+        float $quantity = 1.0,
+        ?float $unitCost = null,
+        ?float $taxRate = null,
+        ?float $salePrice = null
+    ): array {
+        $import = $this->query(
+            "SELECT id, status, supplier_id FROM purchase_invoice_imports WHERE id = ? LIMIT 1",
+            [$importId]
+        )->fetch();
+        if (!$import || ($import['status'] ?? '') !== 'pending') {
+            throw new \RuntimeException('Solo se pueden agregar líneas a facturas pendientes de confirmar');
+        }
+
+        $product = $this->query(
+            "SELECT id, code, barcode, name, purchase_price, sale_price
+             FROM products
+             WHERE id = ? AND status = 'active' AND COALESCE(product_type, 'product') = 'product'
+             LIMIT 1",
+            [$productId]
+        )->fetch();
+        if (!$product) {
+            throw new \RuntimeException('Producto no encontrado o inactivo');
+        }
+
+        $qty = round(max(0.001, $quantity), 3);
+        $cost = $unitCost !== null && $unitCost >= 0
+            ? round($unitCost, 2)
+            : round((float)$product['purchase_price'], 2);
+        $tax = $taxRate !== null ? round(max(0, min(100, $taxRate)), 2) : 0.0;
+
+        // Si el mismo producto ya está en el borrador, suma cantidad (evita filas duplicadas).
+        $existing = $this->query(
+            "SELECT id, quantity, unit_cost, tax_rate, discount_pct
+             FROM purchase_invoice_import_items
+             WHERE import_id = ? AND matched_product_id = ? AND row_action = 'add_stock'
+             ORDER BY id DESC LIMIT 1",
+            [$importId, $productId]
+        )->fetch();
+        if ($existing) {
+            $newQty = round((float)$existing['quantity'] + $qty, 3);
+            $useCost = $cost > 0 ? $cost : (float)$existing['unit_cost'];
+            $useTax = (float)$existing['tax_rate'];
+            $dst = (float)$existing['discount_pct'];
+            $lineTotal = round($newQty * $useCost * (1 - $dst / 100) * (1 + $useTax / 100), 2);
+            $this->query(
+                "UPDATE purchase_invoice_import_items
+                 SET quantity = ?, unit_cost = ?, line_total = ?
+                 WHERE id = ? AND import_id = ?",
+                [$newQty, $useCost, $lineTotal, (int)$existing['id'], $importId]
+            );
+            $this->refreshTotals($importId);
+            $row = $this->query(
+                "SELECT * FROM purchase_invoice_import_items WHERE id = ? LIMIT 1",
+                [(int)$existing['id']]
+            )->fetch();
+            return is_array($row) ? $row : ['id' => (int)$existing['id']];
+        }
+
+        $lineTotal = round($qty * $cost * (1 + $tax / 100), 2);
+        $sale = $salePrice !== null && $salePrice > 0
+            ? round($salePrice, 2)
+            : (isset($product['sale_price']) && (float)$product['sale_price'] > 0
+                ? round((float)$product['sale_price'], 2)
+                : null);
+
+        $lineNo = (int)$this->query(
+            "SELECT COALESCE(MAX(line_no), 0) + 1 FROM purchase_invoice_import_items WHERE import_id = ?",
+            [$importId]
+        )->fetchColumn();
+
+        $this->query(
+            "INSERT INTO purchase_invoice_import_items
+                (import_id, line_no, raw_line, supplier_sku, barcode, description, quantity, unit_cost,
+                 tax_rate, discount_pct, line_total, matched_product_id, match_type, row_action,
+                 lot_code, expiry_date, sale_price, confidence)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'manual', 'add_stock', NULL, NULL, ?, 100)",
+            [
+                $importId,
+                $lineNo,
+                'Manual / escáner',
+                substr(trim((string)($product['code'] ?? '')), 0, 120) ?: null,
+                $this->normalizeBarcodeValue((string)($product['barcode'] ?? '')) ?: null,
+                substr((string)$product['name'], 0, 255),
+                $qty,
+                $cost,
+                $tax,
+                $lineTotal,
+                $productId,
+                $sale,
+            ]
+        );
+
+        $itemId = (int)$this->db->lastInsertId();
+        $this->refreshTotals($importId);
+
+        $row = $this->query(
+            "SELECT * FROM purchase_invoice_import_items WHERE id = ? LIMIT 1",
+            [$itemId]
+        )->fetch();
+
+        return is_array($row) ? $row : ['id' => $itemId];
+    }
+
+    /**
+     * Casa el borrador de factura con una OC abierta y carga/mezcla sus productos.
+     * No pisa cantidades ni costos que ya traiga la factura (solo rellena ceros y
+     * agrega ítems de la OC que falten).
+     *
+     * @return array{import:array,items:array,added:int,updated:int,message:string}
+     */
+    public function linkOrderAndLoadItems(int $importId, int $orderId): array
+    {
+        $data = $this->get($importId);
+        if (!$data || ($data['import']['status'] ?? '') !== 'pending') {
+            throw new \RuntimeException('Solo se puede casar una OC en facturas pendientes de confirmar');
+        }
+
+        if ($orderId <= 0) {
+            $this->updateHeader($importId, ['linked_order_id' => null]);
+            $fresh = $this->get($importId);
+            return [
+                'import' => $fresh['import'] ?? $data['import'],
+                'items' => $fresh['items'] ?? $data['items'],
+                'added' => 0,
+                'updated' => 0,
+                'message' => 'OC desvinculada (los productos del borrador se conservan)',
+            ];
+        }
+
+        $purchasing = new PurchasingService($this->db);
+        $order = $purchasing->getOrder($orderId);
+        if (!$order || !in_array((string)($order['status'] ?? ''), ['draft', 'ordered'], true)) {
+            throw new \RuntimeException('La OC seleccionada no está disponible para casar');
+        }
+
+        $importSupplier = !empty($data['import']['supplier_id']) ? (int)$data['import']['supplier_id'] : 0;
+        $orderSupplier = !empty($order['supplier_id']) ? (int)$order['supplier_id'] : 0;
+        if ($importSupplier > 0 && $orderSupplier > 0 && $importSupplier !== $orderSupplier) {
+            throw new \RuntimeException('La OC casada pertenece a otro proveedor');
+        }
+
+        $headerMeta = ['linked_order_id' => $orderId];
+        if ($importSupplier <= 0 && $orderSupplier > 0) {
+            $headerMeta['supplier_id'] = $orderSupplier;
+        }
+        // Hereda nº/fecha de factura de la OC si el borrador aún no los tiene.
+        if (empty($data['import']['invoice_number']) && !empty($order['invoice_number'])) {
+            $headerMeta['invoice_number'] = (string)$order['invoice_number'];
+        }
+        if (empty($data['import']['invoice_date']) && !empty($order['invoice_date'])) {
+            $headerMeta['invoice_date'] = (string)$order['invoice_date'];
+        }
+        if (empty($data['import']['due_date']) && !empty($order['due_date'])) {
+            $headerMeta['due_date'] = (string)$order['due_date'];
+        }
+        $this->updateHeader($importId, $headerMeta);
+
+        $byProduct = [];
+        foreach ($data['items'] as $it) {
+            $pid = (int)($it['matched_product_id'] ?? 0);
+            if ($pid > 0) {
+                $byProduct[$pid] = $it;
+            }
+        }
+
+        $added = 0;
+        $updated = 0;
+        $orderLabel = (string)($order['order_number'] ?? ('#' . $orderId));
+
+        foreach ($order['items'] as $oi) {
+            $pid = (int)($oi['product_id'] ?? 0);
+            if ($pid <= 0) {
+                continue;
+            }
+            $qty = round(max(0, (float)($oi['quantity'] ?? 0)), 3);
+            if ($qty <= 0) {
+                continue;
+            }
+            $cost = round(max(0, (float)($oi['unit_cost'] ?? 0)), 2);
+            $tax = round(max(0, (float)($oi['tax_rate'] ?? 0)), 2);
+
+            if (isset($byProduct[$pid])) {
+                $ex = $byProduct[$pid];
+                if (($ex['row_action'] ?? '') === 'skip') {
+                    continue;
+                }
+                $needQty = !((float)($ex['quantity'] ?? 0) > 0);
+                $needCost = !((float)($ex['unit_cost'] ?? 0) > 0)
+                    && !((float)($ex['line_total'] ?? 0) > 0);
+                if (!$needQty && !$needCost) {
+                    continue;
+                }
+                $newQty = $needQty ? $qty : (float)$ex['quantity'];
+                $newCost = $needCost ? $cost : (float)$ex['unit_cost'];
+                $useTax = (float)($ex['tax_rate'] ?? 0) > 0 ? (float)$ex['tax_rate'] : $tax;
+                $dst = (float)($ex['discount_pct'] ?? 0);
+                $lineTotal = round($newQty * $newCost * (1 - $dst / 100) * (1 + $useTax / 100), 2);
+                $this->query(
+                    "UPDATE purchase_invoice_import_items
+                     SET quantity = ?, unit_cost = ?, tax_rate = ?, line_total = ?
+                     WHERE id = ? AND import_id = ?",
+                    [$newQty, $newCost, $useTax, $lineTotal, (int)$ex['id'], $importId]
+                );
+                $updated++;
+                continue;
+            }
+
+            $product = $this->query(
+                "SELECT id, code, barcode, name, sale_price
+                 FROM products
+                 WHERE id = ? AND status = 'active' AND COALESCE(product_type, 'product') = 'product'
+                 LIMIT 1",
+                [$pid]
+            )->fetch();
+            if (!$product) {
+                continue;
+            }
+
+            $lineTotal = round($qty * $cost * (1 + $tax / 100), 2);
+            $sale = isset($product['sale_price']) && (float)$product['sale_price'] > 0
+                ? round((float)$product['sale_price'], 2)
+                : null;
+            $lineNo = (int)$this->query(
+                "SELECT COALESCE(MAX(line_no), 0) + 1 FROM purchase_invoice_import_items WHERE import_id = ?",
+                [$importId]
+            )->fetchColumn();
+
+            $this->query(
+                "INSERT INTO purchase_invoice_import_items
+                    (import_id, line_no, raw_line, supplier_sku, barcode, description, quantity, unit_cost,
+                     tax_rate, discount_pct, line_total, matched_product_id, match_type, row_action,
+                     lot_code, expiry_date, sale_price, confidence)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'purchase_order', 'add_stock', ?, ?, ?, 100)",
+                [
+                    $importId,
+                    $lineNo,
+                    'Desde OC ' . $orderLabel,
+                    substr(trim((string)($oi['product_code'] ?? $product['code'] ?? '')), 0, 120) ?: null,
+                    $this->normalizeBarcodeValue((string)($oi['barcode'] ?? $product['barcode'] ?? '')) ?: null,
+                    substr((string)($oi['product_name'] ?? $product['name']), 0, 255),
+                    $qty,
+                    $cost,
+                    $tax,
+                    $lineTotal,
+                    $pid,
+                    !empty($oi['lot_code']) ? substr((string)$oi['lot_code'], 0, 60) : null,
+                    $this->normalizeDate($oi['expiry_date'] ?? null),
+                    $sale,
+                ]
+            );
+            $added++;
+            $byProduct[$pid] = ['id' => (int)$this->db->lastInsertId()];
+        }
+
+        $this->refreshTotals($importId);
+        $fresh = $this->get($importId);
+        $parts = [];
+        if ($added > 0) {
+            $parts[] = $added . ' producto(s) cargados desde la OC';
+        }
+        if ($updated > 0) {
+            $parts[] = $updated . ' línea(s) completadas con datos de la OC';
+        }
+        if ($parts === []) {
+            $parts[] = 'OC casada (los productos ya estaban en el borrador)';
+        }
+
+        return [
+            'import' => $fresh['import'] ?? $data['import'],
+            'items' => $fresh['items'] ?? [],
+            'added' => $added,
+            'updated' => $updated,
+            'message' => implode('. ', $parts),
+        ];
+    }
+
     /** Actualiza la cabecera con lo corregido en el modal. */
     public function updateHeader(int $importId, array $meta): void
     {
+        $linkedOrderId = array_key_exists('linked_order_id', $meta)
+            ? ((int)($meta['linked_order_id'] ?? 0) ?: null)
+            : null;
+
+        // Si llega linked_order_id en el meta, persistirlo (incluye limpiar con null vía clave presente).
+        if (array_key_exists('linked_order_id', $meta)) {
+            try {
+                $this->query(
+                    "UPDATE purchase_invoice_imports SET linked_order_id = ? WHERE id = ? AND status = 'pending'",
+                    [$linkedOrderId, $importId]
+                );
+            } catch (\Throwable $e) {
+                // Columna aún no migrada en installs viejos
+            }
+        }
+
         $this->query(
             "UPDATE purchase_invoice_imports SET
                 supplier_id = COALESCE(?, supplier_id),
@@ -1864,6 +2172,8 @@ class PurchaseInvoiceImportService
                 'tax_rate' => (float)($item['tax_rate'] ?? 0),
                 'lot_code' => (string)($item['lot_code'] ?? ''),
                 'expiry_date' => $item['expiry_date'] ?? null,
+                'barcode' => $this->normalizeBarcodeValue((string)($item['barcode'] ?? '')) ?: null,
+                'product_code' => substr(trim((string)($item['supplier_sku'] ?? '')), 0, 255) ?: null,
             ];
 
             $this->links->link($productoId, $supplierId, [
@@ -1904,25 +2214,61 @@ class PurchaseInvoiceImportService
         $fechaFactura = (string)($import['invoice_date'] ?? date('Y-m-d'));
         $fechaBodega = $this->normalizeDate($warehouseDate) ?? $fechaFactura;
 
-        $orderId = $purchasing->createOrder(
-            $supplierId,
-            $fechaFactura,
-            $fechaBodega,
-            null,
-            'Factura importada #' . $importId,
-            $lineas,
-            'ordered',
-            (float)($import['early_payment_discount_pct'] ?? 0),
-            $import['due_date'] ?? null,
-            $fechaFactura,
-            $import['invoice_number'] ?? null,
-            false // no forzar descuento aliado sobre el total de factura
-        );
+        $linkedOrderId = !empty($import['linked_order_id']) ? (int)$import['linked_order_id'] : 0;
+        $orderId = 0;
 
-        $this->query(
-            "UPDATE purchase_orders SET origin = 'invoice_import', invoice_import_id = ? WHERE id = ?",
-            [$importId, $orderId]
-        );
+        if ($linkedOrderId > 0) {
+            $linked = $purchasing->getOrder($linkedOrderId);
+            if (!$linked || !in_array($linked['status'], ['draft', 'ordered'], true)) {
+                throw new \RuntimeException('La OC seleccionada no está disponible para casar con esta factura');
+            }
+            // Si la OC no tenía proveedor, hereda el de la factura.
+            if (empty($linked['supplier_id']) && $supplierId > 0) {
+                $this->query(
+                    "UPDATE purchase_orders SET supplier_id = ? WHERE id = ? AND status IN ('draft','ordered')",
+                    [$supplierId, $linkedOrderId]
+                );
+            } elseif (!empty($linked['supplier_id']) && (int)$linked['supplier_id'] !== $supplierId) {
+                throw new \RuntimeException('La OC casada pertenece a otro proveedor');
+            }
+
+            $purchasing->replaceOrderItems($linkedOrderId, $lineas);
+            $purchasing->applyInvoiceMeta($linkedOrderId, [
+                'due_date' => $import['due_date'] ?? null,
+                'invoice_date' => $fechaFactura,
+                'invoice_number' => $import['invoice_number'] ?? null,
+                'early_payment_discount_pct' => $import['early_payment_discount_pct'] ?? 0,
+            ]);
+            $this->query(
+                "UPDATE purchase_orders SET origin = COALESCE(NULLIF(origin,''), 'invoice_import'),
+                    invoice_import_id = ?, notes = CONCAT(COALESCE(notes,''),
+                    CASE WHEN COALESCE(notes,'') = '' THEN '' ELSE ' | ' END,
+                    'Factura importada #', ?)
+                 WHERE id = ?",
+                [$importId, (string)$importId, $linkedOrderId]
+            );
+            $orderId = $linkedOrderId;
+        } else {
+            $orderId = $purchasing->createOrder(
+                $supplierId,
+                $fechaFactura,
+                $fechaBodega,
+                null,
+                'Factura importada #' . $importId,
+                $lineas,
+                'ordered',
+                (float)($import['early_payment_discount_pct'] ?? 0),
+                $import['due_date'] ?? null,
+                $fechaFactura,
+                $import['invoice_number'] ?? null,
+                false // no forzar descuento aliado sobre el total de factura
+            );
+
+            $this->query(
+                "UPDATE purchase_orders SET origin = 'invoice_import', invoice_import_id = ? WHERE id = ?",
+                [$importId, $orderId]
+            );
+        }
 
         $purchasing->receiveOrder(
             $orderId,
@@ -1931,6 +2277,10 @@ class PurchaseInvoiceImportService
             (string)($import['payment_mode'] ?? 'payable'),
             'Ingreso por factura importada'
         );
+
+        // El ingreso usa WAC; si el precio de la factura cambió respecto al catálogo,
+        // el costo de compra del inventario debe quedar en el de la factura confirmada.
+        $this->applyInvoiceCostsToCatalog($lineas);
 
         $accountingOk = true;
         try {
@@ -1965,6 +2315,29 @@ class PurchaseInvoiceImportService
                 ? ''
                 : 'Asiento contable pendiente: use «Sincronizar» en Contabilidad.',
         ];
+    }
+
+    /**
+     * Deja el precio de compra del catálogo en el costo unitario de la factura.
+     * Así, si el proveedor cambió el precio, inventario refleja el costo real recibido.
+     *
+     * @param array<int,array<string,mixed>> $lineas
+     */
+    private function applyInvoiceCostsToCatalog(array $lineas): void
+    {
+        foreach ($lineas as $ln) {
+            $pid = (int)($ln['product_id'] ?? 0);
+            $cost = round((float)($ln['unit_cost'] ?? 0), 2);
+            if ($pid <= 0 || $cost <= 0) {
+                continue;
+            }
+            $this->query(
+                "UPDATE products
+                 SET purchase_price = ?
+                 WHERE id = ? AND COALESCE(product_type, 'product') = 'product'",
+                [$cost, $pid]
+            );
+        }
     }
 
     /**

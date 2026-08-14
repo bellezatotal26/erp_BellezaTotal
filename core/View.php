@@ -107,8 +107,7 @@ class View
      */
     public function route(string $path): string
     {
-        $baseUrl = config('app.url', 'http://localhost/SoftNova/public');
-        return rtrim($baseUrl, '/') . '/' . ltrim($path, '/');
+        return \SoftNova\Core\base_url(ltrim($path, '/'));
     }
     
     /**

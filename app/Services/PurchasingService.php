@@ -186,6 +186,15 @@ class PurchasingService
         $normalized = [];
         $subtotal = 0.0;
         $tax = 0.0;
+        $productIds = [];
+        foreach ($items as $item) {
+            $pid = !empty($item['product_id']) ? (int)$item['product_id'] : 0;
+            if ($pid > 0) {
+                $productIds[$pid] = true;
+            }
+        }
+        $productMeta = $this->loadProductCodeMeta(array_keys($productIds));
+
         foreach ($items as $item) {
             $qty = (int)($item['quantity'] ?? 0);
             $cost = round((float)($item['unit_cost'] ?? 0), 2);
@@ -198,11 +207,13 @@ class PurchasingService
             $productId = !empty($item['product_id']) ? (int)$item['product_id'] : null;
             $name = trim((string)($item['product_name'] ?? ''));
             if ($name === '' && $productId) {
-                $name = (string)$this->query("SELECT name FROM products WHERE id = ?", [$productId])->fetchColumn();
+                $name = (string)($productMeta[$productId]['name']
+                    ?? $this->query("SELECT name FROM products WHERE id = ?", [$productId])->fetchColumn());
             }
             if ($name === '') {
                 continue;
             }
+            [$snapBarcode, $snapCode] = $this->productCodeSnapshot($productId, $item, $productMeta);
             $normalized[] = [
                 'product_id' => $productId,
                 'product_name' => $name,
@@ -214,6 +225,8 @@ class PurchasingService
                 'line_total' => round($lineSub + $lineTax, 2),
                 'lot_code' => substr(trim((string)($item['lot_code'] ?? '')), 0, 60) ?: null,
                 'expiry_date' => $this->validExpiry($item['expiry_date'] ?? null),
+                'barcode' => $snapBarcode,
+                'product_code' => $snapCode,
             ];
             $subtotal += $lineSub;
             $tax += $lineTax;
@@ -257,15 +270,17 @@ class PurchasingService
 
         $stmt = $this->db->prepare(
             "INSERT INTO purchase_order_items
-                (purchase_order_id, product_id, product_name, quantity, unit_cost,
+                (purchase_order_id, product_id, product_name, barcode, product_code, quantity, unit_cost,
                  tax_rate, tax_amount, subtotal, line_total, lot_code, expiry_date)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
         foreach ($normalized as $row) {
             $stmt->execute([
                 $orderId,
                 $row['product_id'],
                 $row['product_name'],
+                $row['barcode'],
+                $row['product_code'],
                 $row['quantity'],
                 $row['unit_cost'],
                 $row['tax_rate'],
@@ -307,6 +322,8 @@ class PurchasingService
         }
         $order['items'] = $this->query(
             "SELECT poi.*,
+                    COALESCE(NULLIF(poi.barcode, ''), p.barcode) AS barcode,
+                    COALESCE(NULLIF(poi.product_code, ''), p.code) AS product_code,
                     COALESCE((
                         SELECT SUM(ci.quantity)
                         FROM purchase_credit_note_items ci
@@ -314,11 +331,65 @@ class PurchasingService
                         WHERE ci.purchase_order_item_id = poi.id AND cn.status = 'posted'
                     ), 0) credited_qty
              FROM purchase_order_items poi
+             LEFT JOIN products p ON p.id = poi.product_id
              WHERE poi.purchase_order_id = ?
              ORDER BY poi.id",
             [$id]
         )->fetchAll();
         return $order;
+    }
+
+    /**
+     * @param array<string,mixed> $item
+     * @param array<int,array{code:?string,barcode:?string,name?:string}> $metaCache
+     * @return array{0:?string,1:?string} [barcode, product_code]
+     */
+    private function productCodeSnapshot(?int $productId, array $item, array $metaCache = []): array
+    {
+        $barcode = !empty($item['barcode']) ? substr(trim((string)$item['barcode']), 0, 64) : null;
+        $code = !empty($item['product_code']) ? substr(trim((string)$item['product_code']), 0, 255) : null;
+        if ($productId && ($barcode === null || $code === null)) {
+            $prod = $metaCache[$productId] ?? null;
+            if ($prod === null) {
+                $prod = $this->query(
+                    "SELECT code, barcode, name FROM products WHERE id = ? LIMIT 1",
+                    [$productId]
+                )->fetch() ?: [];
+            }
+            if ($barcode === null) {
+                $barcode = trim((string)($prod['barcode'] ?? '')) ?: null;
+            }
+            if ($code === null) {
+                $code = trim((string)($prod['code'] ?? '')) ?: null;
+            }
+        }
+        return [$barcode, $code];
+    }
+
+    /**
+     * @param list<int> $productIds
+     * @return array<int,array{code:?string,barcode:?string,name:?string}>
+     */
+    private function loadProductCodeMeta(array $productIds): array
+    {
+        $productIds = array_values(array_unique(array_filter(array_map('intval', $productIds))));
+        if (empty($productIds)) {
+            return [];
+        }
+        $placeholders = implode(',', array_fill(0, count($productIds), '?'));
+        $rows = $this->query(
+            "SELECT id, code, barcode, name FROM products WHERE id IN ($placeholders)",
+            $productIds
+        )->fetchAll();
+        $out = [];
+        foreach ($rows as $row) {
+            $out[(int)$row['id']] = [
+                'code' => $row['code'] ?? null,
+                'barcode' => $row['barcode'] ?? null,
+                'name' => $row['name'] ?? null,
+            ];
+        }
+        return $out;
     }
 
     /**
@@ -381,7 +452,12 @@ class PurchasingService
     {
         $where = ['1=1'];
         $params = [];
-        if ($status !== '' && in_array($status, ['draft', 'ordered', 'received', 'cancelled'], true)) {
+        if ($status === 'open') {
+            // Pedidos aún no facturados/recibidos
+            $where[] = "po.status IN ('draft','ordered')";
+        } elseif ($status === 'invoices') {
+            $where[] = "po.status = 'received'";
+        } elseif ($status !== '' && in_array($status, ['draft', 'ordered', 'received', 'cancelled'], true)) {
             $where[] = 'po.status = ?';
             $params[] = $status;
         }
@@ -410,6 +486,206 @@ class PurchasingService
     private function balancePendingSql(): string
     {
         return "po.total - COALESCE(po.paid_total, 0) - COALESCE(po.credit_total, 0) > 0.009";
+    }
+
+    /**
+     * OC abiertas (borrador/ordenada) para casar con una factura de proveedor.
+     *
+     * @return list<array<string,mixed>>
+     */
+    public function openOrdersForMatch(?int $supplierId = null, int $limit = 80): array
+    {
+        $where = ["po.status IN ('draft','ordered')"];
+        $params = [];
+        if ($supplierId !== null && $supplierId > 0) {
+            $where[] = '(po.supplier_id = ? OR po.supplier_id IS NULL)';
+            $params[] = $supplierId;
+        }
+        $limit = max(1, min(200, $limit));
+        return $this->query(
+            "SELECT po.id, po.order_number, po.order_date, po.expected_date, po.total,
+                    po.supplier_id, s.name AS supplier_name
+             FROM purchase_orders po
+             LEFT JOIN suppliers s ON s.id = po.supplier_id
+             WHERE " . implode(' AND ', $where) . "
+             ORDER BY po.order_date DESC, po.id DESC
+             LIMIT {$limit}",
+            $params
+        )->fetchAll();
+    }
+
+    /**
+     * Sustituye los ítems de una OC pendiente (p. ej. al casar factura real con el pedido).
+     *
+     * @param list<array{product_id?:int,product_name?:string,quantity:int,unit_cost:float,tax_rate?:float,lot_code?:?string,expiry_date?:?string}> $items
+     */
+    public function replaceOrderItems(int $orderId, array $items): void
+    {
+        $order = $this->getOrder($orderId);
+        if (!$order) {
+            throw new \RuntimeException('Orden de compra no encontrada');
+        }
+        if (!in_array($order['status'], ['draft', 'ordered'], true)) {
+            throw new \RuntimeException('Solo se pueden actualizar ítems en OC pendientes de recibir');
+        }
+
+        $normalized = [];
+        $subtotal = 0.0;
+        $tax = 0.0;
+        $productIds = [];
+        foreach ($items as $item) {
+            $pid = !empty($item['product_id']) ? (int)$item['product_id'] : 0;
+            if ($pid > 0) {
+                $productIds[$pid] = true;
+            }
+        }
+        $productMeta = $this->loadProductCodeMeta(array_keys($productIds));
+
+        foreach ($items as $item) {
+            $qty = (int)($item['quantity'] ?? 0);
+            $cost = round((float)($item['unit_cost'] ?? 0), 2);
+            $rate = round(max(0, (float)($item['tax_rate'] ?? 0)), 2);
+            if ($qty <= 0 || $cost < 0) {
+                continue;
+            }
+            $lineSub = round($qty * $cost, 2);
+            $lineTax = round($lineSub * ($rate / 100), 2);
+            $productId = !empty($item['product_id']) ? (int)$item['product_id'] : null;
+            $name = trim((string)($item['product_name'] ?? ''));
+            if ($name === '' && $productId) {
+                $name = (string)($productMeta[$productId]['name']
+                    ?? $this->query("SELECT name FROM products WHERE id = ?", [$productId])->fetchColumn());
+            }
+            if ($name === '') {
+                continue;
+            }
+            [$snapBarcode, $snapCode] = $this->productCodeSnapshot($productId, $item, $productMeta);
+            $normalized[] = [
+                'product_id' => $productId,
+                'product_name' => $name,
+                'quantity' => $qty,
+                'unit_cost' => $cost,
+                'tax_rate' => $rate,
+                'tax_amount' => $lineTax,
+                'subtotal' => $lineSub,
+                'line_total' => round($lineSub + $lineTax, 2),
+                'lot_code' => substr(trim((string)($item['lot_code'] ?? '')), 0, 60) ?: null,
+                'expiry_date' => $this->validExpiry($item['expiry_date'] ?? null),
+                'barcode' => $snapBarcode,
+                'product_code' => $snapCode,
+            ];
+            $subtotal += $lineSub;
+            $tax += $lineTax;
+        }
+        if (empty($normalized)) {
+            throw new \InvalidArgumentException('Los ítems de la factura no son válidos');
+        }
+
+        $earlyPct = (float)($order['early_payment_discount_pct'] ?? 0);
+        $gross = round($subtotal + $tax, 2);
+        $discountAmt = round($gross * ($earlyPct / 100), 2);
+        $total = round($gross - $discountAmt, 2);
+
+        $this->query("DELETE FROM purchase_order_items WHERE purchase_order_id = ?", [$orderId]);
+        $stmt = $this->db->prepare(
+            "INSERT INTO purchase_order_items
+                (purchase_order_id, product_id, product_name, barcode, product_code, quantity, unit_cost,
+                 tax_rate, tax_amount, subtotal, line_total, lot_code, expiry_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        );
+        foreach ($normalized as $row) {
+            $stmt->execute([
+                $orderId,
+                $row['product_id'],
+                $row['product_name'],
+                $row['barcode'],
+                $row['product_code'],
+                $row['quantity'],
+                $row['unit_cost'],
+                $row['tax_rate'],
+                $row['tax_amount'],
+                $row['subtotal'],
+                $row['line_total'],
+                $row['lot_code'],
+                $row['expiry_date'],
+            ]);
+        }
+
+        $this->query(
+            "UPDATE purchase_orders SET subtotal = ?, tax = ?, total = ?,
+                early_payment_discount_amount = ?
+             WHERE id = ?",
+            [round($subtotal, 2), round($tax, 2), $total, $discountAmt, $orderId]
+        );
+    }
+
+    /**
+     * Listado de facturas = OC recibidas, con filtros de CxP.
+     *
+     * @return list<array<string,mixed>>
+     */
+    public function listInvoices(int $limit = 50, int $offset = 0, string $paymentFilter = '', string $dueFilter = ''): array
+    {
+        [$whereSql, $params] = $this->invoiceFilters($paymentFilter, $dueFilter);
+        $limit = max(1, min(200, $limit));
+        $offset = max(0, $offset);
+        return $this->query(
+            "SELECT po.*, s.name supplier_name,
+                    DATEDIFF(CURDATE(), po.due_date) AS days_overdue
+             FROM purchase_orders po
+             LEFT JOIN suppliers s ON s.id = po.supplier_id
+             {$whereSql}
+             ORDER BY COALESCE(po.invoice_date, po.warehouse_date, po.order_date) DESC, po.id DESC
+             LIMIT {$limit} OFFSET {$offset}",
+            $params
+        )->fetchAll();
+    }
+
+    public function countInvoices(string $paymentFilter = '', string $dueFilter = ''): int
+    {
+        [$whereSql, $params] = $this->invoiceFilters($paymentFilter, $dueFilter);
+        return (int)$this->query(
+            "SELECT COUNT(*) FROM purchase_orders po {$whereSql}",
+            $params
+        )->fetchColumn();
+    }
+
+    /**
+     * @return array{0:string,1:list<mixed>}
+     */
+    private function invoiceFilters(string $paymentFilter, string $dueFilter): array
+    {
+        $where = ["po.status = 'received'"];
+        $params = [];
+        $paymentFilter = strtolower(trim($paymentFilter));
+        if ($paymentFilter === 'pending' || $paymentFilter === 'partial' || $paymentFilter === 'paid') {
+            $where[] = 'po.payment_status = ?';
+            $params[] = $paymentFilter;
+        } elseif ($paymentFilter === 'unpaid') {
+            $where[] = "COALESCE(po.payment_mode, 'payable') = 'payable'";
+            $where[] = $this->balancePendingSql();
+        } elseif ($paymentFilter === 'paid_only') {
+            $where[] = 'po.total - COALESCE(po.paid_total, 0) - COALESCE(po.credit_total, 0) <= 0.009';
+        }
+
+        $dueFilter = strtolower(trim($dueFilter));
+        if ($dueFilter === 'overdue') {
+            $where[] = 'po.due_date IS NOT NULL AND po.due_date < CURDATE()';
+            $where[] = "COALESCE(po.payment_mode, 'payable') = 'payable'";
+            $where[] = $this->balancePendingSql();
+        } elseif ($dueFilter === 'due_today') {
+            $where[] = 'po.due_date = CURDATE()';
+            $where[] = "COALESCE(po.payment_mode, 'payable') = 'payable'";
+            $where[] = $this->balancePendingSql();
+        } elseif ($dueFilter === 'due_soon') {
+            $where[] = 'po.due_date IS NOT NULL AND po.due_date >= CURDATE() AND po.due_date <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)';
+            $where[] = "COALESCE(po.payment_mode, 'payable') = 'payable'";
+            $where[] = $this->balancePendingSql();
+        } elseif ($dueFilter === 'no_due') {
+            $where[] = 'po.due_date IS NULL';
+        }
+
+        return ['WHERE ' . implode(' AND ', $where), $params];
     }
 
     /**
@@ -754,6 +1030,7 @@ class PurchasingService
      * Registra un abono al proveedor y actualiza el saldo de la orden.
      * Solo aplica a órdenes recibidas que quedaron como cuenta por pagar.
      *
+     * @param array{path?:string,mime?:string,original?:string}|null $receipt Adjunto del comprobante
      * @return array{payment_id:int,paid_total:float,balance:float,payment_status:string}
      */
     public function registerPayment(
@@ -762,7 +1039,8 @@ class PurchasingService
         string $paymentDate,
         string $paymentMethod = 'cash',
         string $reference = '',
-        string $notes = ''
+        string $notes = '',
+        ?array $receipt = null
     ): array {
         SupplyChainSchema::ensure($this->db);
 
@@ -798,13 +1076,18 @@ class PurchasingService
         $stock = new StockService($this->db);
         $paymentDate = $stock->normalizeDate($paymentDate);
 
+        $receiptPath = isset($receipt['path']) ? substr(trim((string)$receipt['path']), 0, 255) : '';
+        $receiptMime = isset($receipt['mime']) ? substr(trim((string)$receipt['mime']), 0, 80) : '';
+        $receiptName = isset($receipt['original']) ? substr(trim((string)$receipt['original']), 0, 255) : '';
+
         $this->db->beginTransaction();
         try {
             $this->query(
                 "INSERT INTO supplier_payments
                     (supplier_id, purchase_order_id, payment_date, amount,
-                     payment_method, reference, notes, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     payment_method, reference, notes,
+                     receipt_path, receipt_mime, receipt_original_name, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (int)$order['supplier_id'],
                     $orderId,
@@ -813,6 +1096,9 @@ class PurchasingService
                     $paymentMethod !== '' ? $paymentMethod : 'cash',
                     $reference !== '' ? $reference : null,
                     $notes !== '' ? $notes : null,
+                    $receiptPath !== '' ? $receiptPath : null,
+                    $receiptMime !== '' ? $receiptMime : null,
+                    $receiptName !== '' ? $receiptName : null,
                     $_SESSION['tenant_user_id'] ?? null,
                 ]
             );
@@ -821,6 +1107,10 @@ class PurchasingService
             $this->db->commit();
         } catch (\Throwable $e) {
             $this->db->rollBack();
+            // Compatibilidad si la columna aún no migró: reintentar sin adjunto.
+            if ($receiptPath !== '' && str_contains($e->getMessage(), 'receipt_path')) {
+                return $this->registerPayment($orderId, $amount, $paymentDate, $paymentMethod, $reference, $notes, null);
+            }
             throw $e;
         }
 
@@ -931,6 +1221,23 @@ class PurchasingService
             )->fetchAll();
         } catch (\Throwable $e) {
             return [];
+        }
+    }
+
+    /** @return array<string,mixed>|null */
+    public function getSupplierPayment(int $paymentId): ?array
+    {
+        if ($paymentId <= 0) {
+            return null;
+        }
+        try {
+            $row = $this->query(
+                "SELECT * FROM supplier_payments WHERE id = ? LIMIT 1",
+                [$paymentId]
+            )->fetch();
+            return $row ?: null;
+        } catch (\Throwable $e) {
+            return null;
         }
     }
 

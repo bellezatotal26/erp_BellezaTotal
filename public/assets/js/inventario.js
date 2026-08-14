@@ -100,6 +100,66 @@ function editProduct(id) {
     document.getElementById('productModal').style.display = 'flex';
 }
 
+/** Reserva el siguiente EAN de la secuencia (Configuración → Preferencias). */
+function generateProductEan() {
+    var input = document.getElementById('prodBarcode');
+    if (!input) return;
+    if (input.value && String(input.value).trim() !== '') {
+        if (!confirm('El campo EAN ya tiene un valor. ¿Reemplazarlo con el siguiente de la secuencia?')) {
+            return;
+        }
+    }
+    var fd = new FormData();
+    fd.append('csrf_token', window.invCsrf || '');
+    fetch(window.invRouteGenerateBarcode || (window.invRouteBase + '?action=generate_barcode'), {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        if (!d || !d.success || !d.barcode) {
+            throw new Error((d && d.message) || 'No se pudo generar el EAN');
+        }
+        input.value = d.barcode;
+        if (typeof showAlert === 'function') showAlert(d.message || ('EAN ' + d.barcode), 'success');
+    })
+    .catch(function(err) {
+        if (typeof showAlert === 'function') showAlert(err.message || 'Error al generar EAN', 'error');
+    });
+}
+
+/** Reserva el siguiente SKU de la secuencia (Configuración → Preferencias). */
+function generateProductSku() {
+    var input = document.getElementById('prodCode');
+    if (!input) return;
+    if (input.value && String(input.value).trim() !== '') {
+        if (!confirm('El campo SKU ya tiene un valor. ¿Reemplazarlo con el siguiente de la secuencia?')) {
+            return;
+        }
+    }
+    var fd = new FormData();
+    fd.append('csrf_token', window.invCsrf || '');
+    fetch(window.invRouteGenerateSku || (window.invRouteBase + '?action=generate_sku'), {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        if (!d || !d.success || !d.sku) {
+            throw new Error((d && d.message) || 'No se pudo generar el SKU');
+        }
+        input.value = d.sku;
+        if (typeof showAlert === 'function') showAlert(d.message || ('SKU ' + d.sku), 'success');
+    })
+    .catch(function(err) {
+        if (typeof showAlert === 'function') showAlert(err.message || 'Error al generar SKU', 'error');
+    });
+}
+
 function onTypeChange() {
     var isSvc = document.getElementById('prodType').value === 'service';
     document.getElementById('stockGroup').style.display = isSvc ? 'none' : '';

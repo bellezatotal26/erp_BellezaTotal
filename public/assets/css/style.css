@@ -2919,7 +2919,7 @@ a.stat-card-link:hover {
     bottom: calc(100% + 8px);
     transform: translateX(-50%);
     min-width: 180px;
-    max-width: 260px;
+    max-width: 320px;
     padding: 8px 10px;
     border-radius: 8px;
     background: #1f2937;

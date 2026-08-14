@@ -647,11 +647,23 @@ if (!empty($products)) {
                 </div>
                 <div class="form-group">
                     <label>Código / SKU <span class="field-tip" data-tip="Fórmula de ingreso o creación de SKU= [Categoría]-[Marca / Línea]-[Producto / Subtipo][Atributo / Tamaño].">?</span></label>
-                    <input type="text" name="code" id="prodCode" class="form-control" placeholder="SKU interno" maxlength="255" autocomplete="off" inputmode="text">
+                    <div style="display:flex;gap:8px;align-items:stretch;">
+                        <input type="text" name="code" id="prodCode" class="form-control" placeholder="SKU interno o Generar" maxlength="255" autocomplete="off" inputmode="text" style="flex:1;">
+                        <button type="button" class="btn btn-secondary" style="white-space:nowrap;" onclick="generateProductSku()" title="Siguiente SKU de la secuencia">Generar SKU</button>
+                    </div>
+                    <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">
+                        Manual (según la fórmula del ?) o automático. Configure prefijo/consecutivo en Configuración → Preferencias.
+                    </small>
                 </div>
                 <div class="form-group">
-                    <label>Código de barras (EAN) <span class="field-tip" data-tip="Código EAN/UPC de la pistola. Se busca aparte del SKU en ventas y compras.">?</span></label>
-                    <input type="text" name="barcode" id="prodBarcode" class="form-control" placeholder="EAN / UPC" maxlength="64" autocomplete="off" inputmode="text">
+                    <label>Código de barras (EAN) <span class="field-tip" data-tip="Código EAN/UPC de la pistola. Puede escribirlo a mano o generar el siguiente de la secuencia configurada.">?</span></label>
+                    <div style="display:flex;gap:8px;align-items:stretch;">
+                        <input type="text" name="barcode" id="prodBarcode" class="form-control" placeholder="EAN / UPC o Generar" maxlength="64" autocomplete="off" inputmode="text" style="flex:1;">
+                        <button type="button" class="btn btn-secondary" style="white-space:nowrap;" onclick="generateProductEan()" title="Siguiente EAN de la secuencia">Generar EAN</button>
+                    </div>
+                    <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">
+                        Manual o automático. Configure prefijo/consecutivo en Configuración → Preferencias.
+                    </small>
                 </div>
                 <div class="form-group" style="grid-column:1/-1;">
                     <label>Nombre * <span class="field-tip" data-tip="Nombre visible en ventas, cotizaciones e inventario.">?</span></label>
@@ -1266,6 +1278,8 @@ if (!empty($products)) {
     window.invRouteEdit = '<?php echo $viewInstance->route('app/inventario'); ?>?action=edit';
     window.invRouteDetail = '<?php echo $viewInstance->route('app/inventario'); ?>?action=detail';
     window.invRouteBase = '<?php echo $viewInstance->route('app/inventario'); ?>';
+    window.invRouteGenerateBarcode = '<?php echo $viewInstance->route('app/inventario'); ?>?action=generate_barcode';
+    window.invRouteGenerateSku = '<?php echo $viewInstance->route('app/inventario'); ?>?action=generate_sku';
     window.invRouteOfferCancel = '<?php echo $viewInstance->route('app/inventario'); ?>?action=offer_cancel';
     window.invRouteVentas = '<?php echo $viewInstance->route('app/ventas'); ?>';
     window.invCanEdit = <?php echo $canEditProduct ? 'true' : 'false'; ?>;

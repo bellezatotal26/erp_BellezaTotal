@@ -755,8 +755,11 @@ class PdfService
 
         $itemsHtml = '';
         foreach ($items as $item) {
+            $ean = trim((string)($item['barcode'] ?? ''));
+            $sku = trim((string)($item['supplier_sku'] ?? $item['product_code'] ?? ''));
             $itemsHtml .= '<tr>
-                <td>' . htmlspecialchars((string)($item['supplier_sku'] ?? $item['product_code'] ?? '—')) . '</td>
+                <td>' . htmlspecialchars($sku !== '' ? $sku : '—') . '</td>
+                <td>' . htmlspecialchars($ean !== '' ? $ean : '—') . '</td>
                 <td>' . htmlspecialchars((string)($item['product_name'] ?? '')) . '</td>
                 <td style="text-align:center;">' . (int)($item['quantity'] ?? 0) . '</td>
                 <td style="text-align:right;">' . $fmt($item['unit_cost'] ?? 0) . '</td>
@@ -789,6 +792,7 @@ class PdfService
             <table width="100%" cellpadding="8" cellspacing="0" style="border-collapse:collapse;">
                 <tr style="background:#1E3A8A;color:#fff;">
                     <th style="text-align:left;padding:10px;">Código</th>
+                    <th style="text-align:left;padding:10px;">EAN</th>
                     <th style="text-align:left;padding:10px;">Producto</th>
                     <th style="text-align:center;padding:10px;">Cant.</th>
                     <th style="text-align:right;padding:10px;">Costo Unit.</th>

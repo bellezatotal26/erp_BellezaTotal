@@ -13,8 +13,12 @@ $payableTotal = $payableTotal ?? 0;
 $payableOrders = $payableOrders ?? [];
 $pendingInvoices = $pendingInvoices ?? [];
 $aiInvoiceReady = !empty($aiInvoiceReady);
-$statusFilter = $statusFilter ?? '';
+$statusFilter = $statusFilter ?? 'open';
 $dueFilter = $dueFilter ?? '';
+$paymentFilter = $paymentFilter ?? '';
+$paidMonth = $paidMonth ?? 0;
+$comprasTab = $comprasTab ?? 'ordenes';
+$isFacturasTab = $comprasTab === 'facturas';
 $creditNotesPanel = !empty($creditNotesPanel);
 $creditNotes = $creditNotes ?? [];
 $creditNotesQ = $creditNotesQ ?? '';
@@ -41,6 +45,10 @@ $statusLabels = [
 
 if ($creditNotesPanel) {
     $pageTitle = 'Notas de crédito (compras)';
+} elseif ($isFacturasTab) {
+    $pageTitle = 'Compras / Facturas';
+} else {
+    $pageTitle = 'Compras / Órdenes de compra';
 }
 ?>
 <meta name="currency-symbol" content="<?php echo htmlspecialchars($currency['symbol']); ?>">
@@ -49,10 +57,10 @@ if ($creditNotesPanel) {
 
 <?php if ($creditNotesPanel): ?>
 <div style="display:flex;gap:12px;margin-bottom:18px;flex-wrap:wrap;align-items:center;">
-    <a href="<?php echo $viewInstance->route('app/compras'); ?>" class="btn btn-secondary">← Volver a compras</a>
+    <a href="<?php echo $viewInstance->route('app/compras'); ?>?action=facturas" class="btn btn-secondary">← Volver a facturas</a>
     <?php if ($canEdit): ?>
         <span style="font-size:13px;color:var(--color-text-secondary);">
-            Para emitir una NC abra el detalle de una OC recibida o use el botón <strong>NC</strong>.
+            Para emitir una NC use el botón <strong>NC</strong> en la pestaña Facturas.
         </span>
     <?php endif; ?>
     <form method="GET" action="<?php echo $viewInstance->route('app/compras'); ?>" style="display:flex;gap:8px;align-items:center;margin-left:auto;">
@@ -67,7 +75,7 @@ if ($creditNotesPanel) {
     <div class="card-body">
         <?php if (empty($creditNotes)): ?>
             <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">
-                Aún no hay notas de crédito. Emítalas desde una orden de compra recibida (botón NC).
+                Aún no hay notas de crédito. Emítalas desde Facturas (botón NC).
             </p>
         <?php else: ?>
             <div class="table-container"><table>
@@ -188,51 +196,106 @@ function viewPurchase(id) {
 </script>
 <?php return; endif; ?>
 
+<?php
+$comprasBase = $viewInstance->route('app/compras');
+$tabBtn = static function (bool $active): string {
+    return $active
+        ? 'btn btn-primary'
+        : 'btn btn-secondary';
+};
+?>
+
+<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center;">
+    <a href="<?php echo $comprasBase; ?>" class="<?php echo $tabBtn(!$isFacturasTab); ?>">Órdenes de compra</a>
+    <a href="<?php echo $comprasBase; ?>?action=facturas" class="<?php echo $tabBtn($isFacturasTab); ?>">Facturas</a>
+    <a href="<?php echo $comprasBase; ?>?action=notas_credito" class="btn btn-secondary">Notas de crédito</a>
+    <a href="<?php echo $comprasBase; ?>?action=reposicion" class="btn btn-secondary">Panel de reposición</a>
+</div>
+
+<?php if ($isFacturasTab): ?>
+<div class="stats-grid">
+    <div class="stat-card neumorphic"><h4>Por pagar</h4><div class="stat-value" style="color:<?php echo $payableTotal > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo fmtC((float)$payableTotal, $currency); ?></div></div>
+    <div class="stat-card neumorphic"><h4>Recibido este mes</h4><div class="stat-value" style="color:#10B981;"><?php echo fmtC((float)$monthReceived, $currency); ?></div></div>
+    <div class="stat-card neumorphic"><h4>Abonos del mes</h4><div class="stat-value"><?php echo fmtC((float)$paidMonth, $currency); ?></div></div>
+    <div class="stat-card neumorphic"><h4>Facturas</h4><div class="stat-value"><?php echo (int)($pagination['total'] ?? count($orders)); ?></div></div>
+</div>
+<?php else: ?>
 <div class="stats-grid">
     <div class="stat-card neumorphic"><h4>OC abiertas</h4><div class="stat-value"><?php echo fmtC((float)$openTotal, $currency); ?></div></div>
     <div class="stat-card neumorphic"><h4>Recibido este mes</h4><div class="stat-value" style="color:#10B981;"><?php echo fmtC((float)$monthReceived, $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Por pagar a proveedores</h4><div class="stat-value" style="color:<?php echo $payableTotal > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo fmtC((float)$payableTotal, $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Registros</h4><div class="stat-value"><?php echo (int)($pagination['total'] ?? count($orders)); ?></div></div>
+    <div class="stat-card neumorphic"><h4>Por pagar</h4><div class="stat-value" style="color:<?php echo $payableTotal > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo fmtC((float)$payableTotal, $currency); ?></div>
+        <div style="font-size:12px;color:var(--color-text-secondary);margin-top:4px;"><a href="<?php echo $comprasBase; ?>?action=facturas">Ver en Facturas →</a></div>
+    </div>
+    <div class="stat-card neumorphic"><h4>Pedidos</h4><div class="stat-value"><?php echo (int)($pagination['total'] ?? count($orders)); ?></div></div>
 </div>
+<?php endif; ?>
 
 <div style="display:flex;gap:12px;margin-bottom:18px;flex-wrap:wrap;align-items:center;">
-    <?php if ($canCreate): ?>
-        <button type="button" class="btn btn-primary" onclick="openPurchaseModal()">Nueva orden de compra</button>
-        <button type="button" class="btn btn-secondary" onclick="openInvoiceUpload()">Cargar factura de proveedor</button>
+    <?php if (!$isFacturasTab && $canCreate): ?>
+        <button type="button" class="btn btn-primary" onclick="openPurchaseModal()"
+                title="Crear una OC solo de pedido (sin inventario ni CxP hasta recibir/cargar factura)">Nueva orden de compra</button>
     <?php endif; ?>
-    <a href="<?php echo $viewInstance->route('app/compras'); ?>?action=notas_credito" class="btn btn-secondary">Notas de crédito</a>
-    <a href="<?php echo $viewInstance->route('app/compras'); ?>?action=reposicion" class="btn btn-secondary">Panel de reposición</a>
-    <form method="GET" action="<?php echo $viewInstance->route('app/compras'); ?>" style="display:flex;gap:8px;align-items:center;margin:0;flex-wrap:wrap;">
-        <select name="status" class="form-control" style="width:auto;" onchange="this.form.submit()">
-            <option value="">Todos los estados</option>
-            <?php foreach ($statusLabels as $k => $lab): ?>
-                <option value="<?php echo $k; ?>" <?php echo $statusFilter === $k ? 'selected' : ''; ?>><?php echo $lab; ?></option>
-            <?php endforeach; ?>
-        </select>
-        <select name="due" class="form-control" style="width:auto;" onchange="this.form.submit()" title="Filtro por vencimiento de pago">
-            <option value="">Vencimiento: todos</option>
-            <option value="overdue" <?php echo $dueFilter === 'overdue' ? 'selected' : ''; ?>>Vencidas</option>
-            <option value="due_today" <?php echo $dueFilter === 'due_today' ? 'selected' : ''; ?>>Vencen hoy</option>
-            <option value="due_soon" <?php echo $dueFilter === 'due_soon' ? 'selected' : ''; ?>>Por vencer (7 días)</option>
-            <option value="no_due" <?php echo $dueFilter === 'no_due' ? 'selected' : ''; ?>>Sin fecha de vencimiento</option>
-        </select>
-    </form>
+    <?php if ($canCreate): ?>
+        <button type="button" class="btn btn-secondary" onclick="openInvoiceUpload()"
+                title="Leer foto/PDF/Excel de factura: revise líneas, case con OC y confirme para inventario + CxP">Cargar factura de proveedor</button>
+    <?php endif; ?>
+    <?php if ($isFacturasTab): ?>
+        <form method="GET" action="<?php echo $comprasBase; ?>" style="display:flex;gap:8px;align-items:center;margin:0;flex-wrap:wrap;">
+            <input type="hidden" name="action" value="facturas">
+            <label style="font-size:12px;color:var(--color-text-secondary);display:flex;align-items:center;gap:4px;margin:0;">
+                Pago <span class="field-tip" data-tip="Filtra facturas por estado de CxP: con saldo, abono parcial, pagadas o saldo en cero." tabindex="0">?</span>
+            </label>
+            <select name="payment" class="form-control" style="width:auto;" onchange="this.form.submit()" title="Estado de pago / saldo">
+                <option value="">Pago: todas</option>
+                <option value="unpaid" <?php echo $paymentFilter === 'unpaid' ? 'selected' : ''; ?>>Con saldo</option>
+                <option value="partial" <?php echo $paymentFilter === 'partial' ? 'selected' : ''; ?>>Abono parcial</option>
+                <option value="paid" <?php echo $paymentFilter === 'paid' ? 'selected' : ''; ?>>Pagadas</option>
+                <option value="paid_only" <?php echo $paymentFilter === 'paid_only' ? 'selected' : ''; ?>>Saldo en cero</option>
+            </select>
+            <label style="font-size:12px;color:var(--color-text-secondary);display:flex;align-items:center;gap:4px;margin:0;">
+                Vence <span class="field-tip" data-tip="Filtra por fecha de vencimiento de pago al proveedor (vencidas, hoy, próximos 7 días o sin fecha)." tabindex="0">?</span>
+            </label>
+            <select name="due" class="form-control" style="width:auto;" onchange="this.form.submit()" title="Filtro por vencimiento de CxP">
+                <option value="">Vencimiento: todos</option>
+                <option value="overdue" <?php echo $dueFilter === 'overdue' ? 'selected' : ''; ?>>Vencidas</option>
+                <option value="due_today" <?php echo $dueFilter === 'due_today' ? 'selected' : ''; ?>>Vencen hoy</option>
+                <option value="due_soon" <?php echo $dueFilter === 'due_soon' ? 'selected' : ''; ?>>Por vencer (7 días)</option>
+                <option value="no_due" <?php echo $dueFilter === 'no_due' ? 'selected' : ''; ?>>Sin fecha de vencimiento</option>
+            </select>
+        </form>
+    <?php else: ?>
+        <form method="GET" action="<?php echo $comprasBase; ?>" style="display:flex;gap:8px;align-items:center;margin:0;flex-wrap:wrap;">
+            <label style="font-size:12px;color:var(--color-text-secondary);display:flex;align-items:center;gap:4px;margin:0;">
+                Estado <span class="field-tip" data-tip="Borrador: aún editable. Ordenada: pedida al proveedor. Cancelada: anulada. Abiertas = borrador + ordenada." tabindex="0">?</span>
+            </label>
+            <select name="status" class="form-control" style="width:auto;" onchange="this.form.submit()" title="Estado de la orden de compra">
+                <option value="open" <?php echo $statusFilter === 'open' || $statusFilter === '' ? 'selected' : ''; ?>>Abiertas (borrador + ordenada)</option>
+                <option value="draft" <?php echo $statusFilter === 'draft' ? 'selected' : ''; ?>>Borrador</option>
+                <option value="ordered" <?php echo $statusFilter === 'ordered' ? 'selected' : ''; ?>>Ordenada</option>
+                <option value="cancelled" <?php echo $statusFilter === 'cancelled' ? 'selected' : ''; ?>>Cancelada</option>
+            </select>
+        </form>
+    <?php endif; ?>
 </div>
 
 <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 14px;">
-    Flujo: <strong>OC</strong> (pedido al proveedor) →
-    <strong>Cargar factura / Recibir</strong> (bodega, vencimiento, dsto. pronto pago) →
-    asiento <em>Inventarios + IVA / Proveedores o Caja</em>.
-    El costo se actualiza con <strong>promedio ponderado</strong>.
+    <?php if ($isFacturasTab): ?>
+        <strong>Momento 2–3:</strong> al llegar la mercancía cargue o confirme la factura (inventario + asiento).
+        Aquí controla <strong>saldo</strong>, <strong>abonos</strong>, <strong>notas de crédito</strong> y facturas pagadas.
+        Puede casar cada factura con una OC de pedido.
+    <?php else: ?>
+        <strong>Momento 1:</strong> las OC solo solicitan pedido al proveedor (sin saldo ni abonos).
+        Cuando llega la factura y la mercancía, use <a href="<?php echo $comprasBase; ?>?action=facturas">Facturas</a>
+        o el botón <strong>Recibir</strong>.
+    <?php endif; ?>
 </p>
 
-<?php if (!empty($pendingInvoices)): ?>
+<?php if ($isFacturasTab && !empty($pendingInvoices)): ?>
 <div class="card neumorphic" style="margin-bottom:18px;border-left:4px solid #F59E0B;">
     <div class="card-header"><h3>Facturas leídas pendientes de confirmar</h3></div>
     <div class="card-body">
         <p style="font-size:13px;color:var(--color-text-secondary);margin-top:0;">
-            Estas facturas ya fueron interpretadas pero <strong>aún no afectan el inventario</strong>.
-            Revise las líneas y confirme para ingresarlas.
+            Ya interpretadas pero <strong>aún no afectan el inventario</strong>. Revise líneas (puede agregar productos a mano) y confirme.
         </p>
         <div class="table-container"><table>
             <thead><tr><th>Factura</th><th>Proveedor</th><th>Fecha</th><th>Origen</th><th>Líneas</th><th>Total</th><th>Acciones</th></tr></thead>
@@ -248,7 +311,7 @@ function viewPurchase(id) {
                     <td style="white-space:nowrap;">
                         <button type="button" class="btn btn-sm btn-primary" onclick="openInvoiceReview(<?php echo (int)$inv['id']; ?>)">Revisar</button>
                         <?php if ($canCreate): ?>
-                            <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=invoice_discard" style="display:inline;">
+                            <form method="POST" action="<?php echo $comprasBase; ?>?action=invoice_discard" style="display:inline;">
                                 <?php echo \SoftNova\Core\csrf_field(); ?>
                                 <input type="hidden" name="import_id" value="<?php echo (int)$inv['id']; ?>">
                                 <button type="submit" class="btn btn-sm btn-danger" onclick="return confirm('¿Descartar esta factura leída?')">Descartar</button>
@@ -261,19 +324,35 @@ function viewPurchase(id) {
         </table></div>
     </div>
 </div>
+<?php elseif (!$isFacturasTab && !empty($pendingInvoices)): ?>
+<div class="card neumorphic" style="margin-bottom:18px;border-left:4px solid #F59E0B;">
+    <div class="card-body" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+        <p style="margin:0;flex:1;font-size:13px;">
+            Hay <strong><?php echo count($pendingInvoices); ?></strong> factura(s) leída(s) pendientes de confirmar.
+        </p>
+        <a href="<?php echo $comprasBase; ?>?action=facturas" class="btn btn-primary">Ir a Facturas</a>
+    </div>
+</div>
 <?php endif; ?>
 
 <div class="card neumorphic">
-    <div class="card-header"><h3>Órdenes de compra</h3></div>
+    <div class="card-header"><h3><?php echo $isFacturasTab ? 'Facturas de proveedor' : 'Órdenes de compra'; ?></h3></div>
     <div class="card-body">
         <?php if (empty($orders)): ?>
-            <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">Aún no hay órdenes de compra</p>
+            <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">
+                <?php echo $isFacturasTab ? 'Aún no hay facturas recibidas' : 'Aún no hay órdenes de compra'; ?>
+            </p>
         <?php else: ?>
             <div class="table-container"><table>
                 <thead>
                     <tr>
-                        <th>OC</th><th>Fecha</th><th>Vence</th><th>Proveedor</th><th>Factura</th><th>Foto</th>
-                        <th>Total</th><th>Saldo</th><th>Estado</th><th>Asiento</th><th>Acciones</th>
+                        <?php if ($isFacturasTab): ?>
+                            <th>Factura</th><th>OC</th><th>Fecha</th><th>Vence</th><th>Proveedor</th><th>Foto</th>
+                            <th>Total</th><th>Abonado</th><th>Saldo</th><th>Pago</th><th>Asiento</th><th>Acciones</th>
+                        <?php else: ?>
+                            <th>OC</th><th>Fecha</th><th>Entrega est.</th><th>Proveedor</th>
+                            <th>Total est.</th><th>Estado</th><th>Acciones</th>
+                        <?php endif; ?>
                     </tr>
                 </thead>
                 <tbody>
@@ -299,81 +378,118 @@ function viewPurchase(id) {
                     $daysOver = isset($o['days_overdue']) ? (int)$o['days_overdue'] : null;
                     $dueOverdue = $dueDate && $daysOver !== null && $daysOver > 0 && $isPayable;
                     $dueSoon = $dueDate && $daysOver !== null && $daysOver <= 0 && $daysOver >= -7 && $isPayable;
+                    $payLabel = match ($o['payment_mode'] ?? 'payable') {
+                        'cash' => 'Efectivo',
+                        'transfer' => 'Transferencia',
+                        'card' => 'Tarjeta',
+                        default => 'Crédito',
+                    };
                     ?>
                     <tr>
-                        <td><strong><?php echo htmlspecialchars($o['order_number']); ?></strong></td>
-                        <td><?php echo date('d/m/Y', strtotime($o['order_date'])); ?></td>
-                        <td<?php
-                            if ($dueOverdue) {
-                                echo ' style="color:#DC2626;font-weight:600;"';
-                            } elseif ($dueSoon) {
-                                echo ' style="color:#B45309;font-weight:600;"';
-                            }
-                        ?>>
-                            <?php if ($dueDate): ?>
-                                <?php echo date('d/m/Y', strtotime((string)$dueDate)); ?>
-                                <?php if ($dueOverdue): ?>
-                                    <small>(<?php echo $daysOver; ?> d)</small>
-                                <?php elseif ($dueSoon && $daysOver === 0): ?>
-                                    <small>(hoy)</small>
-                                <?php elseif ($dueSoon): ?>
-                                    <small>(<?php echo abs($daysOver); ?> d)</small>
+                        <?php if ($isFacturasTab): ?>
+                            <td><strong><?php echo htmlspecialchars((string)($o['invoice_number'] ?? '—')); ?></strong></td>
+                            <td><?php echo htmlspecialchars($o['order_number']); ?></td>
+                            <td><?php echo !empty($o['invoice_date']) ? date('d/m/Y', strtotime((string)$o['invoice_date'])) : date('d/m/Y', strtotime($o['order_date'])); ?></td>
+                            <td<?php
+                                if ($dueOverdue) {
+                                    echo ' style="color:#DC2626;font-weight:600;"';
+                                } elseif ($dueSoon) {
+                                    echo ' style="color:#B45309;font-weight:600;"';
+                                }
+                            ?>>
+                                <?php if ($dueDate): ?>
+                                    <?php echo date('d/m/Y', strtotime((string)$dueDate)); ?>
+                                    <?php if ($dueOverdue): ?>
+                                        <small>(<?php echo $daysOver; ?> d)</small>
+                                    <?php elseif ($dueSoon && $daysOver === 0): ?>
+                                        <small>(hoy)</small>
+                                    <?php elseif ($dueSoon): ?>
+                                        <small>(<?php echo abs($daysOver); ?> d)</small>
+                                    <?php endif; ?>
+                                <?php else: ?>
+                                    —
                                 <?php endif; ?>
-                            <?php else: ?>
-                                —
-                            <?php endif; ?>
-                        </td>
-                        <td><?php echo htmlspecialchars($o['supplier_name'] ?? '—'); ?></td>
-                        <td><?php echo htmlspecialchars($o['invoice_number'] ?? '—'); ?></td>
-                        <td>
-                            <?php if (!empty($o['invoice_path'])): ?>
-                                <a class="btn btn-sm btn-secondary" href="<?php echo $viewInstance->route('app/compras'); ?>?action=invoice&id=<?php echo (int)$o['id']; ?>" target="_blank" title="Ver foto/PDF factura">Ver</a>
-                            <?php else: ?>
-                                —
-                            <?php endif; ?>
-                        </td>
-                        <td style="font-weight:600;"><?php echo fmtC((float)$o['total'], $currency); ?></td>
-                        <td style="font-weight:600;color:<?php echo $isPayable ? '#DC2626' : '#10B981'; ?>;">
-                            <?php echo $st === 'received' ? fmtC(max(0, $orderBalance), $currency) : '—'; ?>
-                        </td>
-                        <td><span class="badge <?php echo $badge; ?>"><?php echo $statusLabels[$st] ?? $st; ?></span></td>
-                        <td style="font-size:12px;"><?php echo htmlspecialchars($o['accounting_entry_id'] ? ('#' . $o['accounting_entry_id']) : '—'); ?></td>
-                        <td class="table-actions" style="white-space:nowrap;">
-                            <button type="button" class="btn btn-sm btn-secondary" onclick="viewPurchase(<?php echo (int)$o['id']; ?>)" title="Ver">Ver</button>
-                            <?php if ($canCreate): ?>
-                                <button type="button" class="btn btn-sm btn-secondary" onclick="duplicatePurchase(<?php echo (int)$o['id']; ?>)" title="Duplicar para editar fechas/productos">Duplicar</button>
-                            <?php endif; ?>
-                            <?php if ($canEdit && in_array($st, ['draft', 'ordered'], true)): ?>
-                                <button type="button" class="btn btn-sm btn-success" onclick="openReceiveModal(<?php echo (int)$o['id']; ?>, '<?php echo htmlspecialchars($o['order_number'], ENT_QUOTES); ?>')" title="Recibir">Recibir</button>
-                            <?php endif; ?>
-                            <?php if ($canEdit && $st === 'received'): ?>
-                                <button type="button" class="btn btn-sm btn-secondary"
-                                        onclick="openCreditNoteModal(<?php echo (int)$o['id']; ?>)"
-                                        title="Nota de crédito">NC</button>
-                            <?php endif; ?>
-                            <?php if ($canEdit && $isPayable): ?>
-                                <button type="button" class="btn btn-sm btn-primary"
-                                        onclick="openPayModal(<?php echo (int)$o['id']; ?>, '<?php echo htmlspecialchars($o['order_number'], ENT_QUOTES); ?>', <?php echo $orderBalance; ?>, '<?php echo htmlspecialchars($o['supplier_name'] ?? '', ENT_QUOTES); ?>')"
-                                        title="Registrar abono al proveedor">Abonar</button>
-                            <?php endif; ?>
-                            <?php if ($canDelete && in_array($st, ['draft', 'ordered'], true)): ?>
-                                <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=cancel" style="display:inline;" data-ajax="true">
-                                    <?php echo \SoftNova\Core\csrf_field(); ?>
-                                    <input type="hidden" name="id" value="<?php echo (int)$o['id']; ?>">
-                                    <button type="submit" class="btn btn-sm btn-danger" onclick="return confirm('¿Cancelar esta OC?')" title="Cancelar">✕</button>
-                                </form>
-                            <?php endif; ?>
-                        </td>
+                            </td>
+                            <td><?php echo htmlspecialchars($o['supplier_name'] ?? '—'); ?></td>
+                            <td>
+                                <?php if (!empty($o['invoice_path'])): ?>
+                                    <a class="btn btn-sm btn-secondary" href="<?php echo $comprasBase; ?>?action=invoice&id=<?php echo (int)$o['id']; ?>" target="_blank" title="Ver foto/PDF factura">Ver</a>
+                                <?php else: ?>
+                                    —
+                                <?php endif; ?>
+                            </td>
+                            <td style="font-weight:600;"><?php echo fmtC((float)$o['total'], $currency); ?></td>
+                            <td style="color:#10B981;"><?php echo fmtC((float)($o['paid_total'] ?? 0), $currency); ?></td>
+                            <td style="font-weight:600;color:<?php echo $isPayable ? '#DC2626' : '#10B981'; ?>;">
+                                <?php echo fmtC(max(0, $orderBalance), $currency); ?>
+                            </td>
+                            <td style="font-size:12px;"><?php echo htmlspecialchars($payLabel); ?></td>
+                            <td style="font-size:12px;"><?php echo htmlspecialchars($o['accounting_entry_id'] ? ('#' . $o['accounting_entry_id']) : '—'); ?></td>
+                            <td class="table-actions" style="white-space:nowrap;">
+                                <button type="button" class="btn btn-sm btn-secondary" onclick="viewPurchase(<?php echo (int)$o['id']; ?>)" title="Ver">Ver</button>
+                                <?php if ($canEdit): ?>
+                                    <button type="button" class="btn btn-sm btn-secondary"
+                                            onclick="openCreditNoteModal(<?php echo (int)$o['id']; ?>)"
+                                            title="Nota de crédito">NC</button>
+                                <?php endif; ?>
+                                <?php if ($canEdit && $isPayable): ?>
+                                    <button type="button" class="btn btn-sm btn-primary"
+                                            onclick="openPayModal(<?php echo (int)$o['id']; ?>, '<?php echo htmlspecialchars($o['order_number'], ENT_QUOTES); ?>', <?php echo $orderBalance; ?>, '<?php echo htmlspecialchars($o['supplier_name'] ?? '', ENT_QUOTES); ?>')"
+                                            title="Registrar abono al proveedor">Abonar</button>
+                                <?php endif; ?>
+                            </td>
+                        <?php else: ?>
+                            <td><strong><?php echo htmlspecialchars($o['order_number']); ?></strong></td>
+                            <td><?php echo date('d/m/Y', strtotime($o['order_date'])); ?></td>
+                            <td><?php echo !empty($o['expected_date']) ? date('d/m/Y', strtotime((string)$o['expected_date'])) : '—'; ?></td>
+                            <td><?php echo htmlspecialchars($o['supplier_name'] ?? 'Sin proveedor'); ?></td>
+                            <td style="font-weight:600;"><?php echo fmtC((float)$o['total'], $currency); ?></td>
+                            <td><span class="badge <?php echo $badge; ?>"><?php echo $statusLabels[$st] ?? $st; ?></span></td>
+                            <td class="table-actions" style="white-space:nowrap;">
+                                <button type="button" class="btn btn-sm btn-secondary" onclick="viewPurchase(<?php echo (int)$o['id']; ?>)" title="Ver detalle de la orden, ítems y EAN">Ver</button>
+                                <?php if ($canCreate): ?>
+                                    <button type="button" class="btn btn-sm btn-secondary" onclick="duplicatePurchase(<?php echo (int)$o['id']; ?>)" title="Crear una OC nueva copiando productos y cantidades">Duplicar</button>
+                                <?php endif; ?>
+                                <?php if (in_array($st, ['draft', 'ordered'], true)): ?>
+                                    <a href="<?php echo $comprasBase; ?>?action=order_pdf&id=<?php echo (int)$o['id']; ?>"
+                                       class="btn btn-sm btn-secondary" target="_blank" rel="noopener"
+                                       title="Descargar PDF de la orden para el proveedor (incluye EAN)">PDF</a>
+                                    <?php if ($canEdit): ?>
+                                        <button type="button" class="btn btn-sm btn-success"
+                                                onclick="poWhatsapp(<?php echo (int)$o['id']; ?>)"
+                                                title="Abrir WhatsApp con el detalle de la OC (productos y EAN)">WhatsApp</button>
+                                        <button type="button" class="btn btn-sm btn-info"
+                                                onclick="poEmail(<?php echo (int)$o['id']; ?>, '<?php echo htmlspecialchars($o['supplier_name'] ?? '', ENT_QUOTES); ?>')"
+                                                title="Enviar la OC por correo con PDF adjunto">Correo</button>
+                                    <?php endif; ?>
+                                <?php endif; ?>
+                                <?php if ($canEdit && in_array($st, ['draft', 'ordered'], true)): ?>
+                                    <button type="button" class="btn btn-sm btn-success" onclick="openReceiveModal(<?php echo (int)$o['id']; ?>, '<?php echo htmlspecialchars($o['order_number'], ENT_QUOTES); ?>')" title="Registrar llegada a bodega: factura, vencimiento, pago e inventario">Recibir</button>
+                                <?php endif; ?>
+                                <?php if ($canDelete && in_array($st, ['draft', 'ordered'], true)): ?>
+                                    <form method="POST" action="<?php echo $comprasBase; ?>?action=cancel" style="display:inline;" data-ajax="true">
+                                        <?php echo \SoftNova\Core\csrf_field(); ?>
+                                        <input type="hidden" name="id" value="<?php echo (int)$o['id']; ?>">
+                                        <button type="submit" class="btn btn-sm btn-danger" onclick="return confirm('¿Cancelar esta OC?')" title="Cancelar la orden (no se puede si ya fue recibida)">✕</button>
+                                    </form>
+                                <?php endif; ?>
+                            </td>
+                        <?php endif; ?>
                     </tr>
                 <?php endforeach; ?>
                 </tbody>
             </table></div>
             <?php
-            $paginationBaseUrl = $viewInstance->route('app/compras');
-            $paginationQuery = array_filter([
-                'status' => $statusFilter !== '' ? $statusFilter : null,
-                'due' => $dueFilter !== '' ? $dueFilter : null,
-            ]);
+            $paginationBaseUrl = $comprasBase;
+            $paginationQuery = $isFacturasTab
+                ? array_filter([
+                    'action' => 'facturas',
+                    'payment' => $paymentFilter !== '' ? $paymentFilter : null,
+                    'due' => $dueFilter !== '' ? $dueFilter : null,
+                ])
+                : array_filter([
+                    'status' => $statusFilter !== '' && $statusFilter !== 'open' ? $statusFilter : null,
+                ]);
             $viewInstance->partial('pagination', compact('pagination', 'paginationBaseUrl', 'paginationQuery'));
             ?>
         <?php endif; ?>
@@ -400,7 +516,7 @@ function viewPurchase(id) {
                 </p>
                 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
                     <div class="form-group" style="margin:0;">
-                        <label>Proveedor</label>
+                        <label>Proveedor <span class="field-tip" data-tip="A quién se solicita el pedido. Puede dejarse vacío y asignarlo después al recibir o cargar la factura." tabindex="0">?</span></label>
                         <select name="supplier_id" id="poSupplierId" class="form-control">
                             <option value="">Sin proveedor</option>
                             <?php foreach ($suppliers as $s): ?>
@@ -409,22 +525,22 @@ function viewPurchase(id) {
                         </select>
                     </div>
                     <div class="form-group" style="margin:0;">
-                        <label>Fecha OC *</label>
+                        <label>Fecha OC * <span class="field-tip" data-tip="Fecha del documento de pedido (solicitud al proveedor). No es la fecha de ingreso a bodega." tabindex="0">?</span></label>
                         <input type="date" name="order_date" id="poOrderDate" class="form-control" required>
                     </div>
                     <div class="form-group" style="margin:0;">
-                        <label>Entrega estimada</label>
+                        <label>Entrega estimada <span class="field-tip" data-tip="Fecha aproximada en que espera que llegue la mercancía. Sirve para seguimiento, no afecta inventario." tabindex="0">?</span></label>
                         <input type="date" name="expected_date" id="poExpectedDate" class="form-control">
                     </div>
                 </div>
                 <div class="form-group">
-                    <label>Notas</label>
+                    <label>Notas <span class="field-tip" data-tip="Observaciones internas o para el proveedor (condiciones, contacto, referencia del pedido)." tabindex="0">?</span></label>
                     <input type="text" name="notes" id="poNotes" class="form-control" placeholder="Observaciones del pedido">
                 </div>
 
                 <h4 style="margin:12px 0 8px;">Ítems</h4>
                 <div class="form-group" style="margin-bottom:8px;position:relative;">
-                    <label>Buscar / escanear producto</label>
+                    <label>Buscar / escanear producto <span class="field-tip" data-tip="Busque por nombre, SKU o EAN. Con pistola: escanee y pulse Enter para agregar. Solo productos existentes del catálogo." tabindex="0">?</span></label>
                     <input type="search" id="poProductSearch" class="form-control" placeholder="Nombre, SKU o EAN… Enter para agregar"
                            autocomplete="off" data-barcode-input="true" title="Escriba para buscar o use la pistola de códigos">
                     <ul class="combobox-list" id="poProductSuggest" hidden style="z-index:30;"></ul>
@@ -454,27 +570,27 @@ function viewPurchase(id) {
             <p id="receiveOrderLabel" style="font-weight:600;margin-bottom:10px;"></p>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                 <div class="form-group" style="margin:0;">
-                    <label>Fecha ingreso a bodega *</label>
+                    <label>Fecha ingreso a bodega * <span class="field-tip" data-tip="Fecha real en que la mercancía entra al inventario. Define el movimiento de stock y el asiento contable." tabindex="0">?</span></label>
                     <input type="date" name="warehouse_date" id="receiveWarehouseDate" class="form-control" required>
                 </div>
                 <div class="form-group" style="margin:0;">
-                    <label>Fecha factura</label>
+                    <label>Fecha factura <span class="field-tip" data-tip="Fecha impresa en la factura del proveedor. Puede diferir de la fecha de bodega." tabindex="0">?</span></label>
                     <input type="date" name="invoice_date" id="receiveInvoiceDate" class="form-control">
                 </div>
                 <div class="form-group" style="margin:0;">
-                    <label>N° factura proveedor</label>
+                    <label>N° factura proveedor <span class="field-tip" data-tip="Número o consecutivo de la factura del proveedor. Queda en la trazabilidad y en Facturas." tabindex="0">?</span></label>
                     <input type="text" name="invoice_number" class="form-control" placeholder="FV-001">
                 </div>
                 <div class="form-group" style="margin:0;">
-                    <label>Vencimiento de pago</label>
+                    <label>Vencimiento de pago <span class="field-tip" data-tip="Fecha límite para pagar al proveedor (CxP). Se usa en filtros de vencidas / por vencer." tabindex="0">?</span></label>
                     <input type="date" name="due_date" id="receiveDueDate" class="form-control">
                 </div>
                 <div class="form-group" style="margin:0;">
-                    <label>Desc. pronto pago %</label>
+                    <label>Desc. pronto pago % <span class="field-tip" data-tip="Porcentaje de descuento si paga antes del vencimiento. Reduce el total de la OC/factura." tabindex="0">?</span></label>
                     <input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" id="receiveEarlyDiscount" class="form-control" value="" placeholder="0">
                 </div>
                 <div class="form-group" style="margin:0;">
-                    <label>Pago / contrapartida *</label>
+                    <label>Pago / contrapartida * <span class="field-tip" data-tip="Crédito = queda por pagar (220505). Efectivo/transferencia/tarjeta = sale de caja o bancos al recibir." tabindex="0">?</span></label>
                     <select name="payment_mode" class="form-control" required>
                         <option value="payable">Por pagar (220505) + IVA descontable</option>
                         <option value="cash">Efectivo (sale del cajón)</option>
@@ -484,11 +600,11 @@ function viewPurchase(id) {
                 </div>
             </div>
             <div class="form-group">
-                <label>Foto / PDF factura</label>
+                <label>Foto / PDF factura <span class="field-tip" data-tip="Adjunto de evidencia (foto o PDF). Se consulta después desde Facturas → Ver." tabindex="0">?</span></label>
                 <input type="file" name="invoice_file" class="form-control" accept="image/jpeg,image/png,image/webp,application/pdf">
             </div>
             <div class="form-group">
-                <label>Notas</label>
+                <label>Notas <span class="field-tip" data-tip="Comentarios de la recepción (faltantes, novedades, calidad)." tabindex="0">?</span></label>
                 <input type="text" name="notes" class="form-control">
             </div>
             <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 8px;">Si elige <strong>Efectivo</strong>, debe haber una caja abierta: el total se registra como egreso en Caja.</p>
@@ -507,21 +623,22 @@ function viewPurchase(id) {
             <h3>Registrar abono al proveedor</h3>
             <button type="button" class="modal-close" onclick="document.getElementById('payModal').style.display='none'">&times;</button>
         </div>
-        <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=pay" data-ajax="true">
+        <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=pay"
+              data-ajax="true" enctype="multipart/form-data">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="id" id="payOrderId">
             <p id="payOrderLabel" style="font-weight:600;margin-bottom:4px;"></p>
             <p id="payBalanceLabel" style="font-size:13px;color:var(--color-text-secondary);margin-bottom:12px;"></p>
             <div class="form-group">
-                <label>Valor del abono *</label>
+                <label>Valor del abono * <span class="field-tip" data-tip="Monto que paga ahora al proveedor. No puede superar el saldo pendiente (total − abonos − notas de crédito)." tabindex="0">?</span></label>
                 <input type="text" inputmode="decimal" name="amount" id="payAmount" class="form-control money-input" data-money="1" required placeholder="0">
             </div>
             <div class="form-group">
-                <label>Fecha del pago *</label>
+                <label>Fecha del pago * <span class="field-tip" data-tip="Fecha real del desembolso. Define la fecha del asiento contable del abono." tabindex="0">?</span></label>
                 <input type="date" name="payment_date" id="payDate" class="form-control" required>
             </div>
             <div class="form-group">
-                <label>Medio de pago *</label>
+                <label>Medio de pago * <span class="field-tip" data-tip="Efectivo reduce el cajón de la caja abierta. Transferencia/tarjeta afectan bancos (111005)." tabindex="0">?</span></label>
                 <select name="payment_method" class="form-control" required>
                     <option value="cash">Efectivo (110505) · sale del cajón</option>
                     <option value="transfer">Transferencia (111005)</option>
@@ -530,11 +647,19 @@ function viewPurchase(id) {
                 <p style="font-size:12px;color:var(--color-text-secondary);margin:6px 0 0;">Abonos en <strong>efectivo</strong> descuentan el cajón de la caja abierta.</p>
             </div>
             <div class="form-group">
-                <label>Referencia / comprobante</label>
+                <label>Referencia / comprobante <span class="field-tip" data-tip="Número de transferencia, voucher o recibo. Útil para conciliar con el extracto bancario." tabindex="0">?</span></label>
                 <input type="text" name="reference" class="form-control" placeholder="N° transacción o recibo">
             </div>
             <div class="form-group">
-                <label>Notas</label>
+                <label>Foto del comprobante <span class="field-tip" data-tip="Adjunte la foto o PDF del comprobante de consignación, transferencia o pago. Queda guardado con el abono para consulta posterior." tabindex="0">?</span></label>
+                <input type="file" name="payment_receipt" id="payReceiptFile" class="form-control"
+                       accept="image/jpeg,image/png,image/webp,application/pdf">
+                <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">
+                    Opcional. JPG, PNG, WEBP o PDF · máx. 5 MB.
+                </small>
+            </div>
+            <div class="form-group">
+                <label>Notas <span class="field-tip" data-tip="Observación interna del abono (quién pagó, acuerdo, etc.)." tabindex="0">?</span></label>
                 <input type="text" name="notes" class="form-control">
             </div>
             <p style="font-size:12px;color:var(--color-text-secondary);">
@@ -548,7 +673,34 @@ function viewPurchase(id) {
     </div>
 </div>
 
-<?php if (!empty($payableOrders)): ?>
+<?php if ($canEdit): ?>
+<div class="modal-overlay" id="poEmailModal" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:440px;">
+        <div class="modal-header">
+            <h3>Enviar orden por correo</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('poEmailModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $comprasBase; ?>?action=order_email">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="id" id="poEmailOrderId">
+            <p style="margin-top:0;font-weight:600;" id="poEmailSupplier"></p>
+            <div class="form-group">
+                <label>Correo destino <span class="field-tip" data-tip="Si lo deja vacío se usa el email del proveedor. Se adjunta el PDF de la OC con productos y EAN." tabindex="0">?</span></label>
+                <input type="email" name="email" class="form-control" placeholder="Se usa el del proveedor si lo deja vacío">
+            </div>
+            <p style="font-size:12px;color:var(--color-text-secondary);">
+                Se adjunta el PDF de la orden. Si el hosting no tiene correo saliente, descargue el PDF y envíelo manualmente.
+            </p>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('poEmailModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-primary">Enviar</button>
+            </div>
+        </form>
+    </div>
+</div>
+<?php endif; ?>
+
+<?php if ($isFacturasTab && !empty($payableOrders)): ?>
 <div class="card neumorphic" style="margin-top:18px;">
     <div class="card-header"><h3>Cuentas por pagar a proveedores<?php
         echo match ($dueFilter) {
@@ -612,12 +764,14 @@ function viewPurchase(id) {
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <div class="invoice-shell-body">
                 <p style="margin-top:0;font-size:13px;color:var(--color-text-secondary);">
-                    La factura se interpreta y se muestra en un modal de confirmación.
-                    <strong>Nada entra al inventario hasta que usted confirme.</strong>
+                    Puede <strong>cargar un archivo</strong> (foto/PDF/Excel), <strong>pegar texto</strong>
+                    o <strong>continuar sin archivo</strong> y agregar productos a mano (buscar / escanear).
+                    En la revisión también podrá <strong>casar con una OC</strong> abierta.
+                    <strong>Nada entra al inventario hasta que confirme.</strong>
                 </p>
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                     <div class="form-group" style="grid-column:1/-1;">
-                        <label>Proveedor *</label>
+                        <label>Proveedor * <span class="field-tip" data-tip="Obligatorio para casar líneas, precios y CxP. Puede crear uno con + Nuevo sin perder el archivo." tabindex="0">?</span></label>
                         <div class="customer-combobox invoice-supplier-combobox" id="invoiceSupplierCombobox" data-required="1">
                             <input type="hidden" name="supplier_id" id="invoiceSupplierId" value="" required>
                             <div style="display:flex;gap:8px;align-items:stretch;">
@@ -634,19 +788,19 @@ function viewPurchase(id) {
                         </small>
                     </div>
                     <div class="form-group">
-                        <label>Número de factura</label>
+                        <label>Número de factura <span class="field-tip" data-tip="Consecutivo del proveedor. Si viene en el archivo, la lectura lo propone; puede editarlo en la revisión." tabindex="0">?</span></label>
                         <input type="text" name="invoice_number" class="form-control" maxlength="80" placeholder="Se detecta si viene en el archivo">
                     </div>
                     <div class="form-group">
-                        <label>Fecha de factura</label>
+                        <label>Fecha de factura <span class="field-tip" data-tip="Fecha del documento del proveedor. Se puede ajustar al revisar antes de confirmar." tabindex="0">?</span></label>
                         <input type="date" name="invoice_date" class="form-control" value="<?php echo date('Y-m-d'); ?>">
                     </div>
                     <div class="form-group">
-                        <label>Vencimiento de pago</label>
+                        <label>Vencimiento de pago <span class="field-tip" data-tip="Fecha límite de CxP. Alimenta filtros de vencidas / por vencer en Facturas." tabindex="0">?</span></label>
                         <input type="date" name="due_date" class="form-control">
                     </div>
                     <div class="form-group">
-                        <label>Forma de pago</label>
+                        <label>Forma de pago <span class="field-tip" data-tip="Crédito deja saldo por pagar. Efectivo/transferencia/tarjeta liquidan al confirmar el ingreso." tabindex="0">?</span></label>
                         <select name="payment_mode" class="form-control">
                             <option value="payable">Crédito (cuenta por pagar)</option>
                             <option value="cash">Efectivo</option>
@@ -655,31 +809,31 @@ function viewPurchase(id) {
                         </select>
                     </div>
                     <div class="form-group">
-                        <label>Desc. pronto pago %</label>
+                        <label>Desc. pronto pago % <span class="field-tip" data-tip="Porcentaje si paga anticipado. Se confirma en la revisión; reduce el total de la factura." tabindex="0">?</span></label>
                         <input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" class="form-control" value="" placeholder="0">
                         <small style="color:var(--color-text-secondary);">Opcional. Se confirmará al revisar la factura.</small>
                     </div>
                 </div>
-                <div class="form-group">
-                    <label>Archivo de la factura</label>
-                    <input type="file" name="invoice_file" class="form-control" style="padding:8px;"
-                           accept=".csv,.txt,.pdf,.xml,.zip,.xlsx,.xlsm,.xls,.ods,.docx,image/*">
-                    <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
-                        Excel, Word, PDF, XML/ZIP DIAN, CSV y fotos/CamScanner.
-                        Escaneos: marque «Interpretar con IA».
-                    </small>
-                </div>
-                <div class="form-group">
-                    <label>O pegue el texto de la factura</label>
-                    <textarea name="pasted_text" rows="3" class="form-control"
-                              placeholder="Pegue aquí las líneas de la factura si no tiene archivo"></textarea>
-                </div>
+                    <div class="form-group">
+                        <label>Archivo de la factura <span class="field-tip" data-tip="Opcional. Excel, Word, PDF, XML DIAN, CSV o foto. Si no tiene archivo, use «Continuar sin archivo» y agregue productos a mano. Escaneos: active Interpretar con IA." tabindex="0">?</span></label>
+                        <input type="file" name="invoice_file" class="form-control" style="padding:8px;"
+                               accept=".csv,.txt,.pdf,.xml,.zip,.xlsx,.xlsm,.xls,.ods,.docx,image/*">
+                        <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
+                            Opcional. Excel, Word, PDF, XML/ZIP DIAN, CSV y fotos/CamScanner.
+                            Escaneos: marque «Interpretar con IA».
+                        </small>
+                    </div>
+                    <div class="form-group">
+                        <label>O pegue el texto de la factura <span class="field-tip" data-tip="Opcional. Pegue líneas del PDF o correo. También puede dejarlo vacío y cargar todo a mano en la revisión." tabindex="0">?</span></label>
+                        <textarea name="pasted_text" rows="3" class="form-control"
+                                  placeholder="Opcional: pegue aquí las líneas si no tiene archivo"></textarea>
+                    </div>
                 <div class="form-group" style="margin-bottom:0;">
                     <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;<?php echo $aiInvoiceReady ? '' : 'opacity:.55;'; ?>">
                         <input type="checkbox" name="use_ai" id="invoiceUseAi" value="1" style="width:auto;margin-top:3px;"
                                <?php echo $aiInvoiceReady ? 'checked' : 'disabled'; ?>>
                         <span>
-                            Interpretar con IA
+                            Interpretar con IA <span class="field-tip" data-tip="Usa IA para leer fotos o PDF escaneados. Si el PDF ya tiene texto, también mejora el armado de líneas. Requiere OPENROUTER_API_KEY." tabindex="0">?</span>
                             <small style="display:block;color:var(--color-text-secondary);font-weight:400;">
                                 Necesario para PDF escaneados o fotos. Si el PDF ya trae texto, también mejora la lectura.
                             </small>
@@ -690,9 +844,14 @@ function viewPurchase(id) {
                     </label>
                 </div>
             </div>
-            <div class="modal-footer invoice-shell-footer">
+            <div class="modal-footer invoice-shell-footer" style="flex-wrap:wrap;gap:8px;">
                 <button type="button" class="btn btn-secondary" onclick="closeInvoiceUpload()">Cancelar</button>
-                <button type="submit" class="btn btn-primary">Leer factura</button>
+                <button type="button" class="btn btn-primary" onclick="startManualInvoiceDraft()"
+                        title="Crea el borrador vacío y abre la revisión para buscar/escanear productos">
+                    Continuar sin archivo
+                </button>
+                <button type="submit" class="btn btn-secondary"
+                        title="Interpreta el archivo o el texto pegado">Leer factura</button>
             </div>
         </form>
     </div>
@@ -712,11 +871,11 @@ function viewPurchase(id) {
             </p>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                 <div class="form-group" style="grid-column:1/-1;">
-                    <label>Nombre de empresa *</label>
+                    <label>Nombre de empresa * <span class="field-tip" data-tip="Razón social o nombre comercial. Quedará seleccionado en la factura al guardar." tabindex="0">?</span></label>
                     <input type="text" name="name" id="qsName" class="form-control" required maxlength="255">
                 </div>
                 <div class="form-group">
-                    <label>Tipo doc.</label>
+                    <label>Tipo doc. <span class="field-tip" data-tip="Tipo de identificación tributaria o personal del proveedor." tabindex="0">?</span></label>
                     <select name="document_type" id="qsDocType" class="form-control">
                         <option value="NIT">NIT</option>
                         <option value="CC">C.C</option>
@@ -725,23 +884,23 @@ function viewPurchase(id) {
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>N° documento *</label>
+                    <label>N° documento * <span class="field-tip" data-tip="NIT o documento sin puntos. Debe ser único en el catálogo de proveedores." tabindex="0">?</span></label>
                     <input type="text" name="document_number" id="qsDocNum" class="form-control" required maxlength="60">
                 </div>
                 <div class="form-group">
-                    <label>Contacto</label>
+                    <label>Contacto <span class="field-tip" data-tip="Persona de contacto habitual para pedidos o reclamos." tabindex="0">?</span></label>
                     <input type="text" name="contact_name" id="qsContact" class="form-control" maxlength="120">
                 </div>
                 <div class="form-group">
-                    <label>Teléfono *</label>
+                    <label>Teléfono * <span class="field-tip" data-tip="Usado para WhatsApp al enviar órdenes de compra. Incluya indicativo si aplica." tabindex="0">?</span></label>
                     <input type="text" name="phone" id="qsPhone" class="form-control" required maxlength="60">
                 </div>
                 <div class="form-group" style="grid-column:1/-1;">
-                    <label>Email</label>
+                    <label>Email <span class="field-tip" data-tip="Correo por defecto al enviar la OC. Puede sobrescribirse al momento del envío." tabindex="0">?</span></label>
                     <input type="email" name="email" id="qsEmail" class="form-control" maxlength="180">
                 </div>
                 <div class="form-group" style="grid-column:1/-1;">
-                    <label>Dirección</label>
+                    <label>Dirección <span class="field-tip" data-tip="Dirección comercial del proveedor (referencia interna)." tabindex="0">?</span></label>
                     <input type="text" name="address" id="qsAddress" class="form-control" maxlength="255">
                 </div>
             </div>
@@ -801,22 +960,23 @@ function viewPurchase(id) {
             <p id="cnOrderLabel" style="margin-top:0;font-size:13px;color:var(--color-text-secondary);"></p>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                 <div class="form-group">
-                    <label>Fecha</label>
+                    <label>Fecha <span class="field-tip" data-tip="Fecha de la nota de crédito. Define el asiento contable inverso." tabindex="0">?</span></label>
                     <input type="date" name="credit_date" id="cnDate" class="form-control" required>
                 </div>
                 <div class="form-group">
-                    <label>N° documento proveedor</label>
+                    <label>N° documento proveedor <span class="field-tip" data-tip="Número de la NC emitida por el proveedor (si la tiene). Queda en trazabilidad." tabindex="0">?</span></label>
                     <input type="text" name="external_number" class="form-control" placeholder="Opcional">
                 </div>
             </div>
             <div class="form-group">
-                <label>Motivo</label>
+                <label>Motivo <span class="field-tip" data-tip="Devolución, daño, descuento comercial, error de facturación, etc." tabindex="0">?</span></label>
                 <input type="text" name="reason" class="form-control" placeholder="Devolución, mercancía dañada, descuento, etc.">
             </div>
             <div class="form-group">
                 <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
                     <input type="checkbox" name="affects_stock" id="cnAffectsStock" value="1" checked style="width:auto;">
                     Devolver mercancía al proveedor (salida de inventario)
+                    <span class="field-tip" data-tip="Marcado: sale stock y reduce CxP. Desmarcado: solo ajuste comercial (baja el saldo, no toca inventario)." tabindex="0">?</span>
                 </label>
                 <small style="color:var(--color-text-secondary);">Si lo desmarca, solo reduce el saldo por pagar (ajuste comercial sin tocar stock).</small>
             </div>
@@ -853,6 +1013,9 @@ window.poProducts = <?php echo json_encode(array_map(static function ($p) {
 window.poDetailUrl = '<?php echo $viewInstance->route('app/compras'); ?>?action=detail';
 window.poWarehouseKey = 'seri_last_warehouse_date';
 window.poInvoicePreviewUrl = '<?php echo $viewInstance->route('app/compras'); ?>?action=invoice_preview';
+window.poInvoiceAddLineUrl = '<?php echo $viewInstance->route('app/compras'); ?>?action=invoice_add_line';
+window.poInvoiceLinkOrderUrl = '<?php echo $viewInstance->route('app/compras'); ?>?action=invoice_link_order';
+window.poCsrfToken = <?php echo json_encode(\SoftNova\Core\csrf_token()); ?>;
 window.poQuickSupplierUrl = '<?php echo $viewInstance->route('app/compras'); ?>?action=quick_supplier';
 window.poSuppliers = <?php echo json_encode(array_map(static fn($s) => [
     'id' => (int)$s['id'],
@@ -994,6 +1157,53 @@ function closeInvoiceReview() {
     document.getElementById('invoiceReviewModal').style.display = 'none';
 }
 
+/** Crea un borrador de factura vacío (sin PDF/foto) y abre la revisión para agregar productos a mano. */
+function startManualInvoiceDraft() {
+    var form = document.getElementById('invoiceUploadForm');
+    var hid = document.getElementById('invoiceSupplierId');
+    if (!form) return;
+    if (!hid || !hid.value) {
+        if (typeof showAlert === 'function') {
+            showAlert('Seleccione un proveedor de la lista (o cree uno con + Nuevo)', 'warning');
+        }
+        var search = document.getElementById('invoiceSupplierSearch');
+        if (search) search.focus();
+        return;
+    }
+    var fd = new FormData(form);
+    fd.delete('invoice_file');
+    fd.set('pasted_text', '');
+    fd.set('use_ai', '');
+    fd.delete('use_ai');
+
+    var btn = form.querySelector('button[onclick="startManualInvoiceDraft()"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Preparando…'; }
+
+    fetch(form.action, {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        if (!d || !d.success || !d.import_id) {
+            throw new Error((d && d.message) || 'No se pudo crear el borrador');
+        }
+        closeInvoiceUpload();
+        if (typeof showAlert === 'function') {
+            showAlert(d.message || 'Borrador listo: agregue productos', 'success');
+        }
+        openInvoiceReview(d.import_id);
+    })
+    .catch(function(err) {
+        if (typeof showAlert === 'function') showAlert(err.message || 'Error', 'error');
+    })
+    .finally(function() {
+        if (btn) { btn.disabled = false; btn.textContent = 'Continuar sin archivo'; }
+    });
+}
+
 function openQuickSupplierModal(target) {
     window._quickSupplierTarget = target || 'upload';
     var form = document.getElementById('quickSupplierForm');
@@ -1086,35 +1296,54 @@ function openInvoiceReview(importId) {
     .then(function(r) { return r.json(); })
     .then(function(d) {
         if (!d.success) return showAlert(d.message || 'No se pudo cargar la factura', 'error');
+        window._invoiceReviewOpenOrders = d.open_orders || [];
         renderInvoiceReview(d.import, d.items || []);
+        setTimeout(function() {
+            var search = document.getElementById('irProductSearch');
+            if (search && !(d.items || []).length) search.focus();
+            // Si ya venía casada una OC y el borrador está vacío, carga sus productos.
+            if (d.import && d.import.linked_order_id && !(d.items || []).length) {
+                linkInvoiceToOrder(d.import.linked_order_id);
+            }
+        }, 80);
     })
     .catch(function() { showAlert('No se pudo cargar la factura', 'error'); });
 }
 
 function renderInvoiceReview(imp, items) {
     document.getElementById('irImportId').value = imp.id;
+    window._invoiceReviewImportId = imp.id;
+    window._invoiceReviewItems = items || [];
 
+    var tip = function(t) {
+        return ' <span class="field-tip" data-tip="' + esc(t) + '" tabindex="0">?</span>';
+    };
     var h = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px;">';
-    h += '<div class="form-group" style="margin:0;grid-column:1/-1;"><label>Proveedor *</label>' +
+    h += '<div class="form-group" style="margin:0;grid-column:1/-1;"><label>Proveedor *' + tip('Proveedor de la factura. Debe coincidir para casar códigos y CxP.') + '</label>' +
          '<div class="customer-combobox invoice-supplier-combobox" id="reviewSupplierCombobox">' +
          '<input type="hidden" name="supplier_id" id="reviewSupplierId" value="' + esc(imp.supplier_id || '') + '" required>' +
          '<div style="display:flex;gap:8px;align-items:stretch;">' +
          '<input type="search" id="reviewSupplierSearch" class="form-control" autocomplete="off" placeholder="Buscar proveedor…" style="flex:1;">' +
          '<button type="button" class="btn btn-secondary" style="white-space:nowrap;" onclick="openQuickSupplierModal(\'review\')">+ Nuevo</button>' +
          '</div><ul class="combobox-list" id="reviewSupplierList" hidden></ul></div></div>';
-    h += '<div class="form-group" style="margin:0;"><label>N.º factura</label>' +
+    h += '<div class="form-group" style="margin:0;grid-column:1/-1;"><label>Casar con OC de pedido (opcional)' + tip('Al elegir una OC abierta se cargan sus productos al borrador. Puede ajustar cantidades/precios de la factura; al confirmar se recibe esa OC y el costo de inventario se actualiza con el de la factura.') + '</label>' +
+         '<select name="linked_order_id" id="reviewLinkedOrderId" class="form-control">' +
+         openOrdersOptionsHtml(imp.linked_order_id || '') +
+         '</select>' +
+         '<small style="color:var(--color-text-secondary);display:block;margin-top:4px;">Al seleccionar una OC se cargan sus productos. Si el precio de la factura difiere, edítelo aquí: al confirmar se actualiza el costo en inventario.</small></div>';
+    h += '<div class="form-group" style="margin:0;"><label>N.º factura' + tip('Consecutivo del proveedor. Identifica el documento en Facturas y PDF.') + '</label>' +
          '<input type="text" name="invoice_number" class="form-control" maxlength="80" value="' + esc(imp.invoice_number || '') + '"></div>';
-    h += '<div class="form-group" style="margin:0;"><label>Fecha factura</label>' +
+    h += '<div class="form-group" style="margin:0;"><label>Fecha factura' + tip('Fecha impresa en la factura del proveedor.') + '</label>' +
          '<input type="date" name="invoice_date" class="form-control" value="' + (imp.invoice_date || '') + '"></div>';
-    h += '<div class="form-group" style="margin:0;"><label>Vencimiento pago</label>' +
+    h += '<div class="form-group" style="margin:0;"><label>Vencimiento pago' + tip('Fecha límite de CxP. Alimenta alertas de vencidas / por vencer.') + '</label>' +
          '<input type="date" name="due_date" class="form-control" value="' + (imp.due_date || '') + '"></div>';
-    h += '<div class="form-group" style="margin:0;"><label>Fecha a bodega *</label>' +
+    h += '<div class="form-group" style="margin:0;"><label>Fecha a bodega *' + tip('Fecha real de ingreso a inventario y del asiento contable. Puede diferir de la fecha de factura.') + '</label>' +
          '<input type="date" name="warehouse_date" class="form-control" value="' + (imp.invoice_date || poToday()) + '" required></div>';
-    h += '<div class="form-group" style="margin:0;"><label>Desc. pronto pago %</label>' +
+    h += '<div class="form-group" style="margin:0;"><label>Desc. pronto pago %' + tip('Descuento si paga anticipado. Reduce el total al confirmar.') + '</label>' +
          '<input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" class="form-control" value="' +
          (imp.early_payment_discount_pct != null && imp.early_payment_discount_pct !== '' ? esc(imp.early_payment_discount_pct) : '0') +
          '" placeholder="0"></div>';
-    h += '<div class="form-group" style="margin:0;"><label>Forma de pago</label><select name="payment_mode" class="form-control">';
+    h += '<div class="form-group" style="margin:0;"><label>Forma de pago' + tip('Crédito = CxP. Efectivo sale del cajón; transferencia/tarjeta de bancos.') + '</label><select name="payment_mode" class="form-control">';
     [['payable','Crédito (CxP)'],['cash','Efectivo (sale del cajón)'],['transfer','Transferencia'],['card','Tarjeta']].forEach(function(o) {
         h += '<option value="' + o[0] + '"' + (imp.payment_mode === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
     });
@@ -1123,6 +1352,22 @@ function renderInvoiceReview(imp, items) {
     if (imp.parse_notes) {
         h += '<p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">Lectura: ' + esc(imp.parse_notes) + '</p>';
     }
+
+    h += '<div class="card" style="margin:0 0 14px;padding:12px;border:1px solid var(--color-border, #e5e7eb);border-radius:8px;">' +
+         '<label style="font-weight:600;display:block;margin-bottom:8px;">Agregar producto del catálogo (nombre / SKU / EAN o escáner)' +
+         tip('Busque o escanee productos existentes. Ideal si cargó sin archivo o faltaron líneas en la lectura.') + '</label>' +
+         '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">' +
+         '<input type="search" id="irProductSearch" class="form-control" placeholder="Buscar o escanear…" style="flex:1;min-width:220px;" autocomplete="off">' +
+         '<input type="number" id="irProductQty" class="form-control" value="1" min="0.001" step="0.001" style="width:90px;" title="Cantidad a agregar">' +
+         '<button type="button" class="btn btn-primary" onclick="addInvoiceManualFromSearch()">Agregar</button>' +
+         '</div>' +
+         '<ul class="combobox-list" id="irProductList" hidden style="position:relative;max-height:200px;overflow:auto;margin-top:6px;"></ul>' +
+         '<small style="color:var(--color-text-secondary);">' +
+         ((items && items.length)
+            ? 'Además de lo leído del archivo, puede completar líneas a mano con productos existentes.'
+            : 'Borrador vacío: agregue aquí todos los productos de la factura (buscar / escanear) antes de confirmar.') +
+         '</small>' +
+         '</div>';
 
     var nuevos = items.filter(function(i) { return !i.matched_product_id && i.row_action !== 'skip'; }).length;
     if (nuevos > 0) {
@@ -1142,7 +1387,7 @@ function renderInvoiceReview(imp, items) {
          '<th>Cant.</th><th>Costo u.</th><th>IVA %</th><th>Dcto %</th><th>Lote</th><th>Vence</th><th>P. venta</th><th>Total</th>' +
          '</tr></thead><tbody>';
 
-    var matchLabels = { ean: 'EAN', supplier_sku: 'SKU proveedor', code: 'Código', name: 'Nombre' };
+    var matchLabels = { ean: 'EAN', supplier_sku: 'SKU proveedor', code: 'Código', name: 'Nombre', manual: 'Manual' };
 
     items.forEach(function(it) {
         var base = 'items[' + it.id + ']';
@@ -1186,7 +1431,174 @@ function renderInvoiceReview(imp, items) {
     if (reviewWrap) delete reviewWrap.dataset.ready;
     bindSupplierCombobox('reviewSupplierCombobox', 'reviewSupplierId', 'reviewSupplierSearch', 'reviewSupplierList');
     setSupplierCombobox('reviewSupplierId', 'reviewSupplierSearch', imp.supplier_id || '');
+    bindInvoiceProductSearch();
+    bindLinkedOrderSelect();
     document.getElementById('invoiceReviewModal').style.display = 'flex';
+}
+
+function openOrdersOptionsHtml(selected) {
+    var h = '<option value="">Sin casar (crear factura/OC nueva)</option>';
+    (window._invoiceReviewOpenOrders || []).forEach(function(o) {
+        var label = o.order_number + ' · ' + (o.supplier_name || 'Sin proveedor') +
+            ' · ' + poMoney(o.total) +
+            (o.order_date ? (' · ' + o.order_date) : '');
+        h += '<option value="' + o.id + '"' + (String(selected) === String(o.id) ? ' selected' : '') + '>' + esc(label) + '</option>';
+    });
+    return h;
+}
+
+function bindLinkedOrderSelect() {
+    var sel = document.getElementById('reviewLinkedOrderId');
+    if (!sel || sel.dataset.boundLink === '1') return;
+    sel.dataset.boundLink = '1';
+    sel.addEventListener('change', function() {
+        linkInvoiceToOrder(sel.value || '0');
+    });
+}
+
+function linkInvoiceToOrder(orderId) {
+    var importId = window._invoiceReviewImportId || parseInt((document.getElementById('irImportId') || {}).value || '0', 10);
+    if (!importId) return;
+    if (!window.poInvoiceLinkOrderUrl) {
+        return showAlert('No está disponible la vinculación con OC', 'error');
+    }
+
+    var fd = new FormData();
+    fd.append('csrf_token', window.poCsrfToken || '');
+    fd.append('import_id', String(importId));
+    fd.append('linked_order_id', String(orderId || '0'));
+
+    fetch(window.poInvoiceLinkOrderUrl, {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        if (!d || !d.success) throw new Error((d && d.message) || 'No se pudo casar la OC');
+        if (d.open_orders) window._invoiceReviewOpenOrders = d.open_orders;
+        renderInvoiceReview(d.import, d.items || []);
+        if (typeof showAlert === 'function') showAlert(d.message || 'OC vinculada', 'success');
+    })
+    .catch(function(err) {
+        if (typeof showAlert === 'function') showAlert(err.message || 'Error al casar OC', 'error');
+        // Reabrir preview limpio para no dejar un select inconsistente
+        openInvoiceReview(importId);
+    });
+}
+
+function bindInvoiceProductSearch() {
+    var input = document.getElementById('irProductSearch');
+    var list = document.getElementById('irProductList');
+    if (!input || !list || input.dataset.bound === '1') return;
+    input.dataset.bound = '1';
+    var selectedId = null;
+
+    function renderList(q) {
+        var rows = poFilterProducts(q);
+        if (!rows.length) {
+            list.hidden = true;
+            list.innerHTML = '';
+            return;
+        }
+        list.innerHTML = rows.map(function(p) {
+            var label = (p.code ? p.code + ' — ' : '') + p.name + (p.barcode ? ' · EAN ' + p.barcode : '');
+            return '<li data-id="' + p.id + '" style="padding:8px 10px;cursor:pointer;">' + esc(label) + '</li>';
+        }).join('');
+        list.hidden = false;
+    }
+
+    input.addEventListener('input', function() {
+        selectedId = null;
+        var q = input.value.trim();
+        var exact = poFindExactProduct(q);
+        if (exact && q.length >= 6) {
+            selectedId = exact.id;
+            input.value = (exact.code ? exact.code + ' — ' : '') + exact.name;
+            list.hidden = true;
+            addInvoiceManualProduct(exact.id);
+            input.value = '';
+            selectedId = null;
+            return;
+        }
+        renderList(q);
+    });
+    input.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Enter') {
+            ev.preventDefault();
+            addInvoiceManualFromSearch();
+        }
+    });
+    list.addEventListener('click', function(ev) {
+        var li = ev.target.closest('li[data-id]');
+        if (!li) return;
+        selectedId = parseInt(li.getAttribute('data-id'), 10);
+        var p = (window.poProducts || []).find(function(x) { return x.id === selectedId; });
+        input.value = p ? ((p.code ? p.code + ' — ' : '') + p.name) : li.textContent;
+        list.hidden = true;
+        input.dataset.selectedId = String(selectedId);
+    });
+}
+
+function addInvoiceManualFromSearch() {
+    var input = document.getElementById('irProductSearch');
+    if (!input) return;
+    var id = parseInt(input.dataset.selectedId || '0', 10);
+    if (!id) {
+        var exact = poFindExactProduct(input.value);
+        if (exact) id = exact.id;
+    }
+    if (!id) {
+        var matches = poFilterProducts(input.value);
+        if (matches.length === 1) id = matches[0].id;
+    }
+    if (!id) {
+        return showAlert('Seleccione un producto de la lista o escanee un EAN/SKU exacto', 'warning');
+    }
+    addInvoiceManualProduct(id);
+    input.value = '';
+    input.dataset.selectedId = '';
+    var list = document.getElementById('irProductList');
+    if (list) { list.hidden = true; list.innerHTML = ''; }
+}
+
+function addInvoiceManualProduct(productId) {
+    var importId = window._invoiceReviewImportId || parseInt(document.getElementById('irImportId').value, 10);
+    if (!importId || !productId) return;
+    var qtyEl = document.getElementById('irProductQty');
+    var qty = qtyEl ? parseFloat(qtyEl.value) : 1;
+    if (!(qty > 0)) qty = 1;
+
+    var fd = new FormData();
+    fd.append('csrf_token', window.poCsrfToken || '');
+    fd.append('import_id', String(importId));
+    fd.append('product_id', String(productId));
+    fd.append('quantity', String(qty));
+
+    fetch(window.poInvoiceAddLineUrl, {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        if (!d || !d.success) throw new Error((d && d.message) || 'No se pudo agregar');
+        window._invoiceReviewOpenOrders = window._invoiceReviewOpenOrders || [];
+        // Preservar OC casada seleccionada
+        var linked = document.getElementById('reviewLinkedOrderId');
+        var linkedVal = linked ? linked.value : '';
+        renderInvoiceReview(d.import, d.items || []);
+        if (linkedVal) {
+            var sel = document.getElementById('reviewLinkedOrderId');
+            if (sel) sel.value = linkedVal;
+        }
+        if (typeof showAlert === 'function') showAlert(d.message || 'Producto agregado', 'success');
+    })
+    .catch(function(err) {
+        if (typeof showAlert === 'function') showAlert(err.message || 'Error', 'error');
+    });
 }
 
 function poToday() {
@@ -1279,17 +1691,17 @@ function addPoItem(prefill) {
         }
     }
     wrap.innerHTML =
-        '<div class="form-group" style="margin:0;position:relative;"><label>Producto</label>' +
+        '<div class="form-group" style="margin:0;position:relative;"><label>Producto <span class="field-tip" data-tip="Producto del catálogo a pedir. Use buscar o el escáner EAN/SKU." tabindex="0">?</span></label>' +
         '<input type="hidden" name="product_id[]" class="po-product-id" value="' + esc(selectedId) + '" required>' +
         '<input type="search" class="form-control po-product-search" autocomplete="off" placeholder="Buscar producto…" value="' + esc(selectedLabel) + '">' +
         '<ul class="combobox-list po-row-suggest" hidden></ul></div>' +
-        '<div class="form-group" style="margin:0;"><label>Cant.</label>' +
+        '<div class="form-group" style="margin:0;"><label>Cant. <span class="field-tip" data-tip="Unidades solicitadas al proveedor. Aún no afectan el inventario." tabindex="0">?</span></label>' +
         '<input type="number" name="quantity[]" class="form-control" min="1" value="' + (prefill.quantity || 1) + '" required></div>' +
-        '<div class="form-group" style="margin:0;"><label>Costo u.</label>' +
+        '<div class="form-group" style="margin:0;"><label>Costo u. <span class="field-tip" data-tip="Costo unitario estimado de compra. Se ajusta al recibir o cargar la factura real." tabindex="0">?</span></label>' +
         '<input type="text" inputmode="decimal" name="unit_cost[]" class="form-control money-input" data-money="1" value="' + (prefill.unit_cost != null ? (window.SeriMoney ? SeriMoney.format(prefill.unit_cost) : prefill.unit_cost) : '0') + '" required></div>' +
-        '<div class="form-group" style="margin:0;"><label>IVA %</label>' +
+        '<div class="form-group" style="margin:0;"><label>IVA % <span class="field-tip" data-tip="Tarifa de IVA descontable estimada (p. ej. 19). Se confirma en la recepción/factura." tabindex="0">?</span></label>' +
         '<input type="number" step="0.01" name="tax_rate[]" class="form-control" min="0" value="' + (prefill.tax_rate != null ? prefill.tax_rate : 19) + '"></div>' +
-        '<button type="button" class="btn btn-sm btn-danger" onclick="this.parentElement.remove()">✕</button>';
+        '<button type="button" class="btn btn-sm btn-danger" onclick="this.parentElement.remove()" title="Quitar línea">✕</button>';
     document.getElementById('poItems').appendChild(wrap);
     bindPoRowSearch(wrap);
     if (window.SeriMoney && typeof SeriMoney.enhanceAll === 'function') {
@@ -1479,7 +1891,32 @@ function openPayModal(id, number, balance, supplier) {
     amount.removeAttribute('max');
     document.getElementById('payDate').value = poToday();
     if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(amount);
+    var receipt = document.getElementById('payReceiptFile');
+    if (receipt) receipt.value = '';
     document.getElementById('payModal').style.display = 'flex';
+}
+
+function poWhatsapp(orderId) {
+    fetch('<?php echo $comprasBase; ?>?action=order_whatsapp&id=' + orderId, {
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        if (!d.success) return showAlert(d.message || 'No se pudo preparar el mensaje', 'error');
+        if (!d.has_phone) {
+            showAlert('El proveedor no tiene teléfono registrado: elija el contacto en WhatsApp', 'warning');
+        }
+        window.open(d.link, '_blank');
+    })
+    .catch(function() { showAlert('No se pudo preparar el mensaje', 'error'); });
+}
+
+function poEmail(orderId, supplier) {
+    var modal = document.getElementById('poEmailModal');
+    if (!modal) return showAlert('No tiene permiso para enviar correo', 'warning');
+    document.getElementById('poEmailOrderId').value = orderId;
+    document.getElementById('poEmailSupplier').textContent = supplier || '';
+    modal.style.display = 'flex';
 }
 
 function openCreditNoteModal(id) {
@@ -1546,9 +1983,13 @@ function viewPurchase(id) {
             h += '<div><strong>Notas crédito:</strong> ' + sym + parseFloat(o.credit_total||0).toFixed(dec) + '</div>';
             h += '<div><strong>Asiento:</strong> ' + esc(o.accounting_entry_number || (o.accounting_entry_id ? ('#'+o.accounting_entry_id) : 'pendiente')) + '</div>';
             h += '</div>';
-            h += '<table><thead><tr><th>Producto</th><th>Cant</th><th>Recibido</th><th>NC</th><th>Costo</th><th>IVA%</th><th>Total</th></tr></thead><tbody>';
+            h += '<table><thead><tr><th>Producto</th><th>EAN</th><th>Cant</th><th>Recibido</th><th>NC</th><th>Costo</th><th>IVA%</th><th>Total</th></tr></thead><tbody>';
             items.forEach(function(it) {
-                h += '<tr><td>' + esc(it.product_name) + '</td><td>' + it.quantity + '</td>';
+                h += '<tr><td>' + esc(it.product_name) +
+                    (it.product_code ? '<div style="font-size:11px;color:var(--color-text-secondary);">' + esc(it.product_code) + '</div>' : '') +
+                    '</td>';
+                h += '<td style="font-size:12px;white-space:nowrap;">' + esc(it.barcode || '—') + '</td>';
+                h += '<td>' + it.quantity + '</td>';
                 h += '<td>' + (it.received_qty != null ? it.received_qty : it.quantity) + '</td>';
                 h += '<td>' + (it.credited_qty || 0) + '</td>';
                 h += '<td>' + sym + parseFloat(it.unit_cost||0).toFixed(dec) + '</td>';
@@ -1559,12 +2000,19 @@ function viewPurchase(id) {
             var payments = o.payments || [];
             if (payments.length) {
                 h += '<h4 style="margin-top:16px;">Abonos al proveedor</h4>';
-                h += '<table><thead><tr><th>Fecha</th><th>Medio</th><th>Referencia</th><th>Asiento</th><th>Valor</th></tr></thead><tbody>';
+                h += '<table><thead><tr><th>Fecha</th><th>Medio</th><th>Referencia</th><th>Asiento</th><th>Comprobante</th><th>Valor</th></tr></thead><tbody>';
                 payments.forEach(function(p) {
                     h += '<tr><td>' + esc((p.payment_date || '').substr(0,10)) + '</td>';
                     h += '<td>' + esc(p.payment_method || '') + '</td>';
                     h += '<td>' + esc(p.reference || '—') + '</td>';
                     h += '<td>' + esc(p.accounting_entry_number || '—') + '</td>';
+                    h += '<td>';
+                    if (p.receipt_path) {
+                        h += '<a class="btn btn-sm btn-secondary" href="<?php echo $viewInstance->route('app/compras'); ?>?action=payment_receipt&id=' + p.id + '" target="_blank" rel="noopener">Ver</a>';
+                    } else {
+                        h += '—';
+                    }
+                    h += '</td>';
                     h += '<td>' + sym + parseFloat(p.amount||0).toFixed(dec) + '</td></tr>';
                 });
                 h += '</tbody></table>';

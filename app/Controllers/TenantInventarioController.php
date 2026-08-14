@@ -193,6 +193,16 @@ class TenantInventarioController extends TenantController
             $this->downloadImportTemplate();
             return;
         }
+        if ($action === 'generate_barcode' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('inventario', 'create');
+            $this->generateBarcode();
+            return;
+        }
+        if ($action === 'generate_sku' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('inventario', 'create');
+            $this->generateSku();
+            return;
+        }
         if ($action === 'create_category' && $this->request->method() === 'POST') {
             TenantMiddleware::authorize('inventario', 'create');
             $this->createCategory();
@@ -936,6 +946,20 @@ class TenantInventarioController extends TenantController
         if ($barcode === false) {
             $this->respond(false, 'Código de barras EAN inválido (máx. 64 caracteres).', '/app/inventario');
             return;
+        }
+        if ($barcode !== '') {
+            $dup = $this->query(
+                "SELECT id, name FROM products WHERE barcode = ? AND id <> ? LIMIT 1",
+                [$barcode, $id]
+            )->fetch();
+            if ($dup) {
+                $this->respond(
+                    false,
+                    'El EAN ya está asignado al producto «' . ($dup['name'] ?? ('#' . $dup['id'])) . '».',
+                    '/app/inventario'
+                );
+                return;
+            }
         }
         
         $lotInput = $this->lotInput();
@@ -2204,6 +2228,46 @@ class TenantInventarioController extends TenantController
             return $row ?: null;
         } catch (\Throwable $e) {
             return null;
+        }
+    }
+
+    /** Genera el siguiente EAN según la secuencia de Configuración → Preferencias. */
+    private function generateBarcode(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/inventario')) {
+            return;
+        }
+        try {
+            $seq = new \SoftNova\Services\BarcodeSequenceService($this->db);
+            $result = $seq->allocateNext();
+            $this->json([
+                'success' => true,
+                'barcode' => $result['barcode'],
+                'message' => 'EAN generado: ' . $result['barcode'],
+                'next' => $result['next'],
+            ]);
+        } catch (\Throwable $e) {
+            $this->json(['success' => false, 'message' => $e->getMessage()]);
+        }
+    }
+
+    /** Genera el siguiente SKU según la secuencia de Configuración → Preferencias. */
+    private function generateSku(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/inventario')) {
+            return;
+        }
+        try {
+            $seq = new \SoftNova\Services\SkuSequenceService($this->db);
+            $result = $seq->allocateNext();
+            $this->json([
+                'success' => true,
+                'sku' => $result['sku'],
+                'message' => 'SKU generado: ' . $result['sku'],
+                'next' => $result['next'],
+            ]);
+        } catch (\Throwable $e) {
+            $this->json(['success' => false, 'message' => $e->getMessage()]);
         }
     }
 }

@@ -102,6 +102,12 @@ class TenantConfigController extends Controller
             return;
         }
 
+        if ($action === 'wipeDatabase' && $this->request->method() === 'POST') {
+            \SoftNova\Core\TenantMiddleware::authorize('configuracion', 'edit');
+            $this->wipeDatabase();
+            return;
+        }
+
         if ($action === 'createUser' && $this->request->method() === 'POST') {
             $this->createTeamUser();
             return;
@@ -479,6 +485,8 @@ class TenantConfigController extends Controller
             'currency', 'company_name', 'tax_name', 'tax_rate', 'invoice_prefix',
             'low_stock_alert', 'language', 'webhook_sale_url',
             'company_nit', 'company_address', 'company_phone', 'company_email',
+            'ean_prefix', 'ean_next', 'ean_length', 'ean_check_digit',
+            'sku_prefix', 'sku_next', 'sku_pad',
         ];
         
         foreach ($fields as $field) {
@@ -498,8 +506,48 @@ class TenantConfigController extends Controller
                         return;
                     }
                 }
+                if ($field === 'ean_prefix') {
+                    $value = preg_replace('/\D+/', '', (string)$value) ?? '';
+                    if ($value === '') {
+                        $value = '200';
+                    }
+                    $value = substr($value, 0, 12);
+                }
+                if ($field === 'ean_next') {
+                    $value = (string)max(1, (int)$value);
+                }
+                if ($field === 'ean_length') {
+                    $value = in_array((int)$value, [8, 13], true) ? (string)(int)$value : '13';
+                }
+                if ($field === 'ean_check_digit') {
+                    $value = ((string)$value === '0') ? '0' : '1';
+                }
+                if ($field === 'sku_prefix') {
+                    $value = substr(trim((string)$value), 0, 40);
+                    if ($value === '') {
+                        $value = 'SKU-';
+                    }
+                }
+                if ($field === 'sku_next') {
+                    $value = (string)max(1, (int)$value);
+                }
+                if ($field === 'sku_pad') {
+                    $pad = (int)$value;
+                    if ($pad < 3) {
+                        $pad = 3;
+                    }
+                    if ($pad > 12) {
+                        $pad = 12;
+                    }
+                    $value = (string)$pad;
+                }
                 $this->upsertSetting($field, (string)$value);
             }
+        }
+
+        // Checkbox: si no viene en POST, queda desactivado
+        if ($this->request->post('ean_prefix') !== null && $this->request->post('ean_check_digit') === null) {
+            $this->upsertSetting('ean_check_digit', '0');
         }
 
         $primaryColor = $this->request->post('primary_color');
@@ -663,6 +711,46 @@ class TenantConfigController extends Controller
         $userId = (int)($_SESSION['tenant_user_id'] ?? 0);
         $user = $this->query("SELECT password FROM users WHERE id = ?", [$userId])->fetch();
         return $user && Security::verifyPassword($password, $user['password']);
+    }
+
+    /**
+     * Borrado general: vacía datos operativos y deja solo el admin actual + settings/PUC.
+     */
+    private function wipeDatabase(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/configuracion')) {
+            return;
+        }
+        if (!$this->requireAdmin()) {
+            return;
+        }
+
+        $phrase = strtoupper(trim((string)$this->request->post('confirm_phrase', '')));
+        if ($phrase !== 'BORRAR TODO') {
+            $this->respond(false, 'Debe escribir exactamente BORRAR TODO para confirmar', '/app/configuracion');
+            return;
+        }
+
+        if (!$this->verifyAdminPassword((string)($this->request->post('confirm_password') ?? ''))) {
+            $this->respond(false, 'Contraseña incorrecta. La limpieza fue cancelada.', '/app/configuracion');
+            return;
+        }
+
+        $userId = (int)($_SESSION['tenant_user_id'] ?? 0);
+        try {
+            $result = (new \SoftNova\Services\DatabaseWipeService($this->db))->wipeKeepAdmin($userId);
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/configuracion');
+            return;
+        }
+
+        $msg = sprintf(
+            'Base de datos limpiada: %d tabla(s) vaciadas, %d usuario(s) eliminado(s). Conservado: %s',
+            (int)$result['truncated'],
+            (int)$result['users_deleted'],
+            (string)$result['kept_user_email']
+        );
+        $this->respond(true, $msg, '/app/configuracion');
     }
     
     private function backupDelete(): void

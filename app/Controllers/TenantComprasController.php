@@ -70,12 +70,20 @@ class TenantComprasController extends TenantController
             $this->creditNotesPanel();
             return;
         }
+        if ($action === 'facturas') {
+            $this->invoicesPanel();
+            return;
+        }
         if ($action === 'detail' && $this->request->method() === 'GET') {
             $this->detail();
             return;
         }
         if ($action === 'invoice' && $this->request->method() === 'GET') {
             $this->serveInvoice();
+            return;
+        }
+        if ($action === 'payment_receipt' && $this->request->method() === 'GET') {
+            $this->servePaymentReceipt();
             return;
         }
         if ($action === 'invoice_import' && $this->request->method() === 'POST') {
@@ -90,6 +98,16 @@ class TenantComprasController extends TenantController
         }
         if ($action === 'invoice_preview' && $this->request->method() === 'GET') {
             $this->invoicePreview();
+            return;
+        }
+        if ($action === 'invoice_add_line' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('compras', 'create');
+            $this->invoiceAddLine();
+            return;
+        }
+        if ($action === 'invoice_link_order' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('compras', 'create');
+            $this->invoiceLinkOrder();
             return;
         }
         if ($action === 'invoice_confirm' && $this->request->method() === 'POST') {
@@ -111,6 +129,31 @@ class TenantComprasController extends TenantController
             $this->generateOrders();
             return;
         }
+        if ($action === 'draft_add' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('compras', 'create');
+            $this->draftAdd();
+            return;
+        }
+        if ($action === 'draft_update' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('compras', 'create');
+            $this->draftUpdate();
+            return;
+        }
+        if ($action === 'draft_remove' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('compras', 'create');
+            $this->draftRemove();
+            return;
+        }
+        if ($action === 'draft_clear' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('compras', 'create');
+            $this->draftClear();
+            return;
+        }
+        if ($action === 'draft_generate' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('compras', 'create');
+            $this->draftGenerate();
+            return;
+        }
         if ($action === 'order_pdf' && $this->request->method() === 'GET') {
             $this->orderPdf();
             return;
@@ -130,10 +173,19 @@ class TenantComprasController extends TenantController
             return;
         }
 
-        $status = (string)$this->request->get('status', '');
-        $due = (string)$this->request->get('due', '');
-        if (!in_array($due, ['overdue', 'due_today', 'due_soon', 'no_due'], true)) {
-            $due = '';
+        $status = (string)$this->request->get('status', 'open');
+        if ($status === '') {
+            $status = 'open';
+        }
+        // En Órdenes no se filtra CxP; el vencimiento vive en Facturas.
+        $due = '';
+        if (!in_array($status, ['open', 'draft', 'ordered', 'cancelled', ''], true)) {
+            // Si alguien pide received desde OC, redirigir a Facturas
+            if ($status === 'received' || $status === 'invoices') {
+                $this->redirect(base_url('app/compras') . '?action=facturas');
+                return;
+            }
+            $status = 'open';
         }
         $total = $this->purchasing->countOrders($status, $due);
         $pagination = $this->paginate($total);
@@ -161,14 +213,78 @@ class TenantComprasController extends TenantController
         )->fetchColumn();
 
         $this->view('tenant.compras', $this->tenantViewData([
+            'comprasTab' => 'ordenes',
             'orders' => $orders,
             'products' => $products,
             'suppliers' => $suppliers,
             'pagination' => $pagination,
             'statusFilter' => $status,
-            'dueFilter' => $due,
+            'dueFilter' => '',
+            'paymentFilter' => '',
             'openTotal' => $openTotal,
             'monthReceived' => $monthReceived,
+            'payableTotal' => $this->purchasing->payableTotal(),
+            'payableOrders' => [],
+            'pendingInvoices' => $this->invoiceImports()->pendingImports(20),
+            'aiInvoiceReady' => (new \SoftNova\Services\AiService($this->db))->isConfigured(),
+        ]));
+    }
+
+    /**
+     * Momento 2–3: facturas recibidas (CxP, abonos, NC, trazabilidad).
+     */
+    private function invoicesPanel(): void
+    {
+        $due = (string)$this->request->get('due', '');
+        if (!in_array($due, ['overdue', 'due_today', 'due_soon', 'no_due'], true)) {
+            $due = '';
+        }
+        $payment = (string)$this->request->get('payment', '');
+        if (!in_array($payment, ['unpaid', 'partial', 'paid', 'paid_only', 'pending'], true)) {
+            $payment = '';
+        }
+
+        $total = $this->purchasing->countInvoices($payment, $due);
+        $pagination = $this->paginate($total);
+        $orders = $this->purchasing->listInvoices($pagination['perPage'], $pagination['offset'], $payment, $due);
+
+        $products = $this->query(
+            "SELECT id, code, barcode, name, purchase_price, stock
+             FROM products
+             WHERE status = 'active' AND COALESCE(product_type, 'product') = 'product'
+             ORDER BY name"
+        )->fetchAll();
+        $suppliers = $this->query(
+            "SELECT id, name, document_type, document_number, phone, contact_name
+             FROM suppliers WHERE status = 'active' ORDER BY name"
+        )->fetchAll();
+
+        $openTotal = (float)$this->query(
+            "SELECT COALESCE(SUM(total),0) FROM purchase_orders WHERE status IN ('draft','ordered')"
+        )->fetchColumn();
+        $monthReceived = (float)$this->query(
+            "SELECT COALESCE(SUM(total),0) FROM purchase_orders
+             WHERE status = 'received'
+               AND MONTH(COALESCE(warehouse_date, order_date)) = MONTH(CURDATE())
+               AND YEAR(COALESCE(warehouse_date, order_date)) = YEAR(CURDATE())"
+        )->fetchColumn();
+        $paidMonth = (float)$this->query(
+            "SELECT COALESCE(SUM(amount),0) FROM supplier_payments
+             WHERE MONTH(payment_date) = MONTH(CURDATE()) AND YEAR(payment_date) = YEAR(CURDATE())"
+        )->fetchColumn();
+
+        $this->view('tenant.compras', $this->tenantViewData([
+            'comprasTab' => 'facturas',
+            'orders' => $orders,
+            'products' => $products,
+            'suppliers' => $suppliers,
+            'pagination' => $pagination,
+            'statusFilter' => 'received',
+            'dueFilter' => $due,
+            'paymentFilter' => $payment,
+            'openTotal' => $openTotal,
+            'monthReceived' => $monthReceived,
+            'paidMonth' => $paidMonth,
             'payableTotal' => $this->purchasing->payableTotal(),
             'payableOrders' => $this->purchasing->payableOrders(50, in_array($due, ['overdue', 'due_today', 'due_soon'], true) ? $due : ''),
             'pendingInvoices' => $this->invoiceImports()->pendingImports(20),
@@ -210,8 +326,10 @@ class TenantComprasController extends TenantController
             return;
         }
 
-        $mensaje = 'Factura leída. Revise las líneas antes de ingresarlas al inventario';
-        if ($resultado['notes'] !== '') {
+        $mensaje = empty($resultado['notes']) || str_contains($resultado['notes'], 'Borrador manual')
+            ? 'Borrador listo. Agregue o revise los productos antes de ingresarlos al inventario'
+            : 'Factura leída. Revise las líneas antes de ingresarlas al inventario';
+        if ($resultado['notes'] !== '' && !str_contains($mensaje, $resultado['notes'])) {
             $mensaje .= ' (' . $resultado['notes'] . ')';
         }
 
@@ -225,7 +343,7 @@ class TenantComprasController extends TenantController
             return;
         }
 
-        $this->respond(true, $mensaje, '/app/compras?import_id=' . $resultado['import_id']);
+        $this->respond(true, $mensaje, '/app/compras?action=facturas&import_id=' . $resultado['import_id']);
     }
 
     /**
@@ -342,23 +460,84 @@ class TenantComprasController extends TenantController
             return;
         }
 
+        $supplierId = !empty($data['import']['supplier_id']) ? (int)$data['import']['supplier_id'] : null;
         $this->json([
             'success' => true,
             'import' => $data['import'],
             'items' => $data['items'],
+            'open_orders' => $this->purchasing->openOrdersForMatch($supplierId, 80),
         ]);
+    }
+
+    /** Agrega producto del catálogo (manual / escáner) al borrador de factura. */
+    private function invoiceAddLine(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/compras?action=facturas')) {
+            return;
+        }
+
+        $importId = (int)$this->request->post('import_id', 0);
+        $productId = (int)$this->request->post('product_id', 0);
+        $qty = (float)$this->request->post('quantity', 1);
+        $costRaw = $this->request->post('unit_cost', '');
+        $unitCost = $costRaw === '' || $costRaw === null
+            ? null
+            : \SoftNova\Core\parse_money($costRaw);
+
+        try {
+            $item = $this->invoiceImports()->addManualItem($importId, $productId, $qty, $unitCost);
+            $preview = $this->invoiceImports()->get($importId);
+            $this->json([
+                'success' => true,
+                'message' => 'Producto agregado a la factura',
+                'item' => $item,
+                'import' => $preview['import'] ?? null,
+                'items' => $preview['items'] ?? [],
+            ]);
+        } catch (\Throwable $e) {
+            $this->json(['success' => false, 'message' => $e->getMessage()]);
+        }
+    }
+
+    /** Casa el borrador con una OC y carga sus productos al modal de revisión. */
+    private function invoiceLinkOrder(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/compras?action=facturas')) {
+            return;
+        }
+
+        $importId = (int)$this->request->post('import_id', 0);
+        $orderId = (int)$this->request->post('linked_order_id', 0);
+
+        try {
+            $result = $this->invoiceImports()->linkOrderAndLoadItems($importId, $orderId);
+            $supplierId = !empty($result['import']['supplier_id'])
+                ? (int)$result['import']['supplier_id']
+                : null;
+            $this->json([
+                'success' => true,
+                'message' => (string)($result['message'] ?? 'OC vinculada'),
+                'import' => $result['import'] ?? null,
+                'items' => $result['items'] ?? [],
+                'added' => (int)($result['added'] ?? 0),
+                'updated' => (int)($result['updated'] ?? 0),
+                'open_orders' => $this->purchasing->openOrdersForMatch($supplierId, 80),
+            ]);
+        } catch (\Throwable $e) {
+            $this->json(['success' => false, 'message' => $e->getMessage()]);
+        }
     }
 
     /** Aplica el borrador corregido: crea la orden, recibe el stock y contabiliza. */
     private function invoiceConfirm(): void
     {
-        if (!$this->validateCsrfOrFail('/app/compras')) {
+        if (!$this->validateCsrfOrFail('/app/compras?action=facturas')) {
             return;
         }
 
         $importId = (int)$this->request->post('import_id');
         if ($importId <= 0) {
-            $this->respond(false, 'Importación no válida', '/app/compras');
+            $this->respond(false, 'Importación no válida', '/app/compras?action=facturas');
             return;
         }
 
@@ -371,6 +550,7 @@ class TenantComprasController extends TenantController
                 'due_date' => (string)$this->request->post('due_date', ''),
                 'payment_mode' => (string)$this->request->post('payment_mode', 'payable'),
                 'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
+                'linked_order_id' => (int)$this->request->post('linked_order_id', 0) ?: null,
             ]);
 
             $filas = $this->request->post('items', []);
@@ -383,7 +563,7 @@ class TenantComprasController extends TenantController
                 (string)$this->request->post('warehouse_date', '')
             );
         } catch (\Throwable $e) {
-            $this->respond(false, $e->getMessage(), '/app/compras');
+            $this->respond(false, $e->getMessage(), '/app/compras?action=facturas');
             return;
         }
 
@@ -402,7 +582,7 @@ class TenantComprasController extends TenantController
             $mensaje .= ' ' . ($resultado['accounting_note'] ?: 'Asiento contable pendiente: use «Sincronizar» en Contabilidad.');
         }
 
-        $this->respond(true, $mensaje, '/app/compras');
+        $this->respond(true, $mensaje, '/app/compras?action=facturas');
     }
 
     private function replenishment(): \SoftNova\Services\ReplenishmentService
@@ -432,11 +612,89 @@ class TenantComprasController extends TenantController
             'categories' => $this->query(
                 "SELECT id, name FROM categories WHERE status = 'active' ORDER BY name"
             )->fetchAll(),
+            'draftCart' => $service->draftList(),
+            'draftCount' => $service->draftCount(),
             'draftOrders' => $service->pendingOrders(30),
         ]));
     }
 
-    /** Crea una OC en borrador por proveedor con las cantidades seleccionadas. */
+    /** Agrega selección a la bandeja (sin crear OC todavía). */
+    private function draftAdd(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/compras?action=reposicion')) {
+            return;
+        }
+        $seleccion = array_map('intval', (array)$this->request->post('product_ids', []));
+        $cantidades = [];
+        foreach ((array)$this->request->post('quantities', []) as $productId => $cantidad) {
+            $cantidades[(int)$productId] = (int)$cantidad;
+        }
+        try {
+            $r = $this->replenishment()->draftAdd($seleccion, $cantidades);
+            $this->respond(
+                true,
+                sprintf('Bandeja: %d nuevo(s), %d actualizado(s). Genere la OC cuando esté listo.', $r['added'], $r['updated']),
+                '/app/compras?action=reposicion'
+            );
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/compras?action=reposicion');
+        }
+    }
+
+    private function draftUpdate(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/compras?action=reposicion')) {
+            return;
+        }
+        try {
+            $this->replenishment()->draftUpdateQty(
+                (int)$this->request->post('product_id', 0),
+                (int)$this->request->post('quantity', 0)
+            );
+            $this->respond(true, 'Cantidad actualizada', '/app/compras?action=reposicion');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/compras?action=reposicion');
+        }
+    }
+
+    private function draftRemove(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/compras?action=reposicion')) {
+            return;
+        }
+        try {
+            $this->replenishment()->draftRemove((int)$this->request->post('product_id', 0));
+            $this->respond(true, 'Producto quitado de la bandeja', '/app/compras?action=reposicion');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/compras?action=reposicion');
+        }
+    }
+
+    private function draftClear(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/compras?action=reposicion')) {
+            return;
+        }
+        $this->replenishment()->draftClear();
+        $this->respond(true, 'Bandeja vaciada', '/app/compras?action=reposicion');
+    }
+
+    private function draftGenerate(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/compras?action=reposicion')) {
+            return;
+        }
+        try {
+            $resultado = $this->replenishment()->generateFromDraft();
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/compras?action=reposicion');
+            return;
+        }
+        $mensaje = sprintf('%d orden(es) de compra creadas en borrador desde la bandeja', count($resultado['orders']));
+        $this->respond(true, $mensaje, '/app/compras?action=reposicion');
+    }
+
+    /** Crea una OC en borrador por proveedor con las cantidades seleccionadas (inmediato). */
     private function generateOrders(): void
     {
         if (!$this->validateCsrfOrFail('/app/compras?action=reposicion')) {
@@ -618,7 +876,10 @@ class TenantComprasController extends TenantController
         ];
 
         foreach ($order['items'] as $item) {
-            $lineas[] = '- ' . (string)$item['product_name'] . ' x ' . (int)$item['quantity'];
+            $ean = trim((string)($item['barcode'] ?? ''));
+            $lineas[] = '- ' . (string)$item['product_name']
+                . ($ean !== '' ? (' [EAN ' . $ean . ']') : '')
+                . ' x ' . (int)$item['quantity'];
         }
 
         $lineas[] = '';
@@ -656,9 +917,9 @@ class TenantComprasController extends TenantController
                 (int)$this->request->post('import_id'),
                 (string)$this->request->post('reason', 'Descartada por el usuario')
             );
-            $this->respond(true, 'Importación descartada', '/app/compras');
+            $this->respond(true, 'Importación descartada', '/app/compras?action=facturas');
         } catch (\Throwable $e) {
-            $this->respond(false, $e->getMessage(), '/app/compras');
+            $this->respond(false, $e->getMessage(), '/app/compras?action=facturas');
         }
     }
 
@@ -755,7 +1016,7 @@ class TenantComprasController extends TenantController
                 'credit_number' => $result['credit_number'],
             ]);
         } catch (\Throwable $e) {
-            $this->respond(false, $e->getMessage(), '/app/compras');
+            $this->respond(false, $e->getMessage(), '/app/compras?action=facturas');
         }
     }
 
@@ -823,6 +1084,16 @@ class TenantComprasController extends TenantController
         $reference = trim((string)$this->request->post('reference', ''));
         $notes = trim((string)$this->request->post('notes', ''));
 
+        $receipt = $this->storePaymentReceiptUpload();
+        if ($receipt === false) {
+            $this->respond(
+                false,
+                'Comprobante inválido. Use JPG, PNG, WEBP o PDF de máximo 5 MB',
+                '/app/compras?action=facturas'
+            );
+            return;
+        }
+
         try {
             $method = PaymentMethodCatalog::normalize($method);
             $result = $this->purchasing->registerPayment(
@@ -831,7 +1102,8 @@ class TenantComprasController extends TenantController
                 $paymentDate !== '' ? $paymentDate : date('Y-m-d'),
                 $method,
                 $reference,
-                $notes
+                $notes,
+                $receipt
             );
 
             try {
@@ -848,6 +1120,9 @@ class TenantComprasController extends TenantController
             $message .= $result['balance'] <= 0.009
                 ? 'La orden queda pagada en su totalidad.'
                 : 'Saldo pendiente: ' . $this->formatMoney($result['balance']) . '.';
+            if ($receipt) {
+                $message .= ' Comprobante adjunto.';
+            }
             if ($cashNote !== '') {
                 $message .= ' ' . $cashNote;
             }
@@ -855,9 +1130,9 @@ class TenantComprasController extends TenantController
                 $message .= ' Asiento contable pendiente: use «Sincronizar» en Contabilidad.';
             }
 
-            $this->respond(true, $message, '/app/compras');
+            $this->respond(true, $message, '/app/compras?action=facturas');
         } catch (\Throwable $e) {
-            $this->respond(false, $e->getMessage(), '/app/compras');
+            $this->respond(false, $e->getMessage(), '/app/compras?action=facturas');
         }
     }
 
@@ -946,7 +1221,7 @@ class TenantComprasController extends TenantController
             );
             $invoiceFile = $this->storeInvoiceUpload();
             if ($invoiceFile === false) {
-                $this->respond(false, 'Mercancía recibida, pero falló la subida de la foto/PDF de factura', '/app/compras');
+                $this->respond(false, 'Mercancía recibida, pero falló la subida de la foto/PDF de factura', '/app/compras?action=facturas');
                 return;
             }
             if ($invoiceFile !== null) {
@@ -964,7 +1239,7 @@ class TenantComprasController extends TenantController
             if (!empty($recv['accounting_note'])) {
                 $msg .= ' ' . $recv['accounting_note'];
             }
-            $this->respond(true, $msg, '/app/compras');
+            $this->respond(true, $msg, '/app/compras?action=facturas');
         } catch (\Throwable $e) {
             $this->respond(false, $e->getMessage(), '/app/compras');
         }
@@ -1042,22 +1317,70 @@ class TenantComprasController extends TenantController
         exit;
     }
 
+    /** Sirve la foto/PDF del comprobante de un abono a proveedor. */
+    private function servePaymentReceipt(): void
+    {
+        $paymentId = (int)$this->request->get('id', 0);
+        $payment = $this->purchasing->getSupplierPayment($paymentId);
+        if (!$payment || empty($payment['receipt_path'])) {
+            http_response_code(404);
+            echo 'Comprobante no encontrado';
+            exit;
+        }
+        $relative = str_replace(['\\', '..'], ['/', ''], (string)$payment['receipt_path']);
+        $full = PUBLIC_PATH . '/' . ltrim($relative, '/');
+        if (!is_file($full)) {
+            $alt = ROOT_PATH . '/public/' . ltrim($relative, '/');
+            $full = is_file($alt) ? $alt : $full;
+        }
+        if (!is_file($full)) {
+            http_response_code(404);
+            echo 'Comprobante no encontrado';
+            exit;
+        }
+        $mime = (string)($payment['receipt_mime'] ?: 'application/octet-stream');
+        $name = (string)($payment['receipt_original_name'] ?: basename($full));
+        header('Content-Type: ' . $mime);
+        header('Content-Disposition: inline; filename="' . rawurlencode($name) . '"');
+        header('Content-Length: ' . filesize($full));
+        readfile($full);
+        exit;
+    }
+
     /**
      * @return array{path:string,original:string,mime:string}|null|false null=sin archivo, false=error
      */
     private function storeInvoiceUpload(): array|null|false
     {
-        if (empty($_FILES['invoice_file']['tmp_name'])) {
+        return $this->storePurchaseUpload('invoice_file', 'po_');
+    }
+
+    /**
+     * Foto o PDF del comprobante de consignación / transferencia del abono.
+     *
+     * @return array{path:string,original:string,mime:string}|null|false
+     */
+    private function storePaymentReceiptUpload(): array|null|false
+    {
+        return $this->storePurchaseUpload('payment_receipt', 'pay_');
+    }
+
+    /**
+     * @return array{path:string,original:string,mime:string}|null|false null=sin archivo, false=error
+     */
+    private function storePurchaseUpload(string $field, string $prefix): array|null|false
+    {
+        if (empty($_FILES[$field]['tmp_name'])) {
             return null;
         }
-        if (!is_uploaded_file($_FILES['invoice_file']['tmp_name'])) {
+        if (!is_uploaded_file($_FILES[$field]['tmp_name'])) {
             return false;
         }
-        if (($_FILES['invoice_file']['size'] ?? 0) > self::MAX_INVOICE_BYTES) {
+        if (($_FILES[$field]['size'] ?? 0) > self::MAX_INVOICE_BYTES) {
             return false;
         }
         $finfo = new \finfo(FILEINFO_MIME_TYPE);
-        $mime = $finfo->file($_FILES['invoice_file']['tmp_name']);
+        $mime = $finfo->file($_FILES[$field]['tmp_name']);
         if (!isset(self::INVOICE_MIME[$mime])) {
             return false;
         }
@@ -1066,14 +1389,14 @@ class TenantComprasController extends TenantController
         if (!is_dir($dir)) {
             mkdir($dir, 0755, true);
         }
-        $filename = 'po_' . date('YmdHis') . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
+        $filename = $prefix . date('YmdHis') . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
         $dest = $dir . '/' . $filename;
-        if (!move_uploaded_file($_FILES['invoice_file']['tmp_name'], $dest)) {
+        if (!move_uploaded_file($_FILES[$field]['tmp_name'], $dest)) {
             return false;
         }
         return [
             'path' => 'uploads/purchases/' . $filename,
-            'original' => (string)($_FILES['invoice_file']['name'] ?? $filename),
+            'original' => (string)($_FILES[$field]['name'] ?? $filename),
             'mime' => $mime,
         ];
     }

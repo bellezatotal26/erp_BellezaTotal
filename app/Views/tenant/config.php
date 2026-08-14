@@ -581,7 +581,65 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
                            placeholder="https://hooks.ejemplo.com/venta">
                     <small style="color: var(--color-text-secondary);">POST JSON encolado al cancelar o fallar una venta.</small>
                 </div>
-                <button type="submit" class="btn btn-primary">Guardar Preferencias</button>
+                <hr style="border:none;border-top:1px solid var(--color-border,#e5e7eb);margin:16px 0;">
+                <h4 style="margin:0 0 10px;font-size:14px;">Secuencia automática de EAN</h4>
+                <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 12px;">
+                    En Inventario puede escribir el EAN a mano o usar el botón <strong>Generar EAN</strong>,
+                    que toma el siguiente número de esta secuencia.
+                </p>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                    <div class="form-group" style="margin:0;">
+                        <label>Prefijo</label>
+                        <input type="text" name="ean_prefix" class="form-control" inputmode="numeric"
+                               value="<?php echo htmlspecialchars($settings['ean_prefix'] ?? '200'); ?>"
+                               maxlength="12" placeholder="200">
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label>Siguiente número</label>
+                        <input type="number" name="ean_next" class="form-control" min="1"
+                               value="<?php echo htmlspecialchars($settings['ean_next'] ?? '1'); ?>">
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label>Longitud</label>
+                        <select name="ean_length" class="form-control">
+                            <?php $eanLen = (string)($settings['ean_length'] ?? '13'); ?>
+                            <option value="13" <?php echo $eanLen === '13' ? 'selected' : ''; ?>>EAN-13</option>
+                            <option value="8" <?php echo $eanLen === '8' ? 'selected' : ''; ?>>EAN-8</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="margin:0;display:flex;align-items:flex-end;">
+                        <label style="display:flex;gap:8px;align-items:center;font-weight:500;">
+                            <input type="checkbox" name="ean_check_digit" value="1"
+                                <?php echo ($settings['ean_check_digit'] ?? '1') !== '0' ? 'checked' : ''; ?>>
+                            Calcular dígito de control
+                        </label>
+                    </div>
+                </div>
+                <hr style="border:none;border-top:1px solid var(--color-border,#e5e7eb);margin:18px 0;">
+                <h4 style="margin:0 0 10px;font-size:14px;">Secuencia automática de SKU</h4>
+                <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 12px;">
+                    En Inventario puede escribir el SKU a mano (fórmula del tooltip) o usar
+                    <strong>Generar SKU</strong>, que toma el siguiente de esta secuencia (ej. SKU-000001).
+                </p>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                    <div class="form-group" style="margin:0;">
+                        <label>Prefijo</label>
+                        <input type="text" name="sku_prefix" class="form-control"
+                               value="<?php echo htmlspecialchars($settings['sku_prefix'] ?? 'SKU-'); ?>"
+                               maxlength="40" placeholder="SKU-">
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label>Siguiente número</label>
+                        <input type="number" name="sku_next" class="form-control" min="1"
+                               value="<?php echo htmlspecialchars($settings['sku_next'] ?? '1'); ?>">
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label>Ceros (padding)</label>
+                        <input type="number" name="sku_pad" class="form-control" min="3" max="12"
+                               value="<?php echo htmlspecialchars($settings['sku_pad'] ?? '6'); ?>">
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-primary" style="margin-top:14px;">Guardar Preferencias</button>
             </form>
         </div>
     </div>
@@ -727,6 +785,32 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
             <?php endif; ?>
         </div>
     </div>
+
+    <?php if ($isAdmin): ?>
+    <!-- Zona de peligro: borrado general -->
+    <div class="card neumorphic" style="grid-column: 1 / -1;border:1px solid #DC2626;">
+        <div class="card-header" style="background:rgba(220,38,38,0.08);">
+            <h3 style="color:#B91C1C;">Zona de peligro — Borrado general</h3>
+        </div>
+        <div class="card-body">
+            <p style="color:var(--color-text-secondary);font-size:13px;margin-bottom:12px;">
+                Elimina <strong>todos</strong> los datos operativos: ventas, inventario, compras, clientes, proveedores,
+                caja, nómina, asientos contables, usuarios del equipo, etc.
+            </p>
+            <p style="color:var(--color-text-secondary);font-size:13px;margin-bottom:16px;">
+                Se conservan: su usuario administrador actual (misma contraseña), preferencias de configuración
+                y el catálogo contable (PUC). <strong>Esta acción no se puede deshacer</strong> —
+                descargue una copia de seguridad antes.
+            </p>
+            <form method="POST" action="<?php echo $viewInstance->route('app/configuracion'); ?>?action=wipeDatabase" id="wipeDatabaseForm" onsubmit="return openWipeDangerModal(event)">
+                <?php echo \SoftNova\Core\csrf_field(); ?>
+                <input type="hidden" name="confirm_password" id="wipeConfirmPassword" value="">
+                <input type="hidden" name="confirm_phrase" id="wipeConfirmPhrase" value="">
+                <button type="submit" class="btn btn-danger">Borrar todo y limpiar base de datos</button>
+            </form>
+        </div>
+    </div>
+    <?php endif; ?>
 </div>
 </div><!-- /tab sistema -->
 
@@ -775,6 +859,31 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
     </div>
 </div>
 
+<!-- Modal alto riesgo: borrado general BD -->
+<div id="wipeDangerModal" class="modal-overlay restore-danger-overlay" style="display:none;">
+    <div class="restore-danger-modal" role="dialog" aria-modal="true" aria-labelledby="wipeDangerTitle">
+        <h3 id="wipeDangerTitle">BORRADO GENERAL DE DATOS</h3>
+        <p class="restore-danger-warn">¿Estás seguro?</p>
+        <p class="restore-danger-text">
+            Se eliminarán ventas, inventario, compras, clientes, proveedores, caja, nómina y el resto de datos operativos.
+            Solo quedará <strong>su usuario administrador</strong>, la configuración y el PUC contable.
+            <strong>No se puede deshacer</strong>.
+        </p>
+        <div class="form-group" style="text-align:left;">
+            <label style="color:#fff;">Escriba <strong>BORRAR TODO</strong> para confirmar</label>
+            <input type="text" id="wipeDangerPhrase" class="form-control" autocomplete="off" placeholder="BORRAR TODO" style="text-transform:uppercase;">
+        </div>
+        <div class="form-group" style="text-align:left;">
+            <label style="color:#fff;">Contraseña de administrador</label>
+            <input type="password" id="wipeDangerPassword" class="form-control" autocomplete="current-password" placeholder="Contraseña de administrador">
+        </div>
+        <div class="restore-danger-actions">
+            <button type="button" class="btn btn-secondary" onclick="closeWipeDangerModal()">Cancelar</button>
+            <button type="button" class="btn btn-danger" onclick="confirmWipeDanger()">Sí, borrar todo</button>
+        </div>
+    </div>
+</div>
+
 <script>
 var restoreFormPending = null;
 function openRestoreDangerModal(e) {
@@ -801,6 +910,44 @@ function confirmRestoreDanger() {
     document.getElementById('restoreConfirmPassword').value = pwd;
     document.getElementById('restoreDangerModal').style.display = 'none';
     restoreFormPending = null;
+    if (!form) return;
+    form.onsubmit = null;
+    form.removeAttribute('onsubmit');
+    if (typeof handleAjaxSubmit === 'function') {
+        handleAjaxSubmit(form);
+    } else {
+        form.submit();
+    }
+}
+function openWipeDangerModal(e) {
+    e.preventDefault();
+    document.getElementById('wipeDangerPhrase').value = '';
+    document.getElementById('wipeDangerPassword').value = '';
+    document.getElementById('wipeDangerModal').style.display = 'flex';
+    if (typeof initPasswordToggles === 'function') initPasswordToggles(document.getElementById('wipeDangerModal'));
+    setTimeout(function(){ document.getElementById('wipeDangerPhrase').focus(); }, 50);
+    return false;
+}
+function closeWipeDangerModal() {
+    document.getElementById('wipeDangerModal').style.display = 'none';
+}
+function confirmWipeDanger() {
+    var phrase = (document.getElementById('wipeDangerPhrase').value || '').trim().toUpperCase();
+    var pwd = (document.getElementById('wipeDangerPassword').value || '').trim();
+    if (phrase !== 'BORRAR TODO') {
+        if (typeof showAlert === 'function') showAlert('Debe escribir exactamente BORRAR TODO', 'error');
+        else alert('Debe escribir exactamente BORRAR TODO');
+        return;
+    }
+    if (!pwd) {
+        if (typeof showAlert === 'function') showAlert('Debe escribir la contraseña del administrador', 'error');
+        else alert('Debe escribir la contraseña del administrador');
+        return;
+    }
+    var form = document.getElementById('wipeDatabaseForm');
+    document.getElementById('wipeConfirmPhrase').value = phrase;
+    document.getElementById('wipeConfirmPassword').value = pwd;
+    document.getElementById('wipeDangerModal').style.display = 'none';
     if (!form) return;
     form.onsubmit = null;
     form.removeAttribute('onsubmit');

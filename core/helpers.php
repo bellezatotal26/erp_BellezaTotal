@@ -171,7 +171,21 @@ function public_web_prefix(): string
  */
 function base_url(string $path = ''): string
 {
-    $baseUrl = config('app.url', 'http://localhost/SoftNova');
+    $baseUrl = trim((string)config('app.url', ''));
+    // Si app.url está vacío o apunta a otro host, usar el host actual (evita CSRF en migraciones).
+    $host = (string)($_SERVER['HTTP_HOST'] ?? '');
+    $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || ((string)($_SERVER['SERVER_PORT'] ?? '') === '443')
+        || (strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https');
+    if ($host !== '') {
+        $current = ($https ? 'https' : 'http') . '://' . $host;
+        if ($baseUrl === '' || !str_contains(strtolower($baseUrl), strtolower($host))) {
+            $baseUrl = $current;
+        }
+    }
+    if ($baseUrl === '') {
+        $baseUrl = 'http://localhost';
+    }
     return rtrim($baseUrl, '/') . '/' . ltrim($path, '/');
 }
 
@@ -205,9 +219,8 @@ function asset(string $path): string
  */
 function redirect(string $url): void
 {
-    $baseUrl = config('app.url', 'http://localhost/SoftNova/public');
     if (!str_starts_with($url, 'http')) {
-        $url = rtrim($baseUrl, '/') . '/' . ltrim($url, '/');
+        $url = base_url(ltrim($url, '/'));
     }
     header("Location: {$url}");
     exit;

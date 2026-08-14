@@ -8,6 +8,8 @@ $filters = $filters ?? ['state' => '', 'supplier_id' => 0, 'category_id' => 0, '
 $suppliers = $suppliers ?? [];
 $categories = $categories ?? [];
 $draftOrders = $draftOrders ?? [];
+$draftCart = $draftCart ?? [];
+$draftCount = (int)($draftCount ?? count($draftCart));
 $currency = $currency ?? ['symbol' => '$', 'decimals' => 0, 'decimal' => ',', 'thousands' => '.'];
 $canCreate = \SoftNova\Core\TenantMiddleware::canDo('create', 'compras');
 $canEdit = \SoftNova\Core\TenantMiddleware::canDo('edit', 'compras');
@@ -21,6 +23,14 @@ function repFmt(float $a, array $c): string
 <meta name="currency-symbol" content="<?php echo htmlspecialchars($currency['symbol']); ?>">
 <meta name="currency-decimals" content="<?php echo (int)$currency['decimals']; ?>">
 <?php echo flashMessage(); ?>
+
+<div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;align-items:center;">
+    <a href="<?php echo $comprasBase; ?>" class="btn btn-secondary" title="Volver al módulo de órdenes de compra">← Volver a compras</a>
+    <a href="<?php echo $comprasBase; ?>?action=facturas" class="btn btn-secondary" title="Ir a facturas recibidas, abonos y CxP">Facturas</a>
+    <span style="font-size:13px;color:var(--color-text-secondary);">
+        Acumule productos en la bandeja y genere la OC cuando esté listo.
+    </span>
+</div>
 
 <div class="stats-grid" style="margin-bottom:16px;">
     <div class="stat-card neumorphic">
@@ -102,7 +112,7 @@ function repFmt(float $a, array $c): string
         <div class="card-body" style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;">
             <p style="margin:0;flex:1;min-width:240px;font-size:13px;">
                 Hay <strong><?php echo (int)$summary['without_supplier']; ?></strong> producto(s) sin proveedor asignado.
-                Sin proveedor no se puede generar la orden de compra.
+                Puede generar la OC igual (grupo «Sin proveedor») o asignar proveedores desde el histórico.
             </p>
             <form method="POST" action="<?php echo $comprasBase; ?>?action=link_suppliers" style="margin:0;">
                 <?php echo \SoftNova\Core\csrf_field(); ?>
@@ -115,18 +125,18 @@ function repFmt(float $a, array $c): string
     </div>
 <?php endif; ?>
 
-<form method="POST" action="<?php echo $comprasBase; ?>?action=generate_orders" id="repForm">
+<form method="POST" action="<?php echo $comprasBase; ?>?action=draft_add" id="repForm">
     <?php echo \SoftNova\Core\csrf_field(); ?>
     <div class="card neumorphic">
         <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
             <h3>Productos a reponer (<?php echo count($needs); ?>)</h3>
             <?php if ($canCreate && !empty($needs)): ?>
-                <div style="display:flex;gap:8px;align-items:center;">
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
                     <button type="button" class="btn btn-sm btn-secondary" onclick="repToggleAll(true)">Seleccionar todo</button>
                     <button type="button" class="btn btn-sm btn-secondary" onclick="repToggleAll(false)">Ninguno</button>
                     <button type="submit" class="btn btn-primary"
-                            onclick="return repConfirm()">
-                        Generar órdenes por proveedor
+                            onclick="return repConfirmAdd()">
+                        Añadir a bandeja
                     </button>
                 </div>
             <?php endif; ?>
@@ -138,13 +148,13 @@ function repFmt(float $a, array $c): string
                 </p>
             <?php else: ?>
                 <p style="font-size:13px;color:var(--color-text-secondary);margin-top:0;">
-                    La cantidad sugerida lleva el stock al nivel objetivo y suma el consumo estimado durante
-                    el tiempo de entrega del proveedor. Puede ajustarla antes de generar la orden.
+                    Acumule productos en la <strong>bandeja</strong> y genere la(s) OC cuando decida.
+                    La cantidad sugerida lleva el stock al objetivo y cubre el lead time del proveedor.
                 </p>
                 <div class="table-container"><table>
                     <thead><tr>
                         <?php if ($canCreate): ?><th style="width:34px;"></th><?php endif; ?>
-                        <th>Producto</th><th>Stock</th><th>Mínimo</th><th>Vendidos</th><th>Cobertura</th>
+                        <th>Producto</th><th>EAN</th><th>Stock</th><th>Mínimo</th><th>Vendidos</th><th>Cobertura</th>
                         <th>Proveedor</th><th>Costo unit.</th><th>A pedir</th><th>Estimado</th>
                     </tr></thead>
                     <tbody>
@@ -153,12 +163,13 @@ function repFmt(float $a, array $c): string
                         $agotado = (int)$item['stock'] <= 0;
                         $sinProveedor = empty($item['supplier_id']);
                         ?>
-                        <tr<?php echo $sinProveedor ? ' style="opacity:.72;"' : ''; ?>>
+                        <tr>
                             <?php if ($canCreate): ?>
                                 <td>
                                     <input type="checkbox" name="product_ids[]" class="rep-check"
                                            value="<?php echo (int)$item['id']; ?>"
-                                           <?php echo $sinProveedor ? 'disabled title="Asigne un proveedor primero"' : 'checked'; ?>>
+                                           checked
+                                           <?php echo $sinProveedor ? 'title="Se generará en OC sin proveedor"' : ''; ?>>
                                 </td>
                             <?php endif; ?>
                             <td>
@@ -169,6 +180,9 @@ function repFmt(float $a, array $c): string
                                         · <?php echo htmlspecialchars((string)$item['category_name']); ?>
                                     <?php endif; ?>
                                 </div>
+                            </td>
+                            <td style="font-size:12px;white-space:nowrap;">
+                                <?php echo htmlspecialchars((string)($item['barcode'] ?? '') !== '' ? (string)$item['barcode'] : '—'); ?>
                             </td>
                             <td style="font-weight:600;color:<?php echo $agotado ? '#DC2626' : '#F59E0B'; ?>;">
                                 <?php echo (int)$item['stock']; ?>
@@ -184,7 +198,7 @@ function repFmt(float $a, array $c): string
                             </td>
                             <td>
                                 <?php if ($sinProveedor): ?>
-                                    <span style="color:#DC2626;font-weight:600;">Sin asignar</span>
+                                    <span style="color:#B45309;font-weight:600;">Sin proveedor (OK)</span>
                                 <?php else: ?>
                                     <?php echo htmlspecialchars((string)$item['supplier_name']); ?>
                                     <?php if (!empty($item['supplier_sku'])): ?>
@@ -206,8 +220,7 @@ function repFmt(float $a, array $c): string
                                            class="form-control rep-qty"
                                            name="quantities[<?php echo (int)$item['id']; ?>]"
                                            data-cost="<?php echo (float)$item['unit_cost']; ?>"
-                                           value="<?php echo (int)$item['suggested_qty']; ?>"
-                                           <?php echo $sinProveedor ? 'disabled' : ''; ?>>
+                                           value="<?php echo (int)$item['suggested_qty']; ?>">
                                 <?php else: ?>
                                     <?php echo (int)$item['suggested_qty']; ?>
                                 <?php endif; ?>
@@ -224,6 +237,87 @@ function repFmt(float $a, array $c): string
         </div>
     </div>
 </form>
+
+<div class="card neumorphic" style="margin-top:18px;border-left:4px solid #2563EB;">
+    <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+        <h3>Bandeja de reposición (<?php echo $draftCount; ?>)</h3>
+        <?php if ($canCreate && $draftCount > 0): ?>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <form method="POST" action="<?php echo $comprasBase; ?>?action=draft_clear" style="margin:0;"
+                      onsubmit="return confirm('¿Vaciar toda la bandeja?')">
+                    <?php echo \SoftNova\Core\csrf_field(); ?>
+                    <button type="submit" class="btn btn-sm btn-secondary">Vaciar</button>
+                </form>
+                <form method="POST" action="<?php echo $comprasBase; ?>?action=draft_generate" style="margin:0;"
+                      onsubmit="return confirm('¿Generar órdenes de compra con los <?php echo $draftCount; ?> producto(s) de la bandeja?')">
+                    <?php echo \SoftNova\Core\csrf_field(); ?>
+                    <button type="submit" class="btn btn-primary">Generar órdenes ahora</button>
+                </form>
+            </div>
+        <?php endif; ?>
+    </div>
+    <div class="card-body">
+        <?php if (empty($draftCart)): ?>
+            <p style="text-align:center;color:var(--color-text-secondary);padding:16px;margin:0;">
+                La bandeja está vacía. Seleccione productos arriba y pulse <strong>Añadir a bandeja</strong>.
+                Puede acumular en varias pasadas antes de generar la OC.
+            </p>
+        <?php else: ?>
+            <div class="table-container"><table>
+                <thead><tr>
+                    <th>Producto</th><th>EAN</th><th>Proveedor</th><th>Cantidad</th><th>Costo</th><th>Estimado</th><th></th>
+                </tr></thead>
+                <tbody>
+                <?php
+                $draftTotal = 0.0;
+                foreach ($draftCart as $row):
+                    $cost = (float)($row['unit_cost'] ?? $row['purchase_price'] ?? 0);
+                    $qty = (int)$row['quantity'];
+                    $line = round($cost * $qty, 2);
+                    $draftTotal += $line;
+                ?>
+                    <tr>
+                        <td>
+                            <strong><?php echo htmlspecialchars((string)$row['name']); ?></strong>
+                            <div style="font-size:12px;color:var(--color-text-secondary);">
+                                <?php echo htmlspecialchars((string)($row['code'] ?? '')); ?>
+                            </div>
+                        </td>
+                        <td style="font-size:12px;"><?php echo htmlspecialchars((string)($row['barcode'] ?? '') !== '' ? (string)$row['barcode'] : '—'); ?></td>
+                        <td><?php echo htmlspecialchars((string)($row['supplier_name'] ?? 'Sin proveedor')); ?></td>
+                        <td>
+                            <?php if ($canCreate): ?>
+                                <form method="POST" action="<?php echo $comprasBase; ?>?action=draft_update" style="display:flex;gap:6px;align-items:center;margin:0;">
+                                    <?php echo \SoftNova\Core\csrf_field(); ?>
+                                    <input type="hidden" name="product_id" value="<?php echo (int)$row['product_id']; ?>">
+                                    <input type="number" name="quantity" min="1" value="<?php echo $qty; ?>" class="form-control" style="width:80px;">
+                                    <button type="submit" class="btn btn-sm btn-secondary">OK</button>
+                                </form>
+                            <?php else: ?>
+                                <?php echo $qty; ?>
+                            <?php endif; ?>
+                        </td>
+                        <td><?php echo repFmt($cost, $currency); ?></td>
+                        <td><?php echo repFmt($line, $currency); ?></td>
+                        <td>
+                            <?php if ($canCreate): ?>
+                                <form method="POST" action="<?php echo $comprasBase; ?>?action=draft_remove" style="margin:0;">
+                                    <?php echo \SoftNova\Core\csrf_field(); ?>
+                                    <input type="hidden" name="product_id" value="<?php echo (int)$row['product_id']; ?>">
+                                    <button type="submit" class="btn btn-sm btn-danger" title="Quitar">✕</button>
+                                </form>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table></div>
+            <div style="text-align:right;font-weight:600;margin-top:10px;">
+                Total bandeja: <?php echo repFmt($draftTotal, $currency); ?>
+            </div>
+        <?php endif; ?>
+    </div>
+</div>
 
 <?php if (!empty($draftOrders)): ?>
     <div class="card neumorphic" style="margin-top:18px;">
@@ -323,13 +417,13 @@ function repRecalc() {
     if (out) out.textContent = repMoney(total);
 }
 
-function repConfirm() {
+function repConfirmAdd() {
     var n = document.querySelectorAll('.rep-check:checked').length;
     if (n === 0) {
         showAlert('Seleccione al menos un producto', 'error');
         return false;
     }
-    return confirm('Se crearán órdenes de compra en borrador agrupadas por proveedor para ' + n + ' producto(s). ¿Continuar?');
+    return confirm('Se añadirán ' + n + ' producto(s) a la bandeja (puede acumular y generar la OC después). ¿Continuar?');
 }
 
 function repWhatsapp(orderId) {

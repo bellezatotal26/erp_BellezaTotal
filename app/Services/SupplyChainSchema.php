@@ -311,15 +311,50 @@ class SupplyChainSchema
 
             // EAN/código de barras en líneas de factura importada (distinto del SKU proveedor)
             ['purchase_invoice_import_items', 'barcode', 'VARCHAR(64) NULL AFTER supplier_sku'],
+
+            // Casar factura importada con una OC de pedido existente
+            ['purchase_invoice_imports', 'linked_order_id', 'INT UNSIGNED NULL AFTER purchase_order_id'],
+
+            // Snapshot EAN en líneas de OC (trazabilidad aunque el producto cambie después)
+            ['purchase_order_items', 'barcode', 'VARCHAR(64) NULL AFTER product_name'],
+            ['purchase_order_items', 'product_code', 'VARCHAR(255) NULL AFTER barcode'],
+
+            // Comprobante fotográfico / PDF del abono a proveedor (consignación, transferencia, etc.)
+            ['supplier_payments', 'receipt_path', 'VARCHAR(255) NULL AFTER notes'],
+            ['supplier_payments', 'receipt_mime', 'VARCHAR(80) NULL AFTER receipt_path'],
+            ['supplier_payments', 'receipt_original_name', 'VARCHAR(255) NULL AFTER receipt_mime'],
         ] as [$table, $column, $definition]) {
             self::addColumnIfMissing($db, $table, $column, $definition);
         }
+
+        self::ensureReplenishmentDraftTable($db);
 
         self::addIndexIfMissing($db, 'purchase_orders', 'idx_po_payment_status', '(payment_status)');
         self::addIndexIfMissing($db, 'purchase_orders', 'idx_po_duplicated_from', '(duplicated_from_id)');
         self::addIndexIfMissing($db, 'products', 'idx_products_next_expiry', '(next_expiry_date)');
         self::addIndexIfMissing($db, 'products', 'idx_products_barcode', '(barcode)');
         self::addIndexIfMissing($db, 'cash_movements', 'idx_cm_accounting', '(accounting_entry_id)');
+    }
+
+    private static function ensureReplenishmentDraftTable(\PDO $db): void
+    {
+        try {
+            $db->exec(
+                "CREATE TABLE IF NOT EXISTS replenishment_draft_items (
+                    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    product_id INT UNSIGNED NOT NULL,
+                    quantity INT NOT NULL DEFAULT 1,
+                    unit_cost DECIMAL(12,2) NULL,
+                    added_by INT UNSIGNED NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_rd_product (product_id),
+                    KEY idx_rd_updated (updated_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+            );
+        } catch (\Throwable $e) {
+            // silencioso
+        }
     }
 
     private static function addColumnIfMissing(\PDO $db, string $table, string $column, string $definition): void

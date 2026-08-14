@@ -63,9 +63,9 @@ class ReplenishmentService
             $params[] = (int)$filters['category_id'];
         }
         if (!empty($filters['q'])) {
-            $where[] = '(p.name LIKE ? OR p.code LIKE ?)';
+            $where[] = '(p.name LIKE ? OR p.code LIKE ? OR p.barcode LIKE ?)';
             $like = '%' . $filters['q'] . '%';
-            array_push($params, $like, $like);
+            array_push($params, $like, $like, $like);
         }
 
         if (!empty($filters['supplier_id'])) {
@@ -73,7 +73,7 @@ class ReplenishmentService
             $params[] = (int)$filters['supplier_id'];
         }
 
-        $sql = "SELECT p.id, p.code, p.name, p.stock, p.min_stock, p.max_stock,
+        $sql = "SELECT p.id, p.code, p.barcode, p.name, p.stock, p.min_stock, p.max_stock,
                        p.purchase_price, p.sale_price, p.unit, p.next_expiry_date,
                        c.name category_name,
                        COALESCE(v.sold_qty, 0) sold_qty,
@@ -212,9 +212,6 @@ class ReplenishmentService
             if ($productIds && !in_array($productId, $productIds, true)) {
                 continue;
             }
-            if (empty($item['supplier_id'])) {
-                continue;
-            }
 
             $cantidad = isset($overrides[$productId])
                 ? max(0, (int)$overrides[$productId])
@@ -223,12 +220,15 @@ class ReplenishmentService
                 continue;
             }
 
-            $supplierId = (int)$item['supplier_id'];
+            // 0 = sin proveedor: se genera una OC igualmente
+            $supplierId = !empty($item['supplier_id']) ? (int)$item['supplier_id'] : 0;
             if (!isset($grupos[$supplierId])) {
                 $grupos[$supplierId] = [
                     'supplier' => [
-                        'id' => $supplierId,
-                        'name' => (string)$item['supplier_name'],
+                        'id' => $supplierId > 0 ? $supplierId : null,
+                        'name' => $supplierId > 0
+                            ? (string)$item['supplier_name']
+                            : 'Sin proveedor',
                         'email' => (string)($item['supplier_email'] ?? ''),
                         'phone' => (string)($item['supplier_phone'] ?? ''),
                     ],
@@ -241,6 +241,8 @@ class ReplenishmentService
             $grupos[$supplierId]['items'][] = [
                 'product_id' => $productId,
                 'product_name' => (string)$item['name'],
+                'product_code' => (string)($item['code'] ?? ''),
+                'barcode' => (string)($item['barcode'] ?? ''),
                 'supplier_sku' => (string)($item['supplier_sku'] ?? ''),
                 'quantity' => $cantidad,
                 'unit_cost' => $costo,
@@ -254,6 +256,7 @@ class ReplenishmentService
 
     /**
      * Crea una orden de compra en borrador por cada proveedor de la selección.
+     * Productos sin proveedor van a una OC «Sin proveedor».
      *
      * @param list<int> $productIds
      * @param array<int,int> $overrides Cantidad manual por producto
@@ -263,20 +266,23 @@ class ReplenishmentService
     {
         $grupos = $this->groupBySupplier($productIds, $overrides);
         if (empty($grupos)) {
-            throw new \RuntimeException('No hay productos con proveedor asignado para generar órdenes');
+            throw new \RuntimeException('No hay productos seleccionados para generar órdenes');
         }
 
         $purchasing = new PurchasingService($this->db);
         $hoy = date('Y-m-d');
         $ordenes = [];
 
-        foreach ($grupos as $supplierId => $grupo) {
+        foreach ($grupos as $grupo) {
+            $supplierId = !empty($grupo['supplier']['id']) ? (int)$grupo['supplier']['id'] : null;
             $orderId = $purchasing->createOrder(
                 $supplierId,
                 $hoy,
                 null,
                 null,
-                'Generada desde el panel de reposición',
+                $supplierId
+                    ? 'Generada desde el panel de reposición'
+                    : 'Generada desde reposición (sin proveedor; asígnelo al recibir o cargar factura)',
                 $grupo['items'],
                 'draft'
             );
@@ -291,14 +297,258 @@ class ReplenishmentService
             ];
         }
 
-        $sinProveedor = 0;
+        return ['orders' => $ordenes, 'skipped_no_supplier' => 0];
+    }
+
+    // ------------------------------------------------------------------ Bandeja acumulable
+
+    /** @return list<array<string,mixed>> */
+    public function draftList(): array
+    {
+        try {
+            return $this->query(
+                "SELECT d.id, d.product_id, d.quantity, d.unit_cost, d.updated_at,
+                        p.name, p.code, p.barcode, p.stock, p.min_stock, p.purchase_price,
+                        ps.supplier_id, ps.supplier_sku, s.name supplier_name
+                 FROM replenishment_draft_items d
+                 JOIN products p ON p.id = d.product_id
+                 LEFT JOIN product_suppliers ps ON ps.id = (
+                    SELECT ps2.id FROM product_suppliers ps2
+                    WHERE ps2.product_id = p.id AND ps2.status = 'active'
+                    ORDER BY ps2.is_primary DESC, ps2.last_cost ASC, ps2.id ASC
+                    LIMIT 1
+                 )
+                 LEFT JOIN suppliers s ON s.id = ps.supplier_id
+                 ORDER BY d.updated_at DESC, d.id DESC"
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    public function draftCount(): int
+    {
+        try {
+            return (int)$this->query("SELECT COUNT(*) FROM replenishment_draft_items")->fetchColumn();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Suma productos a la bandeja (acumula cantidad si ya existía).
+     *
+     * @param list<int> $productIds
+     * @param array<int,int> $overrides
+     * @return array{added:int,updated:int}
+     */
+    public function draftAdd(array $productIds, array $overrides = []): array
+    {
+        $productIds = array_values(array_unique(array_filter(array_map('intval', $productIds))));
+        if (empty($productIds)) {
+            throw new \InvalidArgumentException('Seleccione al menos un producto');
+        }
+
+        $needsMap = [];
         foreach ($this->needsList([], 1000) as $item) {
-            if (empty($item['supplier_id']) && (!$productIds || in_array((int)$item['id'], $productIds, true))) {
-                $sinProveedor++;
+            $needsMap[(int)$item['id']] = $item;
+        }
+
+        $placeholders = implode(',', array_fill(0, count($productIds), '?'));
+        $products = $this->query(
+            "SELECT id, name, purchase_price, status, COALESCE(product_type, 'product') product_type
+             FROM products WHERE id IN ($placeholders)",
+            $productIds
+        )->fetchAll();
+        $byId = [];
+        foreach ($products as $p) {
+            $byId[(int)$p['id']] = $p;
+        }
+
+        $added = 0;
+        $updated = 0;
+        $userId = $_SESSION['tenant_user_id'] ?? null;
+        $upsert = $this->db->prepare(
+            "INSERT INTO replenishment_draft_items (product_id, quantity, unit_cost, added_by)
+             VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+                quantity = quantity + VALUES(quantity),
+                unit_cost = COALESCE(VALUES(unit_cost), unit_cost),
+                updated_at = NOW()"
+        );
+
+        foreach ($productIds as $pid) {
+            $prod = $byId[$pid] ?? null;
+            if (!$prod || ($prod['status'] ?? '') !== 'active' || ($prod['product_type'] ?? '') === 'service') {
+                continue;
+            }
+            $need = $needsMap[$pid] ?? null;
+            $qty = array_key_exists($pid, $overrides)
+                ? max(0, (int)$overrides[$pid])
+                : (int)($need['suggested_qty'] ?? 0);
+            if ($qty <= 0) {
+                continue;
+            }
+            $cost = $need
+                ? round((float)$need['unit_cost'], 2)
+                : round((float)$prod['purchase_price'], 2);
+
+            $existed = (bool)$this->query(
+                "SELECT 1 FROM replenishment_draft_items WHERE product_id = ? LIMIT 1",
+                [$pid]
+            )->fetchColumn();
+            $upsert->execute([$pid, $qty, $cost, $userId]);
+            if ($existed) {
+                $updated++;
+            } else {
+                $added++;
             }
         }
 
-        return ['orders' => $ordenes, 'skipped_no_supplier' => $sinProveedor];
+        if ($added + $updated === 0) {
+            throw new \RuntimeException('No se agregó ningún producto (revise cantidades o estado del producto)');
+        }
+
+        return ['added' => $added, 'updated' => $updated];
+    }
+
+    public function draftUpdateQty(int $productId, int $quantity): void
+    {
+        if ($productId <= 0) {
+            throw new \InvalidArgumentException('Producto no válido');
+        }
+        if ($quantity <= 0) {
+            $this->draftRemove($productId);
+            return;
+        }
+        $stmt = $this->query(
+            "UPDATE replenishment_draft_items SET quantity = ?, updated_at = NOW() WHERE product_id = ?",
+            [$quantity, $productId]
+        );
+        if ($stmt->rowCount() < 1) {
+            throw new \RuntimeException('El producto no está en la bandeja');
+        }
+    }
+
+    public function draftRemove(int $productId): void
+    {
+        $this->query("DELETE FROM replenishment_draft_items WHERE product_id = ?", [$productId]);
+    }
+
+    public function draftClear(): void
+    {
+        $this->query("DELETE FROM replenishment_draft_items");
+    }
+
+    /**
+     * Genera OC desde la bandeja con las cantidades guardadas (no depende de needsList)
+     * y la vacía solo al terminar bien. Evita doble clic con bloqueo de filas.
+     *
+     * @return array{orders:list<array{order_id:int,supplier_name:string,total:float}>,skipped_no_supplier:int}
+     */
+    public function generateFromDraft(): array
+    {
+        $this->db->beginTransaction();
+        try {
+            // Bloqueo: otra pestaña no puede generar en paralelo.
+            $lock = $this->query(
+                "SELECT product_id FROM replenishment_draft_items ORDER BY product_id FOR UPDATE"
+            )->fetchAll();
+            if (empty($lock)) {
+                throw new \RuntimeException('La bandeja de reposición está vacía');
+            }
+
+            $draft = $this->draftList();
+            if (empty($draft)) {
+                throw new \RuntimeException('La bandeja de reposición está vacía');
+            }
+
+            $grupos = $this->groupDraftLines($draft);
+            if (empty($grupos)) {
+                throw new \RuntimeException('No hay líneas válidas en la bandeja para generar órdenes');
+            }
+
+            $purchasing = new PurchasingService($this->db);
+            $hoy = date('Y-m-d');
+            $ordenes = [];
+
+            foreach ($grupos as $grupo) {
+                $supplierId = !empty($grupo['supplier']['id']) ? (int)$grupo['supplier']['id'] : null;
+                $orderId = $purchasing->createOrder(
+                    $supplierId,
+                    $hoy,
+                    null,
+                    null,
+                    $supplierId
+                        ? 'Generada desde el panel de reposición'
+                        : 'Generada desde reposición (sin proveedor; asígnelo al recibir o cargar factura)',
+                    $grupo['items'],
+                    'draft'
+                );
+                $this->query(
+                    "UPDATE purchase_orders SET origin = 'replenishment' WHERE id = ?",
+                    [$orderId]
+                );
+                $ordenes[] = [
+                    'order_id' => $orderId,
+                    'supplier_name' => $grupo['supplier']['name'],
+                    'total' => round($grupo['total'], 2),
+                ];
+            }
+
+            $this->draftClear();
+            $this->db->commit();
+            return ['orders' => $ordenes, 'skipped_no_supplier' => 0];
+        } catch (\Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * Agrupa líneas de bandeja por proveedor (independiente de needsList).
+     *
+     * @param list<array<string,mixed>> $draft
+     * @return array<int,array{supplier:array<string,mixed>,items:list<array<string,mixed>>,total:float}>
+     */
+    private function groupDraftLines(array $draft): array
+    {
+        $grupos = [];
+        foreach ($draft as $row) {
+            $productId = (int)($row['product_id'] ?? 0);
+            $cantidad = (int)($row['quantity'] ?? 0);
+            if ($productId <= 0 || $cantidad <= 0) {
+                continue;
+            }
+            $supplierId = !empty($row['supplier_id']) ? (int)$row['supplier_id'] : 0;
+            if (!isset($grupos[$supplierId])) {
+                $grupos[$supplierId] = [
+                    'supplier' => [
+                        'id' => $supplierId > 0 ? $supplierId : null,
+                        'name' => $supplierId > 0
+                            ? (string)($row['supplier_name'] ?? 'Proveedor')
+                            : 'Sin proveedor',
+                    ],
+                    'items' => [],
+                    'total' => 0.0,
+                ];
+            }
+            $costo = round((float)($row['unit_cost'] ?? $row['purchase_price'] ?? 0), 2);
+            $grupos[$supplierId]['items'][] = [
+                'product_id' => $productId,
+                'product_name' => (string)($row['name'] ?? ''),
+                'product_code' => (string)($row['code'] ?? ''),
+                'barcode' => (string)($row['barcode'] ?? ''),
+                'supplier_sku' => (string)($row['supplier_sku'] ?? ''),
+                'quantity' => $cantidad,
+                'unit_cost' => $costo,
+                'tax_rate' => 0.0,
+            ];
+            $grupos[$supplierId]['total'] += round($cantidad * $costo, 2);
+        }
+        return $grupos;
     }
 
     /**
@@ -361,9 +611,11 @@ class ReplenishmentService
         ];
 
         foreach ($order['items'] as $item) {
+            $ean = trim((string)($item['barcode'] ?? ''));
             $lineas[] = sprintf(
-                '- %s x %d',
+                '- %s%s x %d',
                 (string)$item['product_name'],
+                $ean !== '' ? (' [EAN ' . $ean . ']') : '',
                 (int)$item['quantity']
             );
         }
