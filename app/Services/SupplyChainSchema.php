@@ -29,9 +29,35 @@ class SupplyChainSchema
         self::ensureLots($db);
         self::ensureProductSuppliers($db);
         self::ensureInvoiceImports($db);
+        self::ensureInvoiceLifecycleEvents($db);
         self::ensureSupplierPayments($db);
         self::ensurePurchaseCreditNotes($db);
         self::ensureExtraColumns($db);
+    }
+
+    /**
+     * Bitácora de movimientos internos del borrador/factura
+     * (carga, revisión, ediciones, confirmación, descarte).
+     */
+    private static function ensureInvoiceLifecycleEvents(\PDO $db): void
+    {
+        $db->exec(
+            "CREATE TABLE IF NOT EXISTS purchase_invoice_lifecycle_events (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                import_id INT UNSIGNED NULL,
+                purchase_order_id INT UNSIGNED NULL,
+                event_type VARCHAR(40) NOT NULL,
+                label VARCHAR(160) NOT NULL,
+                detail VARCHAR(500) NULL,
+                actor_user_id INT UNSIGNED NULL,
+                meta_json TEXT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_pile_import (import_id),
+                KEY idx_pile_order (purchase_order_id),
+                KEY idx_pile_created (created_at),
+                KEY idx_pile_type (event_type)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        );
     }
 
     private static function ensurePurchaseCreditNotes(\PDO $db): void
@@ -171,6 +197,7 @@ class SupplyChainSchema
                 invoice_number VARCHAR(80) NULL,
                 invoice_date DATE NULL,
                 due_date DATE NULL,
+                warehouse_date DATE NULL,
                 source ENUM('manual','csv','text','ai','ai_vision') NOT NULL DEFAULT 'manual',
                 file_path VARCHAR(255) NULL,
                 file_mime VARCHAR(100) NULL,
@@ -216,6 +243,30 @@ class SupplyChainSchema
                     "ALTER TABLE purchase_invoice_imports
                      ADD COLUMN early_payment_discount_pct DECIMAL(5,2) NOT NULL DEFAULT 0.00
                      AFTER payment_mode"
+                );
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+        try {
+            $col = $db->query("SHOW COLUMNS FROM purchase_invoice_imports LIKE 'commercial_discount_pct'")->fetch();
+            if (!$col) {
+                $db->exec(
+                    "ALTER TABLE purchase_invoice_imports
+                     ADD COLUMN commercial_discount_pct DECIMAL(5,2) NOT NULL DEFAULT 0.00
+                     AFTER early_payment_discount_pct"
+                );
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+        try {
+            $col = $db->query("SHOW COLUMNS FROM purchase_invoice_imports LIKE 'commercial_discount_amount'")->fetch();
+            if (!$col) {
+                $db->exec(
+                    "ALTER TABLE purchase_invoice_imports
+                     ADD COLUMN commercial_discount_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00
+                     AFTER commercial_discount_pct"
                 );
             }
         } catch (\Throwable $e) {
@@ -315,16 +366,59 @@ class SupplyChainSchema
             // Casar factura importada con una OC de pedido existente
             ['purchase_invoice_imports', 'linked_order_id', 'INT UNSIGNED NULL AFTER purchase_order_id'],
 
+            // Fecha real de ingreso a bodega (puede diferir de la fecha de factura)
+            ['purchase_invoice_imports', 'warehouse_date', 'DATE NULL AFTER due_date'],
+
+            // Tipo de documento proveedor: electrónica / normal / remisión (define IVA de líneas e inventario)
+            ['purchase_invoice_imports', 'document_kind', "VARCHAR(20) NULL AFTER payment_mode"],
+            // Solo F. Normal: 1 = productos con IVA %, 0 = exentos, 2 = IVA monto personalizado (tax_override_amount)
+            ['purchase_invoice_imports', 'apply_product_vat', 'TINYINT(1) NULL AFTER document_kind'],
+            // F. Electrónica: 1 = el Excel/PDF ya trae precios con IVA (no volver a sumar)
+            ['purchase_invoice_imports', 'vat_already_included', 'TINYINT(1) NOT NULL DEFAULT 0 AFTER apply_product_vat'],
+            // F. Normal + apply_product_vat=2: monto exacto de IVA de la factura (asiento 240802)
+            ['purchase_invoice_imports', 'tax_override_amount', 'DECIMAL(14,2) NULL AFTER tax_total'],
+
             // Snapshot EAN en líneas de OC (trazabilidad aunque el producto cambie después)
             ['purchase_order_items', 'barcode', 'VARCHAR(64) NULL AFTER product_name'],
             ['purchase_order_items', 'product_code', 'VARCHAR(255) NULL AFTER barcode'],
+
+            // Descarte de borrador de factura (trazabilidad de revisión)
+            ['purchase_invoice_imports', 'discarded_at', 'DATETIME NULL AFTER confirmed_at'],
+            ['purchase_invoice_imports', 'discarded_by', 'INT UNSIGNED NULL AFTER discarded_at'],
+
+            // Anulación post-recepción: columna dedicada (no depender solo de notes VARCHAR(255))
+            ['purchase_orders', 'voided_at', 'DATETIME NULL'],
+            ['purchase_orders', 'void_reason', 'VARCHAR(255) NULL'],
+
+            // Nota/observación del operador al confirmar factura (visible en Detalle y Timeline)
+            ['purchase_invoice_imports', 'review_notes', 'TEXT NULL'],
+            ['purchase_orders', 'review_notes', 'TEXT NULL'],
 
             // Comprobante fotográfico / PDF del abono a proveedor (consignación, transferencia, etc.)
             ['supplier_payments', 'receipt_path', 'VARCHAR(255) NULL AFTER notes'],
             ['supplier_payments', 'receipt_mime', 'VARCHAR(80) NULL AFTER receipt_path'],
             ['supplier_payments', 'receipt_original_name', 'VARCHAR(255) NULL AFTER receipt_mime'],
+            // Efectivo: 1 = sale del cajón POS; 0 = otro origen (no descuenta caja)
+            ['supplier_payments', 'cash_from_drawer', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER payment_method'],
+            ['supplier_payments', 'cash_source_note', 'VARCHAR(255) NULL AFTER cash_from_drawer'],
         ] as [$table, $column, $definition]) {
             self::addColumnIfMissing($db, $table, $column, $definition);
+        }
+
+        // Backfill: anuladas antiguas que solo tenían el tag en notes.
+        try {
+            $db->exec(
+                "UPDATE purchase_orders
+                 SET voided_at = COALESCE(updated_at, created_at, NOW())
+                 WHERE status = 'cancelled'
+                   AND voided_at IS NULL
+                   AND (
+                        COALESCE(notes,'') LIKE '%ANULADA POST-RECEPCIÓN%'
+                        OR COALESCE(notes,'') LIKE '%[[NC_FULL%'
+                   )"
+            );
+        } catch (\Throwable $e) {
+            // columna aún no existe o sin privilegios
         }
 
         self::ensureReplenishmentDraftTable($db);

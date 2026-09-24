@@ -5,17 +5,58 @@ $pageTitle = 'Gestión de Clientes';
 $tenantName = $tenantName ?? 'Mi Empresa';
 $userName = $userName ?? 'Usuario';
 $customers = $customers ?? [];
+$pagination = $pagination ?? null;
+$perPageOptions = $perPageOptions ?? [20, 50, 100, 200];
+$qFilter = $qFilter ?? '';
+$documentTypeFilter = $documentTypeFilter ?? '';
+$sourceFilter = $sourceFilter ?? '';
+$listQuery = $listQuery ?? [];
+$clientesBase = $viewInstance->route('app/clientes');
 
 $customOpts = new \SoftNova\Services\CustomOptionService(\SoftNova\Core\TenantMiddleware::getDb());
 $sourceOptions = $customOpts->options(\SoftNova\Services\CustomOptionService::GROUP_CUSTOMER_SOURCE, true);
 ?>
 <?php echo flashMessage(); ?>
 
+<form method="GET" action="<?php echo $clientesBase; ?>" class="inv-filters-form" style="margin-bottom:16px;">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+        <div class="form-group" style="margin:0;flex:1;min-width:220px;">
+            <label style="font-size:12px;">Buscar</label>
+            <input type="text" name="q" value="<?php echo htmlspecialchars($qFilter); ?>" class="form-control" placeholder="Nombre, documento, email, teléfono…">
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Tipo doc.</label>
+            <select name="document_type" class="form-control" style="width:auto;">
+                <option value="">Todos</option>
+                <?php foreach (['CC' => 'C.C', 'CE' => 'C.E', 'NIT' => 'NIT', 'PPT' => 'PPT', 'OTROS' => 'OTROS'] as $code => $lab): ?>
+                    <option value="<?php echo $code; ?>" <?php echo $documentTypeFilter === $code ? 'selected' : ''; ?>><?php echo $lab; ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Origen</label>
+            <select name="source" class="form-control" style="width:auto;max-width:200px;">
+                <option value="">Todos</option>
+                <?php foreach ($sourceOptions as $s): ?>
+                    <option value="<?php echo htmlspecialchars((string)$s['value']); ?>" <?php echo $sourceFilter === (string)$s['value'] ? 'selected' : ''; ?>>
+                        <?php echo htmlspecialchars((string)$s['label']); ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <input type="hidden" name="per_page" value="<?php echo (int)($pagination['perPage'] ?? 20); ?>">
+        <div style="display:flex;gap:6px;">
+            <button type="submit" class="btn btn-primary">Filtrar</button>
+            <a href="<?php echo $clientesBase; ?>" class="btn btn-secondary">Limpiar</a>
+        </div>
+    </div>
+</form>
+
 <div class="card neumorphic">
     <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
         <h3>Lista de Clientes (<?php echo (int)($pagination['total'] ?? count($customers)); ?>)</h3>
         <div style="display:flex;gap:8px;">
-            <a href="<?php echo $viewInstance->route('app/clientes'); ?>?action=export" class="btn btn-secondary" title="Exportar CSV">CSV</a>
+            <a href="<?php echo $clientesBase; ?>?action=export<?php echo $listQuery !== [] ? '&' . http_build_query($listQuery) : ''; ?>" class="btn btn-secondary" title="Exporta el listado filtrado; sin filtros exporta todos los activos">CSV</a>
             <button onclick="openModal()" class="btn btn-primary neumorphic-btn" title="Nuevo cliente">+ Nuevo Cliente</button>
         </div>
     </div>
@@ -24,7 +65,10 @@ $sourceOptions = $customOpts->options(\SoftNova\Services\CustomOptionService::GR
             <thead><tr><th>ID</th><th>Nombre</th><th>Apellido</th><th>Empresa</th><th>Documento</th><th>Email</th><th>Teléfono</th><th>Origen</th><th>Acciones</th></tr></thead>
             <tbody>
             <?php if (empty($customers)): ?>
-                <tr><td colspan="9" style="text-align:center;color:var(--color-text-secondary);">No hay clientes</td></tr>
+                <?php $hasCliFilters = $qFilter !== '' || $documentTypeFilter !== '' || $sourceFilter !== ''; ?>
+                <tr><td colspan="9" style="text-align:center;color:var(--color-text-secondary);">
+                    <?php echo $hasCliFilters ? 'No hay clientes con esos filtros' : 'No hay clientes'; ?>
+                </td></tr>
             <?php else: ?>
                 <?php foreach ($customers as $c): ?>
                     <tr>
@@ -39,7 +83,7 @@ $sourceOptions = $customOpts->options(\SoftNova\Services\CustomOptionService::GR
                         <td class="table-actions">
                             <button onclick="viewDetail(<?php echo $c['id']; ?>)" class="btn btn-sm btn-info" title="Ver detalle"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg></button>
                             <button onclick='openModal(<?php echo htmlspecialchars(json_encode($c)); ?>)' class="btn btn-sm btn-secondary" title="Editar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg></button>
-                            <form method="POST" action="<?php echo $viewInstance->route('app/clientes'); ?>?action=delete" style="display:inline;" data-ajax="true">
+                            <form method="POST" action="<?php echo $clientesBase; ?>?action=delete" style="display:inline;" data-ajax="true">
                                 <?php echo \SoftNova\Core\csrf_field(); ?><input type="hidden" name="id" value="<?php echo $c['id']; ?>">
                                 <button type="submit" data-confirm="Eliminar este cliente?" class="btn btn-sm btn-danger" title="Eliminar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
                             </form>
@@ -50,10 +94,10 @@ $sourceOptions = $customOpts->options(\SoftNova\Services\CustomOptionService::GR
             </tbody>
         </table></div>
         <?php
-        $pagination = $pagination ?? null;
-        $paginationBaseUrl = $viewInstance->route('app/clientes');
-        $paginationQuery = [];
-        $viewInstance->partial('pagination', compact('pagination', 'paginationBaseUrl', 'paginationQuery'));
+        $paginationBaseUrl = $clientesBase;
+        $paginationQuery = $listQuery;
+        $paginationPerPageOptions = $perPageOptions;
+        $viewInstance->partial('pagination', compact('pagination', 'paginationBaseUrl', 'paginationQuery', 'paginationPerPageOptions'));
         ?>
     </div>
 </div>

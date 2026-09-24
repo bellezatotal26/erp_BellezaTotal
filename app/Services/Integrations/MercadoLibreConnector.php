@@ -169,7 +169,7 @@ class MercadoLibreConnector implements CatalogProviderInterface
     public function fetchProducts(int $limit = 100): array
     {
         $this->ensureValidToken();
-        $limit = max(1, min(100, $limit));
+        $limit = max(1, min(500, $limit));
         $userId = trim((string)($this->config['user_id'] ?? ''));
         if ($userId === '') {
             $me = $this->request('GET', '/users/me');
@@ -183,15 +183,38 @@ class MercadoLibreConnector implements CatalogProviderInterface
             }
         }
 
-        $search = $this->request(
-            'GET',
-            '/users/' . rawurlencode($userId) . '/items/search?limit=' . $limit . '&status=active'
-        );
-        if (!$search['ok']) {
-            throw new \RuntimeException($search['error'] ?? 'Error al listar ítems ML');
+        $ids = [];
+        $offset = 0;
+        $pageSize = 50;
+        while (count($ids) < $limit) {
+            $need = min($pageSize, $limit - count($ids));
+            $search = $this->request(
+                'GET',
+                '/users/' . rawurlencode($userId) . '/items/search?limit=' . $need . '&offset=' . $offset . '&status=active'
+            );
+            if (!$search['ok']) {
+                if ($offset === 0) {
+                    throw new \RuntimeException($search['error'] ?? 'Error al listar ítems ML');
+                }
+                break;
+            }
+            $batch = $search['data']['results'] ?? [];
+            if (!is_array($batch) || $batch === []) {
+                break;
+            }
+            foreach ($batch as $id) {
+                $ids[] = (string)$id;
+                if (count($ids) >= $limit) {
+                    break;
+                }
+            }
+            $offset += count($batch);
+            if (count($batch) < $need || $offset > 5000) {
+                break;
+            }
         }
-        $ids = $search['data']['results'] ?? [];
-        if (!is_array($ids) || empty($ids)) {
+
+        if ($ids === []) {
             return [];
         }
 
@@ -206,9 +229,14 @@ class MercadoLibreConnector implements CatalogProviderInterface
                 if (!$body || empty($body['id'])) {
                     continue;
                 }
+                $code = trim((string)($body['seller_custom_field'] ?? ''));
+                if ($code === '') {
+                    $code = (string)$body['id'];
+                }
                 $out[] = [
                     'external_id' => (string)$body['id'],
-                    'code' => (string)($body['seller_custom_field'] ?? $body['id']),
+                    'code' => $code,
+                    'barcode' => $this->extractBarcode($body),
                     'name' => (string)($body['title'] ?? 'Producto ML'),
                     'price' => (float)($body['price'] ?? 0),
                     'cost' => 0.0,
@@ -218,6 +246,29 @@ class MercadoLibreConnector implements CatalogProviderInterface
             }
         }
         return $out;
+    }
+
+    private function extractBarcode(array $body): string
+    {
+        $attrs = $body['attributes'] ?? [];
+        if (!is_array($attrs)) {
+            return '';
+        }
+        $wanted = ['GTIN', 'EAN', 'UPC', 'ISBN', 'BARCODE'];
+        foreach ($attrs as $attr) {
+            if (!is_array($attr)) {
+                continue;
+            }
+            $id = strtoupper((string)($attr['id'] ?? ''));
+            $name = strtoupper((string)($attr['name'] ?? ''));
+            if (in_array($id, $wanted, true) || in_array($name, $wanted, true)) {
+                $val = trim((string)($attr['value_name'] ?? $attr['value_id'] ?? ''));
+                if ($val !== '') {
+                    return mb_substr($val, 0, 64);
+                }
+            }
+        }
+        return '';
     }
 
     private function ensureValidToken(): void

@@ -60,7 +60,7 @@ function fmtV(float $a, array $c): string
                 <thead>
                     <tr>
                         <th>Número</th><th>Fecha</th><th>Cliente</th><th>Venta</th>
-                        <th>Motivo</th><th>Stock</th><th>Asiento</th><th>Total</th><th>Acciones</th>
+                        <th>Motivo</th><th>Reembolso</th><th>Stock</th><th>Asiento</th><th>Total</th><th>Acciones</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -73,6 +73,15 @@ function fmtV(float $a, array $c): string
                         <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="<?php echo htmlspecialchars((string)($n['reason'] ?? '')); ?>">
                             <?php echo htmlspecialchars((string)($n['reason'] ?: '—')); ?>
                         </td>
+                        <td><?php
+                            $rm = (string)($n['refund_method'] ?? 'auto');
+                            echo htmlspecialchars(match ($rm) {
+                                'cash' => 'Efectivo',
+                                'transfer' => 'Transferencia',
+                                'receivable' => 'CxC',
+                                default => 'Auto',
+                            });
+                        ?></td>
                         <td><?php echo (int)($n['affects_stock'] ?? 0) === 1 ? 'Reingreso' : 'No'; ?></td>
                         <td><?php echo htmlspecialchars((string)($n['accounting_entry_number'] ?? '—')); ?></td>
                         <td><?php echo fmtV((float)$n['total'], $currency); ?></td>
@@ -215,7 +224,7 @@ function fmtV(float $a, array $c): string
                         <td class="table-actions">
                             <button onclick="viewDetail(<?php echo $sale['id']; ?>)" class="btn btn-sm btn-info" title="Ver detalle"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg></button>
                             <a href="<?php echo $ventasBase; ?>?action=pdf&id=<?php echo $sale['id']; ?>" class="btn btn-sm btn-secondary" target="_blank" title="PDF carta"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg></a>
-                            <a href="<?php echo $ventasBase; ?>?action=pdf&format=ticket&id=<?php echo $sale['id']; ?>" class="btn btn-sm btn-secondary" target="_blank" title="Ticket 58mm">58mm</a>
+                            <a href="<?php echo $ventasBase; ?>?action=pdf&format=print&id=<?php echo $sale['id']; ?>" class="btn btn-sm btn-secondary" target="_blank" title="Imprimir tirilla 58mm">58mm</a>
                             <button type="button" class="btn btn-sm btn-success" onclick="shareSale(<?php echo (int)$sale['id']; ?>)" title="WhatsApp / Correo">↗</button>
                             <?php if ($canEditPaymentMethod && ($sale['status'] ?? '') !== 'cancelled'): ?>
                                 <button type="button" class="btn btn-sm btn-secondary" title="Editar medio de pago"
@@ -294,10 +303,14 @@ function fmtV(float $a, array $c): string
                                     data-stock="<?php echo $p['stock']; ?>"
                                     data-type="<?php echo htmlspecialchars($p['product_type'] ?? 'product'); ?>"
                                     data-code="<?php echo htmlspecialchars($p['code'] ?? ''); ?>"
-                                    data-open-item="<?php echo $isOpen ? '1' : '0'; ?>">
+                                    data-open-item="<?php echo $isOpen ? '1' : '0'; ?>"
+                                    data-ownership="<?php echo htmlspecialchars((string)($p['ownership'] ?? 'owned')); ?>"
+                                    data-consignment="<?php echo (($p['ownership'] ?? 'owned') === 'consignment') ? '1' : '0'; ?>">
                                 <?php echo htmlspecialchars(($p['code'] ?? '') !== '' ? ($p['code'] . ' — ') : ''); ?><?php echo htmlspecialchars($p['name']); ?>
                                 <?php if ($isOpen): ?>
                                     (nombre y precio libres)
+                                <?php elseif (($p['ownership'] ?? 'owned') === 'consignment'): ?>
+                                    · Consignación (<?php echo fmtV($p['sale_price'], $currency); ?>) — Stock: <?php echo (int)$p['stock']; ?>
                                 <?php else: ?>
                                     (<?php echo fmtV($p['sale_price'], $currency); ?>) — Stock: <?php echo (int)$p['stock']; ?>
                                 <?php endif; ?>
@@ -447,6 +460,17 @@ function fmtV(float $a, array $c): string
                 <label>Precio de venta *</label>
                 <input type="text" id="openItemPrice" class="form-control money-input" data-money="1" inputmode="decimal" placeholder="0">
             </div>
+            <div class="form-group" id="openItemTaxWrap" style="margin-bottom:0;">
+                <label style="display:flex;align-items:center;gap:8px;margin:0;cursor:pointer;font-weight:500;">
+                    <input type="checkbox" id="openItemHasTax" style="width:auto;margin:0;" checked>
+                    <span>Este producto tiene IVA (<span id="openItemTaxRateLabel"><?php
+                        echo htmlspecialchars((string)\SoftNova\Services\TaxService::defaultRate(\SoftNova\Core\TenantMiddleware::getDb()));
+                    ?></span>%)</span>
+                </label>
+                <small style="display:block;margin-top:6px;color:var(--color-text-secondary);">
+                    Si lo desmarca, se vende como exento (sin IVA).
+                </small>
+            </div>
         </div>
         <div class="modal-footer">
             <button type="button" class="btn btn-secondary" onclick="document.getElementById('openItemModal').style.display='none'">Cancelar</button>
@@ -526,6 +550,11 @@ function fmtV(float $a, array $c): string
     <div class="modal-content neumorphic" style="max-width:420px;">
         <div class="modal-header"><h3>Enviar recibo</h3><button type="button" class="modal-close" onclick="document.getElementById('shareModal').style.display='none'">&times;</button></div>
         <div class="modal-body">
+            <div class="form-group">
+                <label>WhatsApp (celular)</label>
+                <input type="tel" id="sharePhone" class="form-control" placeholder="Ej. 3001234567" inputmode="tel" autocomplete="tel">
+                <small style="color:var(--color-text-secondary);">Digite el número del cliente. Se abre el chat con el mensaje del recibo.</small>
+            </div>
             <a id="shareWhatsappBtn" href="#" target="_blank" class="btn btn-success" style="width:100%;margin-bottom:10px;">Abrir WhatsApp</a>
             <form method="POST" action="<?php echo $viewInstance->route('app/ventas'); ?>?action=email" data-ajax="true">
                 <?php echo \SoftNova\Core\csrf_field(); ?>
@@ -648,4 +677,6 @@ function fmtV(float $a, array $c): string
     window.invRouteVentasDetail = '<?php echo $viewInstance->route('app/ventas'); ?>?action=detail';
     window.invRouteVentasShare = '<?php echo $viewInstance->route('app/ventas'); ?>?action=share';
     window.ventasBase = <?php echo json_encode($ventasBase); ?>;
+    window.cajaTaxRate = <?php echo json_encode((float)(\SoftNova\Services\TaxService::defaultRate(\SoftNova\Core\TenantMiddleware::getDb()))); ?>;
+    window.cajaTaxEnabled = <?php echo json_encode(\SoftNova\Services\TaxService::isCalculationEnabled(\SoftNova\Core\TenantMiddleware::getDb())); ?>;
 </script>

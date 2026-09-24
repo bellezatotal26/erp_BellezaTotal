@@ -14,6 +14,8 @@ class CustomOptionService
     public const GROUP_DISCOUNT_PERCENT = 'discount_percent';
     public const GROUP_PRODUCT_LOCATION = 'product_location';
     public const GROUP_EXPENSE_CATEGORY = 'expense_category';
+    public const GROUP_LOAN_REASON = 'loan_reason';
+    public const GROUP_LOAN_RECEIVED_REASON = 'loan_received_reason';
 
     private \PDO $db;
 
@@ -99,6 +101,26 @@ class CustomOptionService
                 ['value' => 'Almacén 1', 'label' => 'Almacén 1'],
                 ['value' => 'Local 2', 'label' => 'Local 2'],
             ],
+            self::GROUP_LOAN_REASON => (static function (): array {
+                $out = [];
+                foreach (ProductLoan::reasons() as $value => $label) {
+                    if ($value === ProductLoan::REASON_OTRO) {
+                        continue;
+                    }
+                    $out[] = ['value' => $value, 'label' => $label];
+                }
+                return $out;
+            })(),
+            self::GROUP_LOAN_RECEIVED_REASON => (static function (): array {
+                $out = [];
+                foreach (ProductLoan::receivedReasons() as $value => $label) {
+                    if ($value === 'otro') {
+                        continue;
+                    }
+                    $out[] = ['value' => $value, 'label' => $label];
+                }
+                return $out;
+            })(),
             default => [],
         };
     }
@@ -173,7 +195,7 @@ class CustomOptionService
      * Añade una opción permanente. Si ya existe (mismo value o label), la reutiliza.
      * @return array{value:string,label:string,created:bool}
      */
-    public function add(string $group, string $label): array
+    public function add(string $group, string $label, array $extra = []): array
     {
         $group = trim($group);
         $label = trim(preg_replace('/\s+/', ' ', $label) ?? '');
@@ -184,9 +206,17 @@ class CustomOptionService
             self::GROUP_DISCOUNT_PERCENT,
             self::GROUP_PRODUCT_LOCATION,
             self::GROUP_EXPENSE_CATEGORY,
+            self::GROUP_LOAN_REASON,
+            self::GROUP_LOAN_RECEIVED_REASON,
         ];
         if (!in_array($group, $allowed, true)) {
             throw new \InvalidArgumentException('Grupo de opciones no permitido');
+        }
+        if ($group === self::GROUP_LOAN_REASON) {
+            throw new \InvalidArgumentException(
+                'Los motivos de préstamo (salida) son fijos (proveedor, muestra u otro). '
+                . 'Use «Otro» y detalle en la nota; no se agregan motivos al listado.'
+            );
         }
         if ($label === '') {
             throw new \InvalidArgumentException('Escriba una opción válida');
@@ -200,11 +230,22 @@ class CustomOptionService
 
         // Categorías de gasto: se crean en expense_categories (valor = id).
         if ($group === self::GROUP_EXPENSE_CATEGORY) {
-            $cat = (new ExpenseCategoryService($this->db))->addOrReuse($label, 'administrative');
+            $kind = (string)($extra['kind'] ?? 'operational');
+            if (!ExpenseCategoryService::isValidKind($kind)) {
+                $kind = 'operational';
+            }
+            $svc = new ExpenseCategoryService($this->db);
+            $cat = $svc->addOrReuse($label, $kind);
+            // Asegurar grupo elegido en el modal (operativo vs administrativo).
+            if (($cat['kind'] ?? '') !== $kind) {
+                $svc->setKind((int)$cat['id'], $kind);
+                $cat['kind'] = $kind;
+            }
             return [
                 'value' => (string)$cat['id'],
                 'label' => (string)$cat['name'],
                 'created' => (bool)$cat['created'],
+                'kind' => (string)$cat['kind'],
             ];
         }
 
@@ -274,6 +315,8 @@ class CustomOptionService
             $base = 'pm_' . $base;
         } elseif ($group === self::GROUP_CANCEL_REASON) {
             $base = 'cr_' . $base;
+        } elseif ($group === self::GROUP_LOAN_RECEIVED_REASON) {
+            $base = 'lrr_' . $base;
         }
         $base = substr($base, 0, 60);
 

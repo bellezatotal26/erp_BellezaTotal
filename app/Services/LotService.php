@@ -179,14 +179,17 @@ class LotService
                 continue;
             }
 
-            // El estado se evalúa antes de restar: MySQL aplica los SET en orden.
-            $this->query(
+            // Atómico: solo descuenta si hay cantidad suficiente (evita lotes negativos concurrentes).
+            $upd = $this->query(
                 "UPDATE product_lots
                  SET status = CASE WHEN quantity - ? <= 0 THEN 'depleted' ELSE status END,
                      quantity = quantity - ?
-                 WHERE id = ?",
-                [$take, $take, (int)$lot['id']]
+                 WHERE id = ? AND quantity >= ?",
+                [$take, $take, (int)$lot['id'], $take]
             );
+            if ($upd->rowCount() < 1) {
+                continue;
+            }
 
             $line = [
                 'lot_id' => (int)$lot['id'],
@@ -462,13 +465,16 @@ class LotService
             if ($take <= 0) {
                 continue;
             }
-            $this->query(
+            $upd = $this->query(
                 "UPDATE product_lots
                  SET status = CASE WHEN quantity - ? <= 0 THEN 'depleted' ELSE status END,
                      quantity = quantity - ?
-                 WHERE id = ?",
-                [$take, $take, (int)$lot['id']]
+                 WHERE id = ? AND quantity >= ?",
+                [$take, $take, (int)$lot['id'], $take]
             );
+            if ($upd->rowCount() < 1) {
+                continue;
+            }
             if ($movementId !== null) {
                 try {
                     $this->query(

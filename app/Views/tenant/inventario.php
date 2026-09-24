@@ -19,14 +19,21 @@ $needBarcode = true;
 $pageScripts = ['inventario.js'];
 $channelFilter = $channelFilter ?? '';
 $catalogStatuses = $catalogStatuses ?? [];
+$mlOAuthRedirect = $mlOAuthRedirect ?? '';
 $filters = $filters ?? ['q' => '', 'sort' => 'name', 'dir' => 'asc', 'query' => []];
 $canCreateProduct = \SoftNova\Core\TenantMiddleware::canDo('create', 'inventario');
 $canEditProduct = \SoftNova\Core\TenantMiddleware::canDo('edit', 'inventario');
+$openIntegrations = (string)($_GET['integrations'] ?? '') === '1' || (string)($_GET['catalog'] ?? '') !== '';
 $canViewPrestamos = \SoftNova\Core\TenantMiddleware::canAccess('prestamos');
 $canCreatePrestamos = \SoftNova\Core\TenantMiddleware::canDo('create', 'prestamos');
+$canViewConsignacion = \SoftNova\Core\TenantMiddleware::canAccess('consignacion');
 $canDeleteProduct = \SoftNova\Core\TenantMiddleware::canDo('delete', 'inventario');
 $canExportInv = \SoftNova\Core\TenantMiddleware::canDo('export', 'inventario');
+$isAdmin = \SoftNova\Core\TenantMiddleware::getRole() === 'admin';
 $inventoryValue = $inventoryValue ?? ['cost' => 0.0, 'sale' => 0.0, 'units' => 0];
+$invCost = (float)($inventoryValue['cost'] ?? 0);
+$invSale = (float)($inventoryValue['sale'] ?? 0);
+$costLooksInflated = $isAdmin && $invSale > 0 && $invCost > ($invSale * 5);
 $expirySummary = $expirySummary ?? [];
 $expiryAlerts = (int)($expirySummary['expired_lots'] ?? 0) + (int)($expirySummary['expiring_lots'] ?? 0);
 $offerOptions = $offerOptions ?? \SoftNova\Services\ProductOfferService::formOptions();
@@ -58,6 +65,47 @@ function fmtI(float $a, array $c): string
 {
     return $c['symbol'] . ' ' . number_format($a, $c['decimals'], $c['decimal'] ?? ',', $c['thousands'] ?? '.');
 }
+
+/**
+ * Utilidad unitaria y % de ganancia sobre el costo.
+ * % = (venta − compra) / compra × 100. Sin costo → pct null.
+ *
+ * @return array{profit:float,pct:?float,has_cost:bool}
+ */
+function invUnitMargin(float $cost, float $sale): array
+{
+    $cost = round(max(0, $cost), 2);
+    $sale = round(max(0, $sale), 2);
+    $profit = round($sale - $cost, 2);
+    if ($cost < 0.01) {
+        return ['profit' => $profit, 'pct' => null, 'has_cost' => false];
+    }
+    return [
+        'profit' => $profit,
+        'pct' => round(($profit / $cost) * 100, 1),
+        'has_cost' => true,
+    ];
+}
+
+/** HTML compacto de utilidad / % para lista y cards. */
+function invMarginHtml(float $cost, float $sale, array $currency): string
+{
+    $m = invUnitMargin($cost, $sale);
+    if (!$m['has_cost'] && $sale < 0.01) {
+        return '<div class="inv-margin inv-margin--muted">Util. —</div>';
+    }
+    if (!$m['has_cost']) {
+        return '<div class="inv-margin inv-margin--muted" title="Defina precio de compra para calcular el % de ganancia">Util. '
+            . htmlspecialchars(fmtI($m['profit'], $currency))
+            . ' · % n/d</div>';
+    }
+    $cls = $m['profit'] > 0.009 ? 'inv-margin--ok' : ($m['profit'] < -0.009 ? 'inv-margin--bad' : 'inv-margin--muted');
+    $pct = ($m['pct'] >= 0 ? '+' : '') . number_format((float)$m['pct'], 1, ',', '.') . '%';
+    $title = 'Utilidad unitaria = venta − compra. % ganancia sobre costo = utilidad / compra × 100';
+    return '<div class="inv-margin ' . $cls . '" title="' . htmlspecialchars($title) . '">Util. '
+        . htmlspecialchars(fmtI($m['profit'], $currency))
+        . ' · ' . htmlspecialchars($pct) . '</div>';
+}
 ?>
 <meta name="currency-symbol" content="<?php echo $currency['symbol']; ?>">
 <meta name="currency-decimals" content="<?php echo $currency['decimals']; ?>">
@@ -80,6 +128,7 @@ function fmtI(float $a, array $c): string
         <span class="inv-kpi-label">Total ítems</span>
         <span class="inv-kpi-value"><?php echo (int)$totalProducts + (int)$totalServices; ?></span>
     </div>
+    <?php if ($isAdmin): ?>
     <div class="inv-kpi inv-kpi--money">
         <span class="inv-kpi-label">Costo del inventario</span>
         <span class="inv-kpi-value"><?php echo fmtI((float)($inventoryValue['cost'] ?? 0), $currency); ?></span>
@@ -88,6 +137,7 @@ function fmtI(float $a, array $c): string
             · <?php echo (int)($inventoryValue['units'] ?? 0); ?> uds
         </span>
     </div>
+    <?php endif; ?>
     <a href="<?php echo $viewInstance->route('app/inventario'); ?>?action=vencimientos" class="inv-kpi inv-kpi--link">
         <span class="inv-kpi-label">Por vencer / vencidos</span>
         <span class="inv-kpi-value" style="color:<?php echo $expiryAlerts > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo (int)$expiryAlerts; ?></span>
@@ -100,9 +150,92 @@ function fmtI(float $a, array $c): string
         <span class="inv-kpi-hint">Salidas por préstamo y devoluciones</span>
     </a>
     <?php endif; ?>
+    <?php if ($canViewConsignacion): ?>
+    <a href="<?php echo $viewInstance->route('app/consignacion'); ?>" class="inv-kpi inv-kpi--link">
+        <span class="inv-kpi-label">Consignación</span>
+        <span class="inv-kpi-value" style="color:var(--color-primary);">Ir →</span>
+        <span class="inv-kpi-hint">Mercancía de terceros (no inventario propio)</span>
+    </a>
+    <?php endif; ?>
 </div>
+<?php if ($costLooksInflated && $canEditProduct): ?>
+<div class="alert alert-warning" style="margin:0 0 16px;">
+    <strong>Costo del inventario sospechoso:</strong>
+    el valor a costo (<?php echo fmtI($invCost, $currency); ?>) es mucho mayor que a precio de venta
+    (<?php echo fmtI($invSale, $currency); ?>). Suele pasar cuando Excel exporta costos como
+    <code>15500.000</code> y se interpretan mal.
+    <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>"
+          data-ajax="true" style="display:inline-block;margin:8px 0 0;">
+        <?php echo \SoftNova\Core\csrf_field(); ?>
+        <input type="hidden" name="action" value="repair_inflated_costs">
+        <button type="submit" class="btn btn-primary btn-sm" data-confirm="¿Corregir costos inflados automáticamente comparándolos con el precio de venta?">
+            Reparar costos inflados
+        </button>
+    </form>
+</div>
+<?php endif; ?>
+
+<?php
+$importReport = $_SESSION['inventory_import_report'] ?? null;
+$repairReport = $_SESSION['inventory_cost_repair_report'] ?? null;
+if (!empty($_GET['dismiss_import_report'])) {
+    unset($_SESSION['inventory_import_report']);
+    $importReport = null;
+}
+if (!empty($_GET['dismiss_repair_report'])) {
+    unset($_SESSION['inventory_cost_repair_report']);
+    $repairReport = null;
+}
+?>
+<?php if (is_array($importReport) && !empty($importReport['message'])): ?>
+<div class="alert alert-info" style="margin:0 0 16px;">
+    <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
+        <div style="flex:1;min-width:240px;">
+            <strong>Resultado de la última importación CSV</strong>
+            <span style="opacity:.75;font-size:12px;"> · <?php echo htmlspecialchars((string)($importReport['at'] ?? '')); ?></span>
+            <p style="margin:8px 0 0;font-size:13px;line-height:1.45;">
+                <?php echo htmlspecialchars((string)$importReport['message']); ?>
+            </p>
+            <?php if (!empty($importReport['skip_reasons']) && is_array($importReport['skip_reasons'])): ?>
+                <ul style="margin:8px 0 0 18px;padding:0;font-size:13px;">
+                    <?php foreach ($importReport['skip_reasons'] as $reason => $count): ?>
+                        <li><?php echo htmlspecialchars((string)$reason); ?>: <strong><?php echo (int)$count; ?></strong></li>
+                    <?php endforeach; ?>
+                </ul>
+            <?php endif; ?>
+            <?php if (!empty($importReport['errors']) && is_array($importReport['errors'])): ?>
+                <details style="margin-top:8px;font-size:12px;">
+                    <summary>Ver errores de filas (<?php echo count($importReport['errors']); ?>)</summary>
+                    <ul style="margin:6px 0 0 18px;padding:0;">
+                        <?php foreach ($importReport['errors'] as $err): ?>
+                            <li><?php echo htmlspecialchars((string)$err); ?></li>
+                        <?php endforeach; ?>
+                    </ul>
+                </details>
+            <?php endif; ?>
+        </div>
+        <a class="btn btn-secondary btn-sm" href="<?php echo htmlspecialchars($viewInstance->route('app/inventario') . '?dismiss_import_report=1'); ?>">Cerrar</a>
+    </div>
+</div>
+<?php endif; ?>
+<?php if (is_array($repairReport) && !empty($repairReport['message'])): ?>
+<div class="alert alert-<?php echo ((int)($repairReport['fixed'] ?? 0) > 0) ? 'success' : 'warning'; ?>" style="margin:0 0 16px;">
+    <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
+        <div style="flex:1;min-width:240px;">
+            <strong>Reparación de costos</strong>
+            <span style="opacity:.75;font-size:12px;"> · <?php echo htmlspecialchars((string)($repairReport['at'] ?? '')); ?></span>
+            <p style="margin:8px 0 0;font-size:13px;line-height:1.45;">
+                <?php echo htmlspecialchars((string)$repairReport['message']); ?>
+            </p>
+        </div>
+        <a class="btn btn-secondary btn-sm" href="<?php echo htmlspecialchars($viewInstance->route('app/inventario') . '?dismiss_repair_report=1'); ?>">Cerrar</a>
+    </div>
+</div>
+<?php endif; ?>
 <p style="font-size:13px;color:var(--color-text-secondary);margin:-6px 0 16px;">
     Producto <strong>COMODIN</strong> (comodín): al venderlo en Caja/Ventas pide nombre y precio libres; no descuenta inventario. No lo elimine.
+    Los productos consignados se gestionan en <strong>Consignación</strong> y no suman al valor de inventario propio.
+    Los productos <strong>Prestados</strong> (nos los prestaron) sí aparecen aquí con etiqueta, se gestionan en <strong>Préstamos</strong> y tampoco suman al KPI de valor propio.
 </p>
 
 <?php
@@ -114,7 +247,7 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
         <div class="form-group" style="margin:0;flex:1;min-width:220px;">
             <label style="font-size:12px;">Buscar</label>
-            <input type="text" name="q" value="<?php echo htmlspecialchars($filters['q'] ?? ''); ?>" class="form-control" placeholder="Nombre, SKU, EAN o descripción...">
+            <input type="text" name="q" id="invSearchQ" value="<?php echo htmlspecialchars($filters['q'] ?? ''); ?>" class="form-control" placeholder="Nombre, SKU o EAN… busca al escribir (SKU, EAN, nombre)" autocomplete="off">
         </div>
         <div class="form-group" style="margin:0;">
             <label style="font-size:12px;">Tipo</label>
@@ -122,6 +255,14 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                 <option value="">Todos</option>
                 <option value="product" <?php echo $typeFilter === 'product' ? 'selected' : ''; ?>>Productos</option>
                 <option value="service" <?php echo $typeFilter === 'service' ? 'selected' : ''; ?>>Servicios</option>
+            </select>
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Estado</label>
+            <select name="status" class="form-control" style="width:auto;">
+                <option value="" <?php echo ($statusFilter ?? '') === '' ? 'selected' : ''; ?>>Todos</option>
+                <option value="active" <?php echo ($statusFilter ?? '') === 'active' ? 'selected' : ''; ?>>Activos</option>
+                <option value="inactive" <?php echo ($statusFilter ?? '') === 'inactive' ? 'selected' : ''; ?>>Inactivos</option>
             </select>
         </div>
         <div class="form-group" style="margin:0;">
@@ -172,9 +313,10 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
         </details>
         <input type="hidden" name="sort" value="<?php echo htmlspecialchars($filters['sort'] ?? 'name'); ?>">
         <input type="hidden" name="dir" value="<?php echo htmlspecialchars($filters['dir'] ?? 'asc'); ?>">
+        <input type="hidden" name="per_page" value="<?php echo (int)($pagination['perPage'] ?? 20); ?>">
         <div style="display:flex;gap:6px;">
             <button type="submit" class="btn btn-primary" title="Aplicar filtros">Filtrar</button>
-            <a href="<?php echo $invBase; ?>" class="btn btn-secondary" title="Limpiar filtros">Limpiar</a>
+            <a href="<?php echo $invBase; ?>" class="btn btn-secondary" title="Quitar todos los filtros">Limpiar filtros</a>
         </div>
     </div>
 </form>
@@ -208,28 +350,12 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
             <?php if ($canEditProduct): ?>
                 <button type="button" class="btn btn-secondary" onclick="openStockExitModal()">Salidas</button>
             <?php endif; ?>
-            <?php
-            $hasContabilidad = \SoftNova\Core\TenantMiddleware::canAccess('contabilidad');
-            $wooSt = $catalogStatuses['woocommerce'] ?? [];
-            $mlSt = $catalogStatuses['mercadolibre'] ?? [];
-            ?>
-            <?php if ($canCreateProduct && $hasContabilidad): ?>
-                <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=integrations&amp;provider=woocommerce">WooCommerce</a>
-                <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=integrations&amp;provider=mercadolibre">Mercado Libre</a>
-            <?php endif; ?>
-            <?php if ($canCreateProduct): ?>
-                <?php foreach (['woocommerce' => $wooSt, 'mercadolibre' => $mlSt] as $code => $st): ?>
-                    <?php if (!empty($st['enabled']) && !empty($st['configured'])): ?>
-                        <form method="POST" action="<?php echo $invBase; ?>?action=import_catalog" data-ajax="true" style="display:inline;margin:0;">
-                            <?php echo \SoftNova\Core\csrf_field(); ?>
-                            <input type="hidden" name="provider" value="<?php echo htmlspecialchars($code); ?>">
-                            <button type="submit" class="btn btn-primary" onclick="return confirm('¿Importar productos desde <?php echo htmlspecialchars($st['label'] ?? $code); ?>?')">
-                                Importar <?php echo htmlspecialchars($st['label'] ?? $code); ?>
-                            </button>
-                        </form>
-                    <?php endif; ?>
-                <?php endforeach; ?>
-            <?php endif; ?>
+        </div>
+    </details>
+    <details class="inv-tools-menu inv-integrations-menu" <?php echo $openIntegrations ? 'open' : ''; ?>>
+        <summary class="btn btn-secondary">Integraciones</summary>
+        <div class="inv-tools-panel inv-integrations-panel">
+            <?php require __DIR__ . '/../partials/catalog_integrations.php'; ?>
         </div>
     </details>
     <?php if ($canDeleteProduct && !empty($products)): ?>
@@ -244,6 +370,7 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
     </div>
     <form method="POST" action="<?php echo $invBase; ?>?action=delete_bulk" data-ajax="true" id="invBulkDeleteForm" style="display:none;">
         <?php echo \SoftNova\Core\csrf_field(); ?>
+        <input type="hidden" name="status_change_reason" id="invBulkDeleteReason" value="">
         <div id="invBulkIds"></div>
     </form>
     <?php endif; ?>
@@ -257,14 +384,17 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
 <div class="inv-products-grid">
     <?php if (empty($products)): ?>
         <div class="card neumorphic" style="text-align:center;padding:40px;grid-column:1/-1;">
-            <?php $hasFilters = ($filters['q'] ?? '') !== '' || $typeFilter !== '' || (int)$categoryFilter > 0 || $stockFilter !== ''; ?>
+            <?php $hasFilters = ($filters['q'] ?? '') !== '' || $typeFilter !== '' || ($statusFilter ?? '') !== '' || (int)$categoryFilter > 0 || $stockFilter !== ''; ?>
             <p style="color:var(--color-text-secondary);"><?php echo $hasFilters ? 'No hay ítems con esos filtros' : 'No hay ítems registrados'; ?></p>
         </div>
     <?php else: ?>
         <?php foreach ($products as $p): ?>
-            <?php $isService = ($p['product_type'] ?? 'product') === 'service'; ?>
+            <?php
+            $isService = ($p['product_type'] ?? 'product') === 'service';
+            $isInactive = (($p['status'] ?? 'active') === 'inactive');
+            ?>
             <div class="card neumorphic product-card"
-                 style="border-left:5px solid <?php echo $isService ? '#3B82F6' : 'var(--color-primary)'; ?>;padding:20px;position:relative;"
+                 style="border-left:5px solid <?php echo $isInactive ? '#9CA3AF' : ($isService ? '#3B82F6' : 'var(--color-primary)'); ?>;padding:20px;position:relative;<?php echo $isInactive ? 'opacity:0.78;' : ''; ?>"
                  data-id="<?php echo $p['id']; ?>"
                  data-name="<?php echo htmlspecialchars($p['name']); ?>"
                  data-code="<?php echo htmlspecialchars($p['code'] ?? ''); ?>"
@@ -274,6 +404,7 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                  data-unit="<?php echo htmlspecialchars($p['unit'] ?? 'UNIDAD'); ?>"
                  data-pcompra="<?php echo $p['purchase_price'] ?? 0; ?>"
                  data-pventa="<?php echo $p['sale_price'] ?? 0; ?>"
+                 data-taxrate="<?php echo htmlspecialchars((string)($p['tax_rate'] ?? ($defaultTaxRate ?? 0))); ?>"
                  data-pmayoreo="<?php echo $p['wholesale_price'] ?? 0; ?>"
                  data-stock="<?php echo $p['stock'] ?? 0; ?>"
                  data-minstock="<?php echo $p['min_stock'] ?? 5; ?>"
@@ -285,6 +416,7 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                  data-desc="<?php echo htmlspecialchars((string)($p['description'] ?? ''), ENT_QUOTES); ?>"
                  data-notes="<?php echo htmlspecialchars((string)($p['notes'] ?? ''), ENT_QUOTES); ?>"
                  data-debt="<?php echo (int)($p['stock_debt_qty'] ?? 0); ?>"
+                 data-ownership="<?php echo htmlspecialchars((string)($p['ownership'] ?? 'owned'), ENT_QUOTES); ?>"
                  data-supplier-id="<?php echo (int)($p['primary_supplier_id'] ?? 0); ?>"
                  data-supplier-sku="<?php echo htmlspecialchars((string)($p['primary_supplier_sku'] ?? ''), ENT_QUOTES); ?>"
                  data-offer="<?php echo !empty($p['offer_active']) ? '1' : '0'; ?>"
@@ -315,15 +447,27 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                     <div style="flex:1;min-width:0;">
                         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
                             <h4 style="margin:0;font-size:15px;color:var(--color-primary);"><?php echo htmlspecialchars($p['name']); ?></h4>
-                            <span class="badge <?php echo $isService ? 'badge-info' : 'badge-success'; ?>" style="flex-shrink:0;">
-                                <?php echo $isService ? 'Servicio' : 'Producto'; ?>
+                            <span style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;">
+                                <span class="badge <?php echo $isInactive ? 'badge-warning' : 'badge-success'; ?>">
+                                    <?php echo $isInactive ? 'Inactivo' : 'Activo'; ?>
+                                </span>
+                                <span class="badge <?php echo $isService ? 'badge-info' : 'badge-success'; ?>" style="opacity:0.9;">
+                                    <?php echo $isService ? 'Servicio' : 'Producto'; ?>
+                                </span>
+                                <?php if (($p['ownership'] ?? 'owned') === 'borrowed'): ?>
+                                    <span class="badge badge-info" title="Mercancía que nos prestaron (no consignación)">Prestado</span>
+                                <?php endif; ?>
                             </span>
                         </div>
-                        <?php if (!empty($p['code'])): ?>
-                            <div style="font-size:11px;color:var(--color-text-secondary);margin:3px 0;">SKU: <?php echo htmlspecialchars($p['code']); ?></div>
-                        <?php endif; ?>
-                        <?php if (!empty($p['barcode'])): ?>
-                            <div style="font-size:11px;color:var(--color-text-secondary);margin:3px 0;">EAN: <?php echo htmlspecialchars($p['barcode']); ?></div>
+                        <?php if (!empty($p['code']) || !empty($p['barcode'])): ?>
+                            <div style="font-size:11px;color:var(--color-text-secondary);margin:3px 0;line-height:1.35;">
+                                <?php if (!empty($p['code'])): ?>
+                                    <div>SKU: <?php echo htmlspecialchars($p['code']); ?></div>
+                                <?php endif; ?>
+                                <?php if (!empty($p['barcode'])): ?>
+                                    <div>EAN: <?php echo htmlspecialchars($p['barcode']); ?></div>
+                                <?php endif; ?>
+                            </div>
                         <?php endif; ?>
                         <?php if (!empty($p['category_name'])): ?>
                             <div style="font-size:12px;color:var(--color-text-secondary);margin-bottom:2px;">📂 <?php echo htmlspecialchars($p['category_name']); ?></div>
@@ -357,6 +501,7 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                                     (Compra: <?php echo fmtI($p['purchase_price'], $currency); ?>)
                                 </span>
                             <?php endif; ?>
+                            <?php echo invMarginHtml((float)($p['purchase_price'] ?? 0), (float)($p['sale_price'] ?? 0), $currency); ?>
                         </div>
                         <?php if (!$isService): ?>
                             <div style="margin:4px 0;">
@@ -415,7 +560,11 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                                 <?php endif; ?>
                                 <?php if (!$isService): ?>
                                     <button onclick="addStock(<?php echo $p['id']; ?>)" class="btn btn-sm btn-success" title="Ingresar lote / stock">Lote N</button>
-                                    <?php if ($canViewPrestamos): ?>
+                                    <?php if (($p['ownership'] ?? 'owned') === 'borrowed'): ?>
+                                        <?php if ($canViewPrestamos): ?>
+                                        <a href="<?php echo $viewInstance->route('app/prestamos'); ?>#prestamos-recibidos" class="btn btn-sm btn-secondary" title="Ver / devolver préstamo recibido">Devolver préstamo</a>
+                                        <?php endif; ?>
+                                    <?php elseif ($canViewPrestamos): ?>
                                     <a href="<?php echo $viewInstance->route('app/prestamos'); ?>?product_id=<?php echo (int)$p['id']; ?>" class="btn btn-sm btn-secondary" title="Salida por préstamo">Préstamo</a>
                                     <?php elseif ($canCreatePrestamos && \SoftNova\Core\TenantMiddleware::canAccess('caja')): ?>
                                     <a href="<?php echo $viewInstance->route('app/caja'); ?>?loan_product_id=<?php echo (int)$p['id']; ?>" class="btn btn-sm btn-secondary" title="Registrar préstamo desde Caja">Préstamo</a>
@@ -423,10 +572,11 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                                 <?php endif; ?>
                             <?php endif; ?>
                             <?php if ($canDeleteProduct): ?>
-                            <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=delete" style="display:inline;" data-ajax="true">
+                            <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=delete" style="display:inline;" data-ajax="true" class="inv-delete-form" onsubmit="return invDeleteWithReason(this);">
                                 <?php echo \SoftNova\Core\csrf_field(); ?>
                                 <input type="hidden" name="id" value="<?php echo $p['id']; ?>">
-                                <button type="submit" data-confirm="Eliminar este producto?" class="btn btn-sm btn-danger" title="Eliminar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
+                                <input type="hidden" name="status_change_reason" value="">
+                                <button type="submit" class="btn btn-sm btn-danger" title="Desactivar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
                             </form>
                             <?php endif; ?>
                         </div>
@@ -441,7 +591,6 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
 <div class="inv-products-list card neumorphic">
     <div class="inv-list-toolbar">
         <span id="invListFilterCount" class="inv-list-count"><?php echo count($products); ?> filas</span>
-        <button type="button" class="btn btn-sm btn-secondary" onclick="clearInvListFilters()">Limpiar filtros</button>
     </div>
     <div class="table-container">
         <table class="inv-list-table" id="invListTable">
@@ -452,14 +601,14 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                         <input type="checkbox" id="invSelectAllList" class="inv-select-all-list" style="width:16px;height:16px;" aria-label="Seleccionar todos">
                     </th>
                     <?php endif; ?>
-                    <th><?php $viewInstance->partial('sortable_th', ['label' => 'Código', 'column' => 'code', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
+                    <th><?php $viewInstance->partial('sortable_th', ['label' => 'SKU / EAN', 'column' => 'code', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
                     <th><?php $viewInstance->partial('sortable_th', ['label' => 'Nombre', 'column' => 'name', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
-                    <th>Tipo</th>
+                    <th>Estado</th>
                     <th><?php $viewInstance->partial('sortable_th', ['label' => 'Categoría', 'column' => 'category', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
                     <th><?php $viewInstance->partial('sortable_th', ['label' => 'Stock', 'column' => 'stock', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
                     <th>Vence</th>
                     <th><?php $viewInstance->partial('sortable_th', ['label' => 'P. Compra', 'column' => 'cost', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
-                    <th><?php $viewInstance->partial('sortable_th', ['label' => 'P. Venta', 'column' => 'price', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
+                    <th title="Precio de venta, utilidad unitaria y % de ganancia sobre el costo"><?php $viewInstance->partial('sortable_th', ['label' => 'P. Venta / Util.', 'column' => 'price', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
                     <th>Acciones</th>
                 </tr>
                 <tr class="inv-list-filters">
@@ -467,10 +616,10 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                     <th><input type="text" class="inv-col-filter form-control" data-col="code" placeholder="Filtrar…" autocomplete="off"></th>
                     <th><input type="text" class="inv-col-filter form-control" data-col="name" placeholder="Filtrar…" autocomplete="off"></th>
                     <th>
-                        <select class="inv-col-filter form-control" data-col="type">
+                        <select class="inv-col-filter form-control" data-col="status">
                             <option value="">Todos</option>
-                            <option value="product">Producto</option>
-                            <option value="service">Servicio</option>
+                            <option value="active">Activo</option>
+                            <option value="inactive">Inactivo</option>
                         </select>
                     </th>
                     <th><input type="text" class="inv-col-filter form-control" data-col="category" placeholder="Filtrar…" autocomplete="off"></th>
@@ -485,8 +634,10 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                 <?php foreach ($products as $p): ?>
                     <?php
                     $isService = ($p['product_type'] ?? 'product') === 'service';
-                    $typeKey = $isService ? 'service' : 'product';
+                    $isInactive = (($p['status'] ?? 'active') === 'inactive');
+                    $statusKey = $isInactive ? 'inactive' : 'active';
                     $codeVal = \SoftNova\Core\utf8_fix((string)($p['code'] ?? ''));
+                    $eanVal = \SoftNova\Core\utf8_fix((string)($p['barcode'] ?? ''));
                     $nameVal = \SoftNova\Core\utf8_fix((string)($p['name'] ?? ''));
                     $catVal = \SoftNova\Core\utf8_fix((string)($p['category_name'] ?? ''));
                     $stockVal = $isService ? '' : (string)(int)($p['stock'] ?? 0);
@@ -522,24 +673,41 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                         }
                     }
                     ?>
-                    <tr class="inv-list-row"
+                    <tr class="inv-list-row<?php echo $isInactive ? ' inv-row-inactive' : ''; ?>"
                         data-id="<?php echo (int)$p['id']; ?>"
-                        data-code="<?php echo htmlspecialchars(mb_strtolower($codeVal)); ?>"
+                        data-code="<?php echo htmlspecialchars(mb_strtolower(trim($codeVal . ' ' . $eanVal))); ?>"
                         data-name="<?php echo htmlspecialchars(mb_strtolower($nameVal)); ?>"
-                        data-type="<?php echo $typeKey; ?>"
+                        data-status="<?php echo $statusKey; ?>"
+                        data-type="<?php echo $isService ? 'service' : 'product'; ?>"
                         data-category="<?php echo htmlspecialchars(mb_strtolower($catVal)); ?>"
                         data-stock="<?php echo htmlspecialchars($stockVal); ?>"
+                        data-debt="<?php echo (int)($p['stock_debt_qty'] ?? 0); ?>"
+                        data-tracklots="<?php echo !empty($p['track_lots']) ? '1' : '0'; ?>"
                         data-expiry="<?php echo htmlspecialchars($expiryVal); ?>"
                         data-purchase="<?php echo htmlspecialchars($purchaseVal); ?>"
-                        data-sale="<?php echo htmlspecialchars($saleVal); ?>">
+                        data-sale="<?php echo htmlspecialchars($saleVal); ?>"
+                        <?php echo $isInactive ? 'style="opacity:0.72;background:rgba(156,163,175,0.08);"' : ''; ?>>
                         <?php if ($canDeleteProduct): ?>
                         <td>
                             <input type="checkbox" class="inv-product-check" value="<?php echo (int)$p['id']; ?>" style="width:16px;height:16px;" aria-label="Seleccionar">
                         </td>
                         <?php endif; ?>
-                        <td class="inv-td-code"><?php echo $codeVal !== '' ? \SoftNova\Core\e($codeVal) : '—'; ?></td>
+                        <td class="inv-td-code">
+                            <?php if ($codeVal !== ''): ?>
+                                <div class="inv-code-sku"><?php echo \SoftNova\Core\e($codeVal); ?></div>
+                            <?php else: ?>
+                                <div class="inv-code-sku">—</div>
+                            <?php endif; ?>
+                            <?php if ($eanVal !== ''): ?>
+                                <div class="inv-code-ean" style="font-size:11px;color:var(--color-text-secondary);margin-top:2px;">EAN: <?php echo \SoftNova\Core\e($eanVal); ?></div>
+                            <?php endif; ?>
+                        </td>
                         <td class="inv-td-name"><?php echo \SoftNova\Core\e($nameVal); ?></td>
-                        <td><?php echo $isService ? 'Servicio' : 'Producto'; ?></td>
+                        <td>
+                            <span class="badge <?php echo $isInactive ? 'badge-warning' : 'badge-success'; ?>">
+                                <?php echo $isInactive ? 'Inactivo' : 'Activo'; ?>
+                            </span>
+                        </td>
                         <td><?php echo $catVal !== '' ? htmlspecialchars($catVal) : '—'; ?></td>
                         <td class="<?php echo $stockLow ? 'inv-stock-low' : ''; ?>">
                             <?php echo $isService ? '—' : (int)$p['stock']; ?>
@@ -553,7 +721,12 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                                 —
                             <?php endif; ?>
                         </td>
-                        <td><?php echo fmtI((float)$p['purchase_price'], $currency); ?></td>
+                        <td class="inv-td-cost">
+                            <?php echo fmtI((float)$p['purchase_price'], $currency); ?>
+                            <?php if ((float)($p['purchase_price'] ?? 0) < 0.01): ?>
+                                <div class="inv-margin inv-margin--muted">Sin costo</div>
+                            <?php endif; ?>
+                        </td>
                         <td class="inv-td-price">
                             <?php if (!empty($p['offer_active'])): ?>
                                 <strong style="color:#DC2626;"><?php echo fmtI((float)$p['sale_price'], $currency); ?></strong>
@@ -562,6 +735,7 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                             <?php else: ?>
                                 <?php echo fmtI((float)$p['sale_price'], $currency); ?>
                             <?php endif; ?>
+                            <?php echo invMarginHtml((float)($p['purchase_price'] ?? 0), (float)($p['sale_price'] ?? 0), $currency); ?>
                         </td>
                         <td class="table-actions">
                             <?php if ($isService || ($p['stock'] ?? 0) > 0): ?>
@@ -585,7 +759,11 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                                 <?php endif; ?>
                                 <?php if (!$isService): ?>
                                     <button type="button" onclick="addStock(<?php echo (int)$p['id']; ?>)" class="btn btn-sm btn-success" title="Ingresar lote / stock">Lote N</button>
-                                    <?php if ($canViewPrestamos): ?>
+                                    <?php if (($p['ownership'] ?? 'owned') === 'borrowed'): ?>
+                                        <?php if ($canViewPrestamos): ?>
+                                        <a href="<?php echo $viewInstance->route('app/prestamos'); ?>#prestamos-recibidos" class="btn btn-sm btn-secondary" title="Ver / devolver préstamo recibido">Devolver</a>
+                                        <?php endif; ?>
+                                    <?php elseif ($canViewPrestamos): ?>
                                     <a href="<?php echo $viewInstance->route('app/prestamos'); ?>?product_id=<?php echo (int)$p['id']; ?>" class="btn btn-sm btn-secondary" title="Salida por préstamo">Préstamo</a>
                                     <?php elseif ($canCreatePrestamos && \SoftNova\Core\TenantMiddleware::canAccess('caja')): ?>
                                     <a href="<?php echo $viewInstance->route('app/caja'); ?>?loan_product_id=<?php echo (int)$p['id']; ?>" class="btn btn-sm btn-secondary" title="Registrar préstamo desde Caja">Préstamo</a>
@@ -593,10 +771,11 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                                 <?php endif; ?>
                             <?php endif; ?>
                             <?php if ($canDeleteProduct): ?>
-                            <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=delete" style="display:inline;" data-ajax="true">
+                            <form method="POST" action="<?php echo $viewInstance->route('app/inventario'); ?>?action=delete" style="display:inline;" data-ajax="true" class="inv-delete-form" onsubmit="return invDeleteWithReason(this);">
                                 <?php echo \SoftNova\Core\csrf_field(); ?>
                                 <input type="hidden" name="id" value="<?php echo (int)$p['id']; ?>">
-                                <button type="submit" data-confirm="Eliminar este producto?" class="btn btn-sm btn-danger" title="Eliminar">X</button>
+                                <input type="hidden" name="status_change_reason" value="">
+                                <button type="submit" class="btn btn-sm btn-danger" title="Desactivar">X</button>
                             </form>
                             <?php endif; ?>
                         </td>
@@ -610,15 +789,47 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
 <?php endif; ?>
 
 <?php
-if (!empty($products)) {
-    $pagination = $pagination ?? null;
+$pagination = $pagination ?? null;
+$paginationTotal = (int)($pagination['total'] ?? 0);
+$perPageOptions = $perPageOptions ?? [20, 50, 100, 200];
+$currentPerPage = (int)($pagination['perPage'] ?? 20);
+if ($paginationTotal > 0):
     $paginationBaseUrl = $viewInstance->route('app/inventario');
     $paginationQuery = $filters['query'] ?? [];
-    echo '<div class="inv-catalog-pagination">';
-    $viewInstance->partial('pagination', compact('pagination', 'paginationBaseUrl', 'paginationQuery'));
-    echo '</div>';
-}
+    $perPageKeepQuery = $paginationQuery;
+    unset($perPageKeepQuery['page'], $perPageKeepQuery['per_page']);
 ?>
+<div class="inv-catalog-pagination">
+    <div class="inv-per-page-bar" style="display:flex;align-items:center;justify-content:flex-start;gap:10px;flex-wrap:wrap;margin:12px 0 0;padding-top:12px;border-top:1px solid var(--color-border);">
+        <form method="GET" action="<?php echo htmlspecialchars($paginationBaseUrl, ENT_QUOTES, 'UTF-8'); ?>"
+              style="display:inline-flex;align-items:center;gap:10px;margin:0;flex-wrap:wrap;">
+            <?php foreach ($perPageKeepQuery as $qk => $qv): ?>
+                <?php if ($qv === null || $qv === '') continue; ?>
+                <input type="hidden" name="<?php echo htmlspecialchars((string)$qk, ENT_QUOTES, 'UTF-8'); ?>"
+                       value="<?php echo htmlspecialchars(is_scalar($qv) ? (string)$qv : '', ENT_QUOTES, 'UTF-8'); ?>">
+            <?php endforeach; ?>
+            <input type="hidden" name="page" value="1">
+            <label for="invPerPageSelect" style="font-size:13px;color:var(--color-text-secondary);margin:0;font-weight:600;">
+                Elementos por página
+            </label>
+            <select id="invPerPageSelect" name="per_page" class="form-control" style="width:auto;min-width:90px;"
+                    aria-label="Elementos por página"
+                    onchange="this.form.submit()">
+                <?php foreach ($perPageOptions as $opt): ?>
+                    <option value="<?php echo (int)$opt; ?>" <?php echo (int)$opt === $currentPerPage ? 'selected' : ''; ?>>
+                        <?php echo (int)$opt; ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </form>
+    </div>
+    <?php
+    // El partial solo pinta total + botones (el selector ya está arriba).
+    $paginationPerPageOptions = [];
+    $viewInstance->partial('pagination', compact('pagination', 'paginationBaseUrl', 'paginationQuery', 'paginationPerPageOptions'));
+    ?>
+</div>
+<?php endif; ?>
 </div>
 
 <!-- Modal Producto -->
@@ -646,19 +857,19 @@ if (!empty($products)) {
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>Código / SKU <span class="field-tip" data-tip="Fórmula de ingreso o creación de SKU= [Categoría]-[Marca / Línea]-[Producto / Subtipo][Atributo / Tamaño].">?</span></label>
+                    <label>Código / SKU <span style="font-weight:400;opacity:.75;">(opcional)</span> <span class="field-tip" data-tip="Opcional. Si lo deja vacío, el sistema genera un SKU automático. Fórmula sugerida: [Categoría]-[Marca / Línea]-[Producto / Subtipo][Atributo / Tamaño].">?</span></label>
                     <div style="display:flex;gap:8px;align-items:stretch;">
-                        <input type="text" name="code" id="prodCode" class="form-control" placeholder="SKU interno o Generar" maxlength="255" autocomplete="off" inputmode="text" style="flex:1;">
+                        <input type="text" name="code" id="prodCode" class="form-control" placeholder="Opcional · vacío = automático" maxlength="255" autocomplete="off" inputmode="text" style="flex:1;">
                         <button type="button" class="btn btn-secondary" style="white-space:nowrap;" onclick="generateProductSku()" title="Siguiente SKU de la secuencia">Generar SKU</button>
                     </div>
                     <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">
-                        Manual (según la fórmula del ?) o automático. Configure prefijo/consecutivo en Configuración → Preferencias.
+                        Opcional: manual, Generar, o vacío (el sistema asigna uno). Prefijo/consecutivo en Configuración → Preferencias.
                     </small>
                 </div>
                 <div class="form-group">
                     <label>Código de barras (EAN) <span class="field-tip" data-tip="Código EAN/UPC de la pistola. Puede escribirlo a mano o generar el siguiente de la secuencia configurada.">?</span></label>
                     <div style="display:flex;gap:8px;align-items:stretch;">
-                        <input type="text" name="barcode" id="prodBarcode" class="form-control" placeholder="EAN / UPC o Generar" maxlength="64" autocomplete="off" inputmode="text" style="flex:1;">
+                        <input type="text" name="barcode" id="prodBarcode" class="form-control" placeholder="EAN / UPC o Generar / escanear" maxlength="64" autocomplete="off" inputmode="text" style="flex:1;" data-barcode-field="ean">
                         <button type="button" class="btn btn-secondary" style="white-space:nowrap;" onclick="generateProductEan()" title="Siguiente EAN de la secuencia">Generar EAN</button>
                     </div>
                     <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">
@@ -698,20 +909,45 @@ if (!empty($products)) {
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>Precio Compra <span class="field-tip" data-tip="Costo de adquisición. Sirve para margen y reportes.">?</span></label>
-                    <input type="text" inputmode="decimal" name="purchase_price" id="prodPcompra" class="form-control money-input" data-money="1" placeholder="0">
+                    <label>Precio Compra <span class="field-tip" data-tip="Costo sin IVA. Base para calcular utilidad y % de ganancia.">?</span></label>
+                    <input type="text" inputmode="decimal" name="purchase_price" id="prodPcompra" class="form-control money-input" data-money="1" placeholder="0" oninput="updateProdMarginHint()">
                 </div>
                 <div class="form-group">
-                    <label>Precio Venta * <span class="field-tip" data-tip="Precio al público que se usará en ventas.">?</span></label>
-                    <input type="text" inputmode="decimal" name="sale_price" id="prodPventa" required class="form-control money-input" data-money="1" placeholder="0">
+                    <label>Precio Venta * <span class="field-tip" data-tip="Precio de lista en caja/ventas (base imponible). El IVA se calcula aparte según el % del producto.">?</span></label>
+                    <input type="text" inputmode="decimal" name="sale_price" id="prodPventa" required class="form-control money-input" data-money="1" placeholder="0" oninput="updateProdMarginHint()">
+                </div>
+                <div class="form-group" style="grid-column:1/-1;">
+                    <div id="prodMarginHint" class="inv-margin-hint" aria-live="polite">Utilidad y % de ganancia aparecerán al indicar compra y venta.</div>
+                </div>
+                <div class="form-group">
+                    <label>IVA venta (%) <span class="field-tip" data-tip="Tasa de IVA de este producto (0 = exento, 5, 19…). Si deja vacío al crear, usa la tasa de Configuración.">?</span></label>
+                    <input type="number" name="tax_rate" id="prodTaxRate" class="form-control" min="0" max="100" step="0.01" placeholder="<?php echo htmlspecialchars((string)($defaultTaxRate ?? 0)); ?>" value="">
                 </div>
                 <div class="form-group">
                     <label>Precio al por mayor <span class="field-tip" data-tip="Precio para ventas al por mayor en Caja.">?</span></label>
                     <input type="text" inputmode="decimal" name="wholesale_price" id="prodPmayoreo" class="form-control money-input" data-money="1" placeholder="0">
                 </div>
                 <div class="form-group" id="stockGroup">
-                    <label>Stock Inicial <span class="field-tip" data-tip="Cantidad disponible al crear el producto.">?</span></label>
-                    <input type="number" name="stock" id="prodStock" class="form-control" placeholder="0">
+                    <label id="prodStockLabel">Stock Inicial <span class="field-tip" data-tip="Cantidad disponible. Si la modifica en un producto existente, debe justificar el cambio.">?</span></label>
+                    <input type="number" name="stock" id="prodStock" class="form-control" placeholder="0" oninput="onProdStockChange()">
+                    <input type="hidden" id="prodStockOriginal" value="">
+                </div>
+                <div class="form-group" id="stockAdjNoteGroup" style="display:none;grid-column:1/-1;">
+                    <label>Justificación del cambio de stock * <span class="field-tip" data-tip="Obligatorio. Use Editar para corregir descuadre o error humano. Queda en Trazabilidad.">?</span></label>
+                    <textarea name="stock_adjustment_note" id="prodStockAdjNote" class="form-control" rows="2" maxlength="240" placeholder="Ej: Conteo físico — las unidades sí estaban; corrección de error de inventario…"></textarea>
+                    <p style="margin:6px 0 0;font-size:11px;color:var(--color-text-secondary);">
+                        El campo Stock es el <strong>conteo físico real / saldo final</strong> (no “cuántas sumo”).
+                        <strong>Editar</strong> sirve para corregir descuadre o error (sin compra).
+                        «Lote N» / Compras solo si <em>sí</em> llegó mercancía nueva.
+                    </p>
+                    <p id="prodStockDeltaHint" style="display:none;margin:6px 0 0;font-size:12px;color:var(--color-text-secondary);"></p>
+                    <div id="prodNegConfirmWrap" style="display:none;margin-top:10px;padding:10px 12px;border-radius:8px;background:#FEF3C7;border:1px solid #F59E0B;color:#92400E;font-size:13px;">
+                        <p style="margin:0 0 8px;" id="prodNegConfirmText"></p>
+                        <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-weight:600;">
+                            <input type="checkbox" name="confirm_negative_cover" id="prodNegConfirm" value="1" style="width:auto;margin-top:2px;">
+                            Confirmo: es corrección de inventario (descuadre / error), no una compra
+                        </label>
+                    </div>
                 </div>
                 <div class="form-group" id="minStockGroup">
                     <label>Stock Mínimo <span class="field-tip" data-tip="Umbral de alerta cuando el inventario esté bajo.">?</span></label>
@@ -744,11 +980,15 @@ if (!empty($products)) {
                     <input type="text" name="lot_code" id="prodLotCode" class="form-control" maxlength="60" placeholder="Automático">
                 </div>
                 <div class="form-group" id="statusGroup">
-                    <label>Estado <span class="field-tip" data-tip="Activo: disponible para vender. Inactivo: oculto de nuevas ventas.">?</span></label>
+                    <label>Estado <span class="field-tip" data-tip="Activo: disponible para vender. Inactivo: oculto de nuevas ventas. El cambio exige razón y queda en Trazabilidad.">?</span></label>
                     <select name="status" id="prodStatus" class="form-control">
                         <option value="active">Activo</option>
                         <option value="inactive">Inactivo</option>
                     </select>
+                </div>
+                <div class="form-group" id="statusReasonGroup" style="display:none;">
+                    <label>Razón del cambio de estado * <span class="field-tip" data-tip="Obligatoria al pasar a Inactivo o reactivar. Se registra en Trazabilidad.">?</span></label>
+                    <textarea name="status_change_reason" id="prodStatusReason" class="form-control" rows="2" maxlength="240" placeholder="Ej: Descontinuado, error de alta, temporalmente fuera de catálogo…"></textarea>
                 </div>
             </div>
             <div class="form-group" id="supplierSection" style="margin-top:8px;padding:12px;border:1px solid var(--color-border);border-radius:10px;background:var(--bg-input);">
@@ -802,8 +1042,16 @@ if (!empty($products)) {
             <input type="hidden" name="id" id="stockProdId">
             <p id="stockProdName" style="margin-bottom:10px;font-weight:600;"></p>
             <div id="stockDebtAlert" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:8px;background:#FEF3C7;border:1px solid #F59E0B;color:#92400E;font-size:13px;"></div>
+            <div id="stockNegConfirmWrap" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:8px;background:#FEE2E2;border:1px solid #EF4444;color:#991B1B;font-size:13px;">
+                <p style="margin:0 0 8px;" id="stockNegConfirmText"></p>
+                <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-weight:600;">
+                    <input type="checkbox" name="confirm_negative_cover" id="stockNegConfirm" value="1" style="width:auto;margin-top:2px;">
+                    Confirmo: es un ajuste manual (no es compra) y entiendo que cubre la deuda pendiente
+                </label>
+            </div>
             <p style="font-size:12px;color:var(--color-text-secondary);margin-bottom:12px;">
                 Esto es un <strong>ajuste manual</strong> (no crea compra ni CxP).
+                La cantidad se <strong>suma</strong> al stock actual (ej. −1 + 2 = 1).
                 Para mercancía de proveedor use
                 <a href="<?php echo $viewInstance->route('app/compras'); ?>">Compras</a>.
             </p>
@@ -829,8 +1077,9 @@ if (!empty($products)) {
                 Este producto controla lotes: indique la <strong>fecha de vencimiento</strong> de esta remesa. Si es distinta a lotes previos, se crea un lote nuevo.
             </p>
             <div class="form-group">
-                <label>Notas</label>
-                <input type="text" name="notes" class="form-control" placeholder="Ej: Conteo físico / corrección">
+                <label>Justificación / observación *</label>
+                <textarea name="notes" class="form-control" rows="2" maxlength="240" required minlength="5"
+                          placeholder="Obligatorio: por qué se ingresa stock manualmente (no es compra)"></textarea>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('stockModal').style.display='none'">Cancelar</button>
@@ -882,8 +1131,9 @@ if (!empty($products)) {
                     <input type="date" name="movement_date" class="form-control" value="<?php echo date('Y-m-d'); ?>" required>
                 </div>
                 <div class="form-group">
-                    <label>Nota / detalle</label>
-                    <input type="text" name="notes" class="form-control" maxlength="180" placeholder="Opcional">
+                    <label>Observación / justificación *</label>
+                    <textarea name="notes" class="form-control" rows="2" maxlength="240" required minlength="5"
+                              placeholder="Obligatorio: detalle de la pérdida, garantía, merma, etc."></textarea>
                 </div>
             </div>
             <div class="modal-footer">
@@ -1124,20 +1374,30 @@ if (!empty($products)) {
                     <ol style="margin:8px 0 0 18px;padding:0;">
                         <li>Descargue la <strong>plantilla</strong> (botón de arriba).</li>
                         <li>Ábrala en Excel o Google Sheets. No borre la fila de encabezados.</li>
-                        <li>Reemplace las filas de ejemplo por sus productos. Columna <strong>Nombre</strong> es obligatoria.</li>
+                        <li>Reemplace las filas de ejemplo por sus productos. Columna <strong>Nombre</strong> es obligatoria; <strong>SKU es opcional</strong> (si vacío, se genera automáticamente).</li>
                         <li>Columnas SKU y EAN: formato <strong>Texto</strong> (evita que Excel corte códigos largos).</li>
                         <li>Guarde como CSV y súbalo aquí. En Excel: <em>CSV UTF-8</em> o CSV delimitado por <code>;</code>.</li>
                     </ol>
                     <ul style="margin:10px 0 0 18px;padding:0;">
-                        <li>Columnas: <code>SKU; EAN; Nombre; Tipo; Categoria; Costo; Precio; Precio_mayor; Stock; Min; Unidad; Estado; Ubicacion; Lote; Vence; Modo_stock</code></li>
+                        <li><strong>Re-importar no borra</strong> productos que no vengan en el archivo. Empareja por <strong>SKU</strong>, luego <strong>EAN</strong>, luego <strong>Nombre</strong> (si es único) y actualiza la ficha.</li>
+                        <li><strong>Campos vacíos no pisan</strong> lo ya guardado (precio, costo, IVA, categoría, etc.). Solo se actualiza lo que traiga valor en el CSV.</li>
+                        <li>Si sube un catálogo simple y luego uno completo: use el mismo <strong>Nombre</strong> o el mismo <strong>SKU/EAN</strong> para que complete datos en vez de duplicar.</li>
+                        <li>Columnas: <code>SKU; EAN; Nombre; Tipo; Categoria; Costo; Precio; IVA; Precio_mayor; Stock; Min; Unidad; Estado; Ubicacion; Lote; Vence; Modo_stock</code> (SKU y EAN opcionales).</li>
                         <li><code>Precio_mayor</code>: precio al por mayor (opcional). <code>Unidad</code>: UND, Lts, Mt, etc.</li>
                         <li><strong>Misma SKU + distinto Lote/Vence</strong> = remesa del mismo producto (no cree otro ítem).</li>
-                        <li>Si hay <code>Lote</code> o <code>Vence</code>, <code>Stock</code> es la cantidad de <em>esa remesa</em> (se suma, como una compra).</li>
-                        <li>Sin lote/vence, <code>Stock</code> sincroniza la existencia total (<code>Modo_stock=absoluto</code>).</li>
-                        <li><code>Modo_stock</code>: <code>entrada</code> (suma remesa) o <code>absoluto</code> (fijar total). Vacío: entrada si hay lote/vence; si no, absoluto.</li>
+                        <li><strong style="color:#B45309;">Importante — Modo_stock:</strong>
+                            <ul style="margin:4px 0 0 14px;">
+                                <li><code>absoluto</code> = el valor de <code>Stock</code> es la <em>existencia total</em> (corrige / sincroniza). Úselo para actualizar inventario.</li>
+                                <li><code>entrada</code> = <em>suma</em> esa cantidad al stock actual (como una compra/remesa). Si pone el stock que ya tenía con <code>entrada</code>, lo duplica.</li>
+                                <li>Vacío: si hay Lote/Vence → entrada; si no → absoluto.</li>
+                            </ul>
+                        </li>
+                        <li>Deje <code>Stock</code> vacío si no quiere tocar existencias en un re-import de precios/datos.</li>
+                        <li>SKU y EAN: columna en formato <strong>Texto</strong> en Excel (evita <code>7.70E+12</code>). Sin SKU/EAN válidos puede crear productos nuevos o no emparejar.</li>
                         <li>Tipo: <code>product</code> o <code>service</code>. Estado: <code>active</code> o <code>inactive</code>.</li>
-                        <li>Cada cambio de stock deja movimiento en Trazabilidad (<code>csv_import</code>) y, si aplica, traza de lote.</li>
-                        <li>Máximo 5MB. Archivos &gt;200KB van a cola (Config → Procesar jobs).</li>
+                        <li>Cada cambio de stock deja movimiento en Trazabilidad (<code>csv_import</code>). Ahí puede revisar y corregir.</li>
+                        <li>Máximo 5MB. Archivos grandes (más de ~2000 filas) pueden tardar varios minutos; no cierre la ventana hasta ver el mensaje de confirmación.</li>
+                        <li>Antes de subir, en Excel confirme en la última fila que exportó todas las referencias (Ctrl+Fin). Si el CSV tiene muchas menos filas que su hoja, vuelva a guardar como CSV UTF-8.</li>
                     </ul>
                 </div>
                 <div class="form-group">
@@ -1283,6 +1543,7 @@ if (!empty($products)) {
     window.invRouteOfferCancel = '<?php echo $viewInstance->route('app/inventario'); ?>?action=offer_cancel';
     window.invRouteVentas = '<?php echo $viewInstance->route('app/ventas'); ?>';
     window.invCanEdit = <?php echo $canEditProduct ? 'true' : 'false'; ?>;
+    window.invDefaultTaxRate = <?php echo json_encode((float)($defaultTaxRate ?? 0)); ?>;
     window.invCsrf = <?php echo json_encode(\SoftNova\Core\csrf_token()); ?>;
     window.invCurrency = <?php echo json_encode([
         'symbol' => $currency['symbol'] ?? '$',

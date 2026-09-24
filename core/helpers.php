@@ -93,10 +93,19 @@ function ai_personality(array $activeModules = []): array
  * Ajusta el color de texto sobre el primario para mantener contraste (WCAG).
  * Devuelve un bloque <style> listo para inyectar, o '' si el color es inválido.
  */
-function theme_color_style(?string $hex): string
+function normalize_theme_hex(?string $hex, string $fallback = '#000000'): string
 {
     $hex = trim((string)$hex);
-    if ($hex === '' || !preg_match('/^#[0-9A-Fa-f]{6}$/', $hex)) {
+    if ($hex !== '' && preg_match('/^#[0-9A-Fa-f]{6}$/', $hex)) {
+        return strtoupper($hex);
+    }
+    return $fallback;
+}
+
+function theme_color_style(?string $hex): string
+{
+    $hex = normalize_theme_hex($hex, '');
+    if ($hex === '') {
         return '';
     }
 
@@ -464,6 +473,71 @@ function e(?string $text): string
 }
 
 /**
+ * Búsqueda multi-término.
+ *
+ * - Separadores `,` o `;`: OR entre grupos (pegar varios SKU/EAN).
+ * - Espacios dentro de un grupo: AND (todas las palabras deben aparecer
+ *   en alguna de las columnas). Así "Esmalte revo" encuentra
+ *   "MASGLO ESMALTE - REVOLUCIONARIA".
+ *
+ * @param list<string> $columns Expresiones SQL seguras (ej. p.name, COALESCE(p.barcode,''))
+ * @return array{sql:string,params:list<string>}
+ */
+function multi_term_like_clause(string $rawQuery, array $columns, int $maxTerms = 40): array
+{
+    $rawQuery = trim($rawQuery);
+    if ($rawQuery === '' || $columns === []) {
+        return ['sql' => '1=0', 'params' => []];
+    }
+
+    $groups = preg_split('/[,;]+/u', $rawQuery) ?: [];
+    $groupClauses = [];
+    $params = [];
+    $termBudget = max(1, $maxTerms);
+
+    foreach ($groups as $group) {
+        $group = trim((string)$group);
+        if ($group === '' || $termBudget <= 0) {
+            continue;
+        }
+
+        $words = preg_split('/\s+/u', $group) ?: [];
+        $ands = [];
+        foreach ($words as $word) {
+            $word = trim((string)$word);
+            if ($word === '' || $termBudget <= 0) {
+                continue;
+            }
+            $termBudget--;
+
+            $colOrs = [];
+            $like = '%' . $word . '%';
+            foreach ($columns as $col) {
+                $col = trim((string)$col);
+                if ($col === '') {
+                    continue;
+                }
+                $colOrs[] = $col . ' LIKE ?';
+                $params[] = $like;
+            }
+            if ($colOrs !== []) {
+                $ands[] = '(' . implode(' OR ', $colOrs) . ')';
+            }
+        }
+
+        if ($ands !== []) {
+            $groupClauses[] = '(' . implode(' AND ', $ands) . ')';
+        }
+    }
+
+    if ($groupClauses === []) {
+        return ['sql' => '1=0', 'params' => []];
+    }
+
+    return ['sql' => '(' . implode(' OR ', $groupClauses) . ')', 'params' => $params];
+}
+
+/**
  * Interpreta montos digitados con formato local (1.234.567,50 o 1,234,567.50).
  * No rompe valores ya normalizados (1234.56).
  */
@@ -507,12 +581,22 @@ function parse_money(mixed $raw): float
         if (count($parts) > 2) {
             $s = str_replace('.', '', $s);
         } elseif (count($parts) === 2) {
-            $decLen = strlen($parts[1]);
-            if ($decLen === 3 && strlen($parts[0]) <= 3) {
+            $dec = $parts[1];
+            $decLen = strlen($dec);
+            // Excel suele exportar 15500.000 / 12.00 → NO son miles; quitar ceros de relleno.
+            if ($decLen > 0 && ctype_digit($dec) && (int)$dec === 0) {
+                $s = $parts[0];
+            } elseif ($decLen === 3 && strlen($parts[0]) <= 3) {
                 // Ambiguo 1.234 → miles (COP típico)
                 $s = str_replace('.', '', $s);
             } elseif ($decLen > 2) {
-                $s = str_replace('.', '', $s);
+                // 15500.1234 (raro en COP): conservar como decimal, no concatenar miles.
+                // Antes: borrar puntos → 155001234 (inflaba costos ×1000+).
+                if (strlen($parts[0]) >= 4) {
+                    $s = $parts[0] . '.' . substr($dec, 0, 2);
+                } else {
+                    $s = str_replace('.', '', $s);
+                }
             }
             // si decLen 1–2 se deja como decimal
         }
@@ -520,6 +604,84 @@ function parse_money(mixed $raw): float
 
     $n = (float)$s;
     return $neg ? -$n : $n;
+}
+
+/**
+ * Cantidades (unidades), no dinero.
+ * "7.000" / "7,000" con un solo separador y 3 decimales = 7 unidades,
+ * no 7000 (eso es el formato de miles del peso).
+ */
+function parse_quantity(mixed $raw): float
+{
+    if (is_int($raw) || is_float($raw)) {
+        return max(0.0, (float)$raw);
+    }
+    $s = trim((string)$raw);
+    if ($s === '') {
+        return 0.0;
+    }
+    $s = str_replace(["\xc2\xa0", ' '], '', $s);
+    $s = preg_replace('/[^\d,.\-]/u', '', $s) ?? '';
+    if ($s === '' || $s === '-' || $s === '.' || $s === ',') {
+        return 0.0;
+    }
+    $s = ltrim($s, '+-');
+
+    $comma = strrpos($s, ',');
+    $dot = strrpos($s, '.');
+    if ($comma !== false && $dot !== false) {
+        if ($comma > $dot) {
+            $s = str_replace('.', '', $s);
+            $s = str_replace(',', '.', $s);
+        } else {
+            $s = str_replace(',', '', $s);
+        }
+    } elseif ($comma !== false) {
+        $parts = explode(',', $s);
+        if (count($parts) === 2) {
+            $s = $parts[0] . '.' . $parts[1];
+        } else {
+            $s = str_replace(',', '', $s);
+        }
+    } elseif ($dot !== false) {
+        $parts = explode('.', $s);
+        if (count($parts) > 2) {
+            $last = array_pop($parts);
+            if (strlen($last) <= 3) {
+                $s = implode('', $parts) . '.' . $last;
+            } else {
+                $s = implode('', $parts) . $last;
+            }
+        }
+        // Un solo punto: siempre decimal (7.000 → 7, no 7000).
+    }
+
+    $n = (float)$s;
+    return $n > 0 ? $n : 0.0;
+}
+
+/**
+ * Vueltas / cambio. Si el valor guardado es nulo, 0, mayor al recibido
+ * o overflow DECIMAL (p. ej. 9999999999.99), se recalcula recibido − debido.
+ */
+function cash_change_amount(float $received, float $due, mixed $storedChange = null): float
+{
+    $received = max(0.0, $received);
+    $due = max(0.0, $due);
+    $computed = max(0.0, round($received - $due, 2));
+    if ($received <= 0.009) {
+        return 0.0;
+    }
+    if ($storedChange === null || $storedChange === '') {
+        return $computed;
+    }
+    $stored = is_int($storedChange) || is_float($storedChange)
+        ? (float)$storedChange
+        : parse_money($storedChange);
+    if ($stored <= 0.009 || $stored > ($received + 0.05) || $stored >= 1000000000.0) {
+        return $computed;
+    }
+    return round(max(0.0, $stored), 2);
 }
 
 

@@ -26,6 +26,11 @@ class OfflineSaleSyncService
         $this->cash = new CashService($db);
         $this->receivables = new ReceivableService($db);
         $this->accounting = new AccountingService($db);
+        try {
+            (new ConsignmentService($db, $this->sales->stock()))->ensureSchema();
+        } catch (\Throwable $e) {
+            error_log('OfflineSaleSync consign schema: ' . $e->getMessage());
+        }
     }
 
     private function query(string $sql, array $params = []): \PDOStatement
@@ -239,6 +244,7 @@ class OfflineSaleSyncService
         if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $saleDate)) {
             $saleDate = date('Y-m-d');
         }
+        $saleDate = \SoftNova\Core\BusinessTimezone::clampBusinessDate($saleDate, $this->db);
 
         return [
             'client_sale_uuid' => $uuid,
@@ -353,12 +359,17 @@ class OfflineSaleSyncService
 
         $valid = [];
         $conflicts = [];
+        TaxService::ensureSchema($this->db);
+        $defaultTax = TaxService::defaultRate($this->db);
 
         foreach (array_merge(array_values($grouped), $openItemLines) as $item) {
             $productId = (int)$item['product_id'];
             $quantity = (int)$item['quantity'];
             $product = $this->query(
-                "SELECT id, name, code, sale_price, stock, purchase_price, status, COALESCE(product_type,'product') product_type
+                "SELECT id, name, code, sale_price, wholesale_price, stock, purchase_price, status,
+                        COALESCE(product_type,'product') product_type,
+                        COALESCE(ownership,'owned') ownership,
+                        consignor_id, COALESCE(tax_rate, 0) AS tax_rate
                  FROM products WHERE id = ?",
                 [$productId]
             )->fetch();
@@ -380,6 +391,19 @@ class OfflineSaleSyncService
             $oversellReason = '';
             $oversellNote = '';
             if (!$isService && $available < $quantity) {
+                $isConsignmentEarly = ($product['ownership'] ?? 'owned') === 'consignment';
+                if ($isConsignmentEarly) {
+                    $conflicts[] = [
+                        'product_id' => $productId,
+                        'code' => (string)($product['code'] ?? ''),
+                        'name' => (string)$product['name'],
+                        'requested' => $quantity,
+                        'available' => $available,
+                        'reason' => 'stock',
+                        'message' => 'No se permite sobreventa de consignación',
+                    ];
+                    continue;
+                }
                 try {
                     $parsed = StockOversell::parse(
                         $item['stock_oversell_reason'] ?? null,
@@ -413,13 +437,21 @@ class OfflineSaleSyncService
             }
 
             $isOpenItem = OpenItemProduct::isOpenItem($product);
+            $catalogPrice = round((float)($product['sale_price'] ?? 0), 2);
+            $wholesalePrice = round((float)($product['wholesale_price'] ?? 0), 2);
+            // En sync offline el canal puede venir en la línea; por defecto retail.
+            $lineChannel = strtolower(trim((string)($item['sale_channel'] ?? 'retail')));
+            if ($lineChannel === 'wholesale' && $wholesalePrice > 0.009) {
+                $catalogPrice = $wholesalePrice;
+            }
             $up = array_key_exists('unit_price', $item) && $item['unit_price'] !== null
                 ? round((float)$item['unit_price'], 2)
-                : round((float)$product['sale_price'], 2);
+                : $catalogPrice;
             if ($up < 0) {
                 $up = 0.0;
             }
             $lineName = (string)$product['name'];
+            $qtyDiscApplied = false;
             if ($isOpenItem) {
                 try {
                     $lineName = OpenItemProduct::sanitizeLineName(
@@ -438,18 +470,55 @@ class OfflineSaleSyncService
                     ];
                     continue;
                 }
+            } else {
+                try {
+                    $resolvedQty = (new CommissionService($this->db))->resolveQuantityDiscount($quantity);
+                    if (!empty($resolvedQty['matched'])) {
+                        $rate = (float)$resolvedQty['rate'];
+                        $expected = round($catalogPrice * (1 - $rate / 100), 2);
+                        if (abs($up - $expected) < 0.02 || abs($up - $catalogPrice) < 0.02 || $up > $expected + 0.009) {
+                            $up = $expected;
+                            $qtyDiscApplied = true;
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    // ignore
+                }
             }
-            $catalogPrice = round((float)$product['sale_price'], 2);
+            $isConsignment = ($product['ownership'] ?? 'owned') === 'consignment';
+            $unitCost = $isOpenItem ? 0.0 : round((float)($product['purchase_price'] ?? 0), 2);
+            if (!$isOpenItem && !ProductPriceGuard::saleExceedsCost($up, $unitCost)) {
+                $conflicts[] = [
+                    'product_id' => $productId,
+                    'code' => (string)($product['code'] ?? ''),
+                    'name' => (string)$product['name'],
+                    'requested' => $quantity,
+                    'available' => (int)($product['stock'] ?? 0),
+                    'reason' => 'price_cost',
+                    'message' => ProductPriceGuard::message((string)$product['name'], $up, $unitCost),
+                ];
+                continue;
+            }
+            $lineTaxRate = TaxService::resolveProductRate(
+                $product,
+                $defaultTax,
+                $this->db,
+                $isOpenItem,
+                $isOpenItem ? ($item['tax_rate'] ?? null) : null
+            );
             $valid[] = [
                 'product_id' => $productId,
                 'product_name' => $lineName,
                 'quantity' => $quantity,
                 'unit_price' => $up,
                 'catalog_price' => $catalogPrice,
-                'sync_catalog_price' => !$isOpenItem && abs($up - $catalogPrice) >= 0.01,
-                'unit_cost' => $isOpenItem ? 0.0 : (float)($product['purchase_price'] ?? 0),
+                'sync_catalog_price' => false,
+                'unit_cost' => $unitCost,
                 'subtotal' => $up * $quantity,
+                'tax_rate' => $lineTaxRate,
                 'product_type' => $isOpenItem ? 'service' : (string)($product['product_type'] ?? 'product'),
+                'is_consignment' => $isConsignment,
+                'consignor_id' => $isConsignment ? (int)($product['consignor_id'] ?? 0) : 0,
                 'stock_oversell_reason' => $oversellReason,
                 'stock_oversell_note' => $oversellNote,
             ];
@@ -458,7 +527,7 @@ class OfflineSaleSyncService
         if ($conflicts) {
             return [
                 'status' => 'conflict',
-                'message' => 'Stock insuficiente o productos no disponibles',
+                'message' => 'Stock insuficiente, precio inválido o productos no disponibles',
                 'code' => 'stock',
                 'stock_conflicts' => $conflicts,
             ];
@@ -494,6 +563,7 @@ class OfflineSaleSyncService
         }
 
         $saleDate = (string)$payload['sale_date'];
+        $saleDate = \SoftNova\Core\BusinessTimezone::clampBusinessDate($saleDate, $this->db);
         $dueDateInput = (string)$payload['due_date'];
         $receivedDate = (string)$payload['received_date'];
         $dueDate = preg_match('/^\d{4}-\d{2}-\d{2}$/', $dueDateInput)
@@ -515,9 +585,12 @@ class OfflineSaleSyncService
         }
         $discountPercent = (float)$payload['discount_percent'];
         $discount = round($subtotal * ($discountPercent / 100), 2);
-        $taxable = max(0, $subtotal - $discount);
-        $taxRate = (float)($settings['tax_rate'] ?? 0);
-        $tax = round($taxable * ($taxRate / 100), 2);
+        TaxService::ensureSchema($this->db);
+        $taxBreakdown = TaxService::applyDocumentDiscountAndTax($validItems, $discountPercent);
+        $tax = (float)$taxBreakdown['tax'];
+        $taxable = (float)$taxBreakdown['taxable'];
+        $validItems = $taxBreakdown['lines'];
+        TaxService::assertHeaderMatchesLines($tax, $validItems);
         $deliveryFee = max(0, round((float)($payload['delivery_fee'] ?? 0), 2));
         $deliveryCompanyFee = max(0, round((float)($payload['delivery_company_fee'] ?? 0), 2));
         $deliveryTotalPosted = max(0, round((float)($payload['delivery_total'] ?? 0), 2));
@@ -629,6 +702,20 @@ class OfflineSaleSyncService
             // ignore
         }
 
+        $cashReceivedSync = isset($payload['cash_received']) ? max(0, round((float)$payload['cash_received'], 2)) : null;
+        $cashChangeSync = null;
+        if ($cashReceivedSync !== null && $cashReceivedSync > 0.009) {
+            $dueChange = (float)($payPlan['cash_total'] ?? 0);
+            if ($dueChange <= 0.009) {
+                $dueChange = $paymentType === 'credit' ? min((float)$initialPayment, $total) : $total;
+            }
+            $cashChangeSync = \SoftNova\Core\cash_change_amount(
+                $cashReceivedSync,
+                $dueChange,
+                $payload['cash_change'] ?? null
+            );
+        }
+
         $this->db->beginTransaction();
         try {
             $this->query(
@@ -651,8 +738,8 @@ class OfflineSaleSyncService
                     $discount,
                     $deliveryFee,
                     $deliveryCompanyFee,
-                    isset($payload['cash_received']) ? max(0, round((float)$payload['cash_received'], 2)) : null,
-                    isset($payload['cash_change']) ? max(0, round((float)$payload['cash_change'], 2)) : null,
+                    $cashReceivedSync,
+                    $cashChangeSync,
                     $total,
                     $paymentMethod,
                     $paymentTerms,
@@ -665,12 +752,15 @@ class OfflineSaleSyncService
             $saleId = (int)$this->db->lastInsertId();
 
             foreach ($validItems as $vi) {
+                $isConsignment = !empty($vi['is_consignment']);
                 try {
                     $this->query(
                         "INSERT INTO sale_items
-                            (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal,
+                            (sale_id, product_id, product_name, quantity, unit_price, unit_cost,
+                             is_consignment, consignor_id, subtotal, tax_rate, tax_amount,
+                             discount_amount, taxable,
                              stock_oversell_reason, stock_oversell_note)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         [
                             $saleId,
                             $vi['product_id'],
@@ -678,17 +768,68 @@ class OfflineSaleSyncService
                             $vi['quantity'],
                             $vi['unit_price'],
                             $vi['unit_cost'] ?? 0,
+                            $isConsignment ? 1 : 0,
+                            $isConsignment && !empty($vi['consignor_id']) ? (int)$vi['consignor_id'] : null,
                             $vi['subtotal'],
+                            round((float)($vi['tax_rate'] ?? 0), 2),
+                            round((float)($vi['tax_amount'] ?? 0), 2),
+                            round((float)($vi['discount_amount'] ?? 0), 2),
+                            round((float)($vi['taxable'] ?? $vi['subtotal'] ?? 0), 2),
                             !empty($vi['stock_oversell_reason']) ? $vi['stock_oversell_reason'] : null,
                             !empty($vi['stock_oversell_note']) ? $vi['stock_oversell_note'] : null,
                         ]
                     );
                 } catch (\Throwable $e) {
-                    $this->query(
-                        "INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        [$saleId, $vi['product_id'], $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['unit_cost'] ?? 0, $vi['subtotal']]
-                    );
+                    try {
+                        $this->query(
+                            "INSERT INTO sale_items
+                                (sale_id, product_id, product_name, quantity, unit_price, unit_cost,
+                                 is_consignment, consignor_id, subtotal, tax_rate, tax_amount,
+                                 stock_oversell_reason, stock_oversell_note)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                $saleId,
+                                $vi['product_id'],
+                                $vi['product_name'],
+                                $vi['quantity'],
+                                $vi['unit_price'],
+                                $vi['unit_cost'] ?? 0,
+                                $isConsignment ? 1 : 0,
+                                $isConsignment && !empty($vi['consignor_id']) ? (int)$vi['consignor_id'] : null,
+                                $vi['subtotal'],
+                                round((float)($vi['tax_rate'] ?? 0), 2),
+                                round((float)($vi['tax_amount'] ?? 0), 2),
+                                !empty($vi['stock_oversell_reason']) ? $vi['stock_oversell_reason'] : null,
+                                !empty($vi['stock_oversell_note']) ? $vi['stock_oversell_note'] : null,
+                            ]
+                        );
+                    } catch (\Throwable $e2) {
+                    try {
+                        $this->query(
+                            "INSERT INTO sale_items
+                                (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal,
+                                 stock_oversell_reason, stock_oversell_note)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                $saleId,
+                                $vi['product_id'],
+                                $vi['product_name'],
+                                $vi['quantity'],
+                                $vi['unit_price'],
+                                $vi['unit_cost'] ?? 0,
+                                $vi['subtotal'],
+                                !empty($vi['stock_oversell_reason']) ? $vi['stock_oversell_reason'] : null,
+                                !empty($vi['stock_oversell_note']) ? $vi['stock_oversell_note'] : null,
+                            ]
+                        );
+                    } catch (\Throwable $e3) {
+                        $this->query(
+                            "INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal)
+                             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            [$saleId, $vi['product_id'], $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['unit_cost'] ?? 0, $vi['subtotal']]
+                        );
+                    }
+                    }
                 }
                 $saleItemId = (int)$this->db->lastInsertId();
                 if (!empty($vi['sync_catalog_price'])) {
@@ -717,6 +858,21 @@ class OfflineSaleSyncService
                     (float)($vi['unit_cost'] ?? 0),
                     $oversell
                 );
+                if ($isConsignment) {
+                    try {
+                        (new ConsignmentService($this->db, $this->sales->stock()))->registerSaleDebt(
+                            $saleId,
+                            $saleItemId,
+                            (int)$vi['product_id'],
+                            (int)$vi['quantity'],
+                            (float)($vi['unit_cost'] ?? 0),
+                            (int)($vi['consignor_id'] ?? 0) ?: null
+                        );
+                    } catch (\Throwable $e) {
+                        error_log('consignment sale debt: ' . $e->getMessage());
+                        throw $e;
+                    }
+                }
             }
 
             $cashAmount = 0.0;
@@ -759,6 +915,12 @@ class OfflineSaleSyncService
             $accountingPosted = true;
         } catch (\Throwable $e) {
             error_log('Contabilidad venta offline ' . $saleId . ': ' . $e->getMessage());
+            $this->accounting->enqueuePending(
+                'post_sale',
+                'sale',
+                $saleId,
+                $e->getMessage()
+            );
         }
 
         try {
@@ -775,7 +937,9 @@ class OfflineSaleSyncService
                 if ($paymentMethod === 'mixed') {
                     $label .= ' (efectivo mixto)';
                 }
-                $this->cash->registerIncome($cashAmount, $label, 'sale', $saleId);
+                if (!$this->cash->registerIncome($cashAmount, $label, 'sale', $saleId)) {
+                    error_log('Caja: venta offline ' . $saleId . ' sin movimiento de ingreso');
+                }
             } catch (\Throwable $e) {
                 error_log('Caja venta offline ' . $saleId . ': ' . $e->getMessage());
             }
@@ -787,8 +951,7 @@ class OfflineSaleSyncService
                     $saleId,
                     $invoiceNumber,
                     $deliveryCompanyFee,
-                    $userId,
-                    true
+                    $userId
                 );
             } catch (\Throwable $e) {
                 error_log('Gasto transporte domicilio offline ' . $saleId . ': ' . $e->getMessage());

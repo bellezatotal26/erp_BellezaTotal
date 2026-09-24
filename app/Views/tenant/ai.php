@@ -147,13 +147,9 @@ body:has(.ai-page-root) .breadcrumbs { flex-shrink: 0; margin-bottom: 8px; }
     <div class="card neumorphic">
         <div class="card-header" style="margin-bottom:0;padding-bottom:0;border-bottom:none;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
             <h3 style="margin:0;">Asistente Virtual <?php echo htmlspecialchars($aiName); ?></h3>
-            <span style="font-size:12px;color:var(--color-text-secondary);">
-                <?php if (!empty($aiConfigured)): ?>
-                    Conectado a OpenRouter · <?php echo htmlspecialchars($aiModel ?? 'NVIDIA Nemotron 3 Ultra'); ?>
-                <?php else: ?>
-                    Modo local (configura OPENROUTER_API_KEY en .env para Nemotron)
-                <?php endif; ?>
-            </span>
+            <?php if (empty($aiConfigured)): ?>
+            <span style="font-size:12px;color:var(--color-text-secondary);">Modo local (sin OpenRouter)</span>
+            <?php endif; ?>
         </div>
     </div>
 

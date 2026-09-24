@@ -112,7 +112,11 @@ class AlegraConnector implements InvoiceProviderInterface
                     'quantity' => (float)($item['quantity'] ?? 1),
                     'description' => (string)($item['product_name'] ?? $item['name'] ?? 'Producto'),
                 ];
-                if ($taxId !== '') {
+                // Alegra usa un tax_id de configuración; no aplicar a líneas exentas (tax_rate=0).
+                $itemTaxRate = array_key_exists('tax_rate', $item)
+                    ? (float)$item['tax_rate']
+                    : 19.0;
+                if ($taxId !== '' && $itemTaxRate > 0.009) {
                     $line['tax'] = [['id' => (int)$taxId]];
                 }
                 $alegraItems[] = $line;

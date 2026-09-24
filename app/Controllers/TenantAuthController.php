@@ -111,22 +111,34 @@ class TenantAuthController extends Controller
             }
             
             $stmt = $tenantConn->prepare(
-                "SELECT id FROM users WHERE email = ? LIMIT 1"
+                "SELECT id, role, permissions FROM users WHERE email = ? LIMIT 1"
             );
             $stmt->execute([$user['email']]);
             $localUser = $stmt->fetch();
             
             if ($localUser) {
+                $localUserId = (int)$localUser['id'];
+                $preserveTeamProfile = in_array(
+                    \SoftNova\Core\TenantMiddleware::normalizeRole((string)($localUser['role'] ?? '')),
+                    ['user', 'pos'],
+                    true
+                );
                 try {
-                    $tenantConn->prepare(
-                        "UPDATE users SET name = ?, role = ?, password = ?, permissions = ?, status = 'active' WHERE id = ?"
-                    )->execute([$user['name'], $localRole, $user['password'], $permissionsJson, $localUser['id']]);
+                    if ($preserveTeamProfile) {
+                        // Usuarios gestionados en Config: no pisar rol/permisos al iniciar sesión.
+                        $tenantConn->prepare(
+                            "UPDATE users SET name = ?, password = ?, status = 'active' WHERE id = ?"
+                        )->execute([$user['name'], $user['password'], $localUserId]);
+                    } else {
+                        $tenantConn->prepare(
+                            "UPDATE users SET name = ?, role = ?, password = ?, permissions = ?, status = 'active' WHERE id = ?"
+                        )->execute([$user['name'], $localRole, $user['password'], $permissionsJson, $localUserId]);
+                    }
                 } catch (\Throwable $e) {
                     $tenantConn->prepare(
-                        "UPDATE users SET name = ?, role = ?, password = ?, status = 'active' WHERE id = ?"
-                    )->execute([$user['name'], $localRole, $user['password'], $localUser['id']]);
+                        "UPDATE users SET name = ?, password = ?, status = 'active' WHERE id = ?"
+                    )->execute([$user['name'], $user['password'], $localUserId]);
                 }
-                $localUserId = $localUser['id'];
             } else {
                 try {
                     $tenantConn->prepare(
@@ -161,10 +173,21 @@ class TenantAuthController extends Controller
         $planModules = json_decode($user['plan_modules'] ?? '[]', true) ?: [];
         $_SESSION['tenant_modules'] = $planModules;
 
-        \SoftNova\Core\TenantMiddleware::hydrateSessionPermissions(
-            $user['role'] ?? 'admin',
-            $user['permissions'] ?? null
-        );
+        $sessionRole = $localRole;
+        $sessionPermissions = $user['permissions'] ?? null;
+        try {
+            $localStmt = $tenantConn->prepare('SELECT role, permissions FROM users WHERE id = ? LIMIT 1');
+            $localStmt->execute([(int)$localUserId]);
+            $localRow = $localStmt->fetch();
+            if ($localRow) {
+                $sessionRole = (string)($localRow['role'] ?? $localRole);
+                $sessionPermissions = $localRow['permissions'] ?? $sessionPermissions;
+            }
+        } catch (\Throwable $e) {
+            error_log('login local permissions: ' . $e->getMessage());
+        }
+
+        \SoftNova\Core\TenantMiddleware::hydrateSessionPermissions($sessionRole, $sessionPermissions);
         
         // Actualizar último login
         $masterDb->query(
@@ -278,31 +301,89 @@ class TenantAuthController extends Controller
     private function checkRateLimit(): bool
     {
         $ip = $this->request->ip();
-        $key = 'tenant_rate_limit_' . md5($ip);
-        $attempts = $_SESSION[$key] ?? ['count' => 0, 'first_attempt' => time()];
-        
-        if (time() - $attempts['first_attempt'] > 900) {
-            unset($_SESSION[$key]);
+        $data = $this->readLoginRateLimit($ip);
+        if ($data === null) {
             return true;
         }
-        
-        return $attempts['count'] < 5;
+        if (time() - (int)$data['first_attempt'] > 900) {
+            $this->clearRateLimit();
+            return true;
+        }
+        return (int)$data['count'] < 5;
     }
-    
+
     private function incrementRateLimit(): void
     {
         $ip = $this->request->ip();
-        $key = 'tenant_rate_limit_' . md5($ip);
-        $attempts = $_SESSION[$key] ?? ['count' => 0, 'first_attempt' => time()];
-        $attempts['count']++;
-        $_SESSION[$key] = $attempts;
+        $data = $this->readLoginRateLimit($ip) ?? ['count' => 0, 'first_attempt' => time()];
+        if (time() - (int)$data['first_attempt'] > 900) {
+            $data = ['count' => 0, 'first_attempt' => time()];
+        }
+        $data['count'] = (int)$data['count'] + 1;
+        $this->writeLoginRateLimit($ip, $data);
+        // Mantener mirror en sesión por compatibilidad.
+        $_SESSION['tenant_rate_limit_' . md5($ip)] = $data;
     }
-    
+
     private function clearRateLimit(): void
     {
         $ip = $this->request->ip();
-        $key = 'tenant_rate_limit_' . md5($ip);
-        unset($_SESSION[$key]);
+        unset($_SESSION['tenant_rate_limit_' . md5($ip)]);
+        $file = $this->loginRateLimitPath($ip);
+        if (is_file($file)) {
+            @unlink($file);
+        }
+    }
+
+    /** @return array{count:int,first_attempt:int}|null */
+    private function readLoginRateLimit(string $ip): ?array
+    {
+        $file = $this->loginRateLimitPath($ip);
+        if (is_readable($file)) {
+            $raw = @file_get_contents($file);
+            $decoded = is_string($raw) ? json_decode($raw, true) : null;
+            if (is_array($decoded) && isset($decoded['count'], $decoded['first_attempt'])) {
+                return [
+                    'count' => (int)$decoded['count'],
+                    'first_attempt' => (int)$decoded['first_attempt'],
+                ];
+            }
+        }
+        $sessionKey = 'tenant_rate_limit_' . md5($ip);
+        $fromSession = $_SESSION[$sessionKey] ?? null;
+        if (is_array($fromSession) && isset($fromSession['count'], $fromSession['first_attempt'])) {
+            return [
+                'count' => (int)$fromSession['count'],
+                'first_attempt' => (int)$fromSession['first_attempt'],
+            ];
+        }
+        return null;
+    }
+
+    /** @param array{count:int,first_attempt:int} $data */
+    private function writeLoginRateLimit(string $ip, array $data): void
+    {
+        $dir = $this->loginRateLimitDir();
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+        $file = $this->loginRateLimitPath($ip);
+        @file_put_contents($file, json_encode([
+            'count' => (int)$data['count'],
+            'first_attempt' => (int)$data['first_attempt'],
+            'ip' => $ip,
+        ], JSON_UNESCAPED_UNICODE), LOCK_EX);
+    }
+
+    private function loginRateLimitDir(): string
+    {
+        $base = defined('STORAGE_PATH') ? STORAGE_PATH : (dirname(__DIR__, 2) . '/storage');
+        return $base . '/cache/login_rate';
+    }
+
+    private function loginRateLimitPath(string $ip): string
+    {
+        return $this->loginRateLimitDir() . '/' . hash('sha256', $ip) . '.json';
     }
     
     /**
@@ -323,8 +404,37 @@ class TenantAuthController extends Controller
             $_SESSION['tenant_db_name'],
             $_SESSION['tenant_db_user'],
             $_SESSION['tenant_db_pass'],
-            $_SESSION['tenant_authenticated']
+            $_SESSION['tenant_db_name_production'],
+            $_SESSION['tenant_authenticated'],
+            $_SESSION['csrf_token'],
+            $_SESSION['sandbox_mode'],
+            $_SESSION['sandbox_db_name']
         );
-        redirect('/app/login');
+
+        $loginJs = json_encode(\SoftNova\Core\base_url('/app/login'), JSON_UNESCAPED_SLASHES);
+        header('Content-Type: text/html; charset=utf-8');
+        header('Cache-Control: no-store, no-cache, must-revalidate');
+        echo '<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            . '<title>Cerrando sesión…</title></head><body style="font-family:system-ui,sans-serif;padding:2rem;text-align:center;color:#334155">'
+            . '<p>Cerrando sesión y limpiando datos locales…</p>'
+            . '<script>(function(){'
+            . 'var go=function(){location.replace(' . $loginJs . ');};'
+            . 'var keys=["seri_pos_pending_sales","seri_pos_conflict_sales","seri_pos_offline_meta","eva_cart"];'
+            . 'try{keys.forEach(function(k){localStorage.removeItem(k);});}catch(e){}'
+            . 'var done=function(){go();};'
+            . 'var tasks=[];'
+            . 'if(window.indexedDB&&indexedDB.deleteDatabase){'
+            . 'tasks.push(new Promise(function(res){try{var r=indexedDB.deleteDatabase("seri_pos_offline");r.onsuccess=r.onerror=r.onblocked=function(){res();};}catch(e){res();}}));'
+            . '}'
+            . 'if(window.caches&&caches.keys){'
+            . 'tasks.push(caches.keys().then(function(ks){return Promise.all(ks.filter(function(k){return k.indexOf("seri-pos-")===0;}).map(function(k){return caches.delete(k);}));}).catch(function(){}));'
+            . '}'
+            . 'if(navigator.serviceWorker&&navigator.serviceWorker.controller){'
+            . 'try{navigator.serviceWorker.controller.postMessage({type:"SERI_CLEAR_SENSITIVE"});}catch(e){}'
+            . '}'
+            . 'Promise.all(tasks).then(done).catch(done);'
+            . 'setTimeout(go,2500);'
+            . '})();</script></body></html>';
+        exit;
     }
 }

@@ -20,8 +20,8 @@ class App
         // Generar token CSRF para la sesion
         Security::generateCsrfToken();
         
-        // Configurar timezone
-        date_default_timezone_set(config('app.timezone', 'UTC'));
+        // Timezone de negocio (luego el tenant puede sobrescribir vía settings).
+        BusinessTimezone::applyPhp(BusinessTimezone::fromConfig());
         
         // Configurar error reporting
         if (config('app.debug', false)) {
@@ -50,11 +50,20 @@ class App
     private function setSecurityHeaders(): void
     {
         $headers = config('security.headers', []);
-        
+
         foreach ($headers as $name => $value) {
             if (!empty($name) && !empty($value)) {
                 header("{$name}: {$value}");
             }
+        }
+
+        // HSTS solo en producción HTTPS (evita romper entornos locales http).
+        $appUrl = (string)config('app.url', '');
+        $isHttps = str_starts_with(strtolower($appUrl), 'https://')
+            || (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+            || ((int)($_SERVER['SERVER_PORT'] ?? 0) === 443);
+        if ($isHttps && !headers_sent()) {
+            header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
         }
     }
     
@@ -67,23 +76,28 @@ class App
         $wantsJson = $isAjax
             || (isset($_SERVER['HTTP_ACCEPT']) && str_contains((string)$_SERVER['HTTP_ACCEPT'], 'application/json'));
 
+        $debug = (bool)config('app.debug', false);
+        $publicMessage = $debug
+            ? ('Error: ' . $e->getMessage())
+            : 'Error interno del servidor. Si el problema continúa, contacte soporte.';
+
         if ($wantsJson) {
-            http_response_code(200);
+            http_response_code(500);
             header('Content-Type: application/json; charset=utf-8');
             echo json_encode([
                 'success' => false,
-                'message' => 'Error: ' . $e->getMessage(),
+                'message' => $publicMessage,
                 'redirect' => '',
             ], JSON_UNESCAPED_UNICODE);
             return;
         }
-        
-        if (config('app.debug', false)) {
+
+        http_response_code(500);
+        if ($debug) {
             echo '<h1>Error</h1>';
             echo '<p>' . htmlspecialchars($e->getMessage()) . '</p>';
             echo '<pre>' . htmlspecialchars($e->getTraceAsString()) . '</pre>';
         } else {
-            http_response_code(500);
             echo 'Error interno del servidor';
         }
     }

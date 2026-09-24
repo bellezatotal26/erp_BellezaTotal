@@ -39,6 +39,11 @@ class JobHandlers
 
     public function importCsv(array $payload): void
     {
+        @set_time_limit(0);
+        @ini_set('max_execution_time', '0');
+        @ignore_user_abort(true);
+        @ini_set('memory_limit', '512M');
+
         $path = (string)($payload['path'] ?? '');
         if ($path === '' || !is_file($path)) {
             throw new \RuntimeException('Archivo CSV no encontrado');
@@ -51,7 +56,8 @@ class JobHandlers
             'import:' . time(),
             'Inventario',
             sprintf(
-                'Importación CSV: %d creados, %d actualizados, %d remesas, %d movimientos, %d omitidos',
+                'Importación CSV: %d filas, %d creados, %d actualizados, %d remesas, %d movimientos, %d omitidos',
+                (int)($result['total_rows'] ?? 0),
                 $result['created'],
                 $result['updated'],
                 (int)($result['remesas'] ?? 0),

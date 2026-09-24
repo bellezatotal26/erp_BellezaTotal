@@ -69,6 +69,13 @@ class DashboardLayoutService
                 'type' => 'list',
                 'description' => 'Productos bajo el minimo de inventario',
             ],
+            'today_sold_products' => [
+                'id' => 'today_sold_products',
+                'title' => 'Productos vendidos',
+                'module' => 'ventas',
+                'type' => 'list',
+                'description' => 'Cantidades vendidas del dia en curso',
+            ],
         ];
     }
     
@@ -83,6 +90,7 @@ class DashboardLayoutService
             ['id' => 'receivables', 'visible' => true, 'order' => 5, 'column' => 1],
             ['id' => 'payables', 'visible' => true, 'order' => 6, 'column' => 0],
             ['id' => 'low_stock_list', 'visible' => true, 'order' => 7, 'column' => 1],
+            ['id' => 'today_sold_products', 'visible' => true, 'order' => 8, 'column' => 1],
         ];
         return self::normalizeStatic($defaults);
     }
@@ -247,9 +255,10 @@ class DashboardLayoutService
             if (!isset($byId[$id])) {
                 $byId[$id] = [
                     'id' => $id,
-                    'visible' => false,
+                    // Nuevo widget: visible al debutar para que se note en el tablero.
+                    'visible' => $id === 'today_sold_products',
                     'order' => $order++,
-                    'column' => 0,
+                    'column' => $id === 'today_sold_products' ? 1 : 0,
                 ];
             }
         }

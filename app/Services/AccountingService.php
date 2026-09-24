@@ -123,6 +123,23 @@ class AccountingService
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
         );
 
+        $this->db->exec(
+            "CREATE TABLE IF NOT EXISTS accounting_pending (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                action VARCHAR(40) NOT NULL,
+                source_type VARCHAR(50) NOT NULL,
+                source_id BIGINT UNSIGNED NOT NULL,
+                meta_json TEXT NULL,
+                last_error VARCHAR(500) NULL,
+                attempts INT UNSIGNED NOT NULL DEFAULT 0,
+                status ENUM('pending','done','failed') NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_accounting_pending (action, source_type, source_id),
+                INDEX idx_accounting_pending_status (status, id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        );
+
         // Costo histórico por línea de venta (para COGS correcto).
         try {
             $col = $this->db->query("SHOW COLUMNS FROM sale_items LIKE 'unit_cost'")->fetch();
@@ -131,6 +148,13 @@ class AccountingService
             }
         } catch (\Throwable $e) {
             // silencioso: tabla puede no existir en instalaciones nuevas
+        }
+
+        // Asegura status soft-delete en expenses (consultas de sync lo usan).
+        try {
+            new ExpenseCategoryService($this->db);
+        } catch (\Throwable $e) {
+            // ignore
         }
 
         self::$schemaDone[$this->db] = true;
@@ -152,7 +176,9 @@ class AccountingService
             ['111005', 'Bancos y medios electrónicos', 'asset', 'debit', 1],
             ['130505', 'Clientes nacionales', 'asset', 'debit', 1],
             ['143501', 'Inventarios de mercancías', 'asset', 'debit', 1],
+            ['143510', 'Mercancías en consignación (control)', 'asset', 'debit', 1],
             ['220505', 'Proveedores nacionales', 'liability', 'credit', 1],
+            ['220510', 'Consignantes por pagar', 'liability', 'credit', 1],
             ['233595', 'Costos y gastos por pagar', 'liability', 'credit', 1],
             ['240801', 'IVA generado', 'liability', 'credit', 1],
             ['240802', 'IVA descontable', 'asset', 'debit', 1],
@@ -178,6 +204,7 @@ class AccountingService
             ['530525', 'Gravamen a los movimientos financieros', 'expense', 'debit', 1],
             ['539595', 'Otros gastos no operacionales', 'expense', 'debit', 1],
             ['613501', 'Costo de ventas', 'expense', 'debit', 1],
+            ['613510', 'Costo de ventas consignadas', 'expense', 'debit', 1],
             ['135515', 'Retención en la fuente', 'asset', 'debit', 1],
         ];
 
@@ -195,7 +222,9 @@ class AccountingService
             'bank_account' => '111005',
             'receivable_account' => '130505',
             'inventory_account' => '143501',
+            'consignment_inventory_account' => '143510',
             'payable_account' => '220505',
+            'consignor_payable_account' => '220510',
             'expense_payable_account' => '233595',
             'vat_generated_account' => '240801',
             'vat_deductible_account' => '240802',
@@ -205,6 +234,7 @@ class AccountingService
             'fixed_expense_account' => '510505',
             'financial_expense_account' => '530505',
             'cost_of_sales_account' => '613501',
+            'consignment_cost_account' => '613510',
             'inventory_adjustment_account' => '519595',
             'inventory_loss_account' => '519595',
             'opening_inventory_equity_account' => '310505',
@@ -363,6 +393,7 @@ class AccountingService
                     COALESCE(SUM(amount), 0) total
              FROM expenses
              WHERE expense_date BETWEEN ? AND ?
+               AND COALESCE(status, 'active') <> 'cancelled'
                AND category IN ('dataphone_commission','card_commission','payment_link_commission','financial','bank_fee')
              GROUP BY COALESCE(category,'general')",
             [$from, $to]
@@ -521,9 +552,9 @@ class AccountingService
         if (!$dateObject || $dateObject->format('Y-m-d') !== $date) {
             throw new \InvalidArgumentException('Fecha contable inválida');
         }
-        if ($this->isPeriodClosed($date)) {
-            throw new \RuntimeException('El periodo contable está cerrado');
-        }
+        // Si el periodo del documento está cerrado, reubicar a un periodo abierto
+        // (mismo criterio que reverseSource / sync histórico).
+        $date = $this->resolvePostingDate($date);
 
         $normalized = [];
         $totalDebit = 0.0;
@@ -562,41 +593,74 @@ class AccountingService
             }
         }
 
-        $entryNumber = $this->nextEntryNumber($date);
-        $this->query(
-            "INSERT INTO accounting_entries
-                (entry_number, entry_date, description, source_type, source_id,
-                 source_event, status, reversal_of_id, created_by, approved_by, posted_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'posted', ?, ?, ?, NOW())",
-            [
-                $entryNumber, $date, trim($description), $sourceType, $sourceId,
-                $sourceEvent, $reversalOfId,
-                $_SESSION['tenant_user_id'] ?? null,
-                $_SESSION['tenant_user_id'] ?? null,
-            ]
-        );
-        $entryId = (int)$this->db->lastInsertId();
-
-        $stmt = $this->db->prepare(
-            "INSERT INTO accounting_lines
-                (entry_id, account_id, description, debit, credit,
-                 third_party_type, third_party_id, third_party_name)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        );
-        foreach ($normalized as $line) {
-            $stmt->execute([
-                $entryId,
-                $line['account_id'],
-                trim((string)($line['description'] ?? '')) ?: null,
-                $line['debit'],
-                $line['credit'],
-                $line['third_party_type'] ?? null,
-                !empty($line['third_party_id']) ? (int)$line['third_party_id'] : null,
-                trim((string)($line['third_party_name'] ?? '')) ?: null,
-            ]);
+        $ownTx = !$this->db->inTransaction();
+        if ($ownTx) {
+            $this->db->beginTransaction();
         }
 
-        return $entryId;
+        try {
+            // Re-chequeo dentro de la TX (concurrencia / doble clic).
+            if ($sourceType !== null && $sourceId !== null && $sourceEvent !== null) {
+                $existing = $this->query(
+                    "SELECT id FROM accounting_entries
+                     WHERE source_type = ? AND source_id = ? AND source_event = ?
+                       AND status = 'posted'
+                     LIMIT 1 FOR UPDATE",
+                    [$sourceType, $sourceId, $sourceEvent]
+                )->fetchColumn();
+                if ($existing) {
+                    if ($ownTx) {
+                        $this->db->commit();
+                    }
+                    return (int)$existing;
+                }
+            }
+
+            $entryNumber = $this->nextEntryNumber($date);
+            $this->query(
+                "INSERT INTO accounting_entries
+                    (entry_number, entry_date, description, source_type, source_id,
+                     source_event, status, reversal_of_id, created_by, approved_by, posted_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'posted', ?, ?, ?, NOW())",
+                [
+                    $entryNumber, $date, trim($description), $sourceType, $sourceId,
+                    $sourceEvent, $reversalOfId,
+                    $_SESSION['tenant_user_id'] ?? null,
+                    $_SESSION['tenant_user_id'] ?? null,
+                ]
+            );
+            $entryId = (int)$this->db->lastInsertId();
+
+            $stmt = $this->db->prepare(
+                "INSERT INTO accounting_lines
+                    (entry_id, account_id, description, debit, credit,
+                     third_party_type, third_party_id, third_party_name)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            );
+            foreach ($normalized as $line) {
+                $stmt->execute([
+                    $entryId,
+                    $line['account_id'],
+                    trim((string)($line['description'] ?? '')) ?: null,
+                    $line['debit'],
+                    $line['credit'],
+                    $line['third_party_type'] ?? null,
+                    !empty($line['third_party_id']) ? (int)$line['third_party_id'] : null,
+                    trim((string)($line['third_party_name'] ?? '')) ?: null,
+                ]);
+            }
+
+            if ($ownTx) {
+                $this->db->commit();
+            }
+
+            return $entryId;
+        } catch (\Throwable $e) {
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
     }
 
     public function postSale(int $saleId): int
@@ -683,27 +747,68 @@ class AccountingService
             }
         }
 
-        // Costo histórico: usa unit_cost capturado en la venta; si no existe (ventas
-        // antiguas) cae al costo actual del producto.
-        $cost = (float)$this->query(
-            "SELECT COALESCE(SUM(si.quantity * COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)), 0)
-             FROM sale_items si
-             JOIN products p ON p.id = si.product_id
-             WHERE si.sale_id = ? AND COALESCE(p.product_type, 'product') = 'product'",
-            [$saleId]
-        )->fetchColumn();
-        if ($cost > 0) {
+        // Costo: mercancía propia (CMV ↔ inventario) vs consignada (costo ↔ CxP consignante).
+        $costOwned = 0.0;
+        $costConsignment = 0.0;
+        try {
+            $costOwned = (float)$this->query(
+                "SELECT COALESCE(SUM(si.quantity * COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)), 0)
+                 FROM sale_items si
+                 JOIN products p ON p.id = si.product_id
+                 WHERE si.sale_id = ?
+                   AND COALESCE(p.product_type, 'product') = 'product'
+                   AND COALESCE(p.ownership, 'owned') = 'owned'
+                   AND COALESCE(si.is_consignment, 0) = 0",
+                [$saleId]
+            )->fetchColumn();
+            $costConsignment = (float)$this->query(
+                "SELECT COALESCE(SUM(si.quantity * COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)), 0)
+                 FROM sale_items si
+                 JOIN products p ON p.id = si.product_id
+                 WHERE si.sale_id = ?
+                   AND COALESCE(p.product_type, 'product') = 'product'
+                   AND (
+                        COALESCE(si.is_consignment, 0) = 1
+                        OR COALESCE(p.ownership, 'owned') = 'consignment'
+                   )",
+                [$saleId]
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            // Fallback installs sin columnas ownership / is_consignment
+            $costOwned = (float)$this->query(
+                "SELECT COALESCE(SUM(si.quantity * COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)), 0)
+                 FROM sale_items si
+                 JOIN products p ON p.id = si.product_id
+                 WHERE si.sale_id = ? AND COALESCE(p.product_type, 'product') = 'product'",
+                [$saleId]
+            )->fetchColumn();
+        }
+        if ($costOwned > 0) {
             $lines[] = $this->line(
                 $this->setting('cost_of_sales_account', '613501'),
-                $cost,
+                $costOwned,
                 0,
                 'Costo de mercancía vendida'
             );
             $lines[] = $this->line(
                 $this->setting('inventory_account', '143501'),
                 0,
-                $cost,
-                'Salida de inventario'
+                $costOwned,
+                'Salida de inventario propio'
+            );
+        }
+        if ($costConsignment > 0) {
+            $lines[] = $this->line(
+                $this->setting('consignment_cost_account', '613510'),
+                $costConsignment,
+                0,
+                'Costo consignación vendida'
+            );
+            $lines[] = $this->line(
+                $this->setting('consignor_payable_account', '220510'),
+                0,
+                $costConsignment,
+                'Por pagar a consignantes'
             );
         }
 
@@ -792,7 +897,11 @@ class AccountingService
         );
     }
 
-    public function postExpense(int $expenseId, bool $affectCash): int
+    /**
+     * @param bool $affectCashDrawer Si true, el pago salió del cajón físico (movimiento de caja).
+     * @param bool|null $paidNow Si null, coincide con $affectCashDrawer. Si true sin cajón, contabiliza pago (banco, etc.).
+     */
+    public function postExpense(int $expenseId, bool $affectCashDrawer, ?bool $paidNow = null): int
     {
         $expense = $this->query(
             "SELECT e.*, COALESCE(s.name, '') supplier_name
@@ -803,12 +912,20 @@ class AccountingService
         if (!$expense) {
             throw new \RuntimeException('Gasto no encontrado');
         }
+        if (($expense['status'] ?? 'active') === 'cancelled') {
+            throw new \RuntimeException('Gasto anulado; no se contabiliza');
+        }
+
+        if ($paidNow === null) {
+            $paidNow = $affectCashDrawer;
+        }
 
         $category = (string)($expense['category'] ?? 'general');
         $categoryId = (int)($expense['category_id'] ?? 0);
         $categoryLabel = $category;
         $group = 'operating';
         $expenseAccount = null;
+        $catRow = null;
 
         // Preferir catálogo tipado (expense_categories) sobre códigos legados del config.
         if ($categoryId > 0) {
@@ -816,9 +933,14 @@ class AccountingService
                 $catSvc = new ExpenseCategoryService($this->db);
                 $cat = $catSvc->find($categoryId);
                 if ($cat) {
+                    $catRow = $cat;
                     $categoryLabel = (string)($cat['name'] ?? $category);
                     $kind = (string)($cat['kind'] ?? 'operational');
-                    $group = $kind === 'financial' ? 'financial' : 'operating';
+                    if ($kind === 'administrative' || $kind === 'financial' || $kind === 'management') {
+                        $group = 'administrative';
+                    } else {
+                        $group = 'operating';
+                    }
                     $code = trim((string)($cat['account_code'] ?? ''));
                     if ($code !== '') {
                         $expenseAccount = $code;
@@ -845,17 +967,32 @@ class AccountingService
             }
         }
 
-        $creditCode = $affectCash
-            ? $this->paymentAccount((string)$expense['payment_method'])
-            : $this->setting('expense_payable_account', '233595');
+        $paymentMethod = (string)($expense['payment_method'] ?? 'cash');
+        if ($affectCashDrawer) {
+            $creditCode = $this->paymentAccount($paymentMethod);
+        } elseif ($paidNow) {
+            $creditCode = $this->paidExpenseCreditAccount($paymentMethod, $catRow);
+        } else {
+            $creditCode = $this->setting('expense_payable_account', '233595');
+        }
 
-        $groupLabel = match ($group) {
-            'financial' => 'Gastos financieros',
-            'fixed' => 'Gastos fijos',
-            default => (function_exists('\\SoftNova\\Core\\expense_group_label')
-                ? \SoftNova\Core\expense_group_label($group)
-                : 'Gastos operativos'),
-        };
+        $groupLabel = 'Gastos operativos';
+        if ($catRow) {
+            $catKind = (string)($catRow['kind'] ?? 'operational');
+            if (ExpenseCategoryService::isAccountingKind($catKind)) {
+                $catSvc = new ExpenseCategoryService($this->db);
+                $groupLabel = $catSvc->resolveKindGroupLabel($catKind);
+            }
+        } else {
+            $groupLabel = match ($group) {
+                'financial' => ExpenseCategoryService::kindGroupLabel('financial'),
+                'administrative' => ExpenseCategoryService::kindGroupLabel('administrative'),
+                'fixed' => 'Gastos fijos',
+                default => (function_exists('\\SoftNova\\Core\\expense_group_label')
+                    ? \SoftNova\Core\expense_group_label($group)
+                    : 'Gastos operativos'),
+            };
+        }
 
         return $this->postEntry(
             $expense['expense_date'],
@@ -874,7 +1011,7 @@ class AccountingService
                     $creditCode,
                     0,
                     (float)$expense['amount'],
-                    $affectCash ? 'Pago de gasto' : 'Gasto por pagar',
+                    $affectCashDrawer ? 'Pago desde cajón' : ($paidNow ? 'Pago de gasto' : 'Gasto por pagar'),
                     'supplier',
                     $expense['supplier_id'],
                     $expense['supplier_name']
@@ -887,7 +1024,8 @@ class AccountingService
     }
 
     /**
-     * Gasto de comisión de vendedor con cuenta específica (510508).
+     * Gasto de comisión (vendedor o pasarela) con cuentas específicas.
+     * Crédito típico: CxP (vendedor) o bancos (pasarela / retención del adquirente).
      */
     public function postCommissionExpense(
         int $expenseId,
@@ -994,14 +1132,12 @@ class AccountingService
             $lines[] = $this->line($this->setting('icbf_payable_account', '237007'), 0, $icbf, 'ICBF por pagar');
         }
         if ($net > 0) {
-            $creditNet = $payNow
-                ? $this->paymentAccount((string)($run['payment_method'] ?? 'transfer'))
-                : $this->setting('payroll_payable_account', '250505');
+            $creditNet = $this->payrollNetCreditAccount((string)($run['payment_method'] ?? 'transfer'), $payNow);
             $lines[] = $this->line(
                 $creditNet,
                 0,
                 $net,
-                $payNow ? 'Pago neto a empleados' : 'Salarios por pagar'
+                $payNow ? 'Neto nómina (no descuenta cajón POS)' : 'Salarios por pagar'
             );
         }
 
@@ -1024,7 +1160,9 @@ class AccountingService
     {
         $rows = $this->query(
             "SELECT COALESCE(category,'general') category, COALESCE(SUM(amount),0) total, COUNT(*) cnt
-             FROM expenses WHERE expense_date BETWEEN ? AND ?
+             FROM expenses
+             WHERE expense_date BETWEEN ? AND ?
+               AND COALESCE(status, 'active') <> 'cancelled'
              GROUP BY COALESCE(category,'general') ORDER BY total DESC",
             [$from, $to]
         )->fetchAll();
@@ -1166,6 +1304,9 @@ class AccountingService
             'stock' => 0,
             'supplier_payments' => 0,
             'cash' => 0,
+            'sale_credit_notes' => 0,
+            'purchase_credit_notes' => 0,
+            'pending_queue' => 0,
             'errors' => 0,
             'remaining' => 0,
             'done' => true,
@@ -1173,6 +1314,14 @@ class AccountingService
         $limit = max(0, $limit);
         $budget = $limit > 0 ? $limit : PHP_INT_MAX;
         $limitSql = $limit > 0 ? ' LIMIT ' . ((int)$limit + 1) : '';
+
+        // Primero reintentar la cola de fallos explícitos (anulaciones / ediciones).
+        if ($budget > 0) {
+            $queued = $this->processPendingQueue(min(50, $budget));
+            $result['pending_queue'] = (int)($queued['done'] ?? 0);
+            $result['errors'] += (int)($queued['errors'] ?? 0);
+            $budget -= (int)($queued['processed'] ?? 0);
+        }
 
         $sales = $this->query(
             "SELECT s.id
@@ -1229,13 +1378,16 @@ class AccountingService
         if ($budget > 0) {
             $expenseLimitSql = $limit > 0 ? ' LIMIT ' . ((int)$budget + 1) : '';
             $expenses = $this->query(
-                "SELECT x.id
+                "SELECT x.id, x.payment_method, x.category, x.category_id, x.notes
                  FROM expenses x
                  LEFT JOIN accounting_entries e
                    ON e.source_type = 'expense' AND e.source_id = x.id AND e.source_event = 'created'
                  WHERE e.id IS NULL
+                   AND COALESCE(x.status, 'active') <> 'cancelled'
                    AND COALESCE(x.payment_method, '') <> 'inventory_loss'
+                   AND COALESCE(x.category, '') <> 'payroll'
                    AND COALESCE(x.notes, '') NOT LIKE '%[salida_inventario:%'
+                   AND COALESCE(x.notes, '') NOT LIKE '%asiento contable #%'
                  ORDER BY x.id" . $expenseLimitSql
             )->fetchAll();
             foreach ($expenses as $expense) {
@@ -1243,7 +1395,8 @@ class AccountingService
                     break;
                 }
                 try {
-                    $this->postExpense((int)$expense['id'], true);
+                    $flags = $this->resolveExpensePostFlags($expense);
+                    $this->postExpense((int)$expense['id'], $flags['affect_cash'], $flags['paid_now']);
                     $result['expenses']++;
                 } catch (\Throwable $e) {
                     $result['errors']++;
@@ -1288,6 +1441,199 @@ class AccountingService
     }
 
     /**
+     * Misma regla que Alta de Gastos: efectivo contable → banco; operativo → caja.
+     *
+     * @param array<string,mixed> $expense
+     * @return array{affect_cash:bool,paid_now:bool}
+     */
+    private function resolveExpensePostFlags(array $expense): array
+    {
+        $method = strtolower(trim((string)($expense['payment_method'] ?? 'cash')));
+        if ($method === '') {
+            $method = 'cash';
+        }
+        $onAccount = in_array($method, ['credit', 'payable', 'account', 'on_account'], true);
+        $isCashPay = $method === 'cash' || (
+            class_exists(PaymentMethodCatalog::class) && PaymentMethodCatalog::affectsCash($method)
+        );
+
+        $cat = null;
+        $categoryId = (int)($expense['category_id'] ?? 0);
+        if ($categoryId > 0) {
+            try {
+                $cat = (new ExpenseCategoryService($this->db))->find($categoryId);
+            } catch (\Throwable $e) {
+                $cat = null;
+            }
+        }
+
+        $touchCajon = false;
+        if ($isCashPay && $cat) {
+            try {
+                $touchCajon = (new ExpenseCategoryService($this->db))->affectsCashDrawer($cat);
+            } catch (\Throwable $e) {
+                $touchCajon = false;
+            }
+        } elseif ($isCashPay && !$cat) {
+            // Sin categoría tipada: no asumir cajón (evita descuadre 110505 vs 111005).
+            $touchCajon = false;
+        }
+
+        if ($onAccount) {
+            return ['affect_cash' => false, 'paid_now' => false];
+        }
+
+        return [
+            'affect_cash' => $touchCajon,
+            'paid_now' => true,
+        ];
+    }
+
+    /**
+     * Encola un asiento fallido para reintento vía «Sincronizar».
+     */
+    public function enqueuePending(
+        string $action,
+        string $sourceType,
+        int $sourceId,
+        string $error,
+        ?array $meta = null
+    ): void {
+        if ($sourceId <= 0 || $action === '' || $sourceType === '') {
+            return;
+        }
+        try {
+            $this->query(
+                "INSERT INTO accounting_pending
+                    (action, source_type, source_id, meta_json, last_error, attempts, status)
+                 VALUES (?, ?, ?, ?, ?, 1, 'pending')
+                 ON DUPLICATE KEY UPDATE
+                    meta_json = VALUES(meta_json),
+                    last_error = VALUES(last_error),
+                    attempts = accounting_pending.attempts + 1,
+                    status = 'pending',
+                    updated_at = CURRENT_TIMESTAMP",
+                [
+                    $action,
+                    $sourceType,
+                    $sourceId,
+                    $meta !== null ? json_encode($meta, JSON_UNESCAPED_UNICODE) : null,
+                    mb_substr($error, 0, 500),
+                ]
+            );
+        } catch (\Throwable $e) {
+            error_log('accounting_pending enqueue: ' . $e->getMessage());
+        }
+    }
+
+    public function pendingQueueCount(): int
+    {
+        try {
+            return (int)$this->query(
+                "SELECT COUNT(*) FROM accounting_pending WHERE status = 'pending'"
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * @return array{processed:int,done:int,errors:int}
+     */
+    public function processPendingQueue(int $limit = 50): array
+    {
+        $out = ['processed' => 0, 'done' => 0, 'errors' => 0];
+        $limit = max(1, min(200, $limit));
+        try {
+            $rows = $this->query(
+                "SELECT * FROM accounting_pending
+                 WHERE status = 'pending'
+                 ORDER BY id ASC
+                 LIMIT " . $limit
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            return $out;
+        }
+
+        foreach ($rows as $row) {
+            $out['processed']++;
+            $id = (int)$row['id'];
+            $action = (string)$row['action'];
+            $sourceType = (string)$row['source_type'];
+            $sourceId = (int)$row['source_id'];
+            $meta = [];
+            if (!empty($row['meta_json'])) {
+                $decoded = json_decode((string)$row['meta_json'], true);
+                if (is_array($decoded)) {
+                    $meta = $decoded;
+                }
+            }
+            try {
+                match ($action) {
+                    'post_sale' => $this->postSaleCascade($sourceId),
+                    'post_sale_payment' => $this->postSalePayment($sourceId),
+                    'post_expense' => (function () use ($sourceId, $meta): void {
+                        $expense = $this->query(
+                            "SELECT id, payment_method, category, category_id, notes, status FROM expenses WHERE id = ?",
+                            [$sourceId]
+                        )->fetch() ?: ['id' => $sourceId];
+                        if (($expense['status'] ?? 'active') === 'cancelled') {
+                            return; // anulado: no re-postear
+                        }
+                        // Preferir flags actuales del gasto (meta solo si la fila no aporta datos).
+                        $flags = $this->resolveExpensePostFlags($expense);
+                        $affect = $flags['affect_cash'];
+                        $paid = $flags['paid_now'];
+                        if (empty($expense['payment_method']) && empty($expense['category_id'])) {
+                            if (array_key_exists('affect_cash', $meta)) {
+                                $affect = (bool)$meta['affect_cash'];
+                            }
+                            if (array_key_exists('paid_now', $meta)) {
+                                $paid = (bool)$meta['paid_now'];
+                            }
+                        }
+                        $this->postExpense($sourceId, $affect, $paid);
+                    })(),
+                    'post_purchase_order' => $this->postPurchaseOrder($sourceId),
+                    'post_purchase_credit_note' => $this->postPurchaseCreditNote($sourceId),
+                    'post_sale_credit_note' => $this->postSaleCreditNote($sourceId),
+                    'post_supplier_payment' => $this->postSupplierPayment($sourceId),
+                    'post_cash_session' => $this->postCashSessionClosing($sourceId),
+                    'post_cash_movement' => $this->postCashMovement($sourceId),
+                    'reverse_source' => $this->reverseSource(
+                        $sourceType,
+                        $sourceId,
+                        (string)($meta['reason'] ?? 'Reintento de reversión')
+                    ),
+                    'reverse_sale_cascade' => $this->reverseSaleCascade(
+                        $sourceId,
+                        (string)($meta['reason'] ?? 'Reintento de reversión de venta')
+                    ),
+                    default => throw new \RuntimeException('Acción pendiente desconocida: ' . $action),
+                };
+                $this->query(
+                    "UPDATE accounting_pending SET status = 'done', last_error = NULL WHERE id = ?",
+                    [$id]
+                );
+                $out['done']++;
+            } catch (\Throwable $e) {
+                $out['errors']++;
+                $attempts = (int)($row['attempts'] ?? 0) + 1;
+                $status = $attempts >= 8 ? 'failed' : 'pending';
+                $this->query(
+                    "UPDATE accounting_pending
+                     SET attempts = ?, last_error = ?, status = ?
+                     WHERE id = ?",
+                    [$attempts, mb_substr($e->getMessage(), 0, 500), $status, $id]
+                );
+                error_log('accounting_pending #' . $id . ': ' . $e->getMessage());
+            }
+        }
+
+        return $out;
+    }
+
+    /**
      * Orígenes históricos contabilizables además de ventas, abonos y gastos.
      * Cada consulta devuelve solo los registros que aún no tienen comprobante.
      *
@@ -1313,7 +1659,7 @@ class AccountingService
                                AND COALESCE(p.product_type, 'product') = 'product'
                           WHERE sm.accounting_entry_id IS NULL
                             AND COALESCE(sm.total_cost, 0) > 0
-                            AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note')
+                            AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return', 'loan_received', 'loan_received_return', 'status_change', 'consignment_in', 'consignment_return')
                           ORDER BY sm.id",
                 'post' => fn(int $id): ?int => $this->postStockMovement($id),
             ],
@@ -1331,6 +1677,39 @@ class AccountingService
                             AND COALESCE(cm.reference_type, 'manual') IN ('manual', '')
                           ORDER BY cm.id",
                 'post' => fn(int $id): ?int => $this->postCashMovement($id),
+            ],
+            'sale_credit_notes' => [
+                'sql' => "SELECT cn.id
+                          FROM sale_credit_notes cn
+                          LEFT JOIN accounting_entries e
+                            ON e.source_type = 'sale_credit_note' AND e.source_id = cn.id
+                               AND e.reversal_of_id IS NULL
+                          WHERE cn.status = 'posted'
+                            AND cn.accounting_entry_id IS NULL
+                            AND e.id IS NULL
+                          ORDER BY cn.id",
+                'post' => fn(int $id): ?int => $this->postSaleCreditNote($id),
+            ],
+            'purchase_credit_notes' => [
+                'sql' => "SELECT cn.id
+                          FROM purchase_credit_notes cn
+                          LEFT JOIN accounting_entries e
+                            ON e.source_type = 'purchase_credit_note' AND e.source_id = cn.id
+                               AND e.reversal_of_id IS NULL
+                          WHERE cn.status = 'posted'
+                            AND cn.accounting_entry_id IS NULL
+                            AND e.id IS NULL
+                          ORDER BY cn.id",
+                'post' => fn(int $id): ?int => $this->postPurchaseCreditNote($id),
+            ],
+            'cash_sessions' => [
+                'sql' => "SELECT cs.id
+                          FROM cash_sessions cs
+                          WHERE cs.status = 'closed'
+                            AND cs.closing_entry_id IS NULL
+                            AND ABS(COALESCE(cs.difference_amount, 0)) >= 0.01
+                          ORDER BY cs.id",
+                'post' => fn(int $id): ?int => $this->postCashSessionClosing($id),
             ],
         ];
     }
@@ -1357,7 +1736,12 @@ class AccountingService
             "SELECT COUNT(*) FROM expenses x
              LEFT JOIN accounting_entries e
                ON e.source_type = 'expense' AND e.source_id = x.id AND e.source_event = 'created'
-             WHERE e.id IS NULL"
+             WHERE e.id IS NULL
+               AND COALESCE(x.status, 'active') <> 'cancelled'
+               AND COALESCE(x.payment_method, '') <> 'inventory_loss'
+               AND COALESCE(x.category, '') <> 'payroll'
+               AND COALESCE(x.notes, '') NOT LIKE '%[salida_inventario:%'
+               AND COALESCE(x.notes, '') NOT LIKE '%asiento contable #%'"
         )->fetchColumn();
 
         $pendingOthers = 0;
@@ -1371,7 +1755,7 @@ class AccountingService
             }
         }
 
-        return $pendingSales + $pendingPayments + $pendingExpenses + $pendingOthers;
+        return $pendingSales + $pendingPayments + $pendingExpenses + $pendingOthers + $this->pendingQueueCount();
     }
 
     public function reverseSource(string $sourceType, int $sourceId, string $reason): ?int
@@ -1408,20 +1792,36 @@ class AccountingService
             ];
         }
 
-        $reversalId = $this->postEntry(
-            date('Y-m-d'),
-            'Reversión ' . $entry['entry_number'] . ': ' . $reason,
-            $lines,
-            $sourceType,
-            $sourceId,
-            'reversal_' . $entry['id'],
-            (int)$entry['id']
-        );
-        $this->query(
-            "UPDATE accounting_entries SET status = 'reversed' WHERE id = ?",
-            [$entry['id']]
-        );
-        return $reversalId;
+        $postingDate = $this->resolvePostingDate(date('Y-m-d'), (string)$entry['entry_date']);
+
+        $ownTx = !$this->db->inTransaction();
+        if ($ownTx) {
+            $this->db->beginTransaction();
+        }
+        try {
+            $reversalId = $this->postEntry(
+                $postingDate,
+                'Reversión ' . $entry['entry_number'] . ': ' . $reason,
+                $lines,
+                $sourceType,
+                $sourceId,
+                'reversal_' . $entry['id'],
+                (int)$entry['id']
+            );
+            $this->query(
+                "UPDATE accounting_entries SET status = 'reversed' WHERE id = ?",
+                [$entry['id']]
+            );
+            if ($ownTx) {
+                $this->db->commit();
+            }
+            return $reversalId;
+        } catch (\Throwable $e) {
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
     }
 
     public function entries(string $from, string $to, int $limit = 200): array
@@ -1456,29 +1856,728 @@ class AccountingService
              WHERE l.entry_id = ? ORDER BY l.id",
             [$id]
         )->fetchAll();
+        $entry['source_document'] = $this->sourceDocumentForEntry($entry);
         return $entry;
     }
 
-    public function trialBalance(string $from, string $to): array
+    /**
+     * Datos del documento origen (gasto, venta, etc.) para el detalle del comprobante.
+     *
+     * @return array<string,mixed>|null
+     */
+    private function sourceDocumentForEntry(array $entry): ?array
     {
-        return $this->query(
+        $type = (string)($entry['source_type'] ?? '');
+        $sourceId = (int)($entry['source_id'] ?? 0);
+        if ($sourceId <= 0 || $type === '') {
+            return null;
+        }
+
+        if ($type === 'expense') {
+            try {
+                $row = $this->query(
+                    "SELECT e.id, e.description, e.amount, e.category, e.expense_date,
+                            e.payment_method, e.receipt_number, e.receipt_path, e.receipt_mime,
+                            e.notes, ec.name AS category_label, ec.kind AS category_kind,
+                            COALESCE(s.name, '') AS supplier_name
+                     FROM expenses e
+                     LEFT JOIN expense_categories ec ON ec.id = e.category_id
+                     LEFT JOIN suppliers s ON s.id = e.supplier_id
+                     WHERE e.id = ?",
+                    [$sourceId]
+                )->fetch();
+            } catch (\Throwable $e) {
+                return null;
+            }
+            if (!$row) {
+                return null;
+            }
+
+            $notes = trim((string)($row['notes'] ?? ''));
+            $cashExplanation = '';
+            if (preg_match('/(?:Efectivo|Origen pago):\s*([^|]+)/u', $notes, $m)) {
+                $cashExplanation = trim($m[1]);
+            }
+
+            $paymentMethod = (string)($row['payment_method'] ?? 'cash');
+            $paymentLabel = class_exists(PaymentMethodCatalog::class)
+                ? PaymentMethodCatalog::label($paymentMethod)
+                : $paymentMethod;
+
+            return [
+                'type' => 'expense',
+                'id' => (int)$row['id'],
+                'description' => (string)$row['description'],
+                'amount' => (float)$row['amount'],
+                'category' => (string)($row['category_label'] ?? $row['category'] ?? ''),
+                'category_kind' => (string)($row['category_kind'] ?? ''),
+                'supplier_name' => (string)$row['supplier_name'],
+                'expense_date' => (string)$row['expense_date'],
+                'payment_method' => $paymentMethod,
+                'payment_label' => $paymentLabel,
+                'receipt_number' => (string)($row['receipt_number'] ?? ''),
+                'has_receipt' => !empty($row['receipt_path']),
+                'receipt_mime' => (string)($row['receipt_mime'] ?? ''),
+                'notes' => $notes,
+                'cash_explanation' => $cashExplanation,
+            ];
+        }
+
+        if ($type === 'sale') {
+            try {
+                $row = $this->query(
+                    "SELECT s.id, s.invoice_number, s.total, s.sale_date, s.payment_method,
+                            s.payment_status, s.status, COALESCE(c.name, '') AS customer_name
+                     FROM sales s
+                     LEFT JOIN customers c ON c.id = s.customer_id
+                     WHERE s.id = ?",
+                    [$sourceId]
+                )->fetch();
+            } catch (\Throwable $e) {
+                return null;
+            }
+            if (!$row) {
+                return null;
+            }
+            $paymentMethod = (string)($row['payment_method'] ?? 'cash');
+            return [
+                'type' => 'sale',
+                'id' => (int)$row['id'],
+                'invoice_number' => (string)$row['invoice_number'],
+                'total' => (float)$row['total'],
+                'sale_date' => (string)$row['sale_date'],
+                'payment_method' => $paymentMethod,
+                'payment_label' => PaymentMethodCatalog::label($paymentMethod),
+                'payment_status' => (string)($row['payment_status'] ?? ''),
+                'status' => (string)($row['status'] ?? ''),
+                'customer_name' => (string)$row['customer_name'],
+            ];
+        }
+
+        if ($type === 'sale_payment') {
+            try {
+                $row = $this->query(
+                    "SELECT p.id, p.amount, p.payment_date, p.payment_method, p.notes,
+                            s.id AS sale_id, s.invoice_number, COALESCE(c.name, '') AS customer_name
+                     FROM sale_payments p
+                     JOIN sales s ON s.id = p.sale_id
+                     LEFT JOIN customers c ON c.id = s.customer_id
+                     WHERE p.id = ?",
+                    [$sourceId]
+                )->fetch();
+            } catch (\Throwable $e) {
+                return null;
+            }
+            if (!$row) {
+                return null;
+            }
+            $paymentMethod = (string)($row['payment_method'] ?? 'cash');
+            return [
+                'type' => 'sale_payment',
+                'id' => (int)$row['id'],
+                'sale_id' => (int)$row['sale_id'],
+                'invoice_number' => (string)$row['invoice_number'],
+                'amount' => (float)$row['amount'],
+                'payment_date' => (string)$row['payment_date'],
+                'payment_method' => $paymentMethod,
+                'payment_label' => PaymentMethodCatalog::label($paymentMethod),
+                'notes' => (string)($row['notes'] ?? ''),
+                'customer_name' => (string)$row['customer_name'],
+            ];
+        }
+
+        if ($type === 'cash_movement') {
+            try {
+                $row = $this->query(
+                    "SELECT cm.id, cm.type, cm.amount, cm.description, cm.reference_type,
+                            cm.reference_id, cm.created_at, u.name AS user_name
+                     FROM cash_movements cm
+                     LEFT JOIN users u ON u.id = cm.user_id
+                     WHERE cm.id = ?",
+                    [$sourceId]
+                )->fetch();
+            } catch (\Throwable $e) {
+                return null;
+            }
+            if (!$row) {
+                return null;
+            }
+            return [
+                'type' => 'cash_movement',
+                'id' => (int)$row['id'],
+                'movement_type' => (string)$row['type'],
+                'amount' => (float)$row['amount'],
+                'description' => (string)$row['description'],
+                'reference_type' => (string)($row['reference_type'] ?? ''),
+                'reference_id' => (int)($row['reference_id'] ?? 0),
+                'created_at' => (string)$row['created_at'],
+                'user_name' => (string)($row['user_name'] ?? ''),
+            ];
+        }
+
+        if ($type === 'sale_credit_note') {
+            try {
+                $svc = new SalesCreditNoteService($this->db);
+                $note = $svc->getCreditNote($sourceId);
+            } catch (\Throwable $e) {
+                return null;
+            }
+            if (!$note) {
+                return null;
+            }
+            return [
+                'type' => 'sale_credit_note',
+                'id' => (int)$note['id'],
+                'credit_number' => (string)($note['credit_number'] ?? ''),
+                'invoice_number' => (string)($note['invoice_number'] ?? ''),
+                'total' => (float)($note['total'] ?? 0),
+                'credit_date' => (string)($note['credit_date'] ?? ''),
+                'reason' => (string)($note['reason'] ?? ''),
+                'refund_method' => (string)($note['refund_method'] ?? 'auto'),
+                'affects_stock' => (int)($note['affects_stock'] ?? 0) === 1,
+                'customer_name' => (string)($note['customer_name'] ?? ''),
+            ];
+        }
+
+        return null;
+    }
+
+    /**
+     * Balance de prueba clásico (saldo inicial / movimientos / saldo final en Debe-Haber).
+     *
+     * @param array{account_type?:string,include_zero?:bool,q?:string} $options
+     * @return array{
+     *   rows:list<array<string,mixed>>,
+     *   totals:array<string,float>,
+     *   balanced:array{opening:bool,period:bool,closing:bool},
+     *   from:string,to:string
+     * }
+     */
+    public function trialBalance(string $from, string $to, array $options = []): array
+    {
+        $accountType = strtolower(trim((string)($options['account_type'] ?? '')));
+        $includeZero = !empty($options['include_zero']);
+        $q = trim((string)($options['q'] ?? ''));
+
+        $params = [$from, $from, $to, $from, $to, $to];
+        $typeSql = '';
+        if (in_array($accountType, ['asset', 'liability', 'equity', 'revenue', 'expense'], true)) {
+            $typeSql = ' AND a.account_type = ?';
+            $params[] = $accountType;
+        }
+        $qSql = '';
+        if ($q !== '') {
+            $qSql = ' AND (a.code LIKE ? OR a.name LIKE ?)';
+            $like = '%' . $q . '%';
+            $params[] = $like;
+            $params[] = $like;
+        }
+
+        // Solo asientos posted + reversed: el original anulado y su reversión se anulan entre sí.
+        $rows = $this->query(
             "SELECT a.id, a.code, a.name, a.account_type, a.nature,
                     COALESCE(SUM(CASE WHEN e.entry_date < ? AND e.status IN ('posted','reversed')
-                        THEN l.debit - l.credit ELSE 0 END), 0) opening_balance,
+                        THEN l.debit - l.credit ELSE 0 END), 0) AS opening_balance,
                     COALESCE(SUM(CASE WHEN e.entry_date BETWEEN ? AND ? AND e.status IN ('posted','reversed')
-                        THEN l.debit ELSE 0 END), 0) debit,
+                        THEN l.debit ELSE 0 END), 0) AS debit,
                     COALESCE(SUM(CASE WHEN e.entry_date BETWEEN ? AND ? AND e.status IN ('posted','reversed')
-                        THEN l.credit ELSE 0 END), 0) credit,
+                        THEN l.credit ELSE 0 END), 0) AS credit,
                     COALESCE(SUM(CASE WHEN e.entry_date <= ? AND e.status IN ('posted','reversed')
-                        THEN l.debit - l.credit ELSE 0 END), 0) closing_balance
+                        THEN l.debit - l.credit ELSE 0 END), 0) AS closing_balance
              FROM accounting_accounts a
              LEFT JOIN accounting_lines l ON l.account_id = a.id
              LEFT JOIN accounting_entries e ON e.id = l.entry_id
-             GROUP BY a.id
-             HAVING ABS(opening_balance) > 0.009 OR debit > 0 OR credit > 0
+             WHERE 1=1 {$typeSql} {$qSql}
+             GROUP BY a.id, a.code, a.name, a.account_type, a.nature
              ORDER BY a.code",
-            [$from, $from, $to, $from, $to, $to]
+            $params
         )->fetchAll();
+
+        $enriched = [];
+        $totals = [
+            'opening_debit' => 0.0,
+            'opening_credit' => 0.0,
+            'debit' => 0.0,
+            'credit' => 0.0,
+            'closing_debit' => 0.0,
+            'closing_credit' => 0.0,
+            'accounts' => 0.0,
+        ];
+
+        foreach ($rows as $row) {
+            $opening = round((float)$row['opening_balance'], 2);
+            $debit = round((float)$row['debit'], 2);
+            $credit = round((float)$row['credit'], 2);
+            $closing = round((float)$row['closing_balance'], 2);
+
+            if (
+                !$includeZero
+                && abs($opening) < 0.009
+                && abs($debit) < 0.009
+                && abs($credit) < 0.009
+                && abs($closing) < 0.009
+            ) {
+                continue;
+            }
+
+            $openingDebit = $opening > 0.009 ? $opening : 0.0;
+            $openingCredit = $opening < -0.009 ? abs($opening) : 0.0;
+            $closingDebit = $closing > 0.009 ? $closing : 0.0;
+            $closingCredit = $closing < -0.009 ? abs($closing) : 0.0;
+
+            $row['opening_balance'] = $opening;
+            $row['debit'] = $debit;
+            $row['credit'] = $credit;
+            $row['closing_balance'] = $closing;
+            $row['opening_debit'] = $openingDebit;
+            $row['opening_credit'] = $openingCredit;
+            $row['closing_debit'] = $closingDebit;
+            $row['closing_credit'] = $closingCredit;
+            $row['account_type_label'] = match ((string)($row['account_type'] ?? '')) {
+                'asset' => 'Activo',
+                'liability' => 'Pasivo',
+                'equity' => 'Patrimonio',
+                'revenue' => 'Ingreso',
+                'expense' => 'Gasto',
+                default => (string)($row['account_type'] ?? ''),
+            };
+            $row['nature_label'] = (($row['nature'] ?? '') === 'credit') ? 'Crédito' : 'Débito';
+
+            $enriched[] = $row;
+            $totals['opening_debit'] += $openingDebit;
+            $totals['opening_credit'] += $openingCredit;
+            $totals['debit'] += $debit;
+            $totals['credit'] += $credit;
+            $totals['closing_debit'] += $closingDebit;
+            $totals['closing_credit'] += $closingCredit;
+            $totals['accounts'] += 1;
+        }
+
+        foreach ($totals as $k => $v) {
+            if ($k !== 'accounts') {
+                $totals[$k] = round((float)$v, 2);
+            }
+        }
+
+        $balanced = [
+            'opening' => abs($totals['opening_debit'] - $totals['opening_credit']) < 0.02,
+            'period' => abs($totals['debit'] - $totals['credit']) < 0.02,
+            'closing' => abs($totals['closing_debit'] - $totals['closing_credit']) < 0.02,
+        ];
+
+        return [
+            'rows' => $enriched,
+            'totals' => $totals,
+            'balanced' => $balanced,
+            'from' => $from,
+            'to' => $to,
+        ];
+    }
+
+    /**
+     * Compatibilidad: lista plana de filas (p. ej. estados financieros).
+     *
+     * @return list<array<string,mixed>>
+     */
+    public function trialBalanceRows(string $from, string $to): array
+    {
+        return $this->trialBalance($from, $to)['rows'];
+    }
+
+    /** @var array<string, bool> */
+    private static array $schemaColumnCache = [];
+
+    /** @var array<string, bool> */
+    private static array $schemaTableCache = [];
+
+    private function schemaHasTable(string $table): bool
+    {
+        if (!array_key_exists($table, self::$schemaTableCache)) {
+            try {
+                $safe = str_replace(['`', ';', '%', '_'], '', $table);
+                self::$schemaTableCache[$table] = (bool)$this->db
+                    ->query('SHOW TABLES LIKE ' . $this->db->quote($safe))
+                    ->fetch();
+            } catch (\Throwable $e) {
+                self::$schemaTableCache[$table] = false;
+            }
+        }
+        return self::$schemaTableCache[$table];
+    }
+
+    private function schemaHasColumn(string $table, string $column): bool
+    {
+        $key = $table . '.' . $column;
+        if (!array_key_exists($key, self::$schemaColumnCache)) {
+            try {
+                $safeTable = str_replace(['`', ';'], '', $table);
+                self::$schemaColumnCache[$key] = (bool)$this->db
+                    ->query("SHOW COLUMNS FROM `{$safeTable}` LIKE " . $this->db->quote($column))
+                    ->fetch();
+            } catch (\Throwable $e) {
+                self::$schemaColumnCache[$key] = false;
+            }
+        }
+        return self::$schemaColumnCache[$key];
+    }
+
+    /**
+     * Balance operativo mensual (estilo Excel del cliente).
+     * Fuentes: ventas completed, NC venta, facturas OC received, abonos proveedor, gastos.
+     *
+     * @return array{
+     *   year:int,
+     *   months:list<array<string,mixed>>,
+     *   totals:array<string,float>,
+     *   chart:array<string,list<float|string>>,
+     *   meta:array<string,mixed>
+     * }
+     */
+    public function monthlyOperationalBalance(int $year): array
+    {
+        if ($year < 2000 || $year > 2100) {
+            $year = (int)date('Y');
+        }
+
+        $from = sprintf('%04d-01-01', $year);
+        $toExcl = sprintf('%04d-01-01', $year + 1);
+        $warnings = [];
+
+        $empty = static function (int $m): array {
+            return [
+                'month' => $m,
+                'month_label' => str_pad((string)$m, 2, '0', STR_PAD_LEFT),
+                'ingresos' => 0.0,
+                'costo_venta' => 0.0,
+                'facturas_total' => 0.0,
+                'facturas_contado' => 0.0,
+                'facturas_credito' => 0.0,
+                'facturas_pagadas' => 0.0,
+                'facturas_descuentos' => 0.0,
+                'facturas_pendientes' => 0.0,
+                'utilidad_bruta' => 0.0,
+                'utilidad_operacional' => 0.0,
+                'utilidad_neta' => 0.0,
+                'gastos_operativos' => 0.0,
+                'gastos_fijos' => 0.0,
+                'gastos_financieros' => 0.0,
+            ];
+        };
+
+        $byMonth = [];
+        for ($m = 1; $m <= 12; $m++) {
+            $byMonth[$m] = $empty($m);
+        }
+
+        $addMonth = static function (array &$target, int $m, string $key, float $value): void {
+            if ($m < 1 || $m > 12 || abs($value) < 0.00001) {
+                return;
+            }
+            $target[$m][$key] = round((float)$target[$m][$key] + $value, 2);
+        };
+
+        $costExpr = $this->schemaHasColumn('sale_items', 'unit_cost')
+            ? 'COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)'
+            : 'COALESCE(p.purchase_price, 0)';
+
+        // —— Ventas completed (mismo criterio que dashboard / reportes / contabilidad)
+        if ($this->schemaHasTable('sales')) {
+            try {
+                $salesRows = $this->query(
+                    "SELECT MONTH(s.sale_date) AS m,
+                            COALESCE(SUM(s.total), 0) AS ingresos
+                     FROM sales s
+                     WHERE s.sale_date >= ? AND s.sale_date < ?
+                       AND s.status = 'completed'
+                     GROUP BY MONTH(s.sale_date)",
+                    [$from, $toExcl]
+                )->fetchAll();
+                foreach ($salesRows as $row) {
+                    $addMonth($byMonth, (int)$row['m'], 'ingresos', (float)$row['ingresos']);
+                }
+
+                if ($this->schemaHasTable('sale_items')) {
+                    $cogsRows = $this->query(
+                        "SELECT MONTH(s.sale_date) AS m,
+                                COALESCE(SUM(si.quantity * {$costExpr}), 0) AS costo
+                         FROM sale_items si
+                         JOIN sales s ON s.id = si.sale_id
+                         LEFT JOIN products p ON p.id = si.product_id
+                         WHERE s.sale_date >= ? AND s.sale_date < ?
+                           AND s.status = 'completed'
+                         GROUP BY MONTH(s.sale_date)",
+                        [$from, $toExcl]
+                    )->fetchAll();
+                    foreach ($cogsRows as $row) {
+                        $addMonth($byMonth, (int)$row['m'], 'costo_venta', (float)$row['costo']);
+                    }
+                }
+            } catch (\Throwable $e) {
+                $warnings[] = 'ventas';
+                error_log('monthlyBalance sales: ' . $e->getMessage());
+            }
+        }
+
+        // —— Notas de crédito de venta (reducen ingresos y costo)
+        if ($this->schemaHasTable('sale_credit_notes')) {
+            try {
+                $ncRows = $this->query(
+                    "SELECT MONTH(cn.credit_date) AS m,
+                            COALESCE(SUM(cn.total), 0) AS total
+                     FROM sale_credit_notes cn
+                     WHERE cn.credit_date >= ? AND cn.credit_date < ?
+                       AND cn.status = 'posted'
+                     GROUP BY MONTH(cn.credit_date)",
+                    [$from, $toExcl]
+                )->fetchAll();
+                foreach ($ncRows as $row) {
+                    $addMonth($byMonth, (int)$row['m'], 'ingresos', -((float)$row['total']));
+                }
+
+                if ($this->schemaHasTable('sale_credit_note_items')) {
+                    $ncCostExpr = $this->schemaHasColumn('sale_credit_note_items', 'unit_cost')
+                        ? 'COALESCE(NULLIF(ci.unit_cost, 0), 0)'
+                        : '0';
+                    $ncCogs = $this->query(
+                        "SELECT MONTH(cn.credit_date) AS m,
+                                COALESCE(SUM(ci.quantity * {$ncCostExpr}), 0) AS costo
+                         FROM sale_credit_note_items ci
+                         JOIN sale_credit_notes cn ON cn.id = ci.credit_note_id
+                         WHERE cn.credit_date >= ? AND cn.credit_date < ?
+                           AND cn.status = 'posted'
+                         GROUP BY MONTH(cn.credit_date)",
+                        [$from, $toExcl]
+                    )->fetchAll();
+                    foreach ($ncCogs as $row) {
+                        $addMonth($byMonth, (int)$row['m'], 'costo_venta', -((float)$row['costo']));
+                    }
+                }
+            } catch (\Throwable $e) {
+                $warnings[] = 'nc_venta';
+                error_log('monthlyBalance sale NC: ' . $e->getMessage());
+            }
+        }
+
+        // —— Facturas de compra recibidas
+        $poDateParts = [];
+        if ($this->schemaHasColumn('purchase_orders', 'invoice_date')) {
+            $poDateParts[] = 'po.invoice_date';
+        }
+        if ($this->schemaHasColumn('purchase_orders', 'warehouse_date')) {
+            $poDateParts[] = 'po.warehouse_date';
+        }
+        $poDateParts[] = 'po.received_at';
+        $poDateParts[] = 'po.order_date';
+        $poDateExpr = 'COALESCE(' . implode(', ', $poDateParts) . ')';
+
+        $hasPaidTotal = $this->schemaHasColumn('purchase_orders', 'paid_total');
+        $hasCreditTotal = $this->schemaHasColumn('purchase_orders', 'credit_total');
+        $hasPaymentMode = $this->schemaHasColumn('purchase_orders', 'payment_mode');
+        $hasEarlyDisc = $this->schemaHasColumn('purchase_orders', 'early_payment_discount_amount');
+        $hasCommDisc = $this->schemaHasColumn('purchase_orders', 'commercial_discount_amount');
+
+        $contadoModes = "('cash','transfer','card')";
+        $contadoSql = $hasPaymentMode
+            ? "CASE WHEN COALESCE(po.payment_mode,'payable') IN {$contadoModes} THEN po.total ELSE 0 END"
+            : '0';
+        $creditoSql = $hasPaymentMode
+            ? "CASE WHEN COALESCE(po.payment_mode,'payable') = 'payable' THEN po.total ELSE 0 END"
+            : 'po.total';
+
+        $pendSql = 'po.total';
+        if ($hasPaidTotal) {
+            $pendSql .= ' - COALESCE(po.paid_total,0)';
+        }
+        if ($hasCreditTotal) {
+            $pendSql .= ' - COALESCE(po.credit_total,0)';
+        }
+        $pendSql = "GREATEST({$pendSql}, 0)";
+
+        $discParts = [];
+        if ($hasEarlyDisc) {
+            $discParts[] = 'COALESCE(po.early_payment_discount_amount,0)';
+        }
+        if ($hasCommDisc) {
+            $discParts[] = 'COALESCE(po.commercial_discount_amount,0)';
+        }
+        $discSql = $discParts !== [] ? implode(' + ', $discParts) : '0';
+
+        if ($this->schemaHasTable('purchase_orders')) {
+            try {
+                $voidFilter = $this->schemaHasColumn('purchase_orders', 'voided_at')
+                    ? ' AND po.voided_at IS NULL'
+                    : '';
+                $poRows = $this->query(
+                    "SELECT MONTH({$poDateExpr}) AS m,
+                            COALESCE(SUM(po.total), 0) AS total,
+                            COALESCE(SUM({$contadoSql}), 0) AS contado,
+                            COALESCE(SUM({$creditoSql}), 0) AS credito,
+                            COALESCE(SUM({$pendSql}), 0) AS pendientes,
+                            COALESCE(SUM({$discSql}), 0) AS descuentos
+                     FROM purchase_orders po
+                     WHERE po.status = 'received'
+                       {$voidFilter}
+                       AND {$poDateExpr} >= ?
+                       AND {$poDateExpr} < ?
+                     GROUP BY MONTH({$poDateExpr})",
+                    [$from, $toExcl]
+                )->fetchAll();
+                foreach ($poRows as $row) {
+                    $m = (int)$row['m'];
+                    $addMonth($byMonth, $m, 'facturas_total', (float)$row['total']);
+                    $addMonth($byMonth, $m, 'facturas_contado', (float)$row['contado']);
+                    $addMonth($byMonth, $m, 'facturas_credito', (float)$row['credito']);
+                    $addMonth($byMonth, $m, 'facturas_pendientes', (float)$row['pendientes']);
+                    $addMonth($byMonth, $m, 'facturas_descuentos', -((float)$row['descuentos']));
+                }
+            } catch (\Throwable $e) {
+                $warnings[] = 'compras';
+                error_log('monthlyBalance purchases: ' . $e->getMessage());
+            }
+        }
+
+        // —— $ Fact. Pagadas:
+        // 1) abonos a crédito (supplier_payments.payment_date)
+        // 2) contado al recibir (paid_total / total − NC, en fecha de factura)
+        if ($this->schemaHasTable('supplier_payments')) {
+            try {
+                $payStatus = $this->schemaHasColumn('supplier_payments', 'status')
+                    ? "AND sp.status = 'applied'"
+                    : '';
+                $payRows = $this->query(
+                    "SELECT MONTH(sp.payment_date) AS m,
+                            COALESCE(SUM(sp.amount), 0) AS pagado
+                     FROM supplier_payments sp
+                     WHERE sp.payment_date >= ? AND sp.payment_date < ?
+                       {$payStatus}
+                     GROUP BY MONTH(sp.payment_date)",
+                    [$from, $toExcl]
+                )->fetchAll();
+                foreach ($payRows as $row) {
+                    $addMonth($byMonth, (int)$row['m'], 'facturas_pagadas', (float)$row['pagado']);
+                }
+            } catch (\Throwable $e) {
+                $warnings[] = 'abonos';
+                error_log('monthlyBalance payments: ' . $e->getMessage());
+            }
+        }
+
+        if ($this->schemaHasTable('purchase_orders') && $hasPaymentMode) {
+            try {
+                $cashPaidExpr = $hasPaidTotal
+                    ? 'COALESCE(po.paid_total, 0)'
+                    : ($hasCreditTotal
+                        ? 'GREATEST(po.total - COALESCE(po.credit_total,0), 0)'
+                        : 'po.total');
+                $voidFilter = $this->schemaHasColumn('purchase_orders', 'voided_at')
+                    ? ' AND po.voided_at IS NULL'
+                    : '';
+                $cashRows = $this->query(
+                    "SELECT MONTH({$poDateExpr}) AS m,
+                            COALESCE(SUM({$cashPaidExpr}), 0) AS pagado
+                     FROM purchase_orders po
+                     WHERE po.status = 'received'
+                       {$voidFilter}
+                       AND COALESCE(po.payment_mode,'payable') IN {$contadoModes}
+                       AND {$poDateExpr} >= ?
+                       AND {$poDateExpr} < ?
+                     GROUP BY MONTH({$poDateExpr})",
+                    [$from, $toExcl]
+                )->fetchAll();
+                foreach ($cashRows as $row) {
+                    $addMonth($byMonth, (int)$row['m'], 'facturas_pagadas', (float)$row['pagado']);
+                }
+            } catch (\Throwable $e) {
+                $warnings[] = 'pagos_contado';
+                error_log('monthlyBalance cash paid: ' . $e->getMessage());
+            }
+        }
+
+        // —— Gastos por grupo (operativo / fijo / financiero)
+        if ($this->schemaHasTable('expenses')) {
+            try {
+                $expStatus = $this->schemaHasColumn('expenses', 'status')
+                    ? "AND COALESCE(e.status, 'active') <> 'cancelled'"
+                    : '';
+                $hasCategory = $this->schemaHasColumn('expenses', 'category');
+                $catSelect = $hasCategory ? "COALESCE(e.category, 'general')" : "'general'";
+                $catGroup = $hasCategory ? "COALESCE(e.category, 'general')" : "'general'";
+                $expRows = $this->query(
+                    "SELECT MONTH(e.expense_date) AS m,
+                            {$catSelect} AS category,
+                            COALESCE(SUM(e.amount), 0) AS total
+                     FROM expenses e
+                     WHERE e.expense_date >= ? AND e.expense_date < ?
+                       {$expStatus}
+                     GROUP BY MONTH(e.expense_date), {$catGroup}",
+                    [$from, $toExcl]
+                )->fetchAll();
+                foreach ($expRows as $row) {
+                    $m = (int)$row['m'];
+                    $amount = round((float)$row['total'], 2);
+                    $group = function_exists('\\SoftNova\\Core\\expense_category_group')
+                        ? \SoftNova\Core\expense_category_group((string)$row['category'])
+                        : 'operating';
+                    if ($group === 'fixed') {
+                        $addMonth($byMonth, $m, 'gastos_fijos', $amount);
+                    } elseif ($group === 'financial') {
+                        $addMonth($byMonth, $m, 'gastos_financieros', $amount);
+                    } else {
+                        $addMonth($byMonth, $m, 'gastos_operativos', $amount);
+                    }
+                }
+            } catch (\Throwable $e) {
+                $warnings[] = 'gastos';
+                error_log('monthlyBalance expenses: ' . $e->getMessage());
+            }
+        }
+
+        $totals = $empty(0);
+        unset($totals['month'], $totals['month_label']);
+        $months = [];
+        foreach ($byMonth as $row) {
+            // Evitar negativos fantasma por redondeo en NC > ventas del mes
+            $row['ingresos'] = round((float)$row['ingresos'], 2);
+            $row['costo_venta'] = max(0.0, round((float)$row['costo_venta'], 2));
+            $row['utilidad_bruta'] = round($row['ingresos'] - $row['costo_venta'], 2);
+            $row['utilidad_operacional'] = round(
+                $row['utilidad_bruta'] - (float)$row['gastos_operativos'],
+                2
+            );
+            $row['utilidad_neta'] = round(
+                $row['utilidad_operacional']
+                - (float)$row['gastos_fijos']
+                - (float)$row['gastos_financieros'],
+                2
+            );
+            $months[] = $row;
+            foreach ($totals as $k => $_) {
+                $totals[$k] = round((float)($totals[$k] ?? 0) + (float)($row[$k] ?? 0), 2);
+            }
+        }
+
+        $chart = [
+            'labels' => array_map(static fn(array $r): string => (string)$r['month_label'], $months),
+            'ingresos' => array_map(static fn(array $r): float => round((float)$r['ingresos'], 2), $months),
+            'costo_venta' => array_map(static fn(array $r): float => round((float)$r['costo_venta'], 2), $months),
+            'facturas_total' => array_map(static fn(array $r): float => round((float)$r['facturas_total'], 2), $months),
+            'facturas_pagadas' => array_map(static fn(array $r): float => round((float)$r['facturas_pagadas'], 2), $months),
+            'utilidad_bruta' => array_map(static fn(array $r): float => round((float)$r['utilidad_bruta'], 2), $months),
+            'utilidad_operacional' => array_map(static fn(array $r): float => round((float)$r['utilidad_operacional'], 2), $months),
+            'utilidad_neta' => array_map(static fn(array $r): float => round((float)$r['utilidad_neta'], 2), $months),
+        ];
+
+        return [
+            'year' => $year,
+            'months' => $months,
+            'totals' => $totals,
+            'chart' => $chart,
+            'meta' => [
+                'from' => $from,
+                'to' => sprintf('%04d-12-31', $year),
+                'warnings' => array_values(array_unique($warnings)),
+            ],
+        ];
     }
 
     public function ledger(int $accountId, string $from, string $to): array
@@ -1497,7 +2596,7 @@ class AccountingService
 
     public function financialStatements(string $from, string $to): array
     {
-        $rows = $this->trialBalance($from, $to);
+        $rows = $this->trialBalanceRows($from, $to);
         $result = [
             'assets' => [], 'liabilities' => [], 'equity' => [],
             'revenue' => [], 'expenses' => [],
@@ -1576,6 +2675,51 @@ class AccountingService
         )->fetchColumn();
     }
 
+    /**
+     * Fecha de contabilización cuando el periodo preferido está cerrado:
+     * usa hoy si está abierto; si no, el primer día del siguiente periodo abierto.
+     */
+    private function resolvePostingDate(string $preferred, ?string $fallback = null): string
+    {
+        foreach ([$preferred, $fallback] as $candidate) {
+            if (!is_string($candidate) || $candidate === '') {
+                continue;
+            }
+            $dt = \DateTimeImmutable::createFromFormat('Y-m-d', $candidate);
+            if (!$dt || $dt->format('Y-m-d') !== $candidate) {
+                continue;
+            }
+            if (!$this->isPeriodClosed($candidate)) {
+                return $candidate;
+            }
+        }
+
+        $start = $preferred;
+        $dtPreferred = \DateTimeImmutable::createFromFormat('Y-m-d', $preferred);
+        if (!$dtPreferred || $dtPreferred->format('Y-m-d') !== $preferred) {
+            $start = date('Y-m-d');
+            $dtPreferred = new \DateTimeImmutable($start);
+        }
+
+        $cursor = $dtPreferred->modify('first day of this month');
+        for ($i = 0; $i < 48; $i++) {
+            $candidate = $cursor->format('Y-m-d');
+            if (!$this->isPeriodClosed($candidate)) {
+                // Si el mes abierto es el actual, preferir hoy (no el día 1).
+                $today = date('Y-m-d');
+                if ($cursor->format('Y-m') === date('Y-m') && !$this->isPeriodClosed($today)) {
+                    return $today;
+                }
+                return $candidate;
+            }
+            $cursor = $cursor->modify('first day of next month');
+        }
+
+        throw new \RuntimeException(
+            'No hay periodo contable abierto para registrar el asiento. Abra un periodo en Contabilidad.'
+        );
+    }
+
     private function nextEntryNumber(string $date): string
     {
         $prefix = 'CC-' . date('Ym', strtotime($date)) . '-';
@@ -1610,6 +2754,36 @@ class AccountingService
         return is_string($value) && $value !== '' ? $value : $default;
     }
 
+    /**
+     * Crédito contable cuando el gasto ya está pagado pero NO salió del cajón POS.
+     * Efectivo desde Gastos = retiro cajero / ahorros → banco (111005), nunca 110505.
+     */
+    private function paidExpenseCreditAccount(string $method, ?array $category): string
+    {
+        unset($category);
+        if ($method === 'cash' || $method === '') {
+            return $this->setting('bank_account', '111005');
+        }
+        return $this->paymentAccount($method);
+    }
+
+    /**
+     * Cuenta de crédito del neto de nómina. Nunca usa caja POS (110505).
+     */
+    private function payrollNetCreditAccount(string $method, bool $paid): string
+    {
+        if (!$paid) {
+            return $this->setting('payroll_payable_account', '250505');
+        }
+        $method = strtolower(trim($method));
+        $electronic = ['transfer', 'card', 'debit_card', 'credit_card', 'dataphone', 'payment_link', 'nequi', 'daviplata', 'breb'];
+        if (in_array($method, $electronic, true)) {
+            return $this->setting('bank_account', '111005');
+        }
+        // Efectivo u otros: contabiliza contra CxP nómina (pago fuera del cajón físico).
+        return $this->setting('payroll_payable_account', '250505');
+    }
+
     private function paymentAccount(string $method): string
     {
         // Efectivo → caja; resto de medios electrónicos → banco
@@ -1621,7 +2795,10 @@ class AccountingService
                 ? $this->setting('bank_account', '111005')
                 : $this->setting('cash_account', '110505');
         }
-        return in_array($method, ['card', 'debit_card', 'credit_card', 'dataphone', 'payment_link', 'transfer'], true)
+        return in_array($method, [
+            'card', 'debit_card', 'credit_card', 'dataphone', 'payment_link', 'transfer',
+            'nequi', 'daviplata', 'breb',
+        ], true)
             ? $this->setting('bank_account', '111005')
             : $this->setting('cash_account', '110505');
     }
@@ -1660,8 +2837,13 @@ class AccountingService
         $tax = round((float)$order['tax'], 2);
         $total = round((float)$order['total'], 2);
         $discount = round((float)($order['early_payment_discount_amount'] ?? 0), 2);
+        $commercialDiscount = round((float)($order['commercial_discount_amount'] ?? 0), 2);
         $gross = round($subtotal + $tax, 2);
         if ($total <= 0) {
+            // Solo bonificaciones / regalo (total 0): stock ya entró; no hay asiento CxP/caja.
+            if ($subtotal <= 0.009 && $tax <= 0.009) {
+                return null;
+            }
             throw new \RuntimeException('La orden no tiene total contable');
         }
 
@@ -1712,6 +2894,18 @@ class AccountingService
                 $gross > 0 ? $gross : $total,
                 0,
                 'Entrada mercancía ' . $label
+            );
+        }
+
+        if ($commercialDiscount > 0.009) {
+            $lines[] = $this->line(
+                $this->setting('purchase_discount_account', '421040'),
+                0,
+                $commercialDiscount,
+                'Descuento comercial ' . $label,
+                'supplier',
+                $order['supplier_id'] ?? null,
+                $order['supplier_name'] ?? null
             );
         }
 
@@ -1795,42 +2989,101 @@ class AccountingService
 
         $date = date('Y-m-d', strtotime((string)$note['credit_date']));
         $paymentMode = (string)($note['payment_mode'] ?? 'payable');
-        $debitCode = match ($paymentMode) {
-            'cash' => $this->setting('cash_account', '110505'),
-            'transfer', 'card' => $this->setting('bank_account', '111005'),
-            default => $this->setting('payable_account', '220505'),
-        };
-        $debitLabel = match ($paymentMode) {
-            'cash' => 'Devolución/crédito compra en efectivo',
-            'transfer', 'card' => 'Devolución/crédito compra transferencia',
-            default => 'Nota crédito proveedor (reduce CxP)',
-        };
-
         $label = 'NCC ' . $note['credit_number'] . ' / OC ' . $note['order_number'];
         $affectsStock = (int)($note['affects_stock'] ?? 1) === 1;
+        $supplierId = $note['supplier_id'] ?? $note['po_supplier_id'] ?? null;
+        $supplierName = $note['supplier_name'] ?? null;
         $lines = [];
 
-        // Débito: reduce lo que se debe al proveedor (o recupera caja si se pagó de contado).
-        $lines[] = $this->line(
-            $debitCode,
-            $total,
-            0,
-            $debitLabel . ' ' . $label,
-            'supplier',
-            $note['supplier_id'] ?? $note['po_supplier_id'] ?? null,
-            $note['supplier_name'] ?? null
-        );
+        // Débito: reduce CxP / recupera caja-banco. Si la OC a crédito ya tenía abonos,
+        // no sobre-debitar 220505: el excedente va a bancos (reembolso / saldo a favor).
+        $payableDebit = $total;
+        $refundDebit = 0.0;
+        if ($paymentMode === 'payable' || $paymentMode === '') {
+            $orderId = (int)($note['purchase_order_id'] ?? 0);
+            $unpaidBefore = 0.0;
+            try {
+                $ops = $this->query(
+                    "SELECT po.total,
+                            COALESCE((
+                                SELECT SUM(sp.amount) FROM supplier_payments sp
+                                WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                            ), 0) paid,
+                            COALESCE((
+                                SELECT SUM(cn.total) FROM purchase_credit_notes cn
+                                WHERE cn.purchase_order_id = po.id AND cn.status = 'posted' AND cn.id <> ?
+                            ), 0) credited
+                     FROM purchase_orders po
+                     WHERE po.id = ?",
+                    [$creditNoteId, $orderId]
+                )->fetch();
+                if ($ops) {
+                    $unpaidBefore = round(
+                        max(0, (float)$ops['total'] - (float)$ops['paid'] - (float)$ops['credited']),
+                        2
+                    );
+                }
+            } catch (\Throwable $e) {
+                $unpaidBefore = $total;
+            }
+            if ($total > $unpaidBefore + 0.009) {
+                $payableDebit = $unpaidBefore;
+                $refundDebit = round($total - $unpaidBefore, 2);
+            }
+            if ($payableDebit > 0.009) {
+                $lines[] = $this->line(
+                    $this->setting('payable_account', '220505'),
+                    $payableDebit,
+                    0,
+                    'Nota crédito proveedor (reduce CxP) ' . $label,
+                    'supplier',
+                    $supplierId,
+                    $supplierName
+                );
+            }
+            if ($refundDebit > 0.009) {
+                $lines[] = $this->line(
+                    $this->setting('bank_account', '111005'),
+                    $refundDebit,
+                    0,
+                    'Reembolso / saldo a favor tras NC ' . $label,
+                    'supplier',
+                    $supplierId,
+                    $supplierName
+                );
+            }
+        } else {
+            $debitCode = match ($paymentMode) {
+                'cash' => $this->setting('cash_account', '110505'),
+                'transfer', 'card' => $this->setting('bank_account', '111005'),
+                default => $this->setting('payable_account', '220505'),
+            };
+            $debitLabel = match ($paymentMode) {
+                'cash' => 'Devolución/crédito compra en efectivo',
+                'transfer', 'card' => 'Devolución/crédito compra transferencia',
+                default => 'Nota crédito proveedor (reduce CxP)',
+            };
+            $lines[] = $this->line(
+                $debitCode,
+                $total,
+                0,
+                $debitLabel . ' ' . $label,
+                'supplier',
+                $supplierId,
+                $supplierName
+            );
+        }
 
-        // Reverso del ingreso por descuento de la OC (si aplica).
+        // Reverso del ingreso por descuentos de la OC (comercial + pronto pago) si aplica.
         if ($discount > 0.009) {
             $lines[] = $this->line(
                 $this->setting('purchase_discount_account', '421040'),
                 $discount,
                 0,
-                'Reverso descuento pronto pago / aliado ' . $label,
+                'Reverso descuentos compra ' . $label,
                 'supplier',
-                $note['supplier_id'] ?? $note['po_supplier_id'] ?? null,
-                $note['supplier_name'] ?? null
+                $supplierId,
+                $supplierName
             );
         }
 
@@ -1928,18 +3181,7 @@ class AccountingService
         }
 
         $date = date('Y-m-d', strtotime((string)$note['credit_date']));
-        $refundMethod = $svc->resolveRefundMethod($note);
-        $creditCode = match ($refundMethod) {
-            'cash' => $this->setting('cash_account', '110505'),
-            'transfer' => $this->setting('bank_account', '111005'),
-            default => $this->setting('receivable_account', '130505'),
-        };
-        $creditLabel = match ($refundMethod) {
-            'cash' => 'Reembolso en efectivo',
-            'transfer' => 'Reembolso transferencia/banco',
-            default => 'Reduce cuenta por cobrar',
-        };
-
+        $allocation = $svc->allocateRefund($creditNoteId);
         $label = 'NCV ' . $note['credit_number']
             . (!empty($note['invoice_number']) ? ' / ' . $note['invoice_number'] : '');
         $affectsStock = (int)($note['affects_stock'] ?? 1) === 1;
@@ -1980,46 +3222,149 @@ class AccountingService
             );
         }
 
-        // Crédito: CxC o reembolso caja/banco.
-        $lines[] = $this->line(
-            $creditCode,
-            0,
-            $total,
-            $creditLabel . ' ' . $label,
-            'customer',
-            $note['customer_id'] ?? null,
-            $note['customer_name'] ?? null
-        );
+        // Crédito: puede repartirse entre CxC / caja / banco (pago mixto o parcial).
+        $recv = round((float)($allocation['receivable'] ?? 0), 2);
+        $cashAmt = round((float)($allocation['cash'] ?? 0), 2);
+        $transferAmt = round((float)($allocation['transfer'] ?? 0), 2);
+        $creditedSum = round($recv + $cashAmt + $transferAmt, 2);
+        if (abs($creditedSum - $total) > 0.02) {
+            // Seguridad: si la asignación no cuadra, usar método simple.
+            $method = $svc->resolveRefundMethod($note);
+            $recv = $cashAmt = $transferAmt = 0.0;
+            if ($method === 'cash') {
+                $cashAmt = $total;
+            } elseif ($method === 'transfer') {
+                $transferAmt = $total;
+            } else {
+                $recv = $total;
+            }
+        }
+        if ($recv > 0.009) {
+            $lines[] = $this->line(
+                $this->setting('receivable_account', '130505'),
+                0,
+                $recv,
+                'Reduce cuenta por cobrar ' . $label,
+                'customer',
+                $note['customer_id'] ?? null,
+                $note['customer_name'] ?? null
+            );
+        }
+        if ($cashAmt > 0.009) {
+            $lines[] = $this->line(
+                $this->setting('cash_account', '110505'),
+                0,
+                $cashAmt,
+                'Reembolso en efectivo ' . $label,
+                'customer',
+                $note['customer_id'] ?? null,
+                $note['customer_name'] ?? null
+            );
+        }
+        if ($transferAmt > 0.009) {
+            $lines[] = $this->line(
+                $this->setting('bank_account', '111005'),
+                0,
+                $transferAmt,
+                'Reembolso transferencia/banco ' . $label,
+                'customer',
+                $note['customer_id'] ?? null,
+                $note['customer_name'] ?? null
+            );
+        }
+        if ($recv <= 0.009 && $cashAmt <= 0.009 && $transferAmt <= 0.009) {
+            $lines[] = $this->line(
+                $this->setting('receivable_account', '130505'),
+                0,
+                $total,
+                'Reduce cuenta por cobrar ' . $label,
+                'customer',
+                $note['customer_id'] ?? null,
+                $note['customer_name'] ?? null
+            );
+        }
 
-        // Reverso CMV / inventario si el producto reingresa.
-        if ($affectsStock) {
-            $cost = 0.0;
-            foreach ($note['items'] ?? [] as $it) {
-                $unitCost = (float)($it['unit_cost'] ?? 0);
-                $qty = (int)($it['quantity'] ?? 0);
-                if ($unitCost <= 0 && !empty($it['product_id'])) {
-                    $unitCost = (float)$this->query(
-                        "SELECT COALESCE(purchase_price, 0) FROM products WHERE id = ?",
-                        [(int)$it['product_id']]
-                    )->fetchColumn();
+        // Reverso CMV / inventario (propio) y CxP consignación.
+        // Consignación: siempre se revierte la CxP al consignante (aunque no reingrese stock).
+        $costOwned = 0.0;
+        $costConsignment = 0.0;
+        foreach ($note['items'] ?? [] as $it) {
+            $unitCost = (float)($it['unit_cost'] ?? 0);
+            $qty = (int)($it['quantity'] ?? 0);
+            $productId = !empty($it['product_id']) ? (int)$it['product_id'] : 0;
+            $saleItemId = !empty($it['sale_item_id']) ? (int)$it['sale_item_id'] : 0;
+            $isConsignment = false;
+            if ($saleItemId > 0) {
+                try {
+                    $flag = $this->query(
+                        "SELECT COALESCE(si.is_consignment, 0) is_consignment,
+                                COALESCE(p.ownership, 'owned') ownership
+                         FROM sale_items si
+                         LEFT JOIN products p ON p.id = si.product_id
+                         WHERE si.id = ? LIMIT 1",
+                        [$saleItemId]
+                    )->fetch();
+                    if ($flag) {
+                        $isConsignment = ((int)($flag['is_consignment'] ?? 0) === 1)
+                            || (($flag['ownership'] ?? '') === 'consignment');
+                    }
+                } catch (\Throwable $e) {
+                    // ignore
                 }
-                $cost += round($unitCost * $qty, 2);
             }
-            $cost = round($cost, 2);
-            if ($cost > 0.009) {
-                $lines[] = $this->line(
-                    $this->setting('inventory_account', '143501'),
-                    $cost,
-                    0,
-                    'Reingreso inventario ' . $label
-                );
-                $lines[] = $this->line(
-                    $this->setting('cost_of_sales_account', '613501'),
-                    0,
-                    $cost,
-                    'Reverso CMV ' . $label
-                );
+            if (!$isConsignment && $productId > 0) {
+                try {
+                    $own = (string)$this->query(
+                        "SELECT COALESCE(ownership, 'owned') FROM products WHERE id = ?",
+                        [$productId]
+                    )->fetchColumn();
+                    $isConsignment = $own === 'consignment';
+                } catch (\Throwable $e) {
+                    // ignore
+                }
             }
+            if ($unitCost <= 0 && $productId > 0) {
+                $unitCost = (float)$this->query(
+                    "SELECT COALESCE(purchase_price, 0) FROM products WHERE id = ?",
+                    [$productId]
+                )->fetchColumn();
+            }
+            $lineCost = round($unitCost * $qty, 2);
+            if ($isConsignment) {
+                $costConsignment += $lineCost;
+            } elseif ($affectsStock) {
+                $costOwned += $lineCost;
+            }
+        }
+        $costOwned = round($costOwned, 2);
+        $costConsignment = round($costConsignment, 2);
+        if ($costOwned > 0.009) {
+            $lines[] = $this->line(
+                $this->setting('inventory_account', '143501'),
+                $costOwned,
+                0,
+                'Reingreso inventario ' . $label
+            );
+            $lines[] = $this->line(
+                $this->setting('cost_of_sales_account', '613501'),
+                0,
+                $costOwned,
+                'Reverso CMV ' . $label
+            );
+        }
+        if ($costConsignment > 0.009) {
+            $lines[] = $this->line(
+                $this->setting('consignor_payable_account', '220510'),
+                $costConsignment,
+                0,
+                'Reverso CxP consignante ' . $label
+            );
+            $lines[] = $this->line(
+                $this->setting('consignment_cost_account', '613510'),
+                0,
+                $costConsignment,
+                'Reverso costo consignación ' . $label
+            );
         }
 
         $entryId = $this->postEntry(
@@ -2028,7 +3373,7 @@ class AccountingService
             $lines,
             'sale_credit_note',
             $creditNoteId,
-            'posted'
+            'created'
         );
 
         $this->query(
@@ -2072,15 +3417,30 @@ class AccountingService
         }
 
         $referenceType = (string)($movement['reference_type'] ?? '');
-        if (in_array($referenceType, ['sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return'], true)) {
+        if (in_array($referenceType, [
+            'sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note',
+            'loan', 'loan_return', 'loan_received', 'loan_received_return', 'status_change',
+            'consignment_in', 'consignment_return',
+        ], true)) {
             // sale/return/NCV: asiento de venta. purchase_order / NCC: asiento propio.
-            // loan / loan_return: no son pérdida (se espera devolución).
+            // loan / consignación / status_change: sin capitalizar inventario propio.
             return null;
         }
+
+        $paymentMode = (string)($movement['payment_mode'] ?? '');
+        $type = (string)$movement['type'];
 
         $amount = round((float)($movement['total_cost'] ?? 0), 2);
         if ($amount <= 0) {
             $amount = round((float)($movement['unit_cost'] ?? 0) * abs((int)$movement['quantity']), 2);
+        }
+        if ($amount <= 0 && ($referenceType === 'inventory_exit' || $paymentMode === 'loss' || $type === 'out')) {
+            // Último recurso: valorizar a PVP para no dejar la pérdida sin asiento.
+            $sale = (float)$this->query(
+                "SELECT COALESCE(sale_price, 0) FROM products WHERE id = ?",
+                [(int)$movement['product_id']]
+            )->fetchColumn();
+            $amount = round($sale * abs((int)$movement['quantity']), 2);
         }
         if ($amount <= 0) {
             return null;
@@ -2092,8 +3452,6 @@ class AccountingService
             ? date('Y-m-d', strtotime((string)$movement['movement_date']))
             : date('Y-m-d', strtotime((string)$movement['created_at']));
         $inventory = $this->setting('inventory_account', '143501');
-        $paymentMode = (string)($movement['payment_mode'] ?? '');
-        $type = (string)$movement['type'];
 
         // Ajuste negativo o salida no-venta: merma / pérdida operativa
         $isOutbound = $type === 'out'
@@ -2106,22 +3464,25 @@ class AccountingService
                 $this->setting('inventory_adjustment_account', '519595')
             );
             $exitNote = trim((string)($movement['notes'] ?? ''));
+            $debitMemo = $exitNote !== ''
+                ? $exitNote
+                : ('Pérdida / salida inventario: ' . $label);
             $lines = [
                 $this->line(
                     $lossAccount,
                     $amount,
                     0,
-                    ($exitNote !== '' ? $exitNote : ('Pérdida / salida inventario: ' . $label))
+                    mb_substr($debitMemo, 0, 255)
                 ),
                 $this->line(
                     $inventory,
                     0,
                     $amount,
-                    'Salida de inventario: ' . $label
+                    'Baja de inventario (activo): ' . $label
                 ),
             ];
             $description = $referenceType === 'inventory_exit'
-                ? ('Salida inventario (pérdida): ' . $label)
+                ? ('Pérdida inventario: ' . $label . ' · $' . number_format($amount, 2, '.', ''))
                 : ('Ajuste inventario (−) ' . $label);
         } else {
             // Entrada / apertura / ajuste positivo
@@ -2214,8 +3575,9 @@ class AccountingService
             $this->setting('inventory_account', '143501'),
             "SELECT COALESCE(SUM(stock * purchase_price), 0)
              FROM products
-             WHERE COALESCE(product_type, 'product') = 'product' AND status = 'active'",
-            'El costo promedio cambia con cada compra; una brecha pequeña es normal.'
+             WHERE COALESCE(product_type, 'product') = 'product' AND status = 'active'
+               AND COALESCE(ownership, 'owned') = 'owned'",
+            'El costo promedio cambia con cada compra; una brecha pequeña es normal. La consignación no se capitaliza en 143501.'
         );
 
         return array_values(array_filter($rows));
@@ -2238,7 +3600,7 @@ class AccountingService
                  FROM accounting_lines l
                  JOIN accounting_accounts a ON a.id = l.account_id
                  JOIN accounting_entries e ON e.id = l.entry_id
-                 WHERE a.code = ? AND e.status = 'posted'",
+                 WHERE a.code = ? AND e.status IN ('posted', 'reversed')",
                 [$accountCode]
             )->fetchColumn();
         } catch (\Throwable $e) {
@@ -2259,6 +3621,60 @@ class AccountingService
             'gap' => round($operational - $accounting, 2),
             'hint' => $hint,
         ];
+    }
+
+    /**
+     * Liquidación a consignante: Dr. CxP consignantes / Cr. caja o banco.
+     */
+    public function postConsignmentSettlement(int $settlementId): ?int
+    {
+        $row = $this->query(
+            "SELECT s.*, c.name consignor_name
+             FROM consignment_settlements s
+             LEFT JOIN consignors c ON c.id = s.consignor_id
+             WHERE s.id = ?",
+            [$settlementId]
+        )->fetch();
+        if (!$row) {
+            throw new \RuntimeException('Liquidación de consignación no encontrada');
+        }
+        if (!empty($row['accounting_entry_id'])) {
+            return (int)$row['accounting_entry_id'];
+        }
+        $amount = round((float)$row['amount'], 2);
+        if ($amount <= 0) {
+            return null;
+        }
+        $method = (string)($row['payment_method'] ?? 'cash');
+        $creditAccount = PaymentMethodCatalog::affectsCash($method)
+            ? $this->setting('cash_account', '110505')
+            : $this->setting('bank_account', '111005');
+        $name = (string)($row['consignor_name'] ?? 'Consignante');
+        $lines = [
+            $this->line(
+                $this->setting('consignor_payable_account', '220510'),
+                $amount,
+                0,
+                'Liquidación consignación · ' . $name,
+                'consignor',
+                (int)$row['consignor_id'],
+                $name
+            ),
+            $this->line(
+                $creditAccount,
+                0,
+                $amount,
+                'Pago a consignante · ' . PaymentMethodCatalog::label($method, $this->db)
+            ),
+        ];
+        return $this->postEntry(
+            date('Y-m-d', strtotime((string)$row['settlement_date'])),
+            'Liquidación consignación #' . $settlementId . ' · ' . $name,
+            $lines,
+            'consignment_settlement',
+            $settlementId,
+            'created'
+        );
     }
 
     /**
@@ -2294,6 +3710,12 @@ class AccountingService
         $date = date('Y-m-d', strtotime((string)$payment['payment_date']));
         $method = (string)($payment['payment_method'] ?? 'cash');
         $supplierName = (string)($payment['supplier_name'] ?? 'Proveedor');
+        $cashFromDrawer = !array_key_exists('cash_from_drawer', $payment)
+            || (int)$payment['cash_from_drawer'] === 1;
+        // Efectivo fuera del cajón: crédito a bancos (igual que gastos fuera de POS), no 110505.
+        $creditCode = ($method === 'cash' && !$cashFromDrawer)
+            ? $this->setting('bank_account', '111005')
+            : $this->paymentAccount($method);
 
         $label = $supplierName;
         if (!empty($payment['order_number'])) {
@@ -2301,6 +3723,14 @@ class AccountingService
         }
         if (!empty($payment['invoice_number'])) {
             $label .= ' / Factura ' . $payment['invoice_number'];
+        }
+
+        $creditDetail = 'Pago a proveedor ' . $label;
+        if ($method === 'cash' && !$cashFromDrawer) {
+            $src = trim((string)($payment['cash_source_note'] ?? ''));
+            $creditDetail .= $src !== ''
+                ? (' · Efectivo fuera del cajón: ' . $src)
+                : ' · Efectivo fuera del cajón';
         }
 
         $lines = [
@@ -2314,10 +3744,10 @@ class AccountingService
                 $supplierName
             ),
             $this->line(
-                $this->paymentAccount($method),
+                $creditCode,
                 0,
                 $amount,
-                'Pago a proveedor ' . $label,
+                $creditDetail,
                 'supplier',
                 $payment['supplier_id'] ?? null,
                 $supplierName
@@ -2417,6 +3847,8 @@ class AccountingService
      */
     public function postCashSessionClosing(int $sessionId): ?int
     {
+        SupplyChainSchema::ensure($this->db);
+
         $session = $this->query(
             "SELECT * FROM cash_sessions WHERE id = ?",
             [$sessionId]

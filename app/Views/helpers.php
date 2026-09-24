@@ -144,6 +144,10 @@ if (!function_exists('flashMessage')) {
             $html .= '<div class="alert alert-error">' . htmlspecialchars($_SESSION['error']) . '</div>';
             unset($_SESSION['error']);
         }
+        if (isset($_SESSION['warning'])) {
+            $html .= '<div class="alert alert-warning">' . htmlspecialchars($_SESSION['warning']) . '</div>';
+            unset($_SESSION['warning']);
+        }
         return $html;
     }
 }

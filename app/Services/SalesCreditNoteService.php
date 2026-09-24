@@ -154,7 +154,7 @@ class SalesCreditNoteService
 
     /**
      * @param list<array{sale_item_id:int,quantity:int}> $lines
-     * @return array{credit_note_id:int,credit_number:string,total:float}
+     * @return array{credit_note_id:int,credit_number:string,total:float,allocation:array<string,float>}
      */
     public function create(
         int $saleId,
@@ -167,12 +167,10 @@ class SalesCreditNoteService
     ): array {
         $this->ensureSchema();
 
-        $sale = $this->getSaleForCredit($saleId);
-        if (!$sale) {
-            throw new \RuntimeException('Venta no encontrada');
-        }
-        if (($sale['status'] ?? '') === 'cancelled') {
-            throw new \RuntimeException('No se puede emitir NC sobre una venta cancelada');
+        $reasonCode = substr(trim($reasonCode), 0, 40);
+        // Vencido/roto no debe volver a bodega vendible (evita NC históricas con stock=1 por error).
+        if (in_array($reasonCode, ['expired', 'broken'], true)) {
+            $affectsStock = false;
         }
 
         $stock = new StockService($this->db);
@@ -180,96 +178,224 @@ class SalesCreditNoteService
         $refundMethod = in_array($refundMethod, ['auto', 'cash', 'transfer', 'receivable'], true)
             ? $refundMethod
             : 'auto';
-
-        $itemsById = [];
-        foreach ($sale['items'] as $item) {
-            $itemsById[(int)$item['id']] = $item;
-        }
-
-        $normalized = [];
-        $subtotal = 0.0;
-        $tax = 0.0;
-        foreach ($lines as $line) {
-            $itemId = (int)($line['sale_item_id'] ?? 0);
-            $qty = (int)($line['quantity'] ?? 0);
-            if ($itemId <= 0 || $qty <= 0) {
-                continue;
-            }
-            $item = $itemsById[$itemId] ?? null;
-            if (!$item) {
-                throw new \InvalidArgumentException('Línea de venta inválida en la nota de crédito');
-            }
-            $sold = (int)($item['quantity'] ?? 0);
-            $already = (int)($item['credited_qty'] ?? 0);
-            $available = $sold - $already;
-            if ($qty > $available) {
-                throw new \InvalidArgumentException(
-                    'Cantidad a devolver supera lo disponible en «' . ($item['product_name'] ?? '') . '»'
-                    . ' (máx. ' . max(0, $available) . ')'
-                );
-            }
-            $unitPrice = round((float)($item['unit_price'] ?? 0), 2);
-            $unitCost = round((float)($item['unit_cost'] ?? 0), 2);
-            $rate = round((float)($item['tax_rate'] ?? 0), 2);
-            $lineSub = round($qty * $unitPrice, 2);
-            // Preferir prorrateo del impuesto real de la línea si existe.
-            $itemSub = round((float)($item['subtotal'] ?? $lineSub), 2);
-            $itemTax = round((float)($item['tax_amount'] ?? 0), 2);
-            if ($itemSub > 0.009 && $itemTax > 0.009 && $sold > 0) {
-                $lineTax = round($itemTax * ($qty / $sold), 2);
-            } else {
-                $lineTax = round($lineSub * ($rate / 100), 2);
-            }
-            $normalized[] = [
-                'sale_item_id' => $itemId,
-                'product_id' => !empty($item['product_id']) ? (int)$item['product_id'] : null,
-                'product_name' => (string)$item['product_name'],
-                'quantity' => $qty,
-                'unit_price' => $unitPrice,
-                'unit_cost' => $unitCost,
-                'tax_rate' => $rate,
-                'tax_amount' => $lineTax,
-                'subtotal' => $lineSub,
-                'line_total' => round($lineSub + $lineTax, 2),
-            ];
-            $subtotal += $lineSub;
-            $tax += $lineTax;
-        }
-
-        if ($normalized === []) {
-            throw new \InvalidArgumentException('Indique al menos un producto y cantidad para la nota de crédito');
-        }
-
-        $subtotal = round($subtotal, 2);
-        $tax = round($tax, 2);
-        $total = round($subtotal + $tax, 2);
-        $creditNumber = $this->nextCreditNumber($creditDate);
         $reason = trim($reason);
-        $reasonCode = substr(trim($reasonCode), 0, 40);
+
+        // DDL de consignación fuera de la TX (MySQL CREATE/ALTER = COMMIT implícito).
+        try {
+            (new ConsignmentService($this->db, $stock))->ensureSchema();
+        } catch (\Throwable $e) {
+            error_log('NC consign schema: ' . $e->getMessage());
+        }
 
         $this->db->beginTransaction();
         try {
-            $this->query(
-                "INSERT INTO sale_credit_notes
-                    (credit_number, sale_id, customer_id, credit_date, reason, reason_code,
-                     refund_method, affects_stock, subtotal, tax, total, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    $creditNumber,
-                    $saleId,
-                    $sale['customer_id'] ?: null,
-                    $creditDate,
-                    $reason !== '' ? $reason : null,
-                    $reasonCode !== '' ? $reasonCode : null,
-                    $refundMethod,
-                    $affectsStock ? 1 : 0,
-                    $subtotal,
-                    $tax,
-                    $total,
-                    $_SESSION['tenant_user_id'] ?? null,
-                ]
-            );
-            $creditNoteId = (int)$this->db->lastInsertId();
+            try {
+                $saleRow = $this->query(
+                    "SELECT s.*, c.name AS customer_name
+                     FROM sales s
+                     LEFT JOIN customers c ON c.id = s.customer_id
+                     WHERE s.id = ?
+                     FOR UPDATE",
+                    [$saleId]
+                )->fetch();
+            } catch (\Throwable $e) {
+                $saleRow = $this->query(
+                    "SELECT s.*, c.name AS customer_name
+                     FROM sales s
+                     LEFT JOIN customers c ON c.id = s.customer_id
+                     WHERE s.id = ?",
+                    [$saleId]
+                )->fetch();
+            }
+
+            if (!$saleRow) {
+                throw new \RuntimeException('Venta no encontrada');
+            }
+            if (($saleRow['status'] ?? '') === 'cancelled') {
+                throw new \RuntimeException('No se puede emitir NC sobre una venta cancelada');
+            }
+
+            $items = [];
+            try {
+                $items = $this->query(
+                    "SELECT si.*,
+                            COALESCE(si.is_consignment, 0) AS is_consignment,
+                            COALESCE(p.ownership, 'owned') AS ownership,
+                            COALESCE((
+                                SELECT SUM(ci.quantity)
+                                FROM sale_credit_note_items ci
+                                INNER JOIN sale_credit_notes cn ON cn.id = ci.credit_note_id
+                                WHERE ci.sale_item_id = si.id AND cn.status = 'posted'
+                            ), 0) AS credited_qty
+                     FROM sale_items si
+                     LEFT JOIN products p ON p.id = si.product_id
+                     WHERE si.sale_id = ?
+                     ORDER BY si.id
+                     FOR UPDATE",
+                    [$saleId]
+                )->fetchAll();
+            } catch (\Throwable $e) {
+                $items = $this->query(
+                    "SELECT si.*,
+                            COALESCE((
+                                SELECT SUM(ci.quantity)
+                                FROM sale_credit_note_items ci
+                                INNER JOIN sale_credit_notes cn ON cn.id = ci.credit_note_id
+                                WHERE ci.sale_item_id = si.id AND cn.status = 'posted'
+                            ), 0) AS credited_qty
+                     FROM sale_items si
+                     WHERE si.sale_id = ?
+                     ORDER BY si.id",
+                    [$saleId]
+                )->fetchAll();
+            }
+
+            $itemsById = [];
+            foreach ($items as $item) {
+                $itemsById[(int)$item['id']] = $item;
+            }
+
+            $normalized = [];
+            $subtotal = 0.0;
+            $tax = 0.0;
+            $saleSubtotal = round((float)($saleRow['subtotal'] ?? 0), 2);
+            $saleDiscount = round((float)($saleRow['discount'] ?? 0), 2);
+            $saleTaxHeader = round((float)($saleRow['tax'] ?? 0), 2);
+            $discRatio = $saleSubtotal > 0.009 ? ($saleDiscount / $saleSubtotal) : 0.0;
+            $saleTaxable = max(0.0, round($saleSubtotal - $saleDiscount, 2));
+
+            foreach ($lines as $line) {
+                $itemId = (int)($line['sale_item_id'] ?? 0);
+                $qty = (int)($line['quantity'] ?? 0);
+                if ($itemId <= 0 || $qty <= 0) {
+                    continue;
+                }
+                $item = $itemsById[$itemId] ?? null;
+                if (!$item) {
+                    throw new \InvalidArgumentException('Línea de venta inválida en la nota de crédito');
+                }
+                $sold = (int)($item['quantity'] ?? 0);
+                $already = (int)($item['credited_qty'] ?? 0);
+                $available = $sold - $already;
+                if ($qty > $available) {
+                    throw new \InvalidArgumentException(
+                        'Cantidad a devolver supera lo disponible en «' . ($item['product_name'] ?? '') . '»'
+                        . ' (máx. ' . max(0, $available) . ')'
+                    );
+                }
+                $unitPrice = round((float)($item['unit_price'] ?? 0), 2);
+                $unitCost = round((float)($item['unit_cost'] ?? 0), 2);
+                $rate = round((float)($item['tax_rate'] ?? 0), 2);
+                $grossLineSub = round($qty * $unitPrice, 2);
+                // Prorratear descuento del documento para no sobre-acreditar vs la venta neta.
+                $itemDiscStored = round((float)($item['discount_amount'] ?? 0), 2);
+                if ($itemDiscStored > 0.009 && $sold > 0) {
+                    $lineDisc = round($itemDiscStored * ($qty / $sold), 2);
+                } else {
+                    $lineDisc = round($grossLineSub * $discRatio, 2);
+                }
+                if ($lineDisc > $grossLineSub) {
+                    $lineDisc = $grossLineSub;
+                }
+                $lineSub = max(0.0, round($grossLineSub - $lineDisc, 2));
+                $itemTax = round((float)($item['tax_amount'] ?? 0), 2);
+                $itemTaxableStored = round((float)($item['taxable'] ?? 0), 2);
+                if ($itemTax > 0.009 && $sold > 0) {
+                    $lineTax = round($itemTax * ($qty / $sold), 2);
+                } elseif ($rate > 0.009) {
+                    $lineTax = round($lineSub * ($rate / 100), 2);
+                } elseif ($saleTaxHeader > 0.009 && $saleTaxable > 0.009) {
+                    // Histórico sin tax_amount: repartir IVA del encabezado por base neta.
+                    $lineTax = round($saleTaxHeader * ($lineSub / $saleTaxable), 2);
+                    if ($rate <= 0.009 && $lineSub > 0.009) {
+                        $rate = round(($lineTax / $lineSub) * 100, 2);
+                    }
+                } else {
+                    $lineTax = 0.0;
+                }
+                // Si hay taxable guardado, preferir proporción para el IVA.
+                if ($itemTaxableStored > 0.009 && $itemTax > 0.009 && $sold > 0 && $lineSub <= 0.009) {
+                    $lineSub = round($itemTaxableStored * ($qty / $sold), 2);
+                }
+                $normalized[] = [
+                    'sale_item_id' => $itemId,
+                    'product_id' => !empty($item['product_id']) ? (int)$item['product_id'] : null,
+                    'product_name' => (string)$item['product_name'],
+                    'quantity' => $qty,
+                    'unit_price' => $unitPrice,
+                    'unit_cost' => $unitCost,
+                    'tax_rate' => $rate,
+                    'tax_amount' => $lineTax,
+                    'subtotal' => $lineSub,
+                    'line_total' => round($lineSub + $lineTax, 2),
+                    'is_consignment' => !empty($item['is_consignment'])
+                        || (($item['ownership'] ?? '') === 'consignment'),
+                ];
+                $subtotal += $lineSub;
+                $tax += $lineTax;
+            }
+
+            if ($normalized === []) {
+                throw new \InvalidArgumentException('Indique al menos un producto y cantidad para la nota de crédito');
+            }
+
+            // Ajuste de redondeo del IVA al último ítem.
+            $subtotal = round($subtotal, 2);
+            $tax = round($tax, 2);
+            $total = round($subtotal + $tax, 2);
+            $taxSumLines = 0.0;
+            foreach ($normalized as $row) {
+                $taxSumLines += $row['tax_amount'];
+            }
+            $taxDiff = round($tax - $taxSumLines, 2);
+            if (abs($taxDiff) >= 0.01 && $normalized !== []) {
+                $last = count($normalized) - 1;
+                $normalized[$last]['tax_amount'] = round($normalized[$last]['tax_amount'] + $taxDiff, 2);
+                $normalized[$last]['line_total'] = round(
+                    $normalized[$last]['subtotal'] + $normalized[$last]['tax_amount'],
+                    2
+                );
+            }
+
+            $creditNoteId = 0;
+            $creditNumber = '';
+            $attempts = 0;
+            while ($attempts < 5) {
+                $attempts++;
+                $creditNumber = $this->nextCreditNumber($creditDate);
+                try {
+                    $this->query(
+                        "INSERT INTO sale_credit_notes
+                            (credit_number, sale_id, customer_id, credit_date, reason, reason_code,
+                             refund_method, affects_stock, subtotal, tax, total, created_by)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            $creditNumber,
+                            $saleId,
+                            $saleRow['customer_id'] ?: null,
+                            $creditDate,
+                            $reason !== '' ? $reason : null,
+                            $reasonCode !== '' ? $reasonCode : null,
+                            $refundMethod,
+                            $affectsStock ? 1 : 0,
+                            $subtotal,
+                            $tax,
+                            $total,
+                            $_SESSION['tenant_user_id'] ?? null,
+                        ]
+                    );
+                    $creditNoteId = (int)$this->db->lastInsertId();
+                    break;
+                } catch (\PDOException $e) {
+                    // Colisión de número único: reintentar con siguiente secuencia.
+                    if ($attempts >= 5 || !str_contains(strtolower($e->getMessage()), 'duplicate')) {
+                        throw $e;
+                    }
+                }
+            }
+            if ($creditNoteId <= 0) {
+                throw new \RuntimeException('No se pudo asignar número de nota de crédito');
+            }
 
             foreach ($normalized as $row) {
                 $this->query(
@@ -292,37 +418,154 @@ class SalesCreditNoteService
                     ]
                 );
 
-                // Devolución del cliente → reingreso a bodega (si aplica).
-                // Productos vencidos/rotos: desmarcar affects_stock para no reingresar.
                 if ($affectsStock && !empty($row['product_id'])) {
+                    $debtCover = null;
                     $stock->increase(
                         (int)$row['product_id'],
                         (int)$row['quantity'],
                         'sale_credit_note',
                         $creditNoteId,
-                        'NC venta ' . $creditNumber . ' / ' . ($sale['invoice_number'] ?? ''),
+                        'NC venta ' . $creditNumber . ' / ' . ($saleRow['invoice_number'] ?? ''),
                         'in',
                         (float)$row['unit_cost'] > 0 ? (float)$row['unit_cost'] : null,
                         null,
                         null,
-                        false
+                        false,
+                        $creditDate,
+                        null,
+                        $debtCover,
+                        false // igual que devolución por anulación: no cubre sobreventas ajenas
+                    );
+                }
+                if (!empty($row['is_consignment'])) {
+                    (new ConsignmentService($this->db, $stock))->reduceDebtForCreditNote(
+                        (int)$row['sale_item_id'],
+                        (int)$row['quantity']
                     );
                 }
             }
 
             $this->db->commit();
         } catch (\Throwable $e) {
-            $this->db->rollBack();
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
             throw $e;
         }
 
         $this->syncReceivable($saleId);
+        $allocation = $this->allocateRefund($creditNoteId);
 
         return [
             'credit_note_id' => $creditNoteId,
             'credit_number' => $creditNumber,
             'total' => $total,
+            'allocation' => $allocation,
         ];
+    }
+
+    /**
+     * Reparte el total de la NC: primero reduce CxC pendiente; el resto se reembolsa
+     * (efectivo cobrado primero, luego transferencia/banco).
+     *
+     * @return array{receivable:float,cash:float,transfer:float,method:string}
+     */
+    public function allocateRefund(int $creditNoteId): array
+    {
+        $note = $this->getCreditNote($creditNoteId);
+        if (!$note || ($note['status'] ?? '') !== 'posted') {
+            return ['receivable' => 0.0, 'cash' => 0.0, 'transfer' => 0.0, 'method' => 'auto'];
+        }
+
+        $ncTotal = round((float)$note['total'], 2);
+        $saleId = (int)($note['sale_id'] ?? 0);
+        $saleTotal = round((float)($note['sale_total'] ?? 0), 2);
+        $paid = round((float)($note['paid_amount'] ?? 0), 2);
+        $forced = (string)($note['refund_method'] ?? 'auto');
+
+        $otherCredited = (float)$this->query(
+            "SELECT COALESCE(SUM(total), 0) FROM sale_credit_notes
+             WHERE sale_id = ? AND status = 'posted' AND id <> ?",
+            [$saleId, $creditNoteId]
+        )->fetchColumn();
+
+        $openBefore = max(0.0, round($saleTotal - $otherCredited - $paid, 2));
+        $toReceivable = min($ncTotal, $openBefore);
+        $toRefund = max(0.0, round($ncTotal - $toReceivable, 2));
+
+        $cashPaid = $this->cashPaidOnSale($saleId, $note);
+        $cashAlreadyRefunded = $this->cashAlreadyRefundedOnSale($saleId, $creditNoteId);
+        $cashAvailable = max(0.0, round($cashPaid - $cashAlreadyRefunded, 2));
+
+        if ($forced === 'receivable') {
+            return [
+                'receivable' => $ncTotal,
+                'cash' => 0.0,
+                'transfer' => 0.0,
+                'method' => 'receivable',
+            ];
+        }
+        if ($forced === 'cash') {
+            return [
+                'receivable' => 0.0,
+                'cash' => $ncTotal,
+                'transfer' => 0.0,
+                'method' => 'cash',
+            ];
+        }
+        if ($forced === 'transfer') {
+            return [
+                'receivable' => 0.0,
+                'cash' => 0.0,
+                'transfer' => $ncTotal,
+                'method' => 'transfer',
+            ];
+        }
+
+        // auto
+        $toCash = min($toRefund, $cashAvailable);
+        $toTransfer = max(0.0, round($toRefund - $toCash, 2));
+        $method = 'receivable';
+        if ($toCash > 0.009 && $toTransfer <= 0.009 && $toReceivable <= 0.009) {
+            $method = 'cash';
+        } elseif ($toTransfer > 0.009 && $toCash <= 0.009 && $toReceivable <= 0.009) {
+            $method = 'transfer';
+        } elseif ($toReceivable > 0.009 && $toCash <= 0.009 && $toTransfer <= 0.009) {
+            $method = 'receivable';
+        } else {
+            $method = 'mixed';
+        }
+
+        return [
+            'receivable' => round($toReceivable, 2),
+            'cash' => round($toCash, 2),
+            'transfer' => round($toTransfer, 2),
+            'method' => $method,
+        ];
+    }
+
+    /** Efectivo ya reembolsado por otras NC de la misma venta. */
+    private function cashAlreadyRefundedOnSale(int $saleId, int $excludeCreditNoteId = 0): float
+    {
+        if ($saleId <= 0) {
+            return 0.0;
+        }
+        try {
+            $sql = "SELECT COALESCE(SUM(cm.amount), 0)
+                    FROM cash_movements cm
+                    INNER JOIN sale_credit_notes cn ON cn.id = cm.reference_id
+                    WHERE cm.reference_type = 'sale_credit_note'
+                      AND cm.type = 'expense'
+                      AND cn.sale_id = ?";
+            $params = [$saleId];
+            if ($excludeCreditNoteId > 0) {
+                $sql .= ' AND cn.id <> ?';
+                $params[] = $excludeCreditNoteId;
+            }
+            return round((float)$this->query($sql, $params)->fetchColumn(), 2);
+        } catch (\Throwable $e) {
+            return 0.0;
+        }
     }
 
     /** Reduce el saldo de CxC considerando NC emitidas. */
@@ -355,27 +598,32 @@ class SalesCreditNoteService
         $balance = max(0, round($netTotal - $paid, 2));
 
         try {
-            (new ReceivableService($this->db))->applyPayment($saleId, $paid, $netTotal);
+            (new ReceivableService($this->db))->applyPayment($saleId, min($paid, $netTotal), $netTotal);
         } catch (\Throwable $e) {
             // Si no hay fila de CxC, no bloquear.
         }
 
-        // Si ya no hay saldo neto pendiente, marcar venta como pagada.
-        if ($balance <= 0.009 && $netTotal > 0.009) {
+        // Sin saldo neto pendiente (incluye NC total: netTotal=0) → marcada pagada.
+        if ($balance <= 0.009) {
             $this->query(
                 "UPDATE sales SET payment_status = 'paid' WHERE id = ? AND status <> 'cancelled'",
                 [$saleId]
             );
-        } elseif ($paid > 0.009 && $balance > 0.009) {
+        } elseif ($paid > 0.009) {
             $this->query(
                 "UPDATE sales SET payment_status = 'partial' WHERE id = ? AND status <> 'cancelled'",
+                [$saleId]
+            );
+        } else {
+            $this->query(
+                "UPDATE sales SET payment_status = 'pending' WHERE id = ? AND status <> 'cancelled'",
                 [$saleId]
             );
         }
     }
 
     /**
-     * Reembolso en caja cuando la venta ya estaba cobrada en efectivo.
+     * Reembolso en caja cuando la asignación auto/forzada incluye efectivo.
      */
     public function syncCash(int $creditNoteId): string
     {
@@ -384,13 +632,9 @@ class SalesCreditNoteService
             return '';
         }
 
-        $method = $this->resolveRefundMethod($note);
-        if ($method !== 'cash') {
-            return '';
-        }
-
-        $total = round((float)$note['total'], 2);
-        if ($total <= 0.009) {
+        $allocation = $this->allocateRefund($creditNoteId);
+        $refundCash = round((float)($allocation['cash'] ?? 0), 2);
+        if ($refundCash <= 0.009) {
             return '';
         }
 
@@ -409,18 +653,32 @@ class SalesCreditNoteService
 
         $cash = new CashService($this->db);
         if (!$cash->getOpenSession()) {
-            return 'Aviso: no hay caja abierta; el reembolso en efectivo no se registró en el cajón.';
+            return 'Aviso: no hay caja abierta; el reembolso en efectivo ('
+                . number_format($refundCash, 0, ',', '.')
+                . ') no se registró en el cajón. Ábrala y ajuste manualmente o use «Sincronizar».';
         }
+
+        $invoice = trim((string)($note['invoice_number'] ?? ''));
+        $ncNumber = (string)($note['credit_number'] ?? ('#' . $creditNoteId));
+        $label = 'NC ' . $ncNumber . ($invoice !== '' ? ' · Factura ' . $invoice : '');
         try {
             $cash->registerMovement(
-                $total,
-                'Reembolso NC venta ' . ($note['credit_number'] ?? ('#' . $creditNoteId))
-                    . (!empty($note['invoice_number']) ? ' / ' . $note['invoice_number'] : ''),
+                $refundCash,
+                'Reembolso ' . $label,
                 'expense',
                 'sale_credit_note',
                 $creditNoteId
             );
-            return 'Reembolso en efectivo descontado del cajón.';
+            $extra = '';
+            if (($allocation['transfer'] ?? 0) > 0.009) {
+                $extra = ' Además: reembolso banco/transferencia '
+                    . number_format((float)$allocation['transfer'], 0, ',', '.') . '.';
+            }
+            if (($allocation['receivable'] ?? 0) > 0.009) {
+                $extra .= ' CxC reducida en '
+                    . number_format((float)$allocation['receivable'], 0, ',', '.') . '.';
+            }
+            return 'Reembolso en efectivo descontado del cajón (' . $label . ').' . $extra;
         } catch (\Throwable $e) {
             error_log('NC venta→Caja #' . $creditNoteId . ': ' . $e->getMessage());
             return 'Aviso: no se pudo registrar el reembolso en caja física.';
@@ -433,16 +691,54 @@ class SalesCreditNoteService
         if ($method !== 'auto') {
             return $method;
         }
+        $id = (int)($note['id'] ?? 0);
+        if ($id > 0) {
+            $allocation = $this->allocateRefund($id);
+            if (($allocation['method'] ?? '') === 'mixed') {
+                return 'mixed';
+            }
+            return (string)($allocation['method'] ?? 'receivable');
+        }
         $paid = (float)($note['paid_amount'] ?? 0);
         $saleTotal = (float)($note['sale_total'] ?? 0);
         $payMethod = (string)($note['payment_method'] ?? 'cash');
-        if ($paid >= ($saleTotal - 0.009) && PaymentMethodCatalog::affectsCash($payMethod)) {
+        $cashPaid = $this->cashPaidOnSale((int)($note['sale_id'] ?? 0), $note);
+        if ($cashPaid > 0.009 && $paid >= ($saleTotal - 0.009)) {
             return 'cash';
         }
         if ($paid >= ($saleTotal - 0.009)) {
             return 'transfer';
         }
         return 'receivable';
+    }
+
+    /** Efectivo cobrado en la factura original (pagos unitarios o medio único). */
+    private function cashPaidOnSale(int $saleId, array $note = []): float
+    {
+        $cash = 0.0;
+        if ($saleId > 0) {
+            try {
+                $rows = $this->query(
+                    "SELECT payment_method, amount FROM sale_payments WHERE sale_id = ?",
+                    [$saleId]
+                )->fetchAll();
+                foreach ($rows as $row) {
+                    if (PaymentMethodCatalog::affectsCash((string)($row['payment_method'] ?? ''))) {
+                        $cash += (float)($row['amount'] ?? 0);
+                    }
+                }
+            } catch (\Throwable $e) {
+                $cash = 0.0;
+            }
+        }
+        if ($cash > 0.009) {
+            return round($cash, 2);
+        }
+        $payMethod = (string)($note['payment_method'] ?? '');
+        if ($payMethod !== '' && $payMethod !== 'mixed' && PaymentMethodCatalog::affectsCash($payMethod)) {
+            return round((float)($note['paid_amount'] ?? 0), 2);
+        }
+        return 0.0;
     }
 
     /** @return array<string,mixed>|null */

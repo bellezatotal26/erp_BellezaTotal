@@ -17,7 +17,7 @@ return [
 
     'session' => [
         'name' => 'SOFTNOVA_SESSION',
-        'lifetime' => 7200,
+        'lifetime' => 57600, // 16h — Caja/almacén abierto todo el día
         'path' => '/',
         'domain' => '',
         'secure' => true,

@@ -138,7 +138,7 @@ class CatalogSyncService
     }
 
     /**
-     * @return array{created:int,updated:int,errors:int,skipped_stock:int,message?:string}
+     * @return array{created:int,updated:int,errors:int,skipped_stock:int,fetched:int}
      */
     public function import(string $providerCode, int $limit = 100): array
     {
@@ -152,12 +152,14 @@ class CatalogSyncService
         }
 
         $authority = $this->stockAuthority($providerCode);
+        $limit = max(1, min(500, $limit));
         $items = $provider->fetchProducts($limit);
         $created = 0;
         $updated = 0;
         $errors = 0;
         $skippedStock = 0;
         $stock = new StockService($this->db);
+        $hasBarcode = $this->productsHasBarcodeColumn();
 
         foreach ($items as $item) {
             try {
@@ -167,8 +169,9 @@ class CatalogSyncService
                     continue;
                 }
                 $existing = $this->db->prepare(
-                    "SELECT id, stock FROM products
-                     WHERE external_source = ? AND external_id = ? LIMIT 1"
+                    $hasBarcode
+                        ? "SELECT id, stock, barcode FROM products WHERE external_source = ? AND external_id = ? LIMIT 1"
+                        : "SELECT id, stock FROM products WHERE external_source = ? AND external_id = ? LIMIT 1"
                 );
                 $existing->execute([$providerCode, $extId]);
                 $row = $existing->fetch();
@@ -182,22 +185,45 @@ class CatalogSyncService
                 $cost = (float)($item['cost'] ?? 0);
                 $remoteStock = max(0, (int)($item['stock'] ?? 0));
                 $desc = (string)($item['description'] ?? '');
+                $barcode = trim((string)($item['barcode'] ?? ''));
+                if (mb_strlen($barcode) > 64) {
+                    $barcode = mb_substr($barcode, 0, 64);
+                }
 
                 if ($row) {
-                    $upd = $this->db->prepare(
-                        "UPDATE products SET name = ?, code = ?, sale_price = ?,
-                            purchase_price = IF(? > 0, ?, purchase_price),
-                            description = IF(? = '', description, ?),
-                            source_channel = ?, updated_at = NOW()
-                         WHERE id = ?"
-                    );
-                    $upd->execute([
-                        $name, $code, $price,
-                        $cost, $cost,
-                        $desc, $desc,
-                        $providerCode,
-                        $row['id'],
-                    ]);
+                    if ($hasBarcode && $barcode !== '' && empty($row['barcode'])) {
+                        $upd = $this->db->prepare(
+                            "UPDATE products SET name = ?, code = ?, sale_price = ?,
+                                purchase_price = IF(? > 0, ?, purchase_price),
+                                description = IF(? = '', description, ?),
+                                barcode = IF(COALESCE(barcode,'') = '', ?, barcode),
+                                source_channel = ?, updated_at = NOW()
+                             WHERE id = ?"
+                        );
+                        $upd->execute([
+                            $name, $code, $price,
+                            $cost, $cost,
+                            $desc, $desc,
+                            $barcode,
+                            $providerCode,
+                            $row['id'],
+                        ]);
+                    } else {
+                        $upd = $this->db->prepare(
+                            "UPDATE products SET name = ?, code = ?, sale_price = ?,
+                                purchase_price = IF(? > 0, ?, purchase_price),
+                                description = IF(? = '', description, ?),
+                                source_channel = ?, updated_at = NOW()
+                             WHERE id = ?"
+                        );
+                        $upd->execute([
+                            $name, $code, $price,
+                            $cost, $cost,
+                            $desc, $desc,
+                            $providerCode,
+                            $row['id'],
+                        ]);
+                    }
 
                     if ($authority === 'store') {
                         $diff = $remoteStock - (int)$row['stock'];
@@ -215,17 +241,31 @@ class CatalogSyncService
                     }
                     $updated++;
                 } else {
-                    $ins = $this->db->prepare(
-                        "INSERT INTO products
-                            (code, name, product_type, description, purchase_price, sale_price,
-                             stock, min_stock, unit, status, source_channel, external_source, external_id, created_by)
-                         VALUES (?, ?, 'product', ?, ?, ?, 0, 5, 'UNIDAD', 'active', ?, ?, ?, ?)"
-                    );
-                    $ins->execute([
-                        $code, $name, $desc ?: null, $cost, $price,
-                        $providerCode, $providerCode, $extId,
-                        $_SESSION['tenant_user_id'] ?? null,
-                    ]);
+                    if ($hasBarcode) {
+                        $ins = $this->db->prepare(
+                            "INSERT INTO products
+                                (code, barcode, name, product_type, description, purchase_price, sale_price,
+                                 stock, min_stock, unit, status, source_channel, external_source, external_id, created_by)
+                             VALUES (?, ?, ?, 'product', ?, ?, ?, 0, 5, 'UNIDAD', 'active', ?, ?, ?, ?)"
+                        );
+                        $ins->execute([
+                            $code, $barcode !== '' ? $barcode : null, $name, $desc ?: null, $cost, $price,
+                            $providerCode, $providerCode, $extId,
+                            $_SESSION['tenant_user_id'] ?? null,
+                        ]);
+                    } else {
+                        $ins = $this->db->prepare(
+                            "INSERT INTO products
+                                (code, name, product_type, description, purchase_price, sale_price,
+                                 stock, min_stock, unit, status, source_channel, external_source, external_id, created_by)
+                             VALUES (?, ?, 'product', ?, ?, ?, 0, 5, 'UNIDAD', 'active', ?, ?, ?, ?)"
+                        );
+                        $ins->execute([
+                            $code, $name, $desc ?: null, $cost, $price,
+                            $providerCode, $providerCode, $extId,
+                            $_SESSION['tenant_user_id'] ?? null,
+                        ]);
+                    }
                     $newId = (int)$this->db->lastInsertId();
 
                     // erp: altas en 0; store/create_only: cargar stock remoto inicial
@@ -242,11 +282,33 @@ class CatalogSyncService
             }
         }
 
+        try {
+            $this->settings->set($providerCode, 'last_sync_at', date('Y-m-d H:i:s'), false);
+        } catch (\Throwable $e) {
+            // no bloquear import por meta
+        }
+
         return [
             'created' => $created,
             'updated' => $updated,
             'errors' => $errors,
             'skipped_stock' => $skippedStock,
+            'fetched' => count($items),
         ];
+    }
+
+    private function productsHasBarcodeColumn(): bool
+    {
+        static $cached = null;
+        if ($cached !== null) {
+            return $cached;
+        }
+        try {
+            $st = $this->db->query("SHOW COLUMNS FROM products LIKE 'barcode'");
+            $cached = (bool)$st->fetch();
+        } catch (\Throwable $e) {
+            $cached = false;
+        }
+        return $cached;
     }
 }

@@ -45,7 +45,13 @@ class TenantCotizacionesController extends TenantController
         }
         if ($action === 'convert' && $this->request->method() === 'POST') {
             TenantMiddleware::authorize('cotizaciones', 'create');
+            TenantMiddleware::authorize('ventas', 'create');
             $this->convertToSale();
+            return;
+        }
+        if ($action === 'set_status' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('cotizaciones', 'edit');
+            $this->setQuoteStatus();
             return;
         }
         if ($action === 'pdf' && $this->request->method() === 'GET') {
@@ -108,12 +114,25 @@ class TenantCotizacionesController extends TenantController
             $params
         )->fetchAll();
         
-        $products = $this->query(
-            "SELECT id, name, code, sale_price, stock FROM products WHERE status = 'active' ORDER BY name"
-        )->fetchAll();
+        $products = [];
+        try {
+            $products = $this->query(
+                "SELECT id, name, code, sale_price, stock,
+                        COALESCE(tax_rate, NULL) tax_rate, COALESCE(taxable, 1) taxable
+                 FROM products WHERE status = 'active' ORDER BY name"
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $products = $this->query(
+                "SELECT id, name, code, sale_price, stock FROM products WHERE status = 'active' ORDER BY name"
+            )->fetchAll();
+        }
         $customers = $this->query(
-            "SELECT id, name, first_name, last_name FROM customers WHERE status = 'active' ORDER BY name"
+            "SELECT id, name, first_name, last_name, document_number, phone
+             FROM customers WHERE status = 'active' ORDER BY name"
         )->fetchAll();
+
+        \SoftNova\Services\TaxService::ensureSchema($this->db);
+        $defaultTaxRate = \SoftNova\Services\TaxService::defaultRate($this->db);
         
         $this->view('tenant.cotizaciones', $this->tenantViewData([
             'quotes' => $quotes,
@@ -121,6 +140,8 @@ class TenantCotizacionesController extends TenantController
             'customers' => $customers,
             'pagination' => $pagination,
             'filters' => $filters,
+            'defaultTaxRate' => $defaultTaxRate,
+            'taxEnabled' => \SoftNova\Services\TaxService::isCalculationEnabled($this->db),
         ]));
     }
     
@@ -159,6 +180,8 @@ class TenantCotizacionesController extends TenantController
         
         $quoteNumber = 'COT-' . date('Ymd') . '-' . strtoupper(substr(bin2hex(random_bytes(2)), 0, 4));
         
+        \SoftNova\Services\TaxService::ensureSchema($this->db);
+        $defaultTax = \SoftNova\Services\TaxService::defaultRate($this->db);
         $subtotal = 0;
         $validItems = [];
         foreach ($items as $item) {
@@ -180,6 +203,7 @@ class TenantCotizacionesController extends TenantController
                 'quantity' => $quantity,
                 'unit_price' => $up,
                 'subtotal' => $is,
+                'tax_rate' => \SoftNova\Services\TaxService::resolveProductRate($product, $defaultTax, $this->db),
             ];
         }
         
@@ -188,8 +212,9 @@ class TenantCotizacionesController extends TenantController
             return;
         }
         
-        $taxRate = (float)$this->getSetting('tax_rate', '0');
-        $tax = $subtotal * ($taxRate / 100);
+        $taxBreakdown = \SoftNova\Services\TaxService::applyDocumentDiscountAndTax($validItems, 0);
+        $tax = (float)$taxBreakdown['tax'];
+        $validItems = $taxBreakdown['lines'];
         $total = $subtotal + $tax;
         
         try {
@@ -201,11 +226,28 @@ class TenantCotizacionesController extends TenantController
             );
             $quoteId = (int)$this->db->lastInsertId();
             foreach ($validItems as $vi) {
-                $this->query(
-                    "INSERT INTO quote_items (quote_id, product_id, product_name, quantity, unit_price, subtotal)
-                     VALUES (?, ?, ?, ?, ?, ?)",
-                    [$quoteId, $vi['product_id'], $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['subtotal']]
-                );
+                try {
+                    $this->query(
+                        "INSERT INTO quote_items (quote_id, product_id, product_name, quantity, unit_price, subtotal, tax_rate, tax_amount)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            $quoteId,
+                            $vi['product_id'],
+                            $vi['product_name'],
+                            $vi['quantity'],
+                            $vi['unit_price'],
+                            $vi['subtotal'],
+                            round((float)($vi['tax_rate'] ?? 0), 2),
+                            round((float)($vi['tax_amount'] ?? 0), 2),
+                        ]
+                    );
+                } catch (\Throwable $e) {
+                    $this->query(
+                        "INSERT INTO quote_items (quote_id, product_id, product_name, quantity, unit_price, subtotal)
+                         VALUES (?, ?, ?, ?, ?, ?)",
+                        [$quoteId, $vi['product_id'], $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['subtotal']]
+                    );
+                }
             }
             $this->db->commit();
             $this->respond(true, 'Cotizacion creada: ' . $quoteNumber, '/app/cotizaciones');
@@ -217,6 +259,31 @@ class TenantCotizacionesController extends TenantController
         }
     }
     
+    private function setQuoteStatus(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/cotizaciones')) {
+            return;
+        }
+        $id = (int)$this->request->post('id');
+        $status = (string)$this->request->post('status', '');
+        if ($id <= 0 || !in_array($status, ['pending', 'accepted', 'rejected'], true)) {
+            $this->respond(false, 'Estado no válido', '/app/cotizaciones');
+            return;
+        }
+        $quote = $this->query("SELECT id, status FROM quotes WHERE id = ?", [$id])->fetch();
+        if (!$quote) {
+            $this->respond(false, 'Cotización no encontrada', '/app/cotizaciones');
+            return;
+        }
+        if (($quote['status'] ?? '') === 'converted') {
+            $this->respond(false, 'No se puede cambiar el estado de una cotización convertida', '/app/cotizaciones');
+            return;
+        }
+        $this->query("UPDATE quotes SET status = ?, updated_at = NOW() WHERE id = ? AND status <> 'converted'", [$status, $id]);
+        $labels = ['pending' => 'pendiente', 'accepted' => 'aceptada', 'rejected' => 'rechazada'];
+        $this->respond(true, 'Cotización marcada como ' . ($labels[$status] ?? $status), '/app/cotizaciones');
+    }
+
     private function deleteQuote(): void
     {
         if (!$this->validateCsrfOrFail('/app/cotizaciones')) {
@@ -266,78 +333,223 @@ class TenantCotizacionesController extends TenantController
         }
         
         $id = (int)$this->request->post('id');
-        $paymentMethod = $this->request->post('payment_method', 'cash');
+        $paymentMethod = \SoftNova\Services\PaymentMethodCatalog::normalize(
+            (string)$this->request->post('payment_method', 'cash')
+        );
         $paymentType = $this->request->post('payment_type', 'full');
         $initialPayment = \SoftNova\Core\parse_money($this->request->post('initial_payment', 0));
-        
-        $quote = $this->query(
-            "SELECT * FROM quotes WHERE id = ? AND status IN ('pending', 'accepted')",
-            [$id]
-        )->fetch();
-        
-        if (!$quote) {
-            $this->respond(false, 'Cotizacion no encontrada o ya convertida', '/app/cotizaciones');
-            return;
-        }
-        
-        $items = $this->query("SELECT * FROM quote_items WHERE quote_id = ?", [$id])->fetchAll();
-        if (empty($items)) {
-            $this->respond(false, 'La cotizacion no tiene productos', '/app/cotizaciones');
-            return;
-        }
-        
-        $prefix = $this->getSetting('invoice_prefix', 'FAC-');
-        $invoiceNumber = $prefix . date('Ymd') . '-' . strtoupper(substr(bin2hex(random_bytes(2)), 0, 4));
-        
-        $paymentStatus = $paymentType === 'credit' ? 'pending' : 'paid';
-        if ($paymentType === 'credit' && $initialPayment >= $quote['total']) {
-            $paymentStatus = 'paid';
+
+        // Efectivo requiere caja abierta (mismo criterio que Ventas).
+        $willTakeCash = ($paymentType !== 'credit' && $paymentMethod === 'cash')
+            || ($paymentType === 'credit' && $initialPayment > 0.009 && $paymentMethod === 'cash');
+        if ($willTakeCash) {
+            $openCash = $this->cash->getOpenSession();
+            if (!$openCash) {
+                $this->respond(false, 'Debe abrir caja para registrar cobros en efectivo', '/app/cotizaciones');
+                return;
+            }
         }
         
         try {
             $this->db->beginTransaction();
+
+            $quote = $this->query(
+                "SELECT * FROM quotes WHERE id = ? AND status IN ('pending', 'accepted') FOR UPDATE",
+                [$id]
+            )->fetch();
             
-            $this->query(
-                "INSERT INTO sales
-                    (invoice_number, customer_id, user_id, sale_date, subtotal, tax, discount, total,
-                     payment_method, payment_status, notes, status)
-                 VALUES (?, ?, ?, NOW(), ?, ?, 0, ?, ?, ?, ?, ?)",
-                [
-                    $invoiceNumber,
-                    $quote['customer_id'],
-                    $_SESSION['tenant_user_id'],
-                    $quote['subtotal'],
-                    $quote['tax'],
-                    $quote['total'],
-                    $paymentMethod,
-                    $paymentStatus,
-                    'Convertido de cotizacion: ' . $quote['quote_number'],
-                    $paymentStatus === 'paid' ? 'completed' : 'pending',
-                ]
+            if (!$quote) {
+                throw new \RuntimeException('Cotización no encontrada o ya convertida');
+            }
+            
+            $items = $this->query("SELECT * FROM quote_items WHERE quote_id = ?", [$id])->fetchAll();
+            if (empty($items)) {
+                throw new \RuntimeException('La cotización no tiene productos');
+            }
+
+            // Claim atómico: evita doble clic / race.
+            $claimed = $this->query(
+                "UPDATE quotes SET status = 'converted', updated_at = NOW()
+                 WHERE id = ? AND status IN ('pending','accepted')",
+                [$id]
             );
+            if ($claimed->rowCount() < 1) {
+                throw new \RuntimeException('La cotización ya fue convertida');
+            }
+            
+            $prefix = $this->getSetting('invoice_prefix', 'FAC-');
+            $invoiceNumber = $prefix . date('Ymd') . '-' . strtoupper(substr(bin2hex(random_bytes(2)), 0, 4));
+            
+            $paymentStatus = $paymentType === 'credit' ? 'pending' : 'paid';
+            if ($paymentType === 'credit' && $initialPayment >= (float)$quote['total']) {
+                $paymentStatus = 'paid';
+            }
+
+            $hasDocType = false;
+            try {
+                $col = $this->query("SHOW COLUMNS FROM sales LIKE 'document_type'")->fetch();
+                $hasDocType = (bool)$col;
+            } catch (\Throwable $e) {
+                $hasDocType = false;
+            }
+
+            if ($hasDocType) {
+                $this->query(
+                    "INSERT INTO sales
+                        (invoice_number, document_type, customer_id, user_id, sale_date, subtotal, tax, discount, total,
+                         payment_method, payment_status, notes, status)
+                     VALUES (?, 'invoice', ?, ?, NOW(), ?, ?, 0, ?, ?, ?, ?, ?)",
+                    [
+                        $invoiceNumber,
+                        $quote['customer_id'],
+                        $_SESSION['tenant_user_id'],
+                        $quote['subtotal'],
+                        $quote['tax'],
+                        $quote['total'],
+                        $paymentMethod,
+                        $paymentStatus,
+                        'Convertido de cotización: ' . $quote['quote_number'],
+                        $paymentStatus === 'paid' ? 'completed' : 'pending',
+                    ]
+                );
+            } else {
+                $this->query(
+                    "INSERT INTO sales
+                        (invoice_number, customer_id, user_id, sale_date, subtotal, tax, discount, total,
+                         payment_method, payment_status, notes, status)
+                     VALUES (?, ?, ?, NOW(), ?, ?, 0, ?, ?, ?, ?, ?)",
+                    [
+                        $invoiceNumber,
+                        $quote['customer_id'],
+                        $_SESSION['tenant_user_id'],
+                        $quote['subtotal'],
+                        $quote['tax'],
+                        $quote['total'],
+                        $paymentMethod,
+                        $paymentStatus,
+                        'Convertido de cotización: ' . $quote['quote_number'],
+                        $paymentStatus === 'paid' ? 'completed' : 'pending',
+                    ]
+                );
+            }
             $saleId = (int)$this->db->lastInsertId();
+
+            try {
+                $this->query("UPDATE quotes SET sale_id = ? WHERE id = ?", [$saleId, $id]);
+            } catch (\Throwable $e) {
+                // Columna sale_id aún no migrada
+            }
             
             foreach ($items as $item) {
                 $unitCost = 0.0;
-                if (!empty($item['product_id'])) {
-                    $unitCost = (float)$this->query(
-                        "SELECT COALESCE(purchase_price, 0) FROM products WHERE id = ?",
-                        [$item['product_id']]
-                    )->fetchColumn();
+                $isConsignment = false;
+                $consignorId = 0;
+                $productStock = null;
+                $taxRate = round((float)($item['tax_rate'] ?? 0), 2);
+                $taxAmount = round((float)($item['tax_amount'] ?? 0), 2);
+                if ($taxAmount <= 0 && $taxRate > 0) {
+                    $taxAmount = round((float)$item['subtotal'] * $taxRate / 100, 2);
                 }
-                $this->query(
-                    "INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    [$saleId, $item['product_id'], $item['product_name'], $item['quantity'], $item['unit_price'], $unitCost, $item['subtotal']]
-                );
+                if (!empty($item['product_id'])) {
+                    $product = $this->query(
+                        "SELECT COALESCE(purchase_price, 0) purchase_price, stock,
+                                COALESCE(ownership,'owned') ownership, consignor_id,
+                                COALESCE(product_type,'product') product_type, name
+                         FROM products WHERE id = ?",
+                        [$item['product_id']]
+                    )->fetch();
+                    if ($product) {
+                        $unitCost = (float)$product['purchase_price'];
+                        $isConsignment = ($product['ownership'] ?? 'owned') === 'consignment';
+                        $consignorId = (int)($product['consignor_id'] ?? 0);
+                        $productStock = (int)($product['stock'] ?? 0);
+                        if (($product['product_type'] ?? 'product') !== 'service'
+                            && (int)$item['quantity'] > max(0, $productStock)
+                        ) {
+                            if ($isConsignment) {
+                                throw new \RuntimeException(
+                                    'Stock consignado insuficiente para ' . ($product['name'] ?? 'producto')
+                                    . ' (disponible: ' . $productStock . ')'
+                                );
+                            }
+                        }
+                    }
+                }
+                $lineInserted = false;
+                try {
+                    $this->query(
+                        "INSERT INTO sale_items
+                            (sale_id, product_id, product_name, quantity, unit_price, unit_cost,
+                             is_consignment, consignor_id, subtotal, tax_rate, tax_amount, taxable)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            $saleId,
+                            $item['product_id'],
+                            $item['product_name'],
+                            $item['quantity'],
+                            $item['unit_price'],
+                            $unitCost,
+                            $isConsignment ? 1 : 0,
+                            $isConsignment && $consignorId > 0 ? $consignorId : null,
+                            $item['subtotal'],
+                            $taxRate,
+                            $taxAmount,
+                            (float)$item['subtotal'],
+                        ]
+                    );
+                    $lineInserted = true;
+                } catch (\Throwable $e) {
+                    // fallback sin columnas fiscales / consignación
+                }
+                if (!$lineInserted) {
+                    try {
+                        $this->query(
+                            "INSERT INTO sale_items
+                                (sale_id, product_id, product_name, quantity, unit_price, unit_cost,
+                                 is_consignment, consignor_id, subtotal, tax_rate, tax_amount)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                $saleId,
+                                $item['product_id'],
+                                $item['product_name'],
+                                $item['quantity'],
+                                $item['unit_price'],
+                                $unitCost,
+                                $isConsignment ? 1 : 0,
+                                $isConsignment && $consignorId > 0 ? $consignorId : null,
+                                $item['subtotal'],
+                                $taxRate,
+                                $taxAmount,
+                            ]
+                        );
+                        $lineInserted = true;
+                    } catch (\Throwable $e2) {
+                        $this->query(
+                            "INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal)
+                             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            [$saleId, $item['product_id'], $item['product_name'], $item['quantity'], $item['unit_price'], $unitCost, $item['subtotal']]
+                        );
+                    }
+                }
+                $saleItemId = (int)$this->db->lastInsertId();
                 if (!empty($item['product_id'])) {
                     $this->sales->stock()->decrease(
                         (int)$item['product_id'],
                         (int)$item['quantity'],
                         'sale',
                         $saleId,
-                        'Venta (desde cotizacion ' . $quote['quote_number'] . ')'
+                        'Venta (desde cotización ' . $quote['quote_number'] . ')'
                     );
+                    if ($isConsignment) {
+                        (new \SoftNova\Services\ConsignmentService($this->db, $this->sales->stock()))->registerSaleDebt(
+                            $saleId,
+                            $saleItemId,
+                            (int)$item['product_id'],
+                            (int)$item['quantity'],
+                            $unitCost,
+                            $consignorId > 0 ? $consignorId : null
+                        );
+                    }
                 }
             }
             
@@ -348,7 +560,7 @@ class TenantCotizacionesController extends TenantController
                     $this->query(
                         "INSERT INTO sale_payments (sale_id, amount, payment_method, notes, user_id)
                          VALUES (?, ?, ?, ?, ?)",
-                        [$saleId, $paidNow, $paymentMethod, 'Pago inicial desde cotizacion', $_SESSION['tenant_user_id']]
+                        [$saleId, $paidNow, $paymentMethod, 'Pago inicial desde cotización', $_SESSION['tenant_user_id']]
                     );
                     $cashAmount = $paidNow;
                     if ($paidNow >= (float)$quote['total']) {
@@ -363,16 +575,13 @@ class TenantCotizacionesController extends TenantController
                 $this->query(
                     "INSERT INTO sale_payments (sale_id, amount, payment_method, notes, user_id)
                      VALUES (?, ?, ?, ?, ?)",
-                    [$saleId, (float)$quote['total'], $paymentMethod, 'Pago completo desde cotizacion', $_SESSION['tenant_user_id']]
+                    [$saleId, (float)$quote['total'], $paymentMethod, 'Pago completo desde cotización', $_SESSION['tenant_user_id']]
                 );
                 $cashAmount = (float)$quote['total'];
             }
 
-            $this->query("UPDATE quotes SET status = 'converted', updated_at = NOW() WHERE id = ?", [$id]);
             $this->db->commit();
 
-            // Contabilización fuera de la transacción: un periodo cerrado u otro
-            // problema contable NO debe impedir convertir la cotización.
             try {
                 $this->accounting->postSaleCascade($saleId);
             } catch (\Throwable $e) {
@@ -385,11 +594,10 @@ class TenantCotizacionesController extends TenantController
                 error_log('Comisiones venta (cotizacion) ' . $saleId . ': ' . $e->getMessage());
             }
 
-            // Solo el efectivo entra a la caja física (evita descuadre con contabilidad).
             if ($cashAmount > 0 && $paymentMethod === 'cash') {
                 $label = ($paymentType === 'credit' && $paymentStatus !== 'paid')
-                    ? 'Abono inicial (cotizacion): ' . $invoiceNumber
-                    : 'Venta (desde cotizacion): ' . $invoiceNumber;
+                    ? 'Abono inicial (cotización): ' . $invoiceNumber
+                    : 'Venta (desde cotización): ' . $invoiceNumber;
                 $this->cash->registerIncome($cashAmount, $label, 'sale', $saleId);
             }
             
@@ -400,7 +608,7 @@ class TenantCotizacionesController extends TenantController
                     $invoiceNumber,
                     (float)$quote['total'],
                     min($initialPayment, (float)$quote['total']),
-                    'Convertido de cotizacion: ' . $quote['quote_number']
+                    'Convertido de cotización: ' . $quote['quote_number']
                 );
             }
 
@@ -416,12 +624,12 @@ class TenantCotizacionesController extends TenantController
                 $einvoiceNote = ' · FE no enviada';
             }
             
-            $this->respond(true, 'Cotizacion convertida a venta: ' . $invoiceNumber . $einvoiceNote, '/app/ventas');
+            $this->respond(true, 'Cotización convertida a venta: ' . $invoiceNumber . $einvoiceNote, '/app/ventas');
         } catch (\Exception $e) {
             if ($this->db->inTransaction()) {
                 $this->db->rollBack();
             }
-            $this->respond(false, 'Error: ' . $e->getMessage(), '/app/cotizaciones');
+            $this->respond(false, $this->clientErrorMessage($e, 'No se pudo convertir la cotización'), '/app/cotizaciones');
         }
     }
     

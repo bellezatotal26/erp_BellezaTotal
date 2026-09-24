@@ -24,13 +24,21 @@ class TenantContabilidadController extends TenantController
 
         if ($this->request->method() === 'POST') {
             $redirect = match ($action) {
-                'save-integration', 'set-active-provider', 'save-catalog-integration' => '/app/contabilidad?tab=integrations',
+                'save-integration', 'set-active-provider' => '/app/contabilidad?tab=integrations',
                 'save-account' => '/app/contabilidad?tab=accounts',
                 'save-commission-rates', 'save-commission-config', 'save-user-commission', 'settle-commissions' => '/app/contabilidad?tab=commissions',
                 'period' => '/app/contabilidad?tab=periods',
                 'manual-entry' => '/app/contabilidad?tab=entries',
                 default => '/app/contabilidad',
             };
+            if ($action === 'save-catalog-integration') {
+                // Compat: catálogo e-commerce vive en Inventario → Integraciones
+                if (!$this->validateCsrfOrFail('/app/inventario?integrations=1')) {
+                    return;
+                }
+                $this->redirectCatalogToInventario();
+                return;
+            }
             if (!$this->validateCsrfOrFail($redirect)) {
                 return;
             }
@@ -44,7 +52,6 @@ class TenantContabilidadController extends TenantController
                 'period' => $this->updatePeriod(),
                 'sync' => $this->syncOperations(),
                 'save-integration' => $this->saveIntegration(),
-                'save-catalog-integration' => $this->saveCatalogIntegration(),
                 'set-active-provider' => $this->setActiveProvider(),
                 default => $this->respond(false, 'Acción contable inválida', '/app/contabilidad'),
             };
@@ -59,16 +66,8 @@ class TenantContabilidadController extends TenantController
             $this->testIntegration();
             return;
         }
-        if ($action === 'catalog-test') {
-            $this->testCatalogIntegration();
-            return;
-        }
-        if ($action === 'ml-oauth-start') {
-            $this->mlOAuthStart();
-            return;
-        }
-        if ($action === 'ml-oauth-callback') {
-            $this->mlOAuthCallback();
+        if ($action === 'catalog-test' || $action === 'ml-oauth-start' || $action === 'ml-oauth-callback') {
+            $this->redirectCatalogToInventario($action);
             return;
         }
         if ($action === 'export') {
@@ -89,56 +88,114 @@ class TenantContabilidadController extends TenantController
         $tab = (string)$this->request->get('tab', 'dashboard');
         $accountId = max(0, (int)$this->request->get('account_id', 0));
         $integrations = new IntegrationManager($this->db);
-        $catalog = new \SoftNova\Services\Integrations\CatalogSyncService($this->db);
         \SoftNova\Services\TenantOpsSchema::ensure($this->db);
 
         $purchaseSummary = ['cnt' => 0, 'total' => 0.0];
         $invoiceTraceOrders = [];
         $invoiceTraceQ = trim((string)$this->request->get('q', ''));
+        $needsPurchaseSummary = in_array($tab, ['dashboard', 'compras'], true);
         try {
             $purchasing = new \SoftNova\Services\PurchasingService($this->db);
-            $purchaseSummary = $this->query(
-                "SELECT COUNT(*) cnt, COALESCE(SUM(total),0) total
-                 FROM purchase_orders
-                 WHERE status = 'received'
-                   AND DATE(COALESCE(warehouse_date, order_date)) BETWEEN ? AND ?",
-                [$from, $to]
-            )->fetch() ?: ['cnt'=>0,'total'=>0];
+            if ($needsPurchaseSummary) {
+                $purchaseSummary = $this->query(
+                    "SELECT COUNT(*) cnt,
+                            COALESCE(SUM(GREATEST(total - COALESCE(credit_total, 0), 0)),0) total
+                     FROM purchase_orders
+                     WHERE status = 'received'
+                       AND DATE(COALESCE(warehouse_date, order_date)) BETWEEN ? AND ?",
+                    [$from, $to]
+                )->fetch() ?: ['cnt'=>0,'total'=>0];
+            }
             if ($tab === 'invoice-trace') {
                 $invoiceTraceOrders = $purchasing->listInvoiceTrace($from, $to, $invoiceTraceQ, 100);
             }
         } catch (\Throwable $e) {
             // schema aún no migrado
         }
-        try {
-            $legacy = $this->query(
-                "SELECT COUNT(*) cnt, COALESCE(SUM(total),0) total
-                 FROM purchases WHERE status='completed' AND DATE(purchase_date) BETWEEN ? AND ?",
-                [$from, $to]
-            )->fetch() ?: ['cnt'=>0,'total'=>0];
-            $purchaseSummary['cnt'] = (int)$purchaseSummary['cnt'] + (int)$legacy['cnt'];
-            $purchaseSummary['total'] = (float)$purchaseSummary['total'] + (float)$legacy['total'];
-        } catch (\Throwable $e) {
-            // tabla purchases puede no existir en installs nuevos
+        if ($needsPurchaseSummary) {
+            try {
+                $legacy = $this->query(
+                    "SELECT COUNT(*) cnt, COALESCE(SUM(total),0) total
+                     FROM purchases WHERE status='completed' AND DATE(purchase_date) BETWEEN ? AND ?",
+                    [$from, $to]
+                )->fetch() ?: ['cnt'=>0,'total'=>0];
+                $purchaseSummary['cnt'] = (int)$purchaseSummary['cnt'] + (int)$legacy['cnt'];
+                $purchaseSummary['total'] = (float)$purchaseSummary['total'] + (float)$legacy['total'];
+            } catch (\Throwable $e) {
+                // tabla purchases puede no existir en installs nuevos
+            }
         }
-        $expenseByType = $this->query(
-            "SELECT COALESCE(category,'general') category, COUNT(*) cnt, COALESCE(SUM(amount),0) total
-             FROM expenses WHERE expense_date BETWEEN ? AND ?
-             GROUP BY COALESCE(category,'general') ORDER BY total DESC",
-            [$from, $to]
-        )->fetchAll();
-        $stock = new \SoftNova\Services\StockService($this->db);
-        $trace = $stock->listMovements(['from' => $from, 'to' => $to], 25, 0);
+        $expenseByType = [];
+        if (in_array($tab, ['dashboard', 'gastos'], true)) {
+            $expenseByType = $this->query(
+                "SELECT COALESCE(category,'general') category, COUNT(*) cnt, COALESCE(SUM(amount),0) total
+                 FROM expenses
+                 WHERE expense_date BETWEEN ? AND ?
+                   AND COALESCE(status, 'active') <> 'cancelled'
+                 GROUP BY COALESCE(category,'general') ORDER BY total DESC",
+                [$from, $to]
+            )->fetchAll();
+        }
+        $trace = ['rows' => [], 'total' => 0];
+        if (in_array($tab, ['dashboard', 'trace'], true)) {
+            $stock = new \SoftNova\Services\StockService($this->db);
+            $trace = $stock->listMovements(['from' => $from, 'to' => $to], 25, 0);
+        }
 
         $accounts = $this->accounting->accounts();
-        $trialBalance = $this->accounting->trialBalance($from, $to);
-        $statements = $this->accounting->financialStatements($from, $to);
-        $ledger = $accountId > 0
+        $needsStatements = in_array($tab, ['dashboard', 'statements'], true);
+        $needsRecon = $tab === 'dashboard';
+        $needsEntries = in_array($tab, ['dashboard', 'entries'], true);
+        $needsLedger = $tab === 'ledger' && $accountId > 0;
+        $needsPeriods = in_array($tab, ['dashboard', 'periods'], true);
+
+        $trialAccountType = trim((string)$this->request->get('account_type', ''));
+        $trialQ = trim((string)$this->request->get('q', ''));
+        $trialIncludeZero = (string)$this->request->get('include_zero', '') === '1';
+        $balanceYear = (int)$this->request->get('year', 0);
+        if ($balanceYear < 2000 || $balanceYear > 2100) {
+            $balanceYear = (int)substr($from, 0, 4);
+        }
+        $monthlyBalance = $tab === 'trial'
+            ? $this->accounting->monthlyOperationalBalance($balanceYear)
+            : [
+                'year' => $balanceYear,
+                'months' => [],
+                'totals' => [],
+                'chart' => [],
+            ];
+        $trialReport = $needsStatements
+            ? $this->accounting->trialBalance($from, $to, [
+                'account_type' => '',
+                'q' => '',
+                'include_zero' => false,
+            ])
+            : [
+                'rows' => [],
+                'totals' => [
+                    'opening_debit' => 0, 'opening_credit' => 0,
+                    'debit' => 0, 'credit' => 0,
+                    'closing_debit' => 0, 'closing_credit' => 0,
+                    'accounts' => 0,
+                ],
+                'balanced' => ['opening' => true, 'period' => true, 'closing' => true],
+                'from' => $from,
+                'to' => $to,
+            ];
+        $trialBalance = $trialReport['rows'];
+        $statements = $needsStatements ? $this->accounting->financialStatements($from, $to) : [
+            'assets' => [], 'liabilities' => [], 'equity' => [],
+            'revenue' => [], 'expenses' => [],
+            'totals' => ['assets' => 0, 'liabilities' => 0, 'equity' => 0, 'revenue' => 0, 'expenses' => 0],
+            'profit' => 0,
+        ];
+        $ledger = $needsLedger
             ? $this->accounting->ledger($accountId, $from, $to)
             : [];
-        $accountAudit = $this->accounting->auditCriticalAccounts();
-        $reconciliation = $this->accounting->subledgerReconciliation();
-        $pendingSync = $this->accounting->pendingSyncCount();
+        $accountAudit = $needsRecon ? $this->accounting->auditCriticalAccounts() : [];
+        $reconciliation = $needsRecon ? $this->accounting->subledgerReconciliation() : [];
+        $pendingSync = $needsRecon ? $this->accounting->pendingSyncCount() : 0;
+        $pendingQueue = $needsRecon ? $this->accounting->pendingQueueCount() : 0;
 
         $commissionCfg = [];
         $commissionList = ['rows' => [], 'pending' => 0, 'paid' => 0, 'cancelled' => 0];
@@ -155,19 +212,41 @@ class TenantContabilidadController extends TenantController
             ], 150);
         }
 
+        $vatBook = null;
+        if ($tab === 'vat') {
+            try {
+                $vatBook = \SoftNova\Services\TaxService::vatBook($this->db, $from, $to);
+            } catch (\Throwable $e) {
+                $vatBook = [
+                    'from' => $from,
+                    'to' => $to,
+                    'documents' => [],
+                    'ledger' => [],
+                    'by_rate' => [],
+                    'warnings' => ['No se pudo calcular el libro IVA: ' . $e->getMessage()],
+                    'accounts' => ['generated' => '240801', 'deductible' => '240802'],
+                ];
+            }
+        }
+
         $this->view('tenant.contabilidad', $this->tenantViewData([
             'tab' => $tab,
             'dateFrom' => $from,
             'dateTo' => $to,
             'accounts' => $accounts,
-            'entries' => $this->accounting->entries($from, $to),
+            'entries' => $needsEntries ? $this->accounting->entries($from, $to) : [],
             'trialBalance' => $trialBalance,
+            'trialReport' => $trialReport,
+            'monthlyBalance' => $monthlyBalance,
+            'balanceYear' => $balanceYear,
+            'trialAccountType' => $trialAccountType,
+            'trialQ' => $trialQ,
+            'trialIncludeZero' => $trialIncludeZero,
             'statements' => $statements,
             'ledger' => $ledger,
             'selectedAccountId' => $accountId,
-            'periods' => $this->accounting->periods(),
+            'periods' => $needsPeriods ? $this->accounting->periods() : [],
             'integrationStatuses' => $integrations->statuses(),
-            'catalogStatuses' => $catalog->statuses(),
             'activeProvider' => $integrations->settings()->getActiveProvider(),
             'purchaseSummary' => $purchaseSummary,
             'expenseByType' => $expenseByType,
@@ -177,96 +256,49 @@ class TenantContabilidadController extends TenantController
             'accountAudit' => $accountAudit,
             'reconciliation' => $reconciliation,
             'pendingSync' => $pendingSync,
-            'mlOAuthRedirect' => \SoftNova\Core\route('app/contabilidad') . '?action=ml-oauth-callback',
+            'pendingQueue' => $pendingQueue,
             'commissionCfg' => $commissionCfg,
             'commissionList' => $commissionList,
             'commissionUsers' => $commissionUsers,
+            'vatBook' => $vatBook,
         ]));
     }
 
-    private function saveCatalogIntegration(): void
+    /**
+     * Compatibilidad: catálogo Woo/ML se gestiona en Inventario → Integraciones.
+     */
+    private function redirectCatalogToInventario(string $action = ''): void
     {
-        TenantMiddleware::authorize('contabilidad', 'edit');
-        $provider = (string)$this->request->post('provider', '');
-        try {
-            $svc = new \SoftNova\Services\Integrations\CatalogSyncService($this->db);
-            $svc->saveProvider($provider, [
-                'enabled' => $this->request->post('enabled', '0'),
-                'store_url' => $this->request->post('store_url', ''),
-                'consumer_key' => $this->request->post('consumer_key', ''),
-                'consumer_secret' => $this->request->post('consumer_secret', ''),
-                'access_token' => $this->request->post('access_token', ''),
-                'refresh_token' => $this->request->post('refresh_token', ''),
-                'client_id' => $this->request->post('client_id', ''),
-                'client_secret' => $this->request->post('client_secret', ''),
-                'user_id' => $this->request->post('user_id', ''),
-                'site_id' => $this->request->post('site_id', 'MCO'),
-                'base_url' => $this->request->post('base_url', ''),
-                'stock_authority' => $this->request->post('stock_authority', 'create_only'),
-            ]);
-            $this->respond(true, 'Integración de catálogo guardada', '/app/contabilidad?tab=integrations&provider=' . urlencode($provider));
-        } catch (\Throwable $e) {
-            $this->respond(false, $e->getMessage(), '/app/contabilidad?tab=integrations');
+        $provider = (string)($this->request->get('provider', '') ?: $this->request->post('provider', 'woocommerce'));
+        if (!in_array($provider, ['woocommerce', 'mercadolibre'], true)) {
+            $provider = 'woocommerce';
         }
-    }
-
-    private function mlOAuthStart(): void
-    {
-        TenantMiddleware::authorize('contabilidad', 'edit');
-        $svc = new \SoftNova\Services\Integrations\CatalogSyncService($this->db);
-        $ml = $svc->mercadoLibre();
-        if (!$ml) {
-            $this->respond(false, 'Conector ML no disponible', '/app/contabilidad?tab=integrations&provider=mercadolibre');
-            return;
-        }
-        $st = $ml->status();
-        if (empty($st['oauth_ready'])) {
-            $this->respond(false, 'Guarde primero Client ID y Client Secret', '/app/contabilidad?tab=integrations&provider=mercadolibre');
-            return;
-        }
-        $state = bin2hex(random_bytes(16));
-        $_SESSION['ml_oauth_state'] = $state;
-        $redirect = \SoftNova\Core\route('app/contabilidad') . '?action=ml-oauth-callback';
-        header('Location: ' . $ml->authorizationUrl($redirect, $state));
-        exit;
-    }
-
-    private function mlOAuthCallback(): void
-    {
-        TenantMiddleware::authorize('contabilidad', 'edit');
-        $error = (string)$this->request->get('error', '');
-        if ($error !== '') {
-            $this->respond(false, 'OAuth ML cancelado: ' . $error, '/app/contabilidad?tab=integrations&provider=mercadolibre');
-            return;
-        }
-        $state = (string)$this->request->get('state', '');
-        $expected = (string)($_SESSION['ml_oauth_state'] ?? '');
-        unset($_SESSION['ml_oauth_state']);
-        if ($expected === '' || !hash_equals($expected, $state)) {
-            $this->respond(false, 'Estado OAuth inválido. Intente conectar de nuevo.', '/app/contabilidad?tab=integrations&provider=mercadolibre');
-            return;
-        }
-        $code = (string)$this->request->get('code', '');
-        if ($code === '') {
-            $this->respond(false, 'Sin código de autorización', '/app/contabilidad?tab=integrations&provider=mercadolibre');
-            return;
-        }
-        try {
-            $svc = new \SoftNova\Services\Integrations\CatalogSyncService($this->db);
-            $ml = $svc->mercadoLibre();
-            if (!$ml) {
-                throw new \RuntimeException('Conector ML no disponible');
+        $qs = 'integrations=1&catalog=' . urlencode($provider);
+        if ($action === 'ml-oauth-callback') {
+            // Reenviar query OAuth completa al nuevo endpoint
+            $params = $_GET;
+            unset($params['action']);
+            $target = \SoftNova\Core\route('app/inventario') . '?action=ml-oauth-callback';
+            if ($params) {
+                $target .= '&' . http_build_query($params);
             }
-            $redirect = \SoftNova\Core\route('app/contabilidad') . '?action=ml-oauth-callback';
-            $ml->exchangeToken('authorization_code', [
-                'code' => $code,
-                'redirect_uri' => $redirect,
-            ]);
-            $svc->settings()->set('mercadolibre', 'enabled', '1', false);
-            $this->respond(true, 'Mercado Libre conectado (token + refresh guardados)', '/app/contabilidad?tab=integrations&provider=mercadolibre');
-        } catch (\Throwable $e) {
-            $this->respond(false, $e->getMessage(), '/app/contabilidad?tab=integrations&provider=mercadolibre');
+            header('Location: ' . $target);
+            exit;
         }
+        if ($action === 'ml-oauth-start') {
+            header('Location: ' . \SoftNova\Core\route('app/inventario') . '?action=ml-oauth-start');
+            exit;
+        }
+        if ($action === 'catalog-test') {
+            header('Location: ' . \SoftNova\Core\route('app/inventario') . '?action=catalog-test&provider=' . urlencode($provider));
+            exit;
+        }
+        // POST save-catalog-integration: no re-ejecutar; pedir reconfiguración en Inventario
+        $this->respond(
+            false,
+            'Las integraciones WooCommerce / Mercado Libre se configuran en Inventario → Integraciones.',
+            '/app/inventario?' . $qs
+        );
     }
 
     private function saveCommissionRates(): void
@@ -316,6 +348,8 @@ class TenantContabilidadController extends TenantController
                 'credit_over_60_days' => $this->request->post('credit_over_60_days', '60'),
                 'credit_tier_days' => $this->request->post('credit_tier_days', []),
                 'credit_tier_rates' => $this->request->post('credit_tier_rates', []),
+                'qty_discount_qty' => $this->request->post('qty_discount_qty', []),
+                'qty_discount_rates' => $this->request->post('qty_discount_rates', []),
             ]);
             $this->respond(true, 'Parámetros de comisiones guardados', '/app/contabilidad?tab=commissions');
         } catch (\Throwable $e) {
@@ -352,13 +386,6 @@ class TenantContabilidadController extends TenantController
         } catch (\Throwable $e) {
             $this->respond(false, $e->getMessage(), '/app/contabilidad?tab=commissions');
         }
-    }
-
-    private function testCatalogIntegration(): void
-    {
-        $provider = (string)$this->request->get('provider', '');
-        $result = (new \SoftNova\Services\Integrations\CatalogSyncService($this->db))->test($provider);
-        $this->json($result);
     }
 
     private function saveIntegration(): void
@@ -459,7 +486,7 @@ class TenantContabilidadController extends TenantController
             $this->db->beginTransaction();
             $id = $this->accounting->postEntry($date, $description, $lines, 'manual', null, null);
             $this->db->commit();
-            $this->respond(true, 'Comprobante contable registrado', '/app/contabilidad?tab=entries&entry=' . $id);
+            $this->respond(true, 'Comprobante contable registrado', '/app/contabilidad?tab=entries&entry_id=' . $id);
         } catch (\Throwable $e) {
             if ($this->db->inTransaction()) {
                 $this->db->rollBack();
@@ -511,6 +538,7 @@ class TenantContabilidadController extends TenantController
 
         $partes = [];
         foreach ([
+            'pending_queue' => 'reintentos de cola',
             'sales' => 'ventas',
             'payments' => 'abonos de clientes',
             'expenses' => 'gastos',
@@ -518,6 +546,8 @@ class TenantContabilidadController extends TenantController
             'stock' => 'movimientos de inventario',
             'supplier_payments' => 'abonos a proveedores',
             'cash' => 'movimientos de caja',
+            'sale_credit_notes' => 'NC de ventas',
+            'purchase_credit_notes' => 'NC de compras',
         ] as $clave => $etiqueta) {
             $cantidad = (int)($result[$clave] ?? 0);
             if ($cantidad > 0) {
@@ -629,18 +659,129 @@ class TenantContabilidadController extends TenantController
             return;
         }
 
-        $rows = [];
-        foreach ($this->accounting->trialBalance($from, $to) as $row) {
-            $rows[] = [
-                $row['code'], $row['name'], $row['opening_balance'],
-                $row['debit'], $row['credit'], $row['closing_balance'],
+        if ($report === 'vat') {
+            $book = \SoftNova\Services\TaxService::vatBook($this->db, $from, $to);
+            $docs = $book['documents'] ?? [];
+            $led = $book['ledger'] ?? [];
+            $rows = [
+                ['Ventas IVA', $docs['sales_tax'] ?? 0],
+                ['NC ventas IVA', $docs['sales_credit_tax'] ?? 0],
+                ['IVA generado neto (docs)', $docs['sales_net'] ?? 0],
+                ['Compras IVA', $docs['purchases_tax'] ?? 0],
+                ['NC compras IVA', $docs['purchases_credit_tax'] ?? 0],
+                ['IVA descontable neto (docs)', $docs['purchases_net'] ?? 0],
+                ['Saldo a pagar (docs)', $docs['balance_to_pay'] ?? 0],
+                ['Libro 240801 neto', $led['generated_net'] ?? 0],
+                ['Libro 240802 neto', $led['deductible_net'] ?? 0],
+                ['Saldo libro contable', $led['balance'] ?? 0],
             ];
+            foreach (($book['by_rate'] ?? []) as $r) {
+                $rows[] = [
+                    'Tarifa ' . number_format((float)($r['rate'] ?? 0), 2, '.', '') . '%',
+                    'base=' . number_format((float)($r['base'] ?? 0), 2, '.', '')
+                        . '; iva=' . number_format((float)($r['tax'] ?? 0), 2, '.', ''),
+                ];
+            }
+            foreach (($book['warnings'] ?? []) as $w) {
+                $rows[] = ['Advertencia', $w];
+            }
+            $this->exportCsv(
+                'libro_iva_' . $from . '_' . $to . '.csv',
+                ['Concepto', 'Valor'],
+                $rows
+            );
+            return;
         }
-        $this->exportCsv(
-            'balance_prueba_' . $from . '_' . $to . '.csv',
-            ['Código', 'Cuenta', 'Saldo inicial', 'Debe', 'Haber', 'Saldo final'],
-            $rows
-        );
+
+        if ($report === 'trial-balance' || $report === 'monthly-balance') {
+            $year = (int)$this->request->get('year', (int)substr($from, 0, 4));
+            $monthly = $this->accounting->monthlyOperationalBalance($year);
+            $rows = [];
+            foreach ($monthly['months'] as $row) {
+                $rows[] = [
+                    $row['month_label'],
+                    $row['ingresos'],
+                    $row['costo_venta'],
+                    $row['facturas_total'],
+                    $row['facturas_contado'],
+                    $row['facturas_credito'],
+                    $row['facturas_pagadas'],
+                    $row['facturas_descuentos'],
+                    $row['facturas_pendientes'],
+                    $row['utilidad_bruta'],
+                    $row['utilidad_operacional'],
+                    $row['utilidad_neta'],
+                ];
+            }
+            $t = $monthly['totals'];
+            $rows[] = [
+                'TOTAL',
+                $t['ingresos'] ?? 0,
+                $t['costo_venta'] ?? 0,
+                $t['facturas_total'] ?? 0,
+                $t['facturas_contado'] ?? 0,
+                $t['facturas_credito'] ?? 0,
+                $t['facturas_pagadas'] ?? 0,
+                $t['facturas_descuentos'] ?? 0,
+                $t['facturas_pendientes'] ?? 0,
+                $t['utilidad_bruta'] ?? 0,
+                $t['utilidad_operacional'] ?? 0,
+                $t['utilidad_neta'] ?? 0,
+            ];
+            $this->exportCsv(
+                'balance_' . $year . '.csv',
+                [
+                    'Mes', 'Ingresos', 'Costo de venta',
+                    'Facturas Total', 'Contado', 'Crédito',
+                    'Fact. Pagadas', 'Dctos X Pagos', 'Pendientes',
+                    'Utilidad Bruta', 'Utilidad Operacional', 'Utilidad Neta',
+                ],
+                $rows
+            );
+            return;
+        }
+
+        if ($report === 'accounts-trial') {
+            $rows = [];
+            $reportData = $this->accounting->trialBalance($from, $to, [
+                'account_type' => trim((string)$this->request->get('account_type', '')),
+                'q' => trim((string)$this->request->get('q', '')),
+                'include_zero' => (string)$this->request->get('include_zero', '') === '1',
+            ]);
+            foreach ($reportData['rows'] as $row) {
+                $rows[] = [
+                    $row['code'],
+                    $row['name'],
+                    $row['account_type_label'] ?? $row['account_type'] ?? '',
+                    $row['nature_label'] ?? '',
+                    $row['opening_debit'] ?? 0,
+                    $row['opening_credit'] ?? 0,
+                    $row['debit'],
+                    $row['credit'],
+                    $row['closing_debit'] ?? 0,
+                    $row['closing_credit'] ?? 0,
+                ];
+            }
+            $t = $reportData['totals'];
+            $rows[] = [
+                '', 'TOTALES', '', '',
+                $t['opening_debit'] ?? 0,
+                $t['opening_credit'] ?? 0,
+                $t['debit'] ?? 0,
+                $t['credit'] ?? 0,
+                $t['closing_debit'] ?? 0,
+                $t['closing_credit'] ?? 0,
+            ];
+            $this->exportCsv(
+                'balance_cuentas_' . $from . '_' . $to . '.csv',
+                [
+                    'Código', 'Cuenta', 'Tipo', 'Naturaleza',
+                    'SI Debe', 'SI Haber', 'Debe', 'Haber', 'SF Debe', 'SF Haber',
+                ],
+                $rows
+            );
+            return;
+        }
     }
 
     private function validDate(string $date, string $fallback): string

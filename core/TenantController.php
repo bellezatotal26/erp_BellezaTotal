@@ -62,6 +62,11 @@ abstract class TenantController extends Controller
             'currency' => $this->getCurrency(),
         ], $extra);
     }
+
+    protected function refreshDbConnection(): void
+    {
+        $this->db = TenantMiddleware::refreshDb();
+    }
     
     /**
      * Paginación server-side
@@ -71,7 +76,7 @@ abstract class TenantController extends Controller
     {
         $perPage = $perPage ?? $this->perPage;
         $page = max(1, (int)$this->request->get('page', 1));
-        $totalPages = max(1, (int)ceil($total / $perPage));
+        $totalPages = max(1, (int)ceil($total / max(1, $perPage)));
         if ($page > $totalPages) {
             $page = $totalPages;
         }
@@ -83,6 +88,28 @@ abstract class TenantController extends Controller
             'total' => $total,
             'totalPages' => $totalPages,
         ];
+    }
+
+    /**
+     * Cantidad por página (mismo patrón que Inventario).
+     *
+     * @param list<int> $options
+     * @return array{perPage:int,options:list<int>}
+     */
+    protected function resolvePerPage(array $options = [20, 50, 100, 200], int $default = 20): array
+    {
+        $options = array_values(array_unique(array_map('intval', $options)));
+        if ($options === []) {
+            $options = [20, 50, 100, 200];
+        }
+        if (!in_array($default, $options, true)) {
+            $default = $options[0];
+        }
+        $perPage = (int)$this->request->get('per_page', $default);
+        if (!in_array($perPage, $options, true)) {
+            $perPage = $default;
+        }
+        return ['perPage' => $perPage, 'options' => $options];
     }
 
     /**
@@ -186,6 +213,7 @@ abstract class TenantController extends Controller
                 status ENUM('pending','accepted','rejected','converted') DEFAULT 'pending',
                 notes TEXT,
                 valid_until DATE,
+                sale_id INT UNSIGNED NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 INDEX idx_customer(customer_id), INDEX idx_status(status)
@@ -199,9 +227,33 @@ abstract class TenantController extends Controller
                 quantity INT NOT NULL DEFAULT 1,
                 unit_price DECIMAL(12,2) DEFAULT 0,
                 subtotal DECIMAL(12,2) DEFAULT 0,
+                tax_rate DECIMAL(5,2) NOT NULL DEFAULT 0,
+                tax_amount DECIMAL(14,2) NOT NULL DEFAULT 0,
                 INDEX idx_quote(quote_id),
                 FOREIGN KEY (quote_id) REFERENCES quotes(id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        }
+
+        try {
+            $col = $this->query("SHOW COLUMNS FROM quotes LIKE 'sale_id'")->fetch();
+            if (!$col) {
+                $this->db->exec("ALTER TABLE quotes ADD COLUMN sale_id INT UNSIGNED NULL AFTER valid_until");
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+        foreach ([
+            ['tax_rate', 'DECIMAL(5,2) NOT NULL DEFAULT 0'],
+            ['tax_amount', 'DECIMAL(14,2) NOT NULL DEFAULT 0'],
+        ] as [$colName, $def]) {
+            try {
+                $col = $this->query("SHOW COLUMNS FROM quote_items LIKE ?", [$colName])->fetch();
+                if (!$col) {
+                    $this->db->exec("ALTER TABLE quote_items ADD COLUMN `{$colName}` {$def}");
+                }
+            } catch (\Throwable $e) {
+                // ignore
+            }
         }
         
         $done = true;

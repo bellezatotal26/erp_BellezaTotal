@@ -94,7 +94,33 @@ class EcommerceIntegrationService
             $name = trim((string)($it['name'] ?? 'Producto'));
             $line = round($qty * $price, 2);
             $subtotal += $line;
-            $normalized[] = compact('qty', 'price', 'name', 'line');
+            $productId = null;
+            $unitCost = 0.0;
+            $isConsignment = false;
+            $consignorId = 0;
+            $sku = trim((string)($it['sku'] ?? $it['code'] ?? ''));
+            if ($sku !== '') {
+                try {
+                    $prod = $this->db->prepare(
+                        "SELECT id, COALESCE(purchase_price,0) purchase_price,
+                                COALESCE(ownership,'owned') ownership, consignor_id
+                         FROM products
+                         WHERE status = 'active' AND (code = ? OR barcode = ?)
+                         LIMIT 1"
+                    );
+                    $prod->execute([$sku, $sku]);
+                    $row = $prod->fetch();
+                    if ($row) {
+                        $productId = (int)$row['id'];
+                        $unitCost = (float)$row['purchase_price'];
+                        $isConsignment = ($row['ownership'] ?? 'owned') === 'consignment';
+                        $consignorId = (int)($row['consignor_id'] ?? 0);
+                    }
+                } catch (\Throwable $e) {
+                    // ignore
+                }
+            }
+            $normalized[] = compact('qty', 'price', 'name', 'line', 'productId', 'unitCost', 'isConsignment', 'consignorId');
         }
         $total = round((float)($order['total'] ?? $subtotal), 2);
         if ($total <= 0) {
@@ -133,10 +159,77 @@ class EcommerceIntegrationService
 
             $itemStmt = $this->db->prepare(
                 "INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal)
-                 VALUES (?, NULL, ?, ?, ?, 0, ?)"
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"
             );
+            $consignment = null;
             foreach ($normalized as $n) {
-                $itemStmt->execute([$saleId, $n['name'], $n['qty'], $n['price'], $n['line']]);
+                $pid = $n['productId'] ?? null;
+                $cost = (float)($n['unitCost'] ?? 0);
+                try {
+                    if (!empty($n['isConsignment'])) {
+                        $this->db->prepare(
+                            "INSERT INTO sale_items
+                                (sale_id, product_id, product_name, quantity, unit_price, unit_cost,
+                                 is_consignment, consignor_id, subtotal)
+                             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)"
+                        )->execute([
+                            $saleId,
+                            $pid,
+                            $n['name'],
+                            $n['qty'],
+                            $n['price'],
+                            $cost,
+                            !empty($n['consignorId']) ? (int)$n['consignorId'] : null,
+                            $n['line'],
+                        ]);
+                    } else {
+                        $itemStmt->execute([$saleId, $pid, $n['name'], $n['qty'], $n['price'], $cost, $n['line']]);
+                    }
+                } catch (\Throwable $e) {
+                    $itemStmt->execute([$saleId, $pid, $n['name'], $n['qty'], $n['price'], $cost, $n['line']]);
+                }
+                $saleItemId = (int)$this->db->lastInsertId();
+                if ($pid && !empty($n['isConsignment'])) {
+                    if ($consignment === null) {
+                        $consignment = new ConsignmentService($this->db);
+                    }
+                    $consignment->registerSaleDebt(
+                        $saleId,
+                        $saleItemId,
+                        (int)$pid,
+                        (int)$n['qty'],
+                        $cost,
+                        !empty($n['consignorId']) ? (int)$n['consignorId'] : null
+                    );
+                    try {
+                        (new StockService($this->db))->decrease(
+                            (int)$pid,
+                            (int)$n['qty'],
+                            'sale',
+                            $saleId,
+                            'Venta e-commerce ' . $invoice
+                        );
+                    } catch (\Throwable $e) {
+                        throw new \RuntimeException(
+                            'Stock insuficiente al importar consignado: ' . $e->getMessage(),
+                            0,
+                            $e
+                        );
+                    }
+                } elseif ($pid) {
+                    try {
+                        (new StockService($this->db))->decrease(
+                            (int)$pid,
+                            (int)$n['qty'],
+                            'sale',
+                            $saleId,
+                            'Venta e-commerce ' . $invoice
+                        );
+                    } catch (\Throwable $e) {
+                        // Pedidos e-commerce históricos pueden no tener stock local; no bloquear import.
+                        error_log('Ecommerce stock: ' . $e->getMessage());
+                    }
+                }
             }
             $payStmt = $this->db->prepare(
                 "INSERT INTO sale_payments (sale_id, amount, payment_method, notes, user_id)

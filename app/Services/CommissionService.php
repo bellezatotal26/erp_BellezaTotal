@@ -66,10 +66,14 @@ class CommissionService
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
         );
 
-        $this->query(
-            "INSERT IGNORE INTO accounting_accounts (code, name, account_type, nature, is_system)
-             VALUES ('510508', 'Comisiones sobre ventas', 'expense', 'debit', 1)"
-        );
+        try {
+            $this->query(
+                "INSERT IGNORE INTO accounting_accounts (code, name, account_type, nature, is_system)
+                 VALUES ('510508', 'Comisiones sobre ventas', 'expense', 'debit', 1)"
+            );
+        } catch (\Throwable $e) {
+            // Contabilidad aún no provisionada en este tenant.
+        }
     }
 
     private function seedDefaults(): void
@@ -123,9 +127,96 @@ class CommissionService
             'credit_over_60_rate' => (float)$this->setting('credit_over_60_surcharge_rate', '0'),
             'credit_over_60_days' => (int)$this->setting('credit_over_60_surcharge_days', '60'),
             'credit_surcharge_tiers' => $this->creditSurchargeTiers(),
+            'quantity_discount_tiers' => $this->quantityDiscountTiers(),
             'seller_account' => $this->setting('seller_commission_account', '510508'),
             'gateway_account' => $this->setting('gateway_commission_account', '530505'),
         ];
+    }
+
+    /**
+     * Tramos de descuento por cantidad (cualquier producto).
+     * Cada tramo: min_qty + rate (%). Se aplica el tramo con mayor min_qty
+     * tal que cantidad_del_producto > min_qty.
+     *
+     * @return list<array{min_qty:int,rate:float}>
+     */
+    public function quantityDiscountTiers(): array
+    {
+        $raw = trim($this->setting('quantity_discount_tiers', ''));
+        $tiers = [];
+        if ($raw !== '') {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                foreach ($decoded as $row) {
+                    if (!is_array($row)) {
+                        continue;
+                    }
+                    $qty = (int)($row['min_qty'] ?? $row['qty'] ?? $row['min_quantity'] ?? 0);
+                    $rate = (float)($row['rate'] ?? 0);
+                    if ($qty < 1 || $rate < 0) {
+                        continue;
+                    }
+                    $tiers[] = [
+                        'min_qty' => min(1000000, $qty),
+                        'rate' => min(100.0, $rate),
+                    ];
+                }
+            }
+        }
+
+        usort($tiers, static fn($a, $b) => $a['min_qty'] <=> $b['min_qty']);
+        $uniq = [];
+        foreach ($tiers as $t) {
+            $uniq[(int)$t['min_qty']] = $t;
+        }
+        return array_values($uniq);
+    }
+
+    /**
+     * Resuelve el descuento por cantidad aplicable.
+     *
+     * @return array{rate:float,min_qty:int,matched:bool}
+     */
+    public function resolveQuantityDiscount(int $quantity): array
+    {
+        $best = ['rate' => 0.0, 'min_qty' => 0, 'matched' => false];
+        foreach ($this->quantityDiscountTiers() as $tier) {
+            $min = (int)$tier['min_qty'];
+            $rate = (float)$tier['rate'];
+            if ($quantity > $min && $rate > 0 && $min >= (int)$best['min_qty']) {
+                $best = ['rate' => $rate, 'min_qty' => $min, 'matched' => true];
+            }
+        }
+        return $best;
+    }
+
+    /**
+     * @param list<array<string,mixed>>|string|null $raw
+     * @return list<array{min_qty:int,rate:float}>
+     */
+    public static function normalizeQuantityDiscountTiers(mixed $raw): array
+    {
+        if (is_string($raw)) {
+            $decoded = json_decode($raw, true);
+            $raw = is_array($decoded) ? $decoded : [];
+        }
+        if (!is_array($raw)) {
+            return [];
+        }
+        $out = [];
+        foreach ($raw as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $qty = (int)($row['min_qty'] ?? $row['qty'] ?? $row['min_quantity'] ?? 0);
+            $rate = (float)($row['rate'] ?? 0);
+            if ($qty < 1 || $rate < 0) {
+                continue;
+            }
+            $out[$qty] = ['min_qty' => min(1000000, $qty), 'rate' => min(100.0, $rate)];
+        }
+        ksort($out);
+        return array_values($out);
     }
 
     /**
@@ -279,6 +370,23 @@ class CommissionService
                 }
             }
         }
+
+        $qtyTiers = self::normalizeQuantityDiscountTiers($input['quantity_discount_tiers'] ?? null);
+        if ($qtyTiers === [] && isset($input['qty_discount_qty'], $input['qty_discount_rates'])
+            && is_array($input['qty_discount_qty']) && is_array($input['qty_discount_rates'])) {
+            $builtQty = [];
+            $qtyArr = array_values($input['qty_discount_qty']);
+            $rateArr = array_values($input['qty_discount_rates']);
+            $nQty = max(count($qtyArr), count($rateArr));
+            for ($i = 0; $i < $nQty; $i++) {
+                $builtQty[] = [
+                    'min_qty' => (int)($qtyArr[$i] ?? 0),
+                    'rate' => (float)($rateArr[$i] ?? 0),
+                ];
+            }
+            $qtyTiers = self::normalizeQuantityDiscountTiers($builtQty);
+        }
+        $map['quantity_discount_tiers'] = json_encode($qtyTiers, JSON_UNESCAPED_UNICODE);
 
         $stmt = $this->db->prepare(
             "INSERT INTO accounting_settings (setting_key, setting_value) VALUES (?, ?)
@@ -656,7 +764,8 @@ class CommissionService
                 if ($kind === 'seller') {
                     $this->postSellerExpense($accounting, $expenseId, (float)$row['amount'], $desc, $affectCash);
                 } else {
-                    $accounting->postExpense($expenseId, $affectCash);
+                    // Pasarela: gasto financiero contra banco (neto cobrado), no contra CxP.
+                    $this->postGatewayExpense($accounting, $expenseId, (float)$row['amount'], $desc);
                 }
             } catch (\Throwable $e) {
                 error_log('Commission settle accounting: ' . $e->getMessage());
@@ -688,7 +797,6 @@ class CommissionService
         $credit = $affectCash
             ? $this->setting('cash_account', '110505')
             : $this->setting('expense_payable_account', '233595');
-        // Acceso vía reflexión no; mejor método público en Accounting o postEntry mirror
         $accounting->postCommissionExpense(
             $expenseId,
             $cfg['seller_account'],
@@ -696,6 +804,30 @@ class CommissionService
             (string)$expense['expense_date'],
             $desc,
             $credit
+        );
+    }
+
+    /**
+     * Comisión de pasarela: Dr gasto financiero / Cr bancos (retención del adquirente).
+     */
+    private function postGatewayExpense(
+        AccountingService $accounting,
+        int $expenseId,
+        float $amount,
+        string $desc
+    ): void {
+        $expense = $this->query('SELECT * FROM expenses WHERE id=?', [$expenseId])->fetch();
+        if (!$expense) {
+            return;
+        }
+        $cfg = $this->config();
+        $accounting->postCommissionExpense(
+            $expenseId,
+            $cfg['gateway_account'],
+            $amount,
+            (string)$expense['expense_date'],
+            $desc,
+            $this->setting('bank_account', '111005')
         );
     }
 

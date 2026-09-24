@@ -14,7 +14,36 @@ class TenantCajaController extends TenantController
     public function index(): void
     {
         TenantMiddleware::authorize('caja');
-        SupplyChainSchema::ensure($this->db);
+        try {
+            $this->indexInner();
+        } catch (\Throwable $e) {
+            error_log('caja index: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+            \SoftNova\Core\Logger::error('caja index', [
+                'message' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            http_response_code(500);
+            $showDebug = (bool)\SoftNova\Core\config('app.debug', false);
+            header('Content-Type: text/html; charset=utf-8');
+            echo '<h1>Error interno del servidor</h1>';
+            echo '<p>No se pudo cargar Caja. Si el problema continúa, contacte soporte.</p>';
+            if ($showDebug) {
+                echo '<pre style="white-space:pre-wrap;background:#111;color:#eee;padding:12px;">'
+                    . htmlspecialchars($e->getMessage() . "\n" . $e->getFile() . ':' . $e->getLine() . "\n\n" . $e->getTraceAsString())
+                    . '</pre>';
+            }
+        }
+    }
+
+    private function indexInner(): void
+    {
+        try {
+            $this->ensureCajaRuntimeSchema();
+        } catch (\Throwable $e) {
+            error_log('caja schema init: ' . $e->getMessage());
+        }
         
         $action = $this->request->get('action');
         
@@ -38,7 +67,9 @@ class TenantCajaController extends TenantController
                 error_log('caja close action: ' . $e->getMessage());
                 $this->json([
                     'success' => false,
-                    'message' => 'Error al cerrar caja: ' . $e->getMessage(),
+                    'message' => (bool)config('app.debug', false)
+                        ? ('Error al cerrar caja: ' . $e->getMessage())
+                        : 'Error al cerrar caja. Revise el cierre e intente de nuevo, o contacte soporte.',
                     'redirect' => base_url('/app/caja'),
                 ]);
             }
@@ -80,70 +111,132 @@ class TenantCajaController extends TenantController
             $this->catalogSnapshot();
             return;
         }
+        if ($action === 'liveSync' && $this->request->method() === 'GET') {
+            $this->liveSyncJson();
+            return;
+        }
 
         // Cierra cajas abiertas cuyo dia de apertura ya termino (pasada medianoche)
         $autoClosed = $this->autoCloseOvernightSessions();
-        
-        $openSession = $this->query(
-            "SELECT cs.*, u.name as user_name
-             FROM cash_sessions cs
-             JOIN users u ON cs.user_id = u.id
-             WHERE cs.status = 'open'
-             ORDER BY cs.opening_date DESC LIMIT 1"
-        )->fetch();
+
+        $ctx = $this->getOpenSessionsContext();
+        $isAdminViewer = $ctx['is_admin_viewer'];
+        $openSessions = $ctx['open_sessions'];
+        $openSession = $ctx['open_session'];
+        $openSessionsCount = $ctx['open_sessions_count'];
         
         $movements = [];
+        $hiddenVoidedCount = 0;
         $todaySales = [];
         $salesPagination = null;
-        $totals = ['incomes' => 0, 'expenses' => 0, 'balance' => 0, 'sales_count' => 0, 'sales_total' => 0, 'movements_count' => 0];
+        $totals = ['incomes' => 0, 'expenses' => 0, 'other_incomes' => 0, 'balance' => 0, 'sales_count' => 0, 'sales_total' => 0, 'movements_count' => 0];
         $isPosRole = TenantMiddleware::isPosRole();
         
         if ($openSession) {
-            $totals = $this->computeSessionTotals($openSession);
-            $movements = $this->query(
-                "SELECT * FROM cash_movements
-                 WHERE cash_session_id = ?
-                 ORDER BY created_at DESC",
-                [$openSession['id']]
-            )->fetchAll();
+            $sessionIds = $ctx['session_ids'];
+
+            try {
+                if (count($sessionIds) === 1) {
+                    $totals = $this->computeSessionTotals($openSession);
+                } else {
+                    $totals = $this->computeUnifiedOpenTotals($openSessions);
+                }
+            } catch (\Throwable $e) {
+                error_log('caja computeSessionTotals: ' . $e->getMessage());
+                $totals = ['incomes' => 0, 'expenses' => 0, 'other_incomes' => 0, 'balance' => 0, 'sales_count' => 0, 'sales_total' => 0, 'movements_count' => 0];
+            }
+            $movements = $this->fetchSessionMovements($sessionIds);
+            $hiddenVoidedCount = 0;
+            if ($movements !== []) {
+                $hiddenVoidedCount = (int)($movements[0]['_hidden_voided_count'] ?? 0);
+                $movements = array_values(array_filter(
+                    $movements,
+                    static fn($m) => empty($m['_meta_only']) && (int)($m['id'] ?? 0) > 0
+                ));
+            }
 
             $salesTotal = (int)$this->query(
                 "SELECT COUNT(*) FROM sales WHERE sale_date >= ? AND status != 'cancelled'",
                 [$openSession['opening_date']]
             )->fetchColumn();
             $salesPagination = $this->paginate($salesTotal, 15);
-            $todaySales = $this->query(
-                "SELECT s.id, s.invoice_number, s.total, s.sale_date, s.payment_method,
-                        s.payment_status, s.status,
-                        c.name as customer_name, u.name as user_name,
-                        COALESCE((SELECT SUM(sp.amount) FROM sale_payments sp WHERE sp.sale_id = s.id), 0) as paid_amount
-                 FROM sales s
-                 LEFT JOIN customers c ON s.customer_id = c.id
-                 LEFT JOIN users u ON s.user_id = u.id
-                 WHERE s.sale_date >= ?
-                 ORDER BY s.sale_date DESC
-                 LIMIT {$salesPagination['perPage']} OFFSET {$salesPagination['offset']}",
-                [$openSession['opening_date']]
-            )->fetchAll();
+            try {
+                (new \SoftNova\Services\SalesCreditNoteService($this->db))->ensureSchema();
+            } catch (\Throwable $e) {
+            }
+            try {
+                $todaySales = $this->query(
+                    "SELECT s.id, s.invoice_number, s.total, s.sale_date, s.payment_method,
+                            s.payment_status, s.status,
+                            c.name as customer_name, u.name as user_name,
+                            COALESCE((SELECT SUM(sp.amount) FROM sale_payments sp WHERE sp.sale_id = s.id), 0) as paid_amount,
+                            COALESCE(cn.credit_note_total, 0) AS credit_note_total,
+                            cn.credit_note_numbers
+                     FROM sales s
+                     LEFT JOIN customers c ON s.customer_id = c.id
+                     LEFT JOIN users u ON s.user_id = u.id
+                     LEFT JOIN (
+                        SELECT sale_id,
+                               SUM(total) AS credit_note_total,
+                               GROUP_CONCAT(credit_number ORDER BY id SEPARATOR ', ') AS credit_note_numbers
+                        FROM sale_credit_notes
+                        WHERE status = 'posted'
+                        GROUP BY sale_id
+                     ) cn ON cn.sale_id = s.id
+                     WHERE s.sale_date >= ?
+                     ORDER BY s.sale_date DESC, s.id DESC
+                     LIMIT {$salesPagination['perPage']} OFFSET {$salesPagination['offset']}",
+                    [$openSession['opening_date']]
+                )->fetchAll();
+            } catch (\Throwable $e) {
+                $todaySales = $this->query(
+                    "SELECT s.id, s.invoice_number, s.total, s.sale_date, s.payment_method,
+                            s.payment_status, s.status,
+                            c.name as customer_name, u.name as user_name,
+                            COALESCE((SELECT SUM(sp.amount) FROM sale_payments sp WHERE sp.sale_id = s.id), 0) as paid_amount,
+                            0 AS credit_note_total,
+                            NULL AS credit_note_numbers
+                     FROM sales s
+                     LEFT JOIN customers c ON s.customer_id = c.id
+                     LEFT JOIN users u ON s.user_id = u.id
+                     WHERE s.sale_date >= ?
+                     ORDER BY s.sale_date DESC, s.id DESC
+                     LIMIT {$salesPagination['perPage']} OFFSET {$salesPagination['offset']}",
+                    [$openSession['opening_date']]
+                )->fetchAll();
+            }
         }
 
         $todayExpenses = [];
         $todayExpensesByUser = [];
         $todayExpensesTotal = 0.0;
         try {
-            $todayExpenses = $this->query(
-                "SELECT e.id, e.description, e.amount, e.expense_date, e.payment_method,
-                        e.receipt_number, e.user_id, e.created_at,
-                        COALESCE(NULLIF(TRIM(u.name), ''), 'Sin usuario') AS user_name,
-                        COALESCE(NULLIF(TRIM(ec.name), ''), NULLIF(TRIM(e.category), ''), 'General') AS category_label,
-                        s.name AS supplier_name
-                 FROM expenses e
-                 LEFT JOIN users u ON u.id = e.user_id
-                 LEFT JOIN expense_categories ec ON ec.id = e.category_id
-                 LEFT JOIN suppliers s ON s.id = e.supplier_id
-                 WHERE DATE(e.expense_date) = CURDATE()
-                 ORDER BY user_name ASC, e.created_at DESC, e.id DESC"
-            )->fetchAll();
+            if ($openSession) {
+                $expenseSessionIds = $ctx['session_ids'];
+                $expenseIn = implode(',', array_fill(0, count($expenseSessionIds), '?'));
+                // Solo egresos que realmente salieron del cajón (movimiento de caja).
+                // Admin: todos los usuarios. Resto: solo los propios.
+                $expenseSql = "SELECT e.id, e.description, e.amount, e.expense_date, e.payment_method,
+                            e.receipt_number, e.user_id, e.created_at,
+                            COALESCE(NULLIF(TRIM(u.name), ''), 'Sin usuario') AS user_name,
+                            COALESCE(NULLIF(TRIM(ec.name), ''), NULLIF(TRIM(e.category), ''), 'General') AS category_label,
+                            s.name AS supplier_name
+                     FROM expenses e
+                     INNER JOIN cash_movements cm
+                        ON cm.reference_type = 'expense' AND cm.reference_id = e.id
+                       AND cm.type = 'expense' AND cm.cash_session_id IN ({$expenseIn})
+                     LEFT JOIN users u ON u.id = e.user_id
+                     LEFT JOIN expense_categories ec ON ec.id = e.category_id
+                     LEFT JOIN suppliers s ON s.id = e.supplier_id
+                     WHERE COALESCE(e.status, 'active') <> 'cancelled'";
+                $expenseParams = $expenseSessionIds;
+                if (!$isAdminViewer) {
+                    $expenseSql .= " AND e.user_id = ?";
+                    $expenseParams[] = (int)($_SESSION['tenant_user_id'] ?? 0);
+                }
+                $expenseSql .= " ORDER BY e.created_at DESC, e.id DESC";
+                $todayExpenses = $this->query($expenseSql, $expenseParams)->fetchAll();
+            }
 
             foreach ($todayExpenses as $exp) {
                 $uid = (string)((int)($exp['user_id'] ?? 0));
@@ -166,43 +259,48 @@ class TenantCajaController extends TenantController
             $todayExpensesTotal = 0.0;
         }
 
-        $historyFrom = trim((string)$this->request->get('history_from', ''));
-        $historyTo = trim((string)$this->request->get('history_to', ''));
-        if ($historyFrom === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $historyFrom)) {
-            $historyFrom = date('Y-m-d', strtotime('-30 days'));
+        // Reportes de cierre: por defecto últimos 2 días; filtro opcional de un solo día.
+        $historyDate = trim((string)$this->request->get('history_date', ''));
+        if ($historyDate !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $historyDate)) {
+            $historyDate = '';
         }
-        if ($historyTo === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $historyTo)) {
+        if ($historyDate !== '') {
+            $historyWhere = ["cs.status = 'closed'", 'DATE(cs.closing_date) = ?'];
+            $historyParams = [$historyDate];
+        } else {
+            $historyFrom = date('Y-m-d', strtotime('-1 day'));
             $historyTo = date('Y-m-d');
+            $historyWhere = ["cs.status = 'closed'", 'DATE(cs.closing_date) >= ?', 'DATE(cs.closing_date) <= ?'];
+            $historyParams = [$historyFrom, $historyTo];
         }
-        if ($historyFrom > $historyTo) {
-            $tmp = $historyFrom;
-            $historyFrom = $historyTo;
-            $historyTo = $tmp;
-        }
-
-        $historyWhere = ["cs.status = 'closed'", 'DATE(cs.closing_date) >= ?', 'DATE(cs.closing_date) <= ?'];
-        $historyParams = [$historyFrom, $historyTo];
         if ($isPosRole) {
             $historyWhere[] = 'cs.user_id = ?';
             $historyParams[] = (int)($_SESSION['tenant_user_id'] ?? 0);
         }
-        $historySessions = $this->query(
-            "SELECT cs.*, u.name as user_name
-             FROM cash_sessions cs
-             JOIN users u ON cs.user_id = u.id
-             WHERE " . implode(' AND ', $historyWhere) . "
-             ORDER BY cs.closing_date DESC
-             LIMIT 100",
-            $historyParams
-        )->fetchAll();
+        try {
+            $historySessions = $this->query(
+                "SELECT cs.*, u.name as user_name
+                 FROM cash_sessions cs
+                 JOIN users u ON cs.user_id = u.id
+                 WHERE " . implode(' AND ', $historyWhere) . "
+                 ORDER BY cs.closing_date DESC
+                 LIMIT 50",
+                $historyParams
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $historySessions = [];
+        }
 
         $posCustomers = [];
         $paymentMethods = [];
         $recentProducts = [];
         $offerProducts = [];
-        $financialCats = [];
+        $consignmentProducts = [];
         $operationalCats = [];
+        $financialCats = [];
         $administrativeCats = [];
+        $managementCats = [];
+        $customSubgroupSections = [];
         $expenseSuppliers = [];
         $loanProducts = [];
         if ($openSession) {
@@ -233,10 +331,20 @@ class TenantCajaController extends TenantController
                 } catch (\Throwable $e) {
                     $offerProducts = [];
                 }
+                foreach ($offerProducts as &$op) {
+                    $op['tax_rate'] = \SoftNova\Services\TaxService::resolveProductRate(
+                        $op,
+                        \SoftNova\Services\TaxService::defaultRate($this->db),
+                        $this->db
+                    );
+                }
+                unset($op);
                 // Últimos 5 productos vendidos (por fecha de venta más reciente).
                 $recentProducts = $this->query(
                     "SELECT p.id, p.name, p.code, p.sale_price, COALESCE(p.wholesale_price, 0) AS wholesale_price,
+                            COALESCE(p.purchase_price, 0) AS purchase_price,
                             p.stock, COALESCE(p.product_type,'product') AS product_type,
+                            COALESCE(p.tax_rate, 0) AS tax_rate,
                             MAX(s.sale_date) AS last_sold_at
                      FROM sale_items si
                      INNER JOIN sales s ON s.id = si.sale_id
@@ -245,7 +353,7 @@ class TenantCajaController extends TenantController
                        AND COALESCE(s.status, 'completed') <> 'cancelled'
                        AND si.product_id IS NOT NULL
                        AND UPPER(COALESCE(p.code,'')) <> ?
-                     GROUP BY p.id, p.name, p.code, p.sale_price, p.wholesale_price, p.stock, p.product_type
+                     GROUP BY p.id, p.name, p.code, p.sale_price, p.wholesale_price, p.purchase_price, p.stock, p.product_type, p.tax_rate
                      ORDER BY last_sold_at DESC, p.id DESC
                      LIMIT 5",
                     [\SoftNova\Services\OpenItemProduct::CODE]
@@ -285,19 +393,63 @@ class TenantCajaController extends TenantController
             foreach ($recentProducts as &$rp) {
                 $rp['name'] = \SoftNova\Core\utf8_fix((string)($rp['name'] ?? ''));
                 $rp['code'] = \SoftNova\Core\utf8_fix((string)($rp['code'] ?? ''));
+                if (empty($rp['is_open_item'])) {
+                    $rp['tax_rate'] = \SoftNova\Services\TaxService::resolveProductRate(
+                        $rp,
+                        \SoftNova\Services\TaxService::defaultRate($this->db),
+                        $this->db
+                    );
+                } else {
+                    $rp['tax_rate'] = \SoftNova\Services\TaxService::defaultRate($this->db);
+                }
             }
             unset($rp);
+
+            // Acceso rápido: mercancía en consignación (no inventario propio).
+            try {
+                (new \SoftNova\Services\ConsignmentService($this->db))->ensureSchema();
+                $consignmentProducts = $this->query(
+                    "SELECT p.id, p.name, p.code, p.sale_price, COALESCE(p.wholesale_price, 0) AS wholesale_price,
+                            COALESCE(p.purchase_price, 0) AS purchase_price,
+                            p.stock, COALESCE(p.product_type,'product') AS product_type,
+                            COALESCE(p.ownership,'owned') AS ownership, p.consignor_id,
+                            COALESCE(p.tax_rate, 0) AS tax_rate,
+                            c.name AS consignor_name
+                     FROM products p
+                     LEFT JOIN consignors c ON c.id = p.consignor_id
+                     WHERE p.status = 'active'
+                       AND COALESCE(p.ownership,'owned') = 'consignment'
+                       AND COALESCE(p.product_type,'product') = 'product'
+                     ORDER BY c.name ASC, p.name ASC
+                     LIMIT 300"
+                )->fetchAll();
+                foreach ($consignmentProducts as &$cp) {
+                    $cp['name'] = \SoftNova\Core\utf8_fix((string)($cp['name'] ?? ''));
+                    $cp['code'] = \SoftNova\Core\utf8_fix((string)($cp['code'] ?? ''));
+                    $cp['consignor_name'] = \SoftNova\Core\utf8_fix((string)($cp['consignor_name'] ?? ''));
+                    $cp['is_consignment'] = 1;
+                    // Tasa cruda del catálogo (0 = exento). Caja aplica la misma regla que inventario.
+                    $cp['tax_rate'] = round((float)($cp['tax_rate'] ?? 0), 2);
+                }
+                unset($cp);
+            } catch (\Throwable $e) {
+                $consignmentProducts = [];
+            }
 
             if ($openSession && $this->canRegisterExpenseFromCaja()) {
                 try {
                     $catSvc = new \SoftNova\Services\ExpenseCategoryService($this->db);
-                    $financialCats = $catSvc->listActive('financial');
                     $operationalCats = $catSvc->listActive('operational');
+                    $financialCats = $catSvc->listActive('financial');
                     $administrativeCats = $catSvc->listActive('administrative');
+                    $managementCats = $catSvc->listActive('management');
+                    $customSubgroupSections = $catSvc->listCustomSubgroupSections();
                 } catch (\Throwable $e) {
-                    $financialCats = [];
                     $operationalCats = [];
+                    $financialCats = [];
                     $administrativeCats = [];
+                    $managementCats = [];
+                    $customSubgroupSections = [];
                 }
                 try {
                     $expenseSuppliers = $this->query(
@@ -367,18 +519,22 @@ class TenantCajaController extends TenantController
         $creditSurchargeRate = 0.0;
         $creditSurchargeDays = 60;
         $creditSurchargeTiers = [];
+        $quantityDiscountTiers = [];
         try {
             $commCfg = (new \SoftNova\Services\CommissionService($this->db))->config();
             $creditSurchargeRate = (float)($commCfg['credit_over_60_rate'] ?? 0);
             $creditSurchargeDays = (int)($commCfg['credit_over_60_days'] ?? 60);
             $creditSurchargeTiers = $commCfg['credit_surcharge_tiers'] ?? [];
+            $quantityDiscountTiers = $commCfg['quantity_discount_tiers'] ?? [];
             if ($creditSurchargeDays < 1) {
                 $creditSurchargeDays = 60;
             }
         } catch (\Throwable $e) {
         }
-        $taxRate = (float)$this->getSetting('tax_rate', '0');
-        if ($taxRate < 0) {
+        $taxRate = \SoftNova\Services\TaxService::normalizeRate((float)$this->getSetting('tax_rate', '0'));
+        $taxEnabled = \SoftNova\Services\TaxService::isCalculationEnabled($this->db);
+        $productTaxEnabled = \SoftNova\Services\TaxService::isProductTaxEnabled($this->db);
+        if (!$taxEnabled) {
             $taxRate = 0.0;
         }
 
@@ -386,6 +542,7 @@ class TenantCajaController extends TenantController
             'count' => 0,
             'negative_count' => 0,
             'loan_count' => 0,
+            'loan_received_count' => 0,
             'sale_debt_count' => 0,
             'summary_lines' => [],
             'summary_text' => '',
@@ -399,29 +556,36 @@ class TenantCajaController extends TenantController
         $this->view('tenant.caja', $this->tenantViewData([
             'openSession' => $openSession,
             'movements' => $movements,
+            'hiddenVoidedCount' => $hiddenVoidedCount,
             'todaySales' => $todaySales,
             'salesPagination' => $salesPagination,
             'todayExpensesByUser' => $todayExpensesByUser,
             'todayExpensesTotal' => $todayExpensesTotal,
             'todayExpensesCount' => count($todayExpenses),
             'taxRate' => $taxRate,
+            'taxEnabled' => $taxEnabled,
+            'productTaxEnabled' => $productTaxEnabled,
             'totals' => $totals,
             'historySessions' => $historySessions,
-            'historyFrom' => $historyFrom,
-            'historyTo' => $historyTo,
+            'historyDate' => $historyDate,
             'posCustomers' => $posCustomers,
             'paymentMethods' => $paymentMethods,
             'recentProducts' => $recentProducts,
             'offerProducts' => $offerProducts,
-            'financialCats' => $financialCats,
+            'consignmentProducts' => $consignmentProducts,
             'operationalCats' => $operationalCats,
+            'financialCats' => $financialCats,
             'administrativeCats' => $administrativeCats,
+            'managementCats' => $managementCats,
+            'customSubgroupSections' => $customSubgroupSections,
             'expenseSuppliers' => $expenseSuppliers,
             'loanProducts' => $loanProducts,
             'canLoanFromCaja' => $this->canLoanFromCaja(),
-            'loanReasonsHtml' => \SoftNova\Services\ProductLoan::optionsHtml(),
+            'loanReasonsHtml' => \SoftNova\Services\ProductLoan::optionsHtml(null, $this->db),
             'loanProductIdPrefill' => (int)$this->request->get('loan_product_id', 0),
             'isPosRole' => $isPosRole,
+            'isAdminViewer' => $isAdminViewer,
+            'openSessionsCount' => count($openSessions),
             'canExpenseFromCaja' => $this->canRegisterExpenseFromCaja(),
             'cancelReasons' => $cancelReasons,
             'stockAlert' => $stockAlert,
@@ -430,9 +594,13 @@ class TenantCajaController extends TenantController
             'creditSurchargeRate' => $creditSurchargeRate,
             'creditSurchargeDays' => $creditSurchargeDays,
             'creditSurchargeTiers' => $creditSurchargeTiers,
+            'quantityDiscountTiers' => $quantityDiscountTiers,
             'invoicePrefix' => $this->query(
                 "SELECT setting_value FROM settings WHERE setting_key = 'invoice_prefix' LIMIT 1"
             )->fetchColumn() ?: 'FAC-',
+            'autoPrintTicket' => !empty(
+                \SoftNova\Services\SalesDocumentConfig::fromSettings($company)['ticket']['auto_print_ticket']
+            ),
             'formatMoney' => fn($a) => $this->formatMoney($a),
         ]));
     }
@@ -520,6 +688,11 @@ class TenantCajaController extends TenantController
         TenantMiddleware::authorize('caja');
         $this->ensureWholesalePriceColumn();
         try {
+            \SoftNova\Services\TaxService::ensureSchema($this->db);
+        } catch (\Throwable $e) {
+            // ignore
+        }
+        try {
             (new \SoftNova\Services\ProductOfferService($this->db))->expireDueOffers();
         } catch (\Throwable $e) {
             // ignore
@@ -532,16 +705,32 @@ class TenantCajaController extends TenantController
 
         $like = '%' . $q . '%';
         $exact = $q;
+        // EAN limpio (solo dígitos) para lectores / espacios / guiones.
+        $eanDigits = preg_replace('/\D+/', '', $q) ?? '';
+        $eanAlt = '';
+        if (strlen($eanDigits) === 12) {
+            $eanAlt = '0' . $eanDigits;
+        } elseif (strlen($eanDigits) === 13 && str_starts_with($eanDigits, '0')) {
+            $eanAlt = substr($eanDigits, 1);
+        }
+        $barcodeExpr = "REPLACE(REPLACE(TRIM(COALESCE(barcode,'')), ' ', ''), '-', '')";
         try {
             $rows = $this->query(
                 "SELECT id, name, code, sale_price, COALESCE(wholesale_price, 0) AS wholesale_price,
+                        COALESCE(purchase_price, 0) AS purchase_price,
                         stock, min_stock, COALESCE(product_type,'product') AS product_type,
-                        COALESCE(barcode,'') AS barcode
+                        COALESCE(barcode,'') AS barcode,
+                        COALESCE(description,'') AS description,
+                        COALESCE(ownership,'owned') AS ownership,
+                        consignor_id, COALESCE(tax_rate, 0) AS tax_rate
                  FROM products
                  WHERE status = 'active'
+                   AND COALESCE(ownership,'owned') <> 'consignment'
                    AND (
                         code = ?
                         OR barcode = ?
+                        OR TRIM(COALESCE(barcode,'')) = ?
+                        OR ({$barcodeExpr} <> '' AND {$barcodeExpr} IN (?, ?))
                         OR code LIKE ?
                         OR name LIKE ?
                         OR barcode LIKE ?
@@ -550,31 +739,82 @@ class TenantCajaController extends TenantController
                  ORDER BY
                     CASE
                         WHEN code = ? THEN 0
-                        WHEN barcode = ? THEN 1
+                        WHEN barcode = ? OR TRIM(COALESCE(barcode,'')) = ? OR {$barcodeExpr} IN (?, ?) THEN 1
                         WHEN code LIKE ? THEN 2
                         WHEN name LIKE ? THEN 3
                         ELSE 4
                     END,
                     name ASC
                  LIMIT 25",
-                [$exact, $exact, $like, $like, $like, $exact, $exact, $exact, $exact . '%', $like]
+                [
+                    $exact, $exact, $exact,
+                    $eanDigits !== '' ? $eanDigits : $exact,
+                    $eanAlt !== '' ? $eanAlt : ($eanDigits !== '' ? $eanDigits : $exact),
+                    $like, $like, $like, $exact,
+                    $exact, $exact, $exact,
+                    $eanDigits !== '' ? $eanDigits : $exact,
+                    $eanAlt !== '' ? $eanAlt : ($eanDigits !== '' ? $eanDigits : $exact),
+                    $exact . '%', $like,
+                ]
             )->fetchAll();
         } catch (\Throwable $e) {
-            $this->json(['success' => false, 'message' => 'No se pudo buscar productos', 'products' => []]);
-            return;
+            try {
+                $rows = $this->query(
+                    "SELECT id, name, code, sale_price, COALESCE(wholesale_price, 0) AS wholesale_price,
+                            COALESCE(purchase_price, 0) AS purchase_price,
+                            stock, min_stock, COALESCE(product_type,'product') AS product_type,
+                            COALESCE(barcode,'') AS barcode,
+                            COALESCE(description,'') AS description
+                     FROM products
+                     WHERE status = 'active'
+                       AND (
+                            code = ?
+                            OR barcode = ?
+                            OR TRIM(COALESCE(barcode,'')) = ?
+                            OR code LIKE ?
+                            OR name LIKE ?
+                            OR barcode LIKE ?
+                            OR CAST(id AS CHAR) = ?
+                       )
+                     ORDER BY
+                        CASE
+                            WHEN code = ? THEN 0
+                            WHEN barcode = ? THEN 1
+                            WHEN code LIKE ? THEN 2
+                            WHEN name LIKE ? THEN 3
+                            ELSE 4
+                        END,
+                        name ASC
+                     LIMIT 25",
+                    [$exact, $exact, $exact, $like, $like, $like, $exact, $exact, $exact, $exact . '%', $like]
+                )->fetchAll();
+            } catch (\Throwable $e2) {
+                $this->json(['success' => false, 'message' => 'No se pudo buscar productos', 'products' => []]);
+                return;
+            }
         }
 
-        $products = array_map(static function (array $p): array {
+        $defaultTax = \SoftNova\Services\TaxService::defaultRate($this->db);
+        $products = array_map(function (array $p) use ($defaultTax): array {
             $code = \SoftNova\Core\utf8_fix((string)($p['code'] ?? ''));
+            $ownership = (string)($p['ownership'] ?? 'owned');
+            $tax = \SoftNova\Services\TaxService::resolveProductRate($p, $defaultTax, $this->db);
             return [
                 'id' => (int)$p['id'],
                 'name' => \SoftNova\Core\utf8_fix((string)$p['name']),
                 'code' => $code,
+                'barcode' => \SoftNova\Core\utf8_fix((string)($p['barcode'] ?? '')),
+                'description' => \SoftNova\Core\utf8_fix((string)($p['description'] ?? '')),
                 'sale_price' => (float)$p['sale_price'],
                 'wholesale_price' => (float)($p['wholesale_price'] ?? 0),
+                'purchase_price' => (float)($p['purchase_price'] ?? 0),
                 'stock' => (int)$p['stock'],
                 'product_type' => (string)($p['product_type'] ?? 'product'),
                 'is_open_item' => strtoupper($code) === \SoftNova\Services\OpenItemProduct::CODE ? 1 : 0,
+                'ownership' => $ownership,
+                'is_consignment' => $ownership === 'consignment' ? 1 : 0,
+                'consignor_id' => (int)($p['consignor_id'] ?? 0),
+                'tax_rate' => $tax,
             ];
         }, $rows);
 
@@ -587,48 +827,101 @@ class TenantCajaController extends TenantController
     private function catalogSnapshot(): void
     {
         TenantMiddleware::authorize('caja');
-        $limit = max(100, min(5000, (int)$this->request->get('limit', 2500)));
+        $limit = max(100, min(5000, (int)$this->request->get('limit', 3000)));
+        $offset = max(0, (int)$this->request->get('offset', 0));
 
         try {
             \SoftNova\Services\OpenItemProduct::ensure($this->db);
+            try {
+                \SoftNova\Services\TaxService::ensureSchema($this->db);
+            } catch (\Throwable $e) {
+                // ignore
+            }
             try {
                 (new \SoftNova\Services\ProductOfferService($this->db))->expireDueOffers();
             } catch (\Throwable $e) {
                 // ignore
             }
+            $total = (int)$this->query(
+                "SELECT COUNT(*) FROM products
+                 WHERE status = 'active'
+                   AND COALESCE(ownership,'owned') <> 'consignment'"
+            )->fetchColumn();
             $rows = $this->query(
-                "SELECT id, name, code, sale_price, stock, COALESCE(product_type, 'product') AS product_type
+                "SELECT id, name, code, sale_price, COALESCE(wholesale_price,0) AS wholesale_price,
+                        COALESCE(purchase_price,0) AS purchase_price, stock,
+                        COALESCE(product_type, 'product') AS product_type,
+                        COALESCE(barcode,'') AS barcode,
+                        COALESCE(description,'') AS description,
+                        COALESCE(ownership,'owned') AS ownership, consignor_id,
+                        COALESCE(tax_rate, 0) AS tax_rate
                  FROM products
                  WHERE status = 'active'
+                   AND COALESCE(ownership,'owned') <> 'consignment'
                  ORDER BY
                     CASE WHEN UPPER(COALESCE(code,'')) = ? THEN 0 ELSE 1 END,
-                    name ASC
-                 LIMIT {$limit}",
+                    id ASC
+                 LIMIT {$limit} OFFSET {$offset}",
                 [\SoftNova\Services\OpenItemProduct::CODE]
             )->fetchAll();
         } catch (\Throwable $e) {
-            $this->json(['success' => false, 'message' => 'No se pudo cargar el catálogo', 'products' => []]);
-            return;
+            try {
+                $total = (int)$this->query(
+                    "SELECT COUNT(*) FROM products WHERE status = 'active'"
+                )->fetchColumn();
+                $rows = $this->query(
+                    "SELECT id, name, code, sale_price, COALESCE(purchase_price,0) AS purchase_price, stock,
+                            COALESCE(product_type, 'product') AS product_type,
+                            COALESCE(barcode,'') AS barcode,
+                            COALESCE(description,'') AS description
+                     FROM products
+                     WHERE status = 'active'
+                     ORDER BY
+                        CASE WHEN UPPER(COALESCE(code,'')) = ? THEN 0 ELSE 1 END,
+                        id ASC
+                     LIMIT {$limit} OFFSET {$offset}",
+                    [\SoftNova\Services\OpenItemProduct::CODE]
+                )->fetchAll();
+            } catch (\Throwable $e2) {
+                $this->json(['success' => false, 'message' => 'No se pudo cargar el catálogo', 'products' => []]);
+                return;
+            }
         }
 
-        $products = array_map(static function (array $p): array {
+        $defaultTax = \SoftNova\Services\TaxService::defaultRate($this->db);
+        $products = array_map(function (array $p) use ($defaultTax): array {
             $code = \SoftNova\Core\utf8_fix((string)($p['code'] ?? ''));
+            $ownership = (string)($p['ownership'] ?? 'owned');
+            $tax = \SoftNova\Services\TaxService::resolveProductRate($p, $defaultTax, $this->db);
             return [
                 'id' => (int)$p['id'],
                 'name' => \SoftNova\Core\utf8_fix((string)$p['name']),
                 'code' => $code,
+                'barcode' => \SoftNova\Core\utf8_fix((string)($p['barcode'] ?? '')),
+                'description' => \SoftNova\Core\utf8_fix((string)($p['description'] ?? '')),
                 'sale_price' => (float)$p['sale_price'],
+                'wholesale_price' => (float)($p['wholesale_price'] ?? 0),
+                'purchase_price' => (float)($p['purchase_price'] ?? 0),
                 'stock' => (int)$p['stock'],
                 'product_type' => (string)($p['product_type'] ?? 'product'),
                 'is_open_item' => strtoupper($code) === \SoftNova\Services\OpenItemProduct::CODE ? 1 : 0,
+                'ownership' => $ownership,
+                'is_consignment' => $ownership === 'consignment' ? 1 : 0,
+                'consignor_id' => (int)($p['consignor_id'] ?? 0),
+                'tax_rate' => $tax,
             ];
         }, $rows);
 
+        $fetched = count($products);
         $this->json([
             'success' => true,
             'products' => $products,
             'synced_at' => date('c'),
-            'count' => count($products),
+            'count' => $fetched,
+            'offset' => $offset,
+            'limit' => $limit,
+            'total' => $total ?? ($offset + $fetched),
+            'has_more' => ($offset + $fetched) < (int)($total ?? ($offset + $fetched)),
         ]);
     }
     
@@ -695,6 +988,15 @@ class TenantCajaController extends TenantController
              VALUES (?, ?, NOW(), 'open', ?)",
             [$_SESSION['tenant_user_id'], $openingAmount, $notes]
         );
+        $sessionId = (int)$this->db->lastInsertId();
+
+        (new \SoftNova\Services\TenantAuditService($this->db))->log(
+            'open',
+            'caja',
+            'Apertura de caja con ' . $this->formatMoney($openingAmount),
+            'cash_session',
+            $sessionId
+        );
         
         $this->respond(true, 'Caja abierta exitosamente con ' . $this->formatMoney($openingAmount), '/app/caja');
     }
@@ -704,6 +1006,8 @@ class TenantCajaController extends TenantController
         if (!$this->validateCsrfOrFail('/app/caja')) {
             return;
         }
+
+        $this->ensureCajaRuntimeSchema();
 
         $sessionId = (int)$this->request->post('session_id', 0);
         $closingAmount = \SoftNova\Core\parse_money($this->request->post('closing_amount', 0));
@@ -769,9 +1073,6 @@ class TenantCajaController extends TenantController
 
         $this->postCashClosingAccounting($sessionId);
 
-        $base = rtrim((string)config('app.url', ''), '/');
-        $pdfUrl = $base . '/app/caja?action=pdf&id=' . $sessionId;
-
         $message = 'Caja cerrada correctamente.';
         if (abs($difference) >= 0.01) {
             $message .= $difference < 0
@@ -783,16 +1084,48 @@ class TenantCajaController extends TenantController
                 . ' producto(s) con stock negativo o pendiente (préstamo/venta sin stock).';
         }
 
+        (new \SoftNova\Services\TenantAuditService($this->db))->log(
+            'close',
+            'caja',
+            'Cierre de caja · contado ' . $this->formatMoney($closingAmount)
+                . ' · esperado ' . $this->formatMoney($expectedCash)
+                . ' · dif. ' . $this->formatMoney($difference),
+            'cash_session',
+            $sessionId
+        );
+
         $this->json([
             'success' => true,
             'message' => $message,
             'redirect' => base_url('/app/caja?share_close=' . $sessionId),
-            'pdf_url' => $pdfUrl,
+            'auto_pdf' => false,
             'session_id' => $sessionId,
             'expected_cash' => $expectedCash,
             'difference' => $difference,
             'stock_alert_count' => (int)($stockAlert['count'] ?? 0),
         ]);
+    }
+
+    /**
+     * Columnas de ventas/caja que no vienen en installs antiguos (payment_terms, arqueo, etc.).
+     */
+    private function ensureCajaRuntimeSchema(): void
+    {
+        try {
+            SupplyChainSchema::ensure($this->db);
+        } catch (\Throwable $e) {
+            error_log('caja SupplyChainSchema: ' . $e->getMessage());
+        }
+        try {
+            new \SoftNova\Services\SalesDocumentService($this->db);
+        } catch (\Throwable $e) {
+            error_log('caja SalesDocumentService: ' . $e->getMessage());
+        }
+        try {
+            (new \SoftNova\Services\ConsignmentService($this->db))->ensureSchema();
+        } catch (\Throwable $e) {
+            error_log('caja ConsignmentService: ' . $e->getMessage());
+        }
     }
 
     /**
@@ -802,6 +1135,8 @@ class TenantCajaController extends TenantController
      */
     private function computeExpectedCash(array $session, ?string $until = null): float
     {
+        $this->ensureCajaRuntimeSchema();
+
         $sessionId = (int)$session['id'];
         $opening = (float)($session['opening_amount'] ?? 0);
 
@@ -816,7 +1151,8 @@ class TenantCajaController extends TenantController
 
         $cash = $opening + (float)$movTotals['incomes'] - (float)$movTotals['expenses'];
 
-        // Ventas en efectivo sin movimiento de caja asociado (evita doble conteo).
+        // Ventas/cobros en efectivo sin movimiento de caja asociado (evita doble conteo).
+        // Usa montos de sale_payments cuando existen; fallback a total solo en contado legacy.
         $params = [$sessionId, $sessionId, (string)($session['opening_date'] ?? '')];
         $untilSql = '';
         if ($until) {
@@ -825,19 +1161,33 @@ class TenantCajaController extends TenantController
         }
 
         $orphanCashSales = $this->query(
-            "SELECT COALESCE(SUM(s.total), 0)
-             FROM sales s
-             WHERE s.status != 'cancelled'
-               AND s.id NOT IN (
-                    SELECT COALESCE(reference_id, 0) FROM cash_movements
-                    WHERE cash_session_id = ? AND reference_type = 'sale'
-               )
-               AND s.id NOT IN (
-                    SELECT COALESCE(reference_id, 0) FROM cash_movements
-                    WHERE cash_session_id = ? AND reference_type = 'sale_payment'
-               )
-               AND s.sale_date >= ?" . $untilSql . "
-               AND COALESCE(s.payment_method, 'cash') IN ('cash', '')",
+            "SELECT COALESCE(SUM(paid_cash), 0) FROM (
+                SELECT s.id,
+                       COALESCE((
+                           SELECT SUM(sp.amount)
+                           FROM sale_payments sp
+                           WHERE sp.sale_id = s.id
+                             AND COALESCE(sp.payment_method, '') IN ('cash', '')
+                       ), CASE
+                           WHEN COALESCE(s.payment_method, 'cash') IN ('cash', '')
+                                AND s.payment_status = 'paid'
+                                AND COALESCE(s.payment_terms, 'cash') = 'cash'
+                                AND NOT EXISTS (SELECT 1 FROM sale_payments sp2 WHERE sp2.sale_id = s.id)
+                           THEN s.total
+                           ELSE 0
+                       END) AS paid_cash
+                FROM sales s
+                WHERE s.status != 'cancelled'
+                  AND s.id NOT IN (
+                       SELECT COALESCE(reference_id, 0) FROM cash_movements
+                       WHERE cash_session_id = ? AND reference_type = 'sale'
+                  )
+                  AND s.id NOT IN (
+                       SELECT COALESCE(reference_id, 0) FROM cash_movements
+                       WHERE cash_session_id = ? AND reference_type = 'sale_payment'
+                  )
+                  AND s.sale_date >= ?" . $untilSql . "
+             ) orphan",
             $params
         )->fetchColumn();
 
@@ -851,6 +1201,15 @@ class TenantCajaController extends TenantController
             (new \SoftNova\Services\AccountingService($this->db))->postCashSessionClosing($sessionId);
         } catch (\Throwable $e) {
             error_log('Contabilidad arqueo caja ' . $sessionId . ': ' . $e->getMessage());
+            try {
+                (new \SoftNova\Services\AccountingService($this->db))->enqueuePending(
+                    'post_cash_session',
+                    'cash_session',
+                    $sessionId,
+                    $e->getMessage()
+                );
+            } catch (\Throwable $ignore) {
+            }
         }
     }
     
@@ -951,7 +1310,7 @@ class TenantCajaController extends TenantController
         );
         $receiptNumber = trim((string)$this->request->post('receipt_number', ''));
         $notes = trim((string)$this->request->post('notes', ''));
-        $affectCash = $this->request->post('affect_cash') === '1';
+        $cashExplanation = trim((string)$this->request->post('cash_explanation', ''));
 
         if ($description === '' || $amount <= 0) {
             $this->respond(false, 'Descripción y monto son requeridos', '/app/caja');
@@ -959,7 +1318,15 @@ class TenantCajaController extends TenantController
         }
 
         $rawCategory = trim((string)$this->request->post('category_id', ''));
-        if ($rawCategory === '' || $rawCategory === '__other__' || $categoryId <= 0) {
+        if (str_starts_with($rawCategory, '__other_')) {
+            $this->respond(
+                false,
+                'Solo el administrador puede crear categorías nuevas. Use Configuración → Administración de gastos.',
+                '/app/caja'
+            );
+            return;
+        }
+        if ($rawCategory === '' || $categoryId <= 0) {
             $this->respond(false, 'Seleccione una categoría de gasto válida', '/app/caja');
             return;
         }
@@ -970,6 +1337,27 @@ class TenantCajaController extends TenantController
             $this->respond(false, 'La categoría de gasto no existe o está inactiva', '/app/caja');
             return;
         }
+        $isCashPay = \SoftNova\Services\PaymentMethodCatalog::affectsCash($paymentMethod);
+        $isAccountingExpense = $categories->isAccounting($cat);
+        $touchCajon = $isCashPay && $categories->affectsCashDrawer($cat);
+        $markPaid = !$isCashPay && $paymentMethod !== '';
+
+        if ($isCashPay && $isAccountingExpense) {
+            if ($cashExplanation === '') {
+                $this->respond(
+                    false,
+                    'En gastos contables con efectivo indique la explicación (ej. retiro cajero). No descuenta el cajón.',
+                    '/app/caja'
+                );
+                return;
+            }
+            $markPaid = true;
+            $prefix = 'Efectivo: ' . $cashExplanation;
+            $notes = $notes !== '' ? ($prefix . ' | ' . $notes) : $prefix;
+        } elseif ($isCashPay && $touchCajon) {
+            $markPaid = true;
+        }
+
         $category = (string)$cat['name'];
 
         $receipt = $this->storeExpenseReceiptUpload();
@@ -1016,12 +1404,22 @@ class TenantCajaController extends TenantController
         }
 
         try {
-            (new \SoftNova\Services\AccountingService($this->db))->postExpense($expenseId, $affectCash);
+            (new \SoftNova\Services\AccountingService($this->db))->postExpense($expenseId, $touchCajon, $markPaid);
         } catch (\Throwable $e) {
             error_log('Contabilidad gasto caja ' . $expenseId . ': ' . $e->getMessage());
+            try {
+                (new \SoftNova\Services\AccountingService($this->db))->enqueuePending(
+                    'post_expense',
+                    'expense',
+                    $expenseId,
+                    $e->getMessage(),
+                    ['affect_cash' => $touchCajon, 'paid_now' => $markPaid]
+                );
+            } catch (\Throwable $ignore) {
+            }
         }
 
-        if ($affectCash && \SoftNova\Services\PaymentMethodCatalog::affectsCash($paymentMethod)) {
+        if ($touchCajon) {
             (new \SoftNova\Services\CashService($this->db))->registerMovement(
                 $amount,
                 'Gasto: ' . $description,
@@ -1030,6 +1428,14 @@ class TenantCajaController extends TenantController
                 $expenseId
             );
         }
+
+        (new \SoftNova\Services\TenantAuditService($this->db))->log(
+            'create',
+            'caja',
+            'Gasto desde caja: ' . $description . ' · ' . $this->formatMoney($amount),
+            'expense',
+            $expenseId
+        );
 
         $this->respond(true, 'Gasto registrado: ' . $this->formatMoney($amount), '/app/caja');
     }
@@ -1137,9 +1543,25 @@ class TenantCajaController extends TenantController
             (new \SoftNova\Services\AccountingService($this->db))->postCashMovement($movementId);
         } catch (\Throwable $e) {
             error_log('Contabilidad movimiento caja ' . $movementId . ': ' . $e->getMessage());
+            try {
+                (new \SoftNova\Services\AccountingService($this->db))->enqueuePending(
+                    'post_cash_movement',
+                    'cash_movement',
+                    $movementId,
+                    $e->getMessage()
+                );
+            } catch (\Throwable $ignore) {
+            }
         }
         
         $label = $type === 'income' ? 'Ingreso' : 'Egreso';
+        (new \SoftNova\Services\TenantAuditService($this->db))->log(
+            'movement',
+            'caja',
+            $label . ' manual: ' . $description . ' · ' . $this->formatMoney($amount),
+            'cash_movement',
+            $movementId
+        );
         $this->respond(true, "{$label} registrado: " . $this->formatMoney($amount), '/app/caja');
     }
     
@@ -1161,7 +1583,8 @@ class TenantCajaController extends TenantController
                 $report['session'],
                 $report['movements'],
                 $report['totals'],
-                $report['sales']
+                $report['sales'],
+                $report['admin_expenses'] ?? []
             );
             $pdf->download($content, 'Cierre_Caja_' . $id . '_' . date('Ymd_His') . '.pdf');
         } catch (\Throwable $e) {
@@ -1246,7 +1669,8 @@ class TenantCajaController extends TenantController
                 $session,
                 $report['movements'],
                 $report['totals'],
-                $report['sales']
+                $report['sales'],
+                $report['admin_expenses'] ?? []
             );
             $temporal = tempnam(sys_get_temp_dir(), 'caja-') . '.pdf';
             file_put_contents($temporal, $content);
@@ -1263,7 +1687,12 @@ class TenantCajaController extends TenantController
                 . "Usuario: " . ($session['user_name'] ?? '') . "\n"
                 . "Apertura: {$apertura}\n"
                 . "Cierre: {$cierre}\n"
-                . "Ventas: " . (int)($report['totals']['sales_count'] ?? 0)
+                . "Base cajón: " . $this->formatMoney((float)($session['opening_amount'] ?? 0)) . "\n"
+                . "Efectivo ventas del día: " . $this->formatMoney((float)($report['totals']['cash_sales'] ?? 0)) . "\n"
+                . "Efectivo esperado en cajón: " . $this->formatMoney((float)($report['totals']['expected_cash'] ?? 0)) . "\n"
+                . "Sub-total sin descuentos: " . $this->formatMoney((float)($report['totals']['sales_subtotal_before_discount'] ?? 0)) . "\n"
+                . "Descuento total aplicado: " . $this->formatMoney((float)($report['totals']['sales_discount_total'] ?? 0)) . "\n"
+                . "Ventas facturadas: " . (int)($report['totals']['sales_count'] ?? 0)
                 . " · Total: " . $this->formatMoney((float)($report['totals']['sales_total'] ?? 0)) . "\n"
                 . "Adjunto encontrará el PDF del cierre.\n";
 
@@ -1324,24 +1753,25 @@ class TenantCajaController extends TenantController
             return null;
         }
 
-        if (TenantMiddleware::isPosRole()) {
+        if (TenantMiddleware::getRole() !== 'admin') {
             $uid = (int)($_SESSION['tenant_user_id'] ?? 0);
             if ((int)($session['user_id'] ?? 0) !== $uid) {
                 return null;
             }
         }
 
-        $movements = $this->query(
-            "SELECT * FROM cash_movements WHERE cash_session_id = ? ORDER BY created_at ASC",
-            [$id]
-        )->fetchAll();
+        $movements = $this->fetchSessionMovements([(int)$id], false);
+        $movements = array_values(array_filter(
+            $movements ?: [],
+            static fn($m) => empty($m['_meta_only']) && (int)($m['id'] ?? 0) > 0
+        ));
 
-        $totals = $this->query(
-            "SELECT COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) as incomes,
-                    COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) as expenses
-             FROM cash_movements WHERE cash_session_id = ?",
-            [$id]
-        )->fetch() ?: ['incomes' => 0, 'expenses' => 0];
+        $cashSvc = new \SoftNova\Services\CashService($this->db);
+        $movNet = $cashSvc->totalsForSession($id);
+        $totals = [
+            'incomes' => $movNet['incomes'],
+            'expenses' => $movNet['expenses'],
+        ];
 
         try {
             $fullTotals = $this->computeSessionTotals($session, $session['closing_date'] ?? null);
@@ -1350,6 +1780,8 @@ class TenantCajaController extends TenantController
             $totals['payment_breakdown'] = $fullTotals['payment_breakdown'] ?? [];
             $totals['sales_total'] = $fullTotals['sales_total'] ?? 0;
             $totals['sales_count'] = $fullTotals['sales_count'] ?? 0;
+            $totals['sales_subtotal_before_discount'] = $fullTotals['sales_subtotal_before_discount'] ?? 0;
+            $totals['sales_discount_total'] = $fullTotals['sales_discount_total'] ?? 0;
             $totals['expected_cash'] = $fullTotals['expected_cash'] ?? null;
             $totals['counted_cash'] = $fullTotals['counted_cash'] ?? null;
             $totals['difference'] = $fullTotals['difference'] ?? null;
@@ -1359,33 +1791,7 @@ class TenantCajaController extends TenantController
 
         $sales = [];
         try {
-            $opening = $session['opening_date'] ?? null;
-            $closing = $session['closing_date'] ?? null;
-            if ($opening) {
-                if ($closing) {
-                    $sales = $this->query(
-                        "SELECT s.id, s.invoice_number, s.sale_date, s.total, s.status, s.payment_method,
-                                COALESCE(c.name, 'Publico general') as customer_name
-                         FROM sales s
-                         LEFT JOIN customers c ON s.customer_id = c.id
-                         WHERE s.sale_date >= ? AND s.sale_date <= ?
-                           AND s.status != 'cancelled'
-                         ORDER BY s.sale_date ASC",
-                        [$opening, $closing]
-                    )->fetchAll();
-                } else {
-                    $sales = $this->query(
-                        "SELECT s.id, s.invoice_number, s.sale_date, s.total, s.status, s.payment_method,
-                                COALESCE(c.name, 'Publico general') as customer_name
-                         FROM sales s
-                         LEFT JOIN customers c ON s.customer_id = c.id
-                         WHERE s.sale_date >= ?
-                           AND s.status != 'cancelled'
-                         ORDER BY s.sale_date ASC",
-                        [$opening]
-                    )->fetchAll();
-                }
-            }
+            $sales = $this->salesForCashSessionReport($session);
         } catch (\Throwable $e) {
             $sales = [];
         }
@@ -1395,7 +1801,142 @@ class TenantCajaController extends TenantController
             'movements' => $movements ?: [],
             'totals' => $totals ?: ['incomes' => 0, 'expenses' => 0],
             'sales' => $sales,
+            'admin_expenses' => $this->loadAdministrativeExpensesForSession($session),
         ];
+    }
+
+    /**
+     * Ventas del cierre: por rango sale_date de la sesión + ventas ligadas a movimientos
+     * de esa caja (evita perder cobros nocturnos mal fechados por UTC).
+     *
+     * @return list<array<string,mixed>>
+     */
+    private function salesForCashSessionReport(array $session): array
+    {
+        $sessionId = (int)($session['id'] ?? 0);
+        $opening = (string)($session['opening_date'] ?? '');
+        $closing = (string)($session['closing_date'] ?? '');
+        if ($opening === '' && $sessionId <= 0) {
+            return [];
+        }
+
+        $byId = [];
+
+        $addRows = static function (array $rows) use (&$byId): void {
+            foreach ($rows as $row) {
+                $id = (int)($row['id'] ?? 0);
+                if ($id <= 0) {
+                    continue;
+                }
+                $byId[$id] = $row;
+            }
+        };
+
+        if ($opening !== '') {
+            if ($closing !== '') {
+                $addRows($this->query(
+                    "SELECT s.id, s.invoice_number, s.sale_date, s.total, s.status, s.payment_method,
+                            COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount,
+                            COALESCE(c.name, 'Publico general') as customer_name
+                     FROM sales s
+                     LEFT JOIN customers c ON s.customer_id = c.id
+                     WHERE s.sale_date >= ? AND s.sale_date <= ?
+                       AND COALESCE(s.status, '') <> 'cancelled'
+                     ORDER BY s.sale_date DESC, s.id DESC",
+                    [$opening, $closing]
+                )->fetchAll() ?: []);
+            } else {
+                $addRows($this->query(
+                    "SELECT s.id, s.invoice_number, s.sale_date, s.total, s.status, s.payment_method,
+                            COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount,
+                            COALESCE(c.name, 'Publico general') as customer_name
+                     FROM sales s
+                     LEFT JOIN customers c ON s.customer_id = c.id
+                     WHERE s.sale_date >= ?
+                       AND COALESCE(s.status, '') <> 'cancelled'
+                     ORDER BY s.sale_date DESC, s.id DESC",
+                    [$opening]
+                )->fetchAll() ?: []);
+            }
+        }
+
+        if ($sessionId > 0) {
+            // Cobros registrados en esta sesión (efectivo) aunque sale_date esté corrido.
+            $addRows($this->query(
+                "SELECT s.id, s.invoice_number, s.sale_date, s.total, s.status, s.payment_method,
+                        COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount,
+                        COALESCE(c.name, 'Publico general') as customer_name
+                 FROM cash_movements cm
+                 INNER JOIN sales s ON s.id = cm.reference_id
+                 LEFT JOIN customers c ON s.customer_id = c.id
+                 WHERE cm.cash_session_id = ?
+                   AND cm.reference_type IN ('sale', 'sale_cancel')
+                   AND COALESCE(s.status, '') <> 'cancelled'",
+                [$sessionId]
+            )->fetchAll() ?: []);
+
+            $addRows($this->query(
+                "SELECT s.id, s.invoice_number, s.sale_date, s.total, s.status, s.payment_method,
+                        COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount,
+                        COALESCE(c.name, 'Publico general') as customer_name
+                 FROM cash_movements cm
+                 INNER JOIN sale_payments sp ON sp.id = cm.reference_id
+                 INNER JOIN sales s ON s.id = sp.sale_id
+                 LEFT JOIN customers c ON s.customer_id = c.id
+                 WHERE cm.cash_session_id = ?
+                   AND cm.reference_type IN ('sale_payment', 'sale_payment_adjust')
+                   AND COALESCE(s.status, '') <> 'cancelled'",
+                [$sessionId]
+            )->fetchAll() ?: []);
+        }
+
+        $sales = array_values($byId);
+        usort($sales, static function ($a, $b) {
+            return strcmp((string)($b['sale_date'] ?? ''), (string)($a['sale_date'] ?? ''))
+                ?: ((int)($b['id'] ?? 0) <=> (int)($a['id'] ?? 0));
+        });
+
+        return $sales;
+    }
+
+    /**
+     * Gastos administrativos del día de la sesión (informativos; no afectan el cajón).
+     *
+     * @return list<array<string,mixed>>
+     */
+    private function loadAdministrativeExpensesForSession(array $session): array
+    {
+        $from = !empty($session['opening_date'])
+            ? date('Y-m-d', strtotime((string)$session['opening_date']))
+            : date('Y-m-d');
+        $to = !empty($session['closing_date'])
+            ? date('Y-m-d', strtotime((string)$session['closing_date']))
+            : $from;
+
+        $adminCodes = \SoftNova\Services\ExpenseCategoryService::ADMINISTRATIVE_CODES;
+        $codePlaceholders = implode(',', array_fill(0, count($adminCodes), '?'));
+
+        try {
+            return $this->query(
+                "SELECT e.description, e.amount, e.expense_date, e.payment_method, e.notes,
+                        COALESCE(ec.name, e.category, 'Administrativo') AS category_name,
+                        COALESCE(NULLIF(TRIM(u.name), ''), 'Sin usuario') AS user_name
+                 FROM expenses e
+                 LEFT JOIN expense_categories ec ON ec.id = e.category_id
+                 LEFT JOIN users u ON u.id = e.user_id
+                 WHERE e.expense_date BETWEEN ? AND ?
+                   AND COALESCE(e.status, 'active') <> 'cancelled'
+                   AND (
+                     ec.kind = 'administrative'
+                     OR ec.code IN ({$codePlaceholders})
+                   )
+                 ORDER BY e.expense_date ASC, e.id ASC",
+                array_merge([$from, $to], $adminCodes)
+            )->fetchAll() ?: [];
+        } catch (\Throwable $e) {
+            error_log('loadAdministrativeExpensesForSession: ' . $e->getMessage());
+            return [];
+        }
     }
 
     /** @param array{session:array,totals:array,sales:list} $report */
@@ -1410,9 +1951,16 @@ class TenantCajaController extends TenantController
             'Usuario: ' . ($session['user_name'] ?? ''),
             'Apertura: ' . (!empty($session['opening_date']) ? date('d/m/Y H:i', strtotime((string)$session['opening_date'])) : '—'),
             'Cierre: ' . (!empty($session['closing_date']) ? date('d/m/Y H:i', strtotime((string)$session['closing_date'])) : 'En curso'),
-            'Apertura $: ' . $this->formatMoney((float)($session['opening_amount'] ?? 0)),
-            'Cierre $: ' . $this->formatMoney((float)($session['closing_amount'] ?? 0)),
-            'Ventas: ' . (int)($totals['sales_count'] ?? 0) . ' · ' . $this->formatMoney((float)($totals['sales_total'] ?? 0)),
+            '',
+            '*Arqueo de efectivo:*',
+            'Base cajón (apertura): ' . $this->formatMoney((float)($session['opening_amount'] ?? 0)),
+            'Efectivo ventas del día: ' . $this->formatMoney((float)($totals['cash_sales'] ?? 0)),
+            'Egresos cajón: ' . $this->formatMoney((float)($totals['expenses'] ?? 0)),
+            'Efectivo esperado en cajón: ' . $this->formatMoney((float)($totals['expected_cash'] ?? 0)),
+            'Contado al cierre: ' . $this->formatMoney((float)($session['closing_amount'] ?? 0)),
+            'Sub-total sin descuentos: ' . $this->formatMoney((float)($totals['sales_subtotal_before_discount'] ?? 0)),
+            'Descuento total aplicado: ' . $this->formatMoney((float)($totals['sales_discount_total'] ?? 0)),
+            'Ventas facturadas: ' . (int)($totals['sales_count'] ?? 0) . ' · ' . $this->formatMoney((float)($totals['sales_total'] ?? 0)),
         ];
         $payBreak = $totals['payment_breakdown'] ?? [];
         if (is_array($payBreak) && $payBreak !== []) {
@@ -1420,16 +1968,12 @@ class TenantCajaController extends TenantController
                 return ((float)($b['total'] ?? 0) <=> (float)($a['total'] ?? 0));
             });
             $lines[] = '';
-            $lines[] = '*Totales por medio de pago:*';
+            $lines[] = '*Totales por medio de pago (sin la base):*';
             foreach ($payBreak as $code => $pb) {
                 $label = (string)($pb['label'] ?? $code);
                 $lines[] = '• ' . $label . ': ' . $this->formatMoney((float)($pb['total'] ?? 0))
                     . ' (' . (int)($pb['count'] ?? 0) . ')';
             }
-        }
-        if (isset($totals['expected_cash'])) {
-            $lines[] = '';
-            $lines[] = 'Efectivo esperado en cajón: ' . $this->formatMoney((float)$totals['expected_cash']);
         }
         if (isset($totals['difference']) && abs((float)$totals['difference']) >= 0.01) {
             $diff = (float)$totals['difference'];
@@ -1442,8 +1986,9 @@ class TenantCajaController extends TenantController
 
     /**
      * Totales de una sesion de caja (movimientos + ventas no duplicadas).
+     * Ingresos/egresos incluyen todos los medios; expected_cash sigue siendo solo cajón.
      *
-     * @return array{incomes:float,expenses:float,balance:float,sales_count:int,sales_total:float,movements_count:int}
+     * @return array{incomes:float,expenses:float,balance:float,other_incomes:float,sales_count:int,sales_total:float,movements_count:int}
      */
     private function computeSessionTotals(array $session, ?string $until = null): array
     {
@@ -1452,17 +1997,11 @@ class TenantCajaController extends TenantController
         $openingDate = (string)($session['opening_date'] ?? '');
         $until = $until ?: null;
 
-        $movTotals = $this->query(
-            "SELECT
-                COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) as incomes,
-                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) as expenses,
-                COUNT(*) as movements_count
-             FROM cash_movements
-             WHERE cash_session_id = ?",
-            [$sessionId]
-        )->fetch() ?: ['incomes' => 0, 'expenses' => 0, 'movements_count' => 0];
+        $cashSvc = new \SoftNova\Services\CashService($this->db);
+        $movTotals = $cashSvc->totalsForSession($sessionId);
 
-        $incomes = (float)$movTotals['incomes'];
+        // Base cajón (efectivo): movimientos de caja + ventas cash legacy sin movimiento.
+        $cashIncomes = (float)$movTotals['incomes'];
         $expenses = (float)$movTotals['expenses'];
         $movementsCount = (int)$movTotals['movements_count'];
 
@@ -1471,51 +2010,136 @@ class TenantCajaController extends TenantController
             [$sessionId]
         )->fetchAll();
         $coveredSaleIds = [];
+        $paymentRefIds = [];
         foreach ($movements as $mov) {
             $rt = (string)($mov['reference_type'] ?? '');
-            if (
-                in_array($rt, ['sale', 'sale_payment', 'sale_payment_adjust', 'sale_cancel'], true)
-                && !empty($mov['reference_id'])
-            ) {
-                $coveredSaleIds[(int)$mov['reference_id']] = true;
+            $rid = (int)($mov['reference_id'] ?? 0);
+            if ($rid <= 0) {
+                continue;
+            }
+            if (in_array($rt, ['sale', 'sale_cancel'], true)) {
+                $coveredSaleIds[$rid] = true;
+            } elseif (in_array($rt, ['sale_payment', 'sale_payment_adjust'], true)) {
+                $paymentRefIds[$rid] = true;
+            }
+        }
+        if ($paymentRefIds !== []) {
+            $payIdList = array_keys($paymentRefIds);
+            $ph = implode(',', array_fill(0, count($payIdList), '?'));
+            try {
+                $linked = $this->query(
+                    "SELECT sale_id FROM sale_payments WHERE id IN ({$ph})",
+                    $payIdList
+                )->fetchAll() ?: [];
+                foreach ($linked as $lr) {
+                    $sid = (int)($lr['sale_id'] ?? 0);
+                    if ($sid > 0) {
+                        $coveredSaleIds[$sid] = true;
+                    }
+                }
+            } catch (\Throwable $e) {
+                // esquema antiguo sin sale_payments
             }
         }
 
-        if ($until) {
-            $sales = $this->query(
-                "SELECT id, total, status, payment_method, payment_status
-                 FROM sales WHERE sale_date >= ? AND sale_date <= ?",
-                [$openingDate, $until]
-            )->fetchAll();
-            $payRows = $this->query(
-                "SELECT sp.payment_method, sp.amount
-                 FROM sale_payments sp
-                 INNER JOIN sales s ON s.id = sp.sale_id
-                 WHERE s.sale_date >= ? AND s.sale_date <= ?
-                   AND COALESCE(s.status, '') <> 'cancelled'",
-                [$openingDate, $until]
-            )->fetchAll();
-        } else {
-            $sales = $this->query(
-                "SELECT id, total, status, payment_method, payment_status
-                 FROM sales WHERE sale_date >= ?",
-                [$openingDate]
-            )->fetchAll();
-            $payRows = $this->query(
-                "SELECT sp.payment_method, sp.amount
-                 FROM sale_payments sp
-                 INNER JOIN sales s ON s.id = sp.sale_id
-                 WHERE s.sale_date >= ?
-                   AND COALESCE(s.status, '') <> 'cancelled'",
-                [$openingDate]
-            )->fetchAll();
+        // Ventas del periodo: por sale_date de la sesión + ventas ligadas a esta caja
+        // (cubre cobros nocturnos mal fechados por UTC en el cliente).
+        $salesById = [];
+        $mergeSales = static function (array $rows) use (&$salesById): void {
+            foreach ($rows as $row) {
+                $id = (int)($row['id'] ?? 0);
+                if ($id > 0) {
+                    $salesById[$id] = $row;
+                }
+            }
+        };
+
+        if ($openingDate !== '') {
+            try {
+                if ($until) {
+                    $mergeSales($this->query(
+                        "SELECT id, total, status, payment_method, payment_status,
+                                COALESCE(subtotal, 0) AS subtotal, COALESCE(discount, 0) AS discount
+                         FROM sales WHERE sale_date >= ? AND sale_date <= ?",
+                        [$openingDate, $until]
+                    )->fetchAll() ?: []);
+                } else {
+                    $mergeSales($this->query(
+                        "SELECT id, total, status, payment_method, payment_status,
+                                COALESCE(subtotal, 0) AS subtotal, COALESCE(discount, 0) AS discount
+                         FROM sales WHERE sale_date >= ?",
+                        [$openingDate]
+                    )->fetchAll() ?: []);
+                }
+            } catch (\Throwable $e) {
+                // Esquema sin subtotal/discount
+                if ($until) {
+                    $mergeSales($this->query(
+                        "SELECT id, total, status, payment_method, payment_status
+                         FROM sales WHERE sale_date >= ? AND sale_date <= ?",
+                        [$openingDate, $until]
+                    )->fetchAll() ?: []);
+                } else {
+                    $mergeSales($this->query(
+                        "SELECT id, total, status, payment_method, payment_status
+                         FROM sales WHERE sale_date >= ?",
+                        [$openingDate]
+                    )->fetchAll() ?: []);
+                }
+            }
         }
 
-        // Solo ventas en efectivo/pagadas SIN movimiento de caja (legacy) entran a ingresos.
-        // Evita inflar el balance con tarjeta/Nequi/crédito o doble conteo de abonos.
-        $salesIncome = 0.0;
+        if ($sessionId > 0) {
+            try {
+                $mergeSales($this->query(
+                    "SELECT s.id, s.total, s.status, s.payment_method, s.payment_status,
+                            COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount
+                     FROM cash_movements cm
+                     INNER JOIN sales s ON s.id = cm.reference_id
+                     WHERE cm.cash_session_id = ?
+                       AND cm.reference_type IN ('sale', 'sale_cancel')",
+                    [$sessionId]
+                )->fetchAll() ?: []);
+                $mergeSales($this->query(
+                    "SELECT s.id, s.total, s.status, s.payment_method, s.payment_status,
+                            COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount
+                     FROM cash_movements cm
+                     INNER JOIN sale_payments sp ON sp.id = cm.reference_id
+                     INNER JOIN sales s ON s.id = sp.sale_id
+                     WHERE cm.cash_session_id = ?
+                       AND cm.reference_type IN ('sale_payment', 'sale_payment_adjust')",
+                    [$sessionId]
+                )->fetchAll() ?: []);
+            } catch (\Throwable $e) {
+                // ignore
+            }
+        }
+
+        $sales = array_values($salesById);
+        $payRows = [];
+        if ($salesById !== []) {
+            $saleIdList = array_keys($salesById);
+            $ph = implode(',', array_fill(0, count($saleIdList), '?'));
+            try {
+                $payRows = $this->query(
+                    "SELECT sp.payment_method, sp.amount
+                     FROM sale_payments sp
+                     INNER JOIN sales s ON s.id = sp.sale_id
+                     WHERE sp.sale_id IN ({$ph})
+                       AND COALESCE(s.status, '') <> 'cancelled'",
+                    $saleIdList
+                )->fetchAll() ?: [];
+            } catch (\Throwable $e) {
+                $payRows = [];
+            }
+        }
+
+        // Ventas en efectivo/pagadas SIN movimiento de caja (legacy) → solo cajón.
+        $orphanCashSales = 0.0;
         $salesCount = 0;
         $salesTotal = 0.0;
+        $salesDiscountTotal = 0.0;
+        $salesSubtotalBeforeDiscount = 0.0;
         foreach ($sales as $sale) {
             if (($sale['status'] ?? '') === 'cancelled') {
                 continue;
@@ -1523,6 +2147,14 @@ class TenantCajaController extends TenantController
             $salesCount++;
             $saleTotal = (float)$sale['total'];
             $salesTotal += $saleTotal;
+            $disc = round((float)($sale['discount'] ?? 0), 2);
+            $sub = round((float)($sale['subtotal'] ?? 0), 2);
+            if ($sub <= 0.009) {
+                // Instalaciones viejas o filas sin subtotal: reconstruir bruto ≈ total + descuento.
+                $sub = round($saleTotal + max(0.0, $disc), 2);
+            }
+            $salesDiscountTotal += max(0.0, $disc);
+            $salesSubtotalBeforeDiscount += max(0.0, $sub);
             $saleId = (int)$sale['id'];
             if (isset($coveredSaleIds[$saleId])) {
                 continue;
@@ -1533,10 +2165,10 @@ class TenantCajaController extends TenantController
                 \SoftNova\Services\PaymentMethodCatalog::affectsCash($methodCode)
                 && in_array($payStatus, ['paid', ''], true)
             ) {
-                $salesIncome += $saleTotal;
+                $orphanCashSales += $saleTotal;
             }
         }
-        $incomes += $salesIncome;
+        $cashIncomes += $orphanCashSales;
 
         $paymentBreakdown = [];
         if ($payRows !== []) {
@@ -1571,9 +2203,44 @@ class TenantCajaController extends TenantController
             }
         }
 
+        // Cobros en medios que NO entran al cajón (Nequi, transferencia, tarjetas, etc.).
+        $otherIncomes = 0.0;
+        foreach ($paymentBreakdown as $code => $row) {
+            if (!\SoftNova\Services\PaymentMethodCatalog::affectsCash((string)$code)) {
+                $otherIncomes += (float)($row['total'] ?? 0);
+            }
+        }
+
+        // Gastos fuera de cajón (transferencia/tarjeta/contables): informativos, NO inflan
+        // el KPI "Egresos" ni el balance de caja (el arqueo usa solo movimientos reales).
+        $expenseParams = [$openingDate];
+        $expenseUntilSql = '';
+        if ($until) {
+            $expenseUntilSql = ' AND COALESCE(e.created_at, CONCAT(e.expense_date, \' 23:59:59\')) <= ?';
+            $expenseParams[] = $until;
+        }
+        try {
+            $orphanExpenses = (float)$this->query(
+                "SELECT COALESCE(SUM(e.amount), 0)
+                 FROM expenses e
+                 WHERE COALESCE(e.created_at, CONCAT(e.expense_date, ' 00:00:00')) >= ?
+                   AND COALESCE(e.status, 'active') <> 'cancelled'
+                   AND NOT EXISTS (
+                        SELECT 1 FROM cash_movements cm
+                        WHERE cm.reference_type = 'expense' AND cm.reference_id = e.id
+                   )" . $expenseUntilSql,
+                $expenseParams
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            $orphanExpenses = 0.0;
+        }
+        // No sumar orphanExpenses a $expenses (regresión: desalineaba KPI vs cajón).
+
+        $incomes = $cashIncomes + $otherIncomes;
+
         // Redondear totales y orden preferido (efectivo / billeteras / tarjetas primero).
         $preferred = [
-            'cash', 'nequi', 'daviplata', 'transfer',
+            'cash', 'nequi', 'daviplata', 'breb', 'transfer',
             'credit_card', 'debit_card', 'card', 'dataphone', 'payment_link',
         ];
         foreach ($paymentBreakdown as $code => &$row) {
@@ -1591,16 +2258,36 @@ class TenantCajaController extends TenantController
             return ((float)($paymentBreakdown[$b]['total'] ?? 0) <=> (float)($paymentBreakdown[$a]['total'] ?? 0));
         });
 
+        $incomes = round($incomes, 2);
+        $expenses = round($expenses, 2);
+        $otherIncomes = round($otherIncomes, 2);
+        $cashSales = round((float)($paymentBreakdown['cash']['total'] ?? 0), 2);
+        $expectedCash = $this->computeExpectedCash($session, $until);
+        $otherCashIncomes = round(max(0.0, $cashIncomes - $cashSales), 2);
+
         return [
             'incomes' => $incomes,
             'expenses' => $expenses,
-            'balance' => $openingAmount + $incomes - $expenses,
+            'other_incomes' => $otherIncomes,
+            'cash_incomes' => round($cashIncomes, 2),
+            // Efectivo cobrado en ventas (sin incluir la base de apertura).
+            'cash_sales' => $cashSales,
+            // Ingresos en efectivo que no son venta (ajustes manuales, etc.).
+            'other_cash_incomes' => $otherCashIncomes,
+            'opening_amount' => round($openingAmount, 2),
+            // Neto que el día aportó al cajón (esperado − base).
+            'cash_day_net' => round($expectedCash - $openingAmount, 2),
+            'balance' => round($openingAmount + $cashIncomes - $expenses, 2),
             'sales_count' => $salesCount,
-            'sales_total' => $salesTotal,
+            'sales_total' => round($salesTotal, 2),
+            // Bruto de mercancía antes del descuento de documento (todos los medios).
+            'sales_subtotal_before_discount' => round($salesSubtotalBeforeDiscount, 2),
+            // Descuento de documento acumulado en ventas del periodo (todos los medios).
+            'sales_discount_total' => round($salesDiscountTotal, 2),
             'movements_count' => $movementsCount,
             'payment_breakdown' => $paymentBreakdown,
             // Solo efectivo: es lo que debe cuadrar contra el conteo del cajón.
-            'expected_cash' => $this->computeExpectedCash($session, $until),
+            'expected_cash' => $expectedCash,
             'counted_cash' => isset($session['closing_amount']) && $session['closing_amount'] !== null
                 ? round((float)$session['closing_amount'], 2)
                 : null,
@@ -1611,13 +2298,93 @@ class TenantCajaController extends TenantController
     }
 
     /**
+     * Totales unificados de todas las cajas abiertas (vista administrador).
+     * Una sola cuenta operativa: movimientos de todas las sesiones + ventas desde la apertura más antigua (sin duplicar).
+     */
+    private function computeUnifiedOpenTotals(array $sessions): array
+    {
+        if ($sessions === []) {
+            return [
+                'incomes' => 0, 'expenses' => 0, 'balance' => 0, 'other_incomes' => 0, 'cash_incomes' => 0,
+                'cash_sales' => 0, 'other_cash_incomes' => 0, 'opening_amount' => 0, 'cash_day_net' => 0,
+                'sales_count' => 0, 'sales_total' => 0, 'movements_count' => 0,
+                'sales_subtotal_before_discount' => 0, 'sales_discount_total' => 0,
+                'payment_breakdown' => [], 'expected_cash' => 0,
+                'counted_cash' => null, 'difference' => null,
+            ];
+        }
+        // Usar la apertura más antigua como ancla de ventas (evita doble conteo entre sesiones).
+        usort($sessions, static fn($a, $b) => strcmp((string)$a['opening_date'], (string)$b['opening_date']));
+        $anchor = $sessions[0];
+        $opening = array_sum(array_map(
+            static fn($s) => (float)($s['opening_amount'] ?? 0),
+            $sessions
+        ));
+        $anchor['opening_amount'] = $opening;
+
+        // Totales de ventas/medios desde ancla; luego reemplazar ingresos/egresos de movimientos por la suma de todas las sesiones.
+        $base = $this->computeSessionTotals($anchor);
+        $ids = array_map(static fn($s) => (int)$s['id'], $sessions);
+        $cashSvc = new \SoftNova\Services\CashService($this->db);
+        $mov = $cashSvc->totalsForSessions($ids);
+        $singleMov = $cashSvc->totalsForSession((int)$anchor['id']);
+
+        // En base, incomes = cash_incomes(movimientos ancla + orphan) + other_incomes.
+        // Sustituir solo la parte de movimientos de caja de la sesión ancla por la de todas las sesiones.
+        $otherIncomes = (float)($base['other_incomes'] ?? 0);
+        $orphanCashPart = (float)($base['cash_incomes'] ?? 0) - (float)$singleMov['incomes'];
+        $cashIncomes = (float)$mov['incomes'] + $orphanCashPart;
+        $incomes = $cashIncomes + $otherIncomes;
+
+        // expenses = solo movimientos de caja (ya no se suman orphan expenses al KPI).
+        $expenses = (float)$mov['expenses'];
+
+        $expectedCash = 0.0;
+        foreach ($sessions as $s) {
+            $expectedCash += $this->computeExpectedCash($s);
+        }
+
+        $cashSales = round((float)($base['cash_sales'] ?? 0), 2);
+
+        return [
+            'incomes' => round($incomes, 2),
+            'expenses' => round($expenses, 2),
+            'other_incomes' => round($otherIncomes, 2),
+            'cash_incomes' => round($cashIncomes, 2),
+            'cash_sales' => $cashSales,
+            'other_cash_incomes' => round(max(0.0, $cashIncomes - $cashSales), 2),
+            'opening_amount' => round($opening, 2),
+            'cash_day_net' => round($expectedCash - $opening, 2),
+            'balance' => round($opening + $cashIncomes - $expenses, 2),
+            'sales_count' => (int)($base['sales_count'] ?? 0),
+            'sales_total' => round((float)($base['sales_total'] ?? 0), 2),
+            'sales_subtotal_before_discount' => round((float)($base['sales_subtotal_before_discount'] ?? 0), 2),
+            'sales_discount_total' => round((float)($base['sales_discount_total'] ?? 0), 2),
+            'movements_count' => (int)$mov['movements_count'],
+            'payment_breakdown' => $base['payment_breakdown'] ?? [],
+            'expected_cash' => round($expectedCash, 2),
+            'counted_cash' => null,
+            'difference' => null,
+        ];
+    }
+
+    /**
      * Cierra automaticamente cajas abiertas cuando ya paso la medianoche
-     * del dia en que se abrieron.
+     * del dia en que se abrieron (zona horaria de negocio).
+     *
+     * No crea sesiones nuevas: solo cierra las que quedaron en status=open.
+     * El usuario que se ve en historial es quien ABRIÓ la sesión, no quien cerró.
      */
     private function autoCloseOvernightSessions(): int
     {
         $closed = 0;
         try {
+            $tzName = \SoftNova\Core\BusinessTimezone::resolve($this->db);
+            \SoftNova\Core\BusinessTimezone::applyPhp($tzName);
+            \SoftNova\Core\BusinessTimezone::applyToPdo($this->db, $tzName);
+            $tz = new \DateTimeZone($tzName);
+            $today = (new \DateTimeImmutable('now', $tz))->format('Y-m-d');
+
             $openSessions = $this->query(
                 "SELECT * FROM cash_sessions WHERE status = 'open'"
             )->fetchAll();
@@ -1625,9 +2392,17 @@ class TenantCajaController extends TenantController
             return 0;
         }
 
-        $today = date('Y-m-d');
         foreach ($openSessions as $session) {
-            $openDay = date('Y-m-d', strtotime((string)$session['opening_date']));
+            $openingRaw = trim((string)($session['opening_date'] ?? ''));
+            if ($openingRaw === '') {
+                continue;
+            }
+            try {
+                $openAt = new \DateTimeImmutable($openingRaw, $tz);
+            } catch (\Throwable $e) {
+                $openAt = new \DateTimeImmutable(date('Y-m-d H:i:s', strtotime($openingRaw)), $tz);
+            }
+            $openDay = $openAt->format('Y-m-d');
             if ($today <= $openDay) {
                 continue;
             }
@@ -1636,7 +2411,7 @@ class TenantCajaController extends TenantController
             try {
                 // Cierre ciego: se asume el efectivo esperado, sin faltante ni sobrante.
                 $expectedCash = $this->computeExpectedCash($session, $closingAt);
-                $this->query(
+                $stmt = $this->query(
                     "UPDATE cash_sessions
                      SET closing_amount = ?, closing_date = ?, status = 'closed',
                          expected_amount = ?, difference_amount = 0,
@@ -1646,16 +2421,510 @@ class TenantCajaController extends TenantController
                         $expectedCash,
                         $closingAt,
                         $expectedCash,
-                        "\nCierre automatico a medianoche del " . date('d/m/Y', strtotime($openDay)),
+                        "\n[[AUTO_CLOSE]] Cierre automatico a medianoche del "
+                            . $openAt->format('d/m/Y')
+                            . ' (sesion quedo abierta; no es un segundo cierre manual).',
                         (int)$session['id'],
                     ]
                 );
-                $closed++;
+                if ($stmt && $stmt->rowCount() > 0) {
+                    $closed++;
+                }
             } catch (\Throwable $e) {
                 error_log('autoCloseOvernightSessions #' . ($session['id'] ?? '?') . ': ' . $e->getMessage());
             }
         }
 
         return $closed;
+    }
+
+    /**
+     * Contexto de sesiones abiertas (vista admin unificada o sesión del usuario).
+     *
+     * @return array{
+     *   is_admin_viewer:bool,
+     *   open_sessions:list<array<string,mixed>>,
+     *   open_session:?array<string,mixed>,
+     *   session_ids:list<int>,
+     *   open_sessions_count:int
+     * }
+     */
+    private function getOpenSessionsContext(): array
+    {
+        $isAdminViewer = TenantMiddleware::getRole() === 'admin';
+        $openSessions = $this->query(
+            "SELECT cs.*, u.name as user_name
+             FROM cash_sessions cs
+             JOIN users u ON cs.user_id = u.id
+             WHERE cs.status = 'open'
+             ORDER BY cs.opening_date ASC"
+        )->fetchAll() ?: [];
+
+        $openSession = $openSessions[0] ?? null;
+        if ($isAdminViewer && count($openSessions) > 1) {
+            $openSession = $openSessions[0];
+            $openSession['user_name'] = 'Caja unificada (' . count($openSessions) . ' abiertas)';
+            $openSession['opening_amount'] = array_sum(array_map(
+                static fn($s) => (float)($s['opening_amount'] ?? 0),
+                $openSessions
+            ));
+            $openSession['opening_date'] = $openSessions[0]['opening_date'];
+            $openSession['_unified_ids'] = array_map(static fn($s) => (int)$s['id'], $openSessions);
+        } elseif ($openSession) {
+            $openSession = $openSessions[count($openSessions) - 1];
+        }
+
+        $sessionIds = !empty($openSession['_unified_ids'])
+            ? array_map('intval', (array)$openSession['_unified_ids'])
+            : ($openSession ? [(int)$openSession['id']] : []);
+
+        return [
+            'is_admin_viewer' => $isAdminViewer,
+            'open_sessions' => $openSessions,
+            'open_session' => $openSession,
+            'session_ids' => $sessionIds,
+            'open_sessions_count' => count($openSessions),
+        ];
+    }
+
+    /**
+     * @param list<int> $sessionIds
+     * @return list<array<string,mixed>>
+     */
+    private function fetchSessionMovements(array $sessionIds, bool $newestFirst = true): array
+    {
+        $sessionIds = array_values(array_filter(array_map('intval', $sessionIds), static fn($id) => $id > 0));
+        if ($sessionIds === []) {
+            return [];
+        }
+
+        $in = implode(',', array_fill(0, count($sessionIds), '?'));
+        $order = $newestFirst ? 'DESC' : 'ASC';
+
+        try {
+            $movements = $this->query(
+                "SELECT cm.*, COALESCE(NULLIF(TRIM(u.name), ''), 'Sin usuario') AS user_name
+                 FROM cash_movements cm
+                 LEFT JOIN users u ON u.id = cm.user_id
+                 WHERE cm.cash_session_id IN ({$in})
+                 ORDER BY cm.created_at {$order}, cm.id {$order}",
+                $sessionIds
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $movements = $this->query(
+                "SELECT * FROM cash_movements
+                 WHERE cash_session_id IN ({$in})
+                 ORDER BY created_at {$order}, id {$order}",
+                $sessionIds
+            )->fetchAll();
+        }
+
+        return $this->filterOffsetCashMovements($this->enrichMovementOrigins($movements ?: []));
+    }
+
+    /**
+     * Oculta pares egreso+reverso ya anulados (compra OC anulada, gasto eliminado, etc.)
+     * para que el listado de caja no muestre egresos “fantasmas”.
+     *
+     * @param list<array<string,mixed>> $movements
+     * @return list<array<string,mixed>>
+     */
+    private function filterOffsetCashMovements(array $movements): array
+    {
+        if ($movements === []) {
+            return [];
+        }
+
+        $reversalTypes = \SoftNova\Services\CashService::expenseReversalTypes();
+        $hideIds = [];
+
+        // 1) Gastos eliminados: expense + expense_cancel del mismo reference_id.
+        $expenseCancelIds = [];
+        foreach ($movements as $m) {
+            if ((string)($m['type'] ?? '') !== 'income') {
+                continue;
+            }
+            if ((string)($m['reference_type'] ?? '') !== 'expense_cancel') {
+                continue;
+            }
+            $rid = (int)($m['reference_id'] ?? 0);
+            if ($rid > 0) {
+                $expenseCancelIds[$rid] = true;
+                $hideIds[(int)($m['id'] ?? 0)] = true;
+            }
+        }
+        foreach ($movements as $m) {
+            if ((string)($m['type'] ?? '') !== 'expense') {
+                continue;
+            }
+            if ((string)($m['reference_type'] ?? '') !== 'expense') {
+                continue;
+            }
+            $rid = (int)($m['reference_id'] ?? 0);
+            if ($rid > 0 && isset($expenseCancelIds[$rid])) {
+                $hideIds[(int)($m['id'] ?? 0)] = true;
+            }
+        }
+
+        // 2) Abonos a proveedor cancelados.
+        $payCancelIds = [];
+        foreach ($movements as $m) {
+            if ((string)($m['type'] ?? '') !== 'income') {
+                continue;
+            }
+            if ((string)($m['reference_type'] ?? '') !== 'supplier_payment_cancel') {
+                continue;
+            }
+            $rid = (int)($m['reference_id'] ?? 0);
+            if ($rid > 0) {
+                $payCancelIds[$rid] = true;
+                $hideIds[(int)($m['id'] ?? 0)] = true;
+            }
+        }
+        foreach ($movements as $m) {
+            if ((string)($m['type'] ?? '') !== 'expense') {
+                continue;
+            }
+            if ((string)($m['reference_type'] ?? '') !== 'supplier_payment') {
+                continue;
+            }
+            $rid = (int)($m['reference_id'] ?? 0);
+            if ($rid > 0 && isset($payCancelIds[$rid])) {
+                $hideIds[(int)($m['id'] ?? 0)] = true;
+            }
+        }
+
+        // 3) Compras en efectivo anuladas (egreso purchase_order + ingreso NC).
+        $ncIds = [];
+        foreach ($movements as $m) {
+            if ((string)($m['type'] ?? '') !== 'income') {
+                continue;
+            }
+            if ((string)($m['reference_type'] ?? '') !== 'purchase_credit_note') {
+                continue;
+            }
+            $rid = (int)($m['reference_id'] ?? 0);
+            if ($rid > 0) {
+                $ncIds[$rid] = (int)($m['id'] ?? 0);
+            }
+        }
+
+        $orderIdsFromNc = [];
+        if ($ncIds !== []) {
+            $ph = implode(',', array_fill(0, count($ncIds), '?'));
+            try {
+                $rows = $this->query(
+                    "SELECT id, purchase_order_id, status FROM purchase_credit_notes WHERE id IN ({$ph})",
+                    array_keys($ncIds)
+                )->fetchAll() ?: [];
+                foreach ($rows as $row) {
+                    $ncid = (int)($row['id'] ?? 0);
+                    $oid = (int)($row['purchase_order_id'] ?? 0);
+                    if ($ncid <= 0 || $oid <= 0) {
+                        continue;
+                    }
+                    if (($row['status'] ?? '') === 'cancelled') {
+                        continue;
+                    }
+                    $orderIdsFromNc[$oid] = $ncid;
+                    if (isset($ncIds[$ncid])) {
+                        $hideIds[$ncIds[$ncid]] = true;
+                    }
+                }
+            } catch (\Throwable $e) {
+                // ignore
+            }
+        }
+
+        // También ocultar egreso de OC cancelada aunque la NC no esté en esta sesión.
+        $poExpenseOrderIds = [];
+        foreach ($movements as $m) {
+            if ((string)($m['type'] ?? '') !== 'expense') {
+                continue;
+            }
+            if ((string)($m['reference_type'] ?? '') !== 'purchase_order') {
+                continue;
+            }
+            $oid = (int)($m['reference_id'] ?? 0);
+            if ($oid > 0) {
+                $poExpenseOrderIds[$oid] = (int)($m['id'] ?? 0);
+            }
+        }
+        $checkOrderIds = array_unique(array_merge(array_keys($orderIdsFromNc), array_keys($poExpenseOrderIds)));
+        $cancelledOrders = [];
+        if ($checkOrderIds !== []) {
+            $ph = implode(',', array_fill(0, count($checkOrderIds), '?'));
+            try {
+                $rows = $this->query(
+                    "SELECT id, status FROM purchase_orders WHERE id IN ({$ph})",
+                    $checkOrderIds
+                )->fetchAll() ?: [];
+                foreach ($rows as $row) {
+                    if ((string)($row['status'] ?? '') === 'cancelled') {
+                        $cancelledOrders[(int)$row['id']] = true;
+                    }
+                }
+            } catch (\Throwable $e) {
+                // ignore
+            }
+        }
+
+        foreach ($poExpenseOrderIds as $oid => $movId) {
+            if (isset($orderIdsFromNc[$oid])) {
+                $hideIds[$movId] = true;
+                continue;
+            }
+            if (!isset($cancelledOrders[$oid])) {
+                continue;
+            }
+            // OC anulada: ocultar egreso si existe NC posted (aunque el reverso esté en otra sesión).
+            try {
+                $hasNc = (int)$this->query(
+                    "SELECT COUNT(*) FROM purchase_credit_notes
+                     WHERE purchase_order_id = ? AND status = 'posted' AND total > 0",
+                    [$oid]
+                )->fetchColumn();
+                if ($hasNc > 0) {
+                    $hideIds[$movId] = true;
+                }
+            } catch (\Throwable $e) {
+                // ignore
+            }
+        }
+
+        // purchase_order_cancel explícito
+        foreach ($movements as $m) {
+            $rt = (string)($m['reference_type'] ?? '');
+            if (!in_array($rt, $reversalTypes, true)) {
+                continue;
+            }
+            if ((string)($m['type'] ?? '') === 'income') {
+                $hideIds[(int)($m['id'] ?? 0)] = true;
+            }
+            if ($rt === 'purchase_order_cancel') {
+                $oid = (int)($m['reference_id'] ?? 0);
+                if ($oid > 0 && isset($poExpenseOrderIds[$oid])) {
+                    $hideIds[$poExpenseOrderIds[$oid]] = true;
+                }
+            }
+        }
+
+        unset($hideIds[0]);
+        if ($hideIds === []) {
+            return $movements;
+        }
+
+        $kept = [];
+        $hidden = 0;
+        foreach ($movements as $m) {
+            $mid = (int)($m['id'] ?? 0);
+            if ($mid > 0 && isset($hideIds[$mid])) {
+                $hidden++;
+                continue;
+            }
+            $kept[] = $m;
+        }
+
+        if ($hidden > 0 && $kept !== []) {
+            $kept[0]['_hidden_voided_count'] = $hidden;
+        } elseif ($hidden > 0) {
+            // Solo metadato: no inventar filas falsas en el kardex de caja.
+            $kept[] = [
+                'id' => 0,
+                '_meta_only' => true,
+                '_hidden_voided_count' => $hidden,
+            ];
+        }
+
+        return $kept;
+    }
+
+    /**
+     * Enriquece movimientos de caja con etiqueta y enlace al documento origen.
+     *
+     * @param list<array<string,mixed>> $movements
+     * @return list<array<string,mixed>>
+     */
+    private function enrichMovementOrigins(array $movements): array
+    {
+        foreach ($movements as &$mov) {
+            $mov['origin_label'] = null;
+            $mov['origin_url'] = null;
+            $rt = (string)($mov['reference_type'] ?? '');
+            $rid = (int)($mov['reference_id'] ?? 0);
+            if ($rid <= 0 || $rt === '' || $rt === 'manual') {
+                continue;
+            }
+
+            if ($rt === 'sale') {
+                $inv = $this->query(
+                    "SELECT invoice_number FROM sales WHERE id = ? LIMIT 1",
+                    [$rid]
+                )->fetchColumn();
+                $mov['origin_label'] = 'Venta ' . ($inv ?: '#' . $rid);
+                $mov['origin_url'] = base_url('/app/ventas');
+                continue;
+            }
+
+            if ($rt === 'sale_payment') {
+                $row = $this->query(
+                    "SELECT s.invoice_number FROM sale_payments p
+                     JOIN sales s ON s.id = p.sale_id WHERE p.id = ? LIMIT 1",
+                    [$rid]
+                )->fetch();
+                if (!$row) {
+                    $inv = $this->query(
+                        "SELECT invoice_number FROM sales WHERE id = ? LIMIT 1",
+                        [$rid]
+                    )->fetchColumn();
+                    if ($inv) {
+                        $mov['origin_label'] = 'Venta ' . $inv . ' (abono legacy)';
+                        $mov['origin_url'] = base_url('/app/ventas');
+                    }
+                    continue;
+                }
+                $mov['origin_label'] = 'Abono · ' . $row['invoice_number'];
+                $mov['origin_url'] = base_url('/app/ventas');
+                continue;
+            }
+
+            if ($rt === 'expense') {
+                $mov['origin_label'] = 'Gasto #' . $rid;
+                $mov['origin_url'] = base_url('/app/gastos');
+                continue;
+            }
+
+            if ($rt === 'expense_cancel') {
+                $mov['origin_label'] = 'Reverso gasto #' . $rid;
+                $mov['origin_url'] = base_url('/app/gastos');
+                continue;
+            }
+
+            if ($rt === 'purchase_order') {
+                $row = $this->query(
+                    "SELECT order_number, status FROM purchase_orders WHERE id = ? LIMIT 1",
+                    [$rid]
+                )->fetch();
+                $num = $row['order_number'] ?? ('#' . $rid);
+                $mov['origin_label'] = 'Compra ' . $num
+                    . ((($row['status'] ?? '') === 'cancelled') ? ' (anulada)' : '');
+                $mov['origin_url'] = base_url('/app/compras?action=facturas');
+                continue;
+            }
+
+            if ($rt === 'purchase_credit_note') {
+                $row = $this->query(
+                    "SELECT cn.credit_number, po.order_number
+                     FROM purchase_credit_notes cn
+                     LEFT JOIN purchase_orders po ON po.id = cn.purchase_order_id
+                     WHERE cn.id = ? LIMIT 1",
+                    [$rid]
+                )->fetch();
+                $mov['origin_label'] = 'NC compra ' . ($row['credit_number'] ?? ('#' . $rid))
+                    . (!empty($row['order_number']) ? ' / ' . $row['order_number'] : '');
+                $mov['origin_url'] = base_url('/app/compras?action=facturas');
+                continue;
+            }
+
+            if ($rt === 'supplier_payment' || $rt === 'supplier_payment_cancel') {
+                $mov['origin_label'] = ($rt === 'supplier_payment_cancel' ? 'Reverso abono #' : 'Abono proveedor #') . $rid;
+                $mov['origin_url'] = base_url('/app/compras?action=facturas');
+                continue;
+            }
+
+            $mov['origin_label'] = ucfirst(str_replace('_', ' ', $rt)) . ' #' . $rid;
+        }
+        unset($mov);
+
+        return $movements;
+    }
+
+    private function liveSyncJson(): void
+    {
+        TenantMiddleware::authorize('caja', 'view');
+
+        $ctx = $this->getOpenSessionsContext();
+        $openSession = $ctx['open_session'];
+        if (!$openSession) {
+            $this->json([
+                'success' => true,
+                'open' => false,
+                'csrf_token' => \SoftNova\Core\csrf_token(),
+                'server_time' => date('c'),
+            ]);
+            return;
+        }
+
+        $sessionIds = $ctx['session_ids'];
+        try {
+            $totals = count($sessionIds) === 1
+                ? $this->computeSessionTotals($openSession)
+                : $this->computeUnifiedOpenTotals($ctx['open_sessions']);
+        } catch (\Throwable $e) {
+            error_log('caja liveSync: ' . $e->getMessage());
+            $totals = [
+                'incomes' => 0.0,
+                'expenses' => 0.0,
+                'balance' => 0.0,
+                'expected_cash' => 0.0,
+                'sales_count' => 0,
+                'sales_total' => 0.0,
+            ];
+        }
+
+        $movements = $this->fetchSessionMovements($sessionIds, true);
+        $incomes = (float)($totals['incomes'] ?? 0);
+        $expenses = (float)($totals['expenses'] ?? 0);
+        $otherIncomes = (float)($totals['other_incomes'] ?? 0);
+        $cashSales = (float)($totals['cash_sales'] ?? 0);
+        $otherCashIncomes = (float)($totals['other_cash_incomes'] ?? 0);
+        $balance = (float)($totals['balance'] ?? 0);
+        $expectedCash = (float)($totals['expected_cash'] ?? $balance);
+
+        $this->json([
+            'success' => true,
+            'open' => true,
+            'csrf_token' => \SoftNova\Core\csrf_token(),
+            'server_time' => date('c'),
+            'totals' => [
+                'incomes' => $incomes,
+                'expenses' => $expenses,
+                'other_incomes' => $otherIncomes,
+                'cash_sales' => $cashSales,
+                'other_cash_incomes' => $otherCashIncomes,
+                'opening_amount' => (float)($totals['opening_amount'] ?? $openSession['opening_amount'] ?? 0),
+                'balance' => $balance,
+                'expected_cash' => $expectedCash,
+                'sales_count' => (int)($totals['sales_count'] ?? 0),
+                'sales_total' => (float)($totals['sales_total'] ?? 0),
+                'sales_subtotal_before_discount' => (float)($totals['sales_subtotal_before_discount'] ?? 0),
+                'sales_discount_total' => (float)($totals['sales_discount_total'] ?? 0),
+                'incomes_fmt' => '+' . $this->formatMoney($incomes),
+                'expenses_fmt' => '-' . $this->formatMoney($expenses),
+                'other_incomes_fmt' => '+' . $this->formatMoney($otherIncomes),
+                'cash_sales_fmt' => '+' . $this->formatMoney($cashSales),
+                'other_cash_incomes_fmt' => '+' . $this->formatMoney($otherCashIncomes),
+                'balance_fmt' => $this->formatMoney($expectedCash),
+                'expected_cash_fmt' => $this->formatMoney($expectedCash),
+            ],
+            'movements' => array_map(function (array $m): array {
+                $type = (string)($m['type'] ?? '');
+                $amount = (float)($m['amount'] ?? 0);
+                return [
+                    'id' => (int)($m['id'] ?? 0),
+                    'time' => date('H:i', strtotime((string)($m['created_at'] ?? 'now'))),
+                    'user_name' => (string)($m['user_name'] ?? '—'),
+                    'type' => $type,
+                    'type_label' => $type === 'income' ? 'Ingreso' : 'Egreso',
+                    'description' => (string)($m['description'] ?? ''),
+                    'origin_label' => (string)($m['origin_label'] ?? ''),
+                    'origin_url' => (string)($m['origin_url'] ?? ''),
+                    'amount' => $amount,
+                    'amount_fmt' => ($type === 'income' ? '+' : '-') . $this->formatMoney($amount),
+                ];
+            }, array_values(array_filter($movements, static fn($m) => empty($m['_meta_only'])))),
+            'movements_count' => count(array_filter($movements, static fn($m) => empty($m['_meta_only']) && (int)($m['id'] ?? 0) > 0)),
+            'hidden_voided_count' => (int)(($movements[0]['_hidden_voided_count'] ?? 0)),
+        ]);
     }
 }

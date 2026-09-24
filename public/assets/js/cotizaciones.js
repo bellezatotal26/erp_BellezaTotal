@@ -3,17 +3,45 @@
 
 var quoteItems = [];
 var curSym = document.querySelector('meta[name="currency-symbol"]')?.content || '$';
-var curDec = parseInt(document.querySelector('meta[name="currency-decimals"]')?.content || '0');
+var curDec = parseInt(document.querySelector('meta[name="currency-decimals"]')?.content || '0', 10);
+var quoteTaxEnabled = (document.querySelector('meta[name="quote-tax-enabled"]')?.content || '0') === '1';
+var quoteTaxRate = parseFloat(document.querySelector('meta[name="quote-tax-rate"]')?.content || '0') || 0;
+
+function money(n) {
+    return curSym + ' ' + (Number(n) || 0).toFixed(curDec);
+}
+
+function lineTaxRate(opt) {
+    if (!quoteTaxEnabled) return 0;
+    var raw = opt && opt.dataset ? opt.dataset.tax : '';
+    if (raw !== '' && raw != null && !isNaN(parseFloat(raw))) {
+        return Math.max(0, parseFloat(raw));
+    }
+    return Math.max(0, quoteTaxRate);
+}
 
 function addQuoteProduct() {
     var sel = document.getElementById('productSelect');
-    var qty = parseInt(document.getElementById('productQty').value) || 1;
+    var qty = parseInt(document.getElementById('productQty').value, 10) || 1;
     if (!sel.value) return;
     var o = sel.options[sel.selectedIndex];
     var id = o.value, name = o.dataset.name, price = parseFloat(o.dataset.price);
+    var taxRate = lineTaxRate(o);
     var ex = quoteItems.find(function(i) { return i.product_id == id; });
-    if (ex) { ex.quantity += qty; ex.subtotal = ex.quantity * price; }
-    else { quoteItems.push({ product_id: id, product_name: name, quantity: qty, unit_price: price, subtotal: qty * price }); }
+    if (ex) {
+        ex.quantity += qty;
+        ex.subtotal = ex.quantity * price;
+        ex.tax_rate = taxRate;
+    } else {
+        quoteItems.push({
+            product_id: id,
+            product_name: name,
+            quantity: qty,
+            unit_price: price,
+            subtotal: qty * price,
+            tax_rate: taxRate
+        });
+    }
     document.getElementById('productQty').value = 1;
     renderQuoteItems();
 }
@@ -21,16 +49,26 @@ function addQuoteProduct() {
 function removeQuoteItem(idx) { quoteItems.splice(idx, 1); renderQuoteItems(); }
 
 function renderQuoteItems() {
-    var tb = document.querySelector('#itemsTable tbody'), tbl = document.getElementById('itemsTable'), t = 0;
+    var tb = document.querySelector('#itemsTable tbody');
+    var tbl = document.getElementById('itemsTable');
+    var subtotal = 0;
+    var tax = 0;
     tb.innerHTML = '';
     if (quoteItems.length === 0) { tbl.style.display = 'none'; return; }
     tbl.style.display = '';
     quoteItems.forEach(function(it, i) {
-        t += it.subtotal;
-        tb.innerHTML += '<tr><td>' + esc(it.product_name) + '</td><td>' + it.quantity + '</td><td>' + curSym + ' ' + it.unit_price.toFixed(curDec) + '</td><td>' + curSym + ' ' + it.subtotal.toFixed(curDec) + '</td><td><button type="button" class="btn btn-sm btn-danger" onclick="removeQuoteItem(' + i + ')">X</button></td></tr>';
+        subtotal += it.subtotal;
+        tax += it.subtotal * ((it.tax_rate || 0) / 100);
+        tb.innerHTML += '<tr><td>' + esc(it.product_name) + '</td><td>' + it.quantity + '</td><td>' + money(it.unit_price) + '</td><td>' + money(it.subtotal) + '</td><td><button type="button" class="btn btn-sm btn-danger" onclick="removeQuoteItem(' + i + ')">X</button></td></tr>';
     });
-    document.getElementById('quoteTotal').textContent = curSym + ' ' + t.toFixed(curDec);
-    document.getElementById('submitQuoteBtn').textContent = 'Crear Cotización (' + curSym + ' ' + t.toFixed(curDec) + ')';
+    tax = Math.round(tax * 100) / 100;
+    var total = subtotal + tax;
+    var subEl = document.getElementById('quoteSubtotal');
+    var taxEl = document.getElementById('quoteTax');
+    if (subEl) subEl.textContent = money(subtotal);
+    if (taxEl) taxEl.textContent = money(tax);
+    document.getElementById('quoteTotal').textContent = money(total);
+    document.getElementById('submitQuoteBtn').textContent = 'Crear Cotización (' + money(total) + ')';
 }
 
 function prepareQuoteItems() {
@@ -50,74 +88,58 @@ function prepareQuoteItems() {
 function openQuoteModal() {
     quoteItems = [];
     renderQuoteItems();
-    if (typeof resetCustomerCombobox === 'function') resetCustomerCombobox();
-    if (typeof initCustomerCombobox === 'function') initCustomerCombobox();
     document.getElementById('quoteModal').style.display = 'flex';
 }
-function closeQuoteModal() { document.getElementById('quoteModal').style.display = 'none'; }
 
-function closeQuickCustomer() { document.getElementById('quickCustomerModal').style.display = 'none'; }
-
-function submitQuickCustomer(form) {
-    var fd = new FormData(form);
-    fetch(form.action, {
-        method: 'POST',
-        body: fd,
-        headers: { 'X-Requested-With': 'XMLHttpRequest' }
-    })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-        if (d.success) {
-            showAlert(d.message, 'success');
-            var newId = d.data ? d.data.id : null;
-            var firstName = fd.get('first_name') || '';
-            var lastName = fd.get('last_name') || '';
-            var newName = (d.data && d.data.name) ? d.data.name : ((firstName + ' ' + lastName).trim() || 'Nuevo Cliente');
-            if (newId && typeof setSelectedCustomer === 'function') {
-                setSelectedCustomer(String(newId), newName.trim());
-            }
-            document.getElementById('quickCustomerModal').style.display = 'none';
-            form.reset();
-        } else {
-            showAlert(d.message || 'Error al crear cliente', 'error');
-        }
-    })
-    .catch(function() {
-        showAlert('Error de conexión', 'error');
-    });
-    return false;
+function closeQuoteModal() {
+    document.getElementById('quoteModal').style.display = 'none';
 }
 
 function openConvertModal(id, total) {
     document.getElementById('convertQuoteId').value = id;
-    document.getElementById('convertInfo').textContent = 'Total a convertir: ' + curSym + ' ' + total.toFixed(curDec);
+    document.getElementById('convertInfo').textContent = 'Total a convertir: ' + money(total);
     document.getElementById('convertModal').style.display = 'flex';
 }
 
-function toggleConvertCredit() {
-    var s = document.querySelector('#convertModal select[name="payment_type"]').value === 'credit';
-    document.getElementById('convertInitialGroup').style.display = s ? 'block' : 'none';
-}
-
 function viewQuoteDetail(id) {
-    fetch(window.quoteRouteDetail + '&id=' + id, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+    var base = window.quoteRouteDetail || ((window.location.pathname || '/app/cotizaciones') + '?action=detail');
+    var url = base + (base.indexOf('?') >= 0 ? '&' : '?') + 'id=' + id;
+    // quoteRouteDetail already includes ?action=detail
+    if (window.quoteRouteDetail) {
+        url = window.quoteRouteDetail + (window.quoteRouteDetail.indexOf('?') >= 0 ? '&' : '?') + 'id=' + encodeURIComponent(id);
+    }
+    fetch(url, {
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    })
     .then(function(r) { return r.json(); })
     .then(function(d) {
-        if (d.error) return;
+        if (d.error) { showAlert(d.error, 'error'); return; }
         var q = d.quote, items = d.items || [];
-        var h = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:15px;">';
+        var h = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">';
         h += '<div><strong>Número:</strong> ' + esc(q.quote_number) + '</div>';
-        h += '<div><strong>Fecha:</strong> ' + (q.quote_date || '').substr(0, 10) + '</div>';
         h += '<div><strong>Cliente:</strong> ' + esc(q.customer_name || 'General') + '</div>';
-        h += '<div><strong>Válido hasta:</strong> ' + (q.valid_until || '').substr(0, 10) + '</div>';
-        h += '<div><strong>Estado:</strong> ' + q.status + '</div>';
-        h += '<div><strong>Total:</strong> <span style="color:#10B981;font-size:18px;">' + curSym + ' ' + parseFloat(q.total).toFixed(curDec) + '</span></div>';
+        h += '<div><strong>Válida hasta:</strong> ' + esc((q.valid_until || '—').toString().substr(0, 10)) + '</div>';
+        h += '<div><strong>Estado:</strong> ' + esc(q.status || '') + '</div>';
+        h += '<div><strong>Subtotal:</strong> ' + money(q.subtotal) + '</div>';
+        h += '<div><strong>IVA:</strong> ' + money(q.tax) + '</div>';
+        h += '<div><strong>Total:</strong> <span style="color:#10B981;font-size:18px;">' + money(q.total) + '</span></div>';
         h += '</div><h4>Productos</h4><table><thead><tr><th>Producto</th><th>Cant</th><th>P.Unit</th><th>Subtotal</th></tr></thead><tbody>';
-        items.forEach(function(i) { h += '<tr><td>' + esc(i.product_name) + '</td><td>' + i.quantity + '</td><td>' + curSym + ' ' + parseFloat(i.unit_price).toFixed(curDec) + '</td><td>' + curSym + ' ' + parseFloat(i.subtotal).toFixed(curDec) + '</td></tr>'; });
+        items.forEach(function(i) {
+            h += '<tr><td>' + esc(i.product_name) + '</td><td>' + i.quantity + '</td><td>' + money(i.unit_price) + '</td><td>' + money(i.subtotal) + '</td></tr>';
+        });
         h += '</tbody></table>';
-        document.getElementById('quoteDetailContent').innerHTML = h;
-        document.getElementById('quoteDetailModal').style.display = 'flex';
-    });
+        if (q.notes) h += '<p style="margin-top:12px;color:var(--color-text-secondary);"><strong>Notas:</strong> ' + esc(q.notes) + '</p>';
+        var body = document.getElementById('quoteDetailContent');
+        if (body) { body.innerHTML = h; document.getElementById('quoteDetailModal').style.display = 'flex'; }
+    })
+    .catch(function() { if (typeof showAlert === 'function') showAlert('No se pudo cargar el detalle', 'error'); });
+}
+
+function esc(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 document.addEventListener('DOMContentLoaded', function() {
@@ -127,34 +149,18 @@ document.addEventListener('DOMContentLoaded', function() {
         if (e.key !== 'Enter') return;
         e.preventDefault();
         var code = (scan.value || '').trim();
-        if (!code || !window.SoftNovaBarcode) return;
-        SoftNovaBarcode.lookup(code).then(function(d) {
-            scan.value = '';
-            if (!d || !d.success || !d.product) {
-                showAlert('Producto no encontrado: ' + code, 'warning');
+        scan.value = '';
+        if (!code) return;
+        var sel = document.getElementById('productSelect');
+        if (!sel) return;
+        for (var i = 0; i < sel.options.length; i++) {
+            var opt = sel.options[i];
+            if ((opt.dataset.code || '') === code || String(opt.value) === code) {
+                sel.selectedIndex = i;
+                addQuoteProduct();
                 return;
             }
-            var p = d.product;
-            var sel = document.getElementById('productSelect');
-            if (!sel) return;
-            var opt = null;
-            Array.prototype.some.call(sel.options, function(o) {
-                if (String(o.value) === String(p.id)) { opt = o; return true; }
-                return false;
-            });
-            if (!opt) {
-                opt = document.createElement('option');
-                opt.value = p.id;
-                opt.setAttribute('data-price', p.sale_price);
-                opt.setAttribute('data-name', p.name);
-                opt.setAttribute('data-code', p.code || code);
-                opt.textContent = (p.code ? p.code + ' — ' : '') + p.name;
-                sel.appendChild(opt);
-            }
-            sel.value = opt.value;
-            var qty = document.getElementById('productQty');
-            if (qty) qty.value = '1';
-            addQuoteProduct();
-        });
+        }
+        if (typeof showAlert === 'function') showAlert('Producto no encontrado: ' + code, 'warning');
     });
 });

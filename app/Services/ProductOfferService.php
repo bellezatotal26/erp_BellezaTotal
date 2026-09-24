@@ -561,6 +561,7 @@ class ProductOfferService
         try {
             $stmt = $this->db->prepare(
                 "SELECT id, name, code, sale_price, COALESCE(wholesale_price, 0) AS wholesale_price,
+                        COALESCE(purchase_price, 0) AS purchase_price,
                         stock, COALESCE(product_type, 'product') AS product_type,
                         offer_active, offer_price, offer_original_price, offer_percent,
                         offer_reason, offer_ends_at, offer_starts_at

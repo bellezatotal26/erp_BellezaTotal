@@ -238,6 +238,7 @@ class ReplenishmentService
             }
 
             $costo = round((float)$item['unit_cost'], 2);
+            // Sin tax_rate explícito: PurchasingService hereda products.tax_rate.
             $grupos[$supplierId]['items'][] = [
                 'product_id' => $productId,
                 'product_name' => (string)$item['name'],
@@ -246,7 +247,6 @@ class ReplenishmentService
                 'supplier_sku' => (string)($item['supplier_sku'] ?? ''),
                 'quantity' => $cantidad,
                 'unit_cost' => $costo,
-                'tax_rate' => 0.0,
             ];
             $grupos[$supplierId]['total'] += round($cantidad * $costo, 2);
         }
@@ -536,6 +536,7 @@ class ReplenishmentService
                 ];
             }
             $costo = round((float)($row['unit_cost'] ?? $row['purchase_price'] ?? 0), 2);
+            // Sin tax_rate explícito: PurchasingService hereda products.tax_rate.
             $grupos[$supplierId]['items'][] = [
                 'product_id' => $productId,
                 'product_name' => (string)($row['name'] ?? ''),
@@ -544,7 +545,6 @@ class ReplenishmentService
                 'supplier_sku' => (string)($row['supplier_sku'] ?? ''),
                 'quantity' => $cantidad,
                 'unit_cost' => $costo,
-                'tax_rate' => 0.0,
             ];
             $grupos[$supplierId]['total'] += round($cantidad * $costo, 2);
         }

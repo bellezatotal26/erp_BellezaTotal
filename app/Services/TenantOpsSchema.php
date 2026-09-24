@@ -15,8 +15,7 @@ class TenantOpsSchema
     {
         self::$done ??= new \WeakMap();
         if (isset(self::$done[$db])) {
-            // Re-aplicar columnas de nómina (barato) por si el código se desplegó mid-worker.
-            self::ensurePayrollSchema($db);
+            // No re-ejecutar CREATE TABLE (DDL = COMMIT implícito en MySQL mid-TX).
             return;
         }
         self::$done[$db] = true;
@@ -78,6 +77,22 @@ class TenantOpsSchema
             'VARCHAR(120) NULL AFTER external_source');
         self::addColumnIfMissing($db, 'sale_items', 'unit_cost',
             'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER unit_price');
+
+        // IVA por producto + snapshot en líneas de venta/cotización
+        self::addColumnIfMissing($db, 'products', 'tax_rate',
+            'DECIMAL(5,2) NOT NULL DEFAULT 0.00 AFTER sale_price');
+        self::addColumnIfMissing($db, 'sale_items', 'tax_rate',
+            'DECIMAL(5,2) NOT NULL DEFAULT 0.00 AFTER subtotal');
+        self::addColumnIfMissing($db, 'sale_items', 'tax_amount',
+            'DECIMAL(14,2) NOT NULL DEFAULT 0.00 AFTER tax_rate');
+        self::addColumnIfMissing($db, 'sale_items', 'discount_amount',
+            'DECIMAL(14,2) NOT NULL DEFAULT 0.00 AFTER tax_amount');
+        self::addColumnIfMissing($db, 'sale_items', 'taxable',
+            'DECIMAL(14,2) NOT NULL DEFAULT 0.00 AFTER discount_amount');
+        self::addColumnIfMissing($db, 'quote_items', 'tax_rate',
+            'DECIMAL(5,2) NOT NULL DEFAULT 0.00 AFTER subtotal');
+        self::addColumnIfMissing($db, 'quote_items', 'tax_amount',
+            'DECIMAL(14,2) NOT NULL DEFAULT 0.00 AFTER tax_rate');
 
         // Unificar payment_method a VARCHAR (evita ENUM frágil en hosting restringido)
         self::paymentMethodToVarchar($db, 'sales');
@@ -235,6 +250,13 @@ class TenantOpsSchema
             ['payroll_items', 'caja_employer', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER arl_employer'],
             ['payroll_items', 'sena_employer', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER caja_employer'],
             ['payroll_items', 'icbf_employer', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER sena_employer'],
+            ['payroll_runs', 'overtime_total', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER incapacity_total'],
+            ['payroll_items', 'overtime_day_hours', 'DECIMAL(8,2) NOT NULL DEFAULT 0.00 AFTER other_earnings'],
+            ['payroll_items', 'overtime_day_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER overtime_day_hours'],
+            ['payroll_items', 'overtime_night_hours', 'DECIMAL(8,2) NOT NULL DEFAULT 0.00 AFTER overtime_day_amount'],
+            ['payroll_items', 'overtime_night_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER overtime_night_hours'],
+            ['payroll_items', 'dominical_hours', 'DECIMAL(8,2) NOT NULL DEFAULT 0.00 AFTER overtime_night_amount'],
+            ['payroll_items', 'dominical_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER dominical_hours'],
         ] as [$table, $col, $def]) {
             self::addColumnIfMissing($db, $table, $col, $def);
         }

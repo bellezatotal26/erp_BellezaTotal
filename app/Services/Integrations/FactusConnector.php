@@ -106,16 +106,22 @@ class FactusConnector implements InvoiceProviderInterface
                 $gross = $qty * $price;
                 $discountRate = ($gross > 0 && $lineDiscount > 0) ? round(($lineDiscount / $gross) * 100, 2) : 0;
 
+                $itemTaxRate = array_key_exists('tax_rate', $item)
+                    ? (float)$item['tax_rate']
+                    : $taxRate;
+                if ($itemTaxRate < 0) {
+                    $itemTaxRate = 0.0;
+                }
                 $factusItems[] = [
                     'code_reference' => $code,
                     'name' => mb_substr((string)($item['product_name'] ?? $item['name'] ?? 'Producto'), 0, 200),
                     'quantity' => $qty,
                     'discount_rate' => $discountRate,
                     'price' => $price,
-                    'tax_rate' => number_format($taxRate, 2, '.', ''),
+                    'tax_rate' => number_format($itemTaxRate, 2, '.', ''),
                     'unit_measure_id' => $unitMeasureId,
                     'standard_code_id' => 1,
-                    'is_excluded' => $taxRate > 0 ? 0 : 1,
+                    'is_excluded' => $itemTaxRate > 0 ? 0 : 1,
                     'tribute_id' => 1,
                     'withholding_taxes' => [],
                 ];

@@ -6,6 +6,7 @@ $tenantName = $tenantName ?? 'Mi Empresa';
 $userName = $userName ?? 'Usuario';
 $currency = $currency ?? ['symbol'=>'$','decimals'=>2,'decimal'=>',','thousands'=>'.'];
 $reportsFull = !empty($reportsFull);
+$canExport = !empty($canExport);
 $plan = $plan ?? ['plan_name' => 'Plan Basico', 'upgrade_plans' => 'Pro o Premium', 'tier' => 'basic'];
 $chartType = in_array(($chartType ?? 'line'), ['line','bar','pie','doughnut'], true) ? $chartType : 'line';
 $salesByMonth = $salesByMonth ?? [];
@@ -27,6 +28,7 @@ $totalCustomers = $totalCustomers ?? 0;
 $lowStock = $lowStock ?? 0;
 $avgTicket = $avgTicket ?? 0;
 $salesTrend = $salesTrend ?? 0;
+$countTrend = $countTrend ?? 0;
 $ticketTrend = $ticketTrend ?? 0;
 $dateFrom = $dateFrom ?? date('Y-m-d', strtotime('-30 days'));
 $dateTo = $dateTo ?? date('Y-m-d');
@@ -141,19 +143,25 @@ if (!function_exists('rptChartTypeSelect')) {
     <div class="card-body" style="display:flex;align-items:center;gap:15px;flex-wrap:wrap;padding:15px 20px;">
         <form method="GET" action="<?php echo $reportBase; ?>" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;flex:1;">
             <label style="font-weight:600;font-size:13px;">Periodo</label>
-            <input type="date" name="from" value="<?php echo htmlspecialchars($dateFrom); ?>" class="form-control" style="width:150px;">
+            <input type="date" name="from" id="rptFrom" value="<?php echo htmlspecialchars($dateFrom); ?>" class="form-control" style="width:150px;">
             <span style="color:var(--color-text-secondary);">hasta</span>
-            <input type="date" name="to" value="<?php echo htmlspecialchars($dateTo); ?>" class="form-control" style="width:150px;">
+            <input type="date" name="to" id="rptTo" value="<?php echo htmlspecialchars($dateTo); ?>" class="form-control" style="width:150px;">
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                <button type="button" class="btn btn-secondary" style="font-size:12px;" onclick="rptPreset('today')">Hoy</button>
+                <button type="button" class="btn btn-secondary" style="font-size:12px;" onclick="rptPreset('month')">Este mes</button>
+                <button type="button" class="btn btn-secondary" style="font-size:12px;" onclick="rptPreset('prev_month')">Mes anterior</button>
+                <button type="button" class="btn btn-secondary" style="font-size:12px;" onclick="rptPreset('30d')">30 días</button>
+            </div>
             <button type="submit" class="btn btn-primary">Aplicar</button>
             <a href="<?php echo $reportBase; ?>" class="btn btn-secondary" style="font-size:12px;">Reset</a>
         </form>
         <div style="display:flex;gap:8px;">
-            <?php if ($reportsFull): ?>
-                <a href="<?php echo $reportBase; ?>?action=export&amp;<?php echo htmlspecialchars($qs); ?>" class="btn btn-secondary" style="font-size:12px;">CSV</a>
-                <a href="<?php echo $reportBase; ?>?action=pdf&amp;<?php echo htmlspecialchars($qs); ?>" class="btn btn-secondary" style="font-size:12px;" target="_blank">PDF</a>
+            <?php if ($canExport): ?>
+                <a href="<?php echo $reportBase; ?>?action=export&amp;<?php echo htmlspecialchars($qs); ?>" class="btn btn-secondary" style="font-size:12px;" title="Listado de ventas del periodo">CSV ventas</a>
+                <a href="<?php echo $reportBase; ?>?action=pdf&amp;<?php echo htmlspecialchars($qs); ?>" class="btn btn-secondary" style="font-size:12px;" target="_blank">PDF analítico</a>
             <?php else: ?>
-                <button type="button" class="btn btn-secondary is-locked-btn" style="font-size:12px;" onclick="showAlert('Exportación disponible en <?php echo $upgradeLabel; ?>','warning')">CSV (Pro)</button>
-                <button type="button" class="btn btn-secondary is-locked-btn" style="font-size:12px;" onclick="showAlert('Exportación disponible en <?php echo $upgradeLabel; ?>','warning')">PDF (Pro)</button>
+                <button type="button" class="btn btn-secondary is-locked-btn" style="font-size:12px;" onclick="showAlert('Exportación disponible en <?php echo $upgradeLabel; ?> con permiso de exportar','warning')">CSV (Pro)</button>
+                <button type="button" class="btn btn-secondary is-locked-btn" style="font-size:12px;" onclick="showAlert('Exportación disponible en <?php echo $upgradeLabel; ?> con permiso de exportar','warning')">PDF (Pro)</button>
             <?php endif; ?>
         </div>
     </div>
@@ -163,10 +171,13 @@ if (!function_exists('rptChartTypeSelect')) {
     <div class="stat-card neumorphic">
         <h4>Ventas del periodo</h4>
         <div class="stat-value" style="color:#10B981;"><?php echo fmtR((float)$totalSales, $currency); ?></div>
-        <small><?php echo (int)$totalSalesCount; ?> ventas</small>
+        <small><?php echo (int)$totalSalesCount; ?> ventas · total facturado</small>
         <?php if ($reportsFull): ?>
         <div style="margin-top:6px;font-size:12px;color:<?php echo trendColor((float)$salesTrend); ?>;">
             <?php echo trendArrow((float)$salesTrend); ?> <?php echo abs((float)$salesTrend); ?>% vs periodo anterior
+        </div>
+        <div style="font-size:11px;color:var(--color-text-secondary);margin-top:2px;">
+            <?php echo trendArrow((float)$countTrend); ?> <?php echo abs((float)$countTrend); ?>% en cantidad de ventas
         </div>
         <?php endif; ?>
     </div>
@@ -197,7 +208,8 @@ if (!function_exists('rptChartTypeSelect')) {
     <div class="card neumorphic">
         <div class="card-header"><h3>Utilidad del periodo</h3></div>
         <div class="card-body">
-            <div class="rpt-row"><span>Ingresos</span><strong style="color:#10B981;"><?php echo fmtR((float)$profitSummary['revenue'], $currency); ?></strong></div>
+            <div class="rpt-row"><span>Ingresos (subtotal ítems)</span><strong style="color:#10B981;"><?php echo fmtR((float)$profitSummary['revenue'], $currency); ?></strong></div>
+            <div class="rpt-row muted"><span>Total facturado (con impuestos)</span><span><?php echo fmtR((float)($profitSummary['billed'] ?? $totalSales), $currency); ?></span></div>
             <div class="rpt-row"><span>− Costo de ventas</span><span><?php echo fmtR((float)$profitSummary['cost'], $currency); ?></span></div>
             <div class="rpt-row rpt-row-sep"><span>Utilidad bruta</span><strong><?php echo fmtR((float)$profitSummary['gross'], $currency); ?></strong></div>
             <div class="rpt-row muted"><span>− Gastos fijos</span><span><?php echo fmtR((float)($profitSummary['expenses_fixed'] ?? 0), $currency); ?></span></div>
@@ -316,6 +328,30 @@ if (!function_exists('rptChartTypeSelect')) {
     </div>
 </div>
 
+<?php if ($reportsFull && !empty($topCustomers)): ?>
+<div class="reports-section-title">Clientes</div>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px;margin-bottom:22px;">
+    <div class="card neumorphic">
+        <div class="card-header"><h3>Top clientes del periodo</h3></div>
+        <div class="card-body">
+            <div class="table-container"><table>
+                <thead><tr><th>#</th><th>Cliente</th><th>Compras</th><th>Total</th></tr></thead>
+                <tbody>
+                <?php foreach ($topCustomers as $i => $cu): ?>
+                    <tr>
+                        <td><?php echo $i + 1; ?></td>
+                        <td><?php echo htmlspecialchars($cu['customer_name']); ?></td>
+                        <td><?php echo (int)$cu['purchase_count']; ?></td>
+                        <td><?php echo fmtR((float)$cu['total'], $currency); ?></td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table></div>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
+
 <div class="reports-section-title">Inventario por mes</div>
 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:20px;margin-bottom:22px;">
     <div class="card neumorphic">
@@ -324,6 +360,7 @@ if (!function_exists('rptChartTypeSelect')) {
             <?php echo rptChartTypeSelect('chartInventoryMonth', ['bar','line']); ?>
         </div>
         <div class="card-body">
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">Histórico fijo de 12 meses (independiente del filtro de periodo).</p>
             <div style="height:240px;margin-bottom:12px;"><canvas id="chartInventoryMonth"></canvas></div>
             <?php if (empty($inventoryByMonth)): ?>
                 <p class="rpt-empty">Sin movimientos registrados</p>
@@ -404,6 +441,7 @@ if (!function_exists('rptChartTypeSelect')) {
     <div class="card neumorphic">
         <div class="card-header"><h3>Caja de hoy</h3></div>
         <div class="card-body">
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">Resumen del día actual, no del periodo filtrado arriba.</p>
             <?php if ($cashSummary['session']): ?>
                 <div class="rpt-row muted"><span>Base inicial</span><span><?php echo fmtR((float)$cashSummary['opening'], $currency); ?></span></div>
                 <div class="rpt-row muted"><span>+ Ingresos</span><strong style="color:#10B981;"><?php echo fmtR((float)$cashSummary['income'], $currency); ?></strong></div>
@@ -547,6 +585,32 @@ if (!function_exists('rptChartTypeSelect')) {
 </style>
 
 <script>
+function rptPreset(key) {
+    var from = document.getElementById('rptFrom');
+    var to = document.getElementById('rptTo');
+    if (!from || !to) return;
+    var now = new Date();
+    var pad = function(n) { return String(n).padStart(2, '0'); };
+    var fmt = function(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); };
+    var end = fmt(now);
+    var start = end;
+    if (key === 'today') {
+        start = end;
+    } else if (key === 'month') {
+        start = fmt(new Date(now.getFullYear(), now.getMonth(), 1));
+    } else if (key === 'prev_month') {
+        var pm = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        start = fmt(pm);
+        end = fmt(new Date(now.getFullYear(), now.getMonth(), 0));
+    } else if (key === '30d') {
+        var d30 = new Date(now);
+        d30.setDate(d30.getDate() - 29);
+        start = fmt(d30);
+    }
+    from.value = start;
+    to.value = end;
+    from.closest('form').submit();
+}
 (function() {
     var isDark = document.body.classList.contains('dark-mode');
     var gridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';

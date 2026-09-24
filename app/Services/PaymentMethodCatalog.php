@@ -26,12 +26,6 @@ class PaymentMethodCatalog
                 'affects_cash' => false,
                 'group' => 'bank',
             ],
-            'card' => [
-                'label' => 'Tarjeta',
-                'account' => 'bank',
-                'affects_cash' => false,
-                'group' => 'bank',
-            ],
             'debit_card' => [
                 'label' => 'Tarjeta débito',
                 'account' => 'bank',
@@ -40,12 +34,6 @@ class PaymentMethodCatalog
             ],
             'credit_card' => [
                 'label' => 'Tarjeta crédito',
-                'account' => 'bank',
-                'affects_cash' => false,
-                'group' => 'bank',
-            ],
-            'dataphone' => [
-                'label' => 'Datáfono',
                 'account' => 'bank',
                 'affects_cash' => false,
                 'group' => 'bank',
@@ -68,12 +56,30 @@ class PaymentMethodCatalog
                 'affects_cash' => false,
                 'group' => 'bank',
             ],
+            'breb' => [
+                'label' => 'BreB',
+                'account' => 'bank',
+                'affects_cash' => false,
+                'group' => 'bank',
+            ],
             'mixed' => [
                 'label' => 'Pago mixto',
                 'account' => 'cash',
                 'affects_cash' => false,
                 'group' => 'mixed',
             ],
+        ];
+    }
+
+    /**
+     * Códigos retirados del selector pero aún presentes en historial.
+     * @return array<string,string> legacy => código activo
+     */
+    public static function legacyAliases(): array
+    {
+        return [
+            'card' => 'credit_card',
+            'dataphone' => 'debit_card',
         ];
     }
 
@@ -88,6 +94,10 @@ class PaymentMethodCatalog
         $method = strtolower(trim($method));
         if ($method === '' || $method === 'other' || $method === '__other__') {
             return 'cash';
+        }
+        $aliases = self::legacyAliases();
+        if (isset($aliases[$method])) {
+            return $aliases[$method];
         }
         if (isset(self::all()[$method])) {
             return $method;
@@ -105,6 +115,13 @@ class PaymentMethodCatalog
         $all = self::all();
         if (isset($all[$method])) {
             return $all[$method]['label'];
+        }
+        // Historial: mostrar etiqueta legible aunque el código ya no esté en el selector.
+        if ($method === 'card') {
+            return 'Tarjeta';
+        }
+        if ($method === 'dataphone') {
+            return 'Datáfono';
         }
         if ($method === 'inventory_loss') {
             return 'Pérdida inventario';
@@ -180,6 +197,11 @@ class PaymentMethodCatalog
         }
         if ($includeOther) {
             $html .= '<option value="__other__">Otro</option>';
+        }
+        // Si la venta/abono ya tiene un código legado, mostrarlo para no perderlo al editar.
+        if (($selected === 'card' || $selected === 'dataphone') && empty($seen[$selected])) {
+            $html = '<option value="' . htmlspecialchars($selected) . '" selected>'
+                . htmlspecialchars(self::label($selected)) . '</option>' . $html;
         }
         return $html;
     }

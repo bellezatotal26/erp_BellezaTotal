@@ -9,7 +9,9 @@ $totals = $totals ?? ['incomes'=>0,'expenses'=>0,'balance'=>0];
 $historySessions = $historySessions ?? [];
 $currency = $currency ?? ['symbol'=>'$','name'=>'Peso','decimals'=>0];
 $isPosRole = $isPosRole ?? \SoftNova\Core\TenantMiddleware::isPosRole();
-$stockAlert = $stockAlert ?? ['count' => 0, 'negative_count' => 0, 'loan_count' => 0, 'sale_debt_count' => 0, 'summary_lines' => []];
+$isAdminViewer = $isAdminViewer ?? (\SoftNova\Core\TenantMiddleware::getRole() === 'admin');
+$openSessionsCount = (int)($openSessionsCount ?? ($openSession ? 1 : 0));
+$stockAlert = $stockAlert ?? ['count' => 0, 'negative_count' => 0, 'loan_count' => 0, 'loan_received_count' => 0, 'sale_debt_count' => 0, 'summary_lines' => []];
 $needBarcode = true;
 $pageScripts = ['ventas.js', 'caja.js'];
 if (!function_exists('fmt')) {
@@ -20,11 +22,25 @@ if (!function_exists('hoursOpen')) {
 }
 ?>
 <?php echo flashMessage(); ?>
+<div id="posPwaInstallBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#ECFDF5;color:#065F46;border:1px solid #10B981;font-size:13px;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+    <span>Instale <strong>Seri Caja</strong> en este computador para usarla como aplicación (incluso sin internet).</span>
+    <span style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="button" class="btn btn-sm btn-primary" id="posPwaInstallBtn">Instalar</button>
+        <button type="button" class="btn btn-sm btn-secondary" id="posPwaInstallDismiss">Ahora no</button>
+    </span>
+</div>
 <div id="posOfflineBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#FEF3C7;color:#92400E;border:1px solid #F59E0B;font-size:13px;"></div>
 <div id="posNetworkBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#DBEAFE;color:#1E3A8A;border:1px solid #3B82F6;font-size:13px;"></div>
+<div id="posCatalogStaleBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#FFF7ED;color:#9A3412;border:1px solid #FB923C;font-size:13px;"></div>
 <div id="posConflictBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#FEE2E2;color:#991B1B;border:1px solid #EF4444;font-size:13px;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
     <span id="posConflictBannerText"></span>
     <button type="button" class="btn btn-sm btn-danger" id="posConflictReviewBtn">Revisar conflictos</button>
+</div>
+<div id="posSyncBar" style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+    <div id="posPwaStatus" style="display:none;font-size:12px;color:var(--color-text-secondary);flex:1;min-width:200px;"></div>
+    <button type="button" class="btn btn-sm btn-secondary" id="posSyncNowBtn" title="Descargar catálogo y subir ventas en cola">
+        Sincronizar ahora
+    </button>
 </div>
 
 <?php if (!$openSession): ?>
@@ -33,7 +49,8 @@ if (!function_exists('hoursOpen')) {
     <strong>Pendiente del día anterior:</strong>
     hay <?php echo (int)$stockAlert['count']; ?> producto(s) con stock negativo o unidades pendientes
     (<?php echo (int)($stockAlert['negative_count'] ?? 0); ?> en negativo ·
-    <?php echo (int)($stockAlert['loan_count'] ?? 0); ?> préstamo(s) ·
+    <?php echo (int)($stockAlert['loan_count'] ?? 0); ?> préstamo(s) salida ·
+    <?php echo (int)($stockAlert['loan_received_count'] ?? 0); ?> nos prestaron ·
     <?php echo (int)($stockAlert['sale_debt_count'] ?? 0); ?> venta(s) sin stock).
     Revise motivos antes de operar.
     <?php if (!$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('prestamos')): ?>
@@ -94,7 +111,8 @@ $canCompras = !$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('compras
     <strong>Inventario pendiente:</strong>
     <?php echo (int)$stockAlert['count']; ?> producto(s) con stock negativo o unidades por reponer/devolver
     (negativos: <?php echo (int)($stockAlert['negative_count'] ?? 0); ?> ·
-    préstamos: <?php echo (int)($stockAlert['loan_count'] ?? 0); ?> ·
+    préstamos salida: <?php echo (int)($stockAlert['loan_count'] ?? 0); ?> ·
+    nos prestaron: <?php echo (int)($stockAlert['loan_received_count'] ?? 0); ?> ·
     ventas sin stock: <?php echo (int)($stockAlert['sale_debt_count'] ?? 0); ?>).
     <?php if (!$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('prestamos')): ?>
         <a href="<?php echo $viewInstance->route('app/prestamos'); ?>">Ver detalle</a>
@@ -104,10 +122,11 @@ $canCompras = !$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('compras
 <?php
 if (!$isPosRole) {
     $pageTopStatsHtml = '
-<div class="page-top-stat"><h4>Monto Apertura</h4><div class="stat-value">' . htmlspecialchars(fmt((float)$openSession['opening_amount'], $currency)) . '</div></div>
-<div class="page-top-stat"><h4>Ingresos</h4><div class="stat-value page-top-stat--in">+' . htmlspecialchars(fmt((float)$totals['incomes'], $currency)) . '</div></div>
-<div class="page-top-stat"><h4>Egresos</h4><div class="stat-value page-top-stat--out">-' . htmlspecialchars(fmt((float)$totals['expenses'], $currency)) . '</div></div>
-<div class="page-top-stat"><h4>Balance Actual</h4><div class="stat-value ' . ($totals['balance'] >= 0 ? 'page-top-stat--in' : 'page-top-stat--out') . '">' . htmlspecialchars(fmt((float)$totals['balance'], $currency)) . '</div></div>';
+<div class="page-top-stat" title="Fondo con el que se abrió el cajón (no es venta)"><h4>Base cajón</h4><div class="stat-value">' . htmlspecialchars(fmt((float)$openSession['opening_amount'], $currency)) . '</div></div>
+<div class="page-top-stat" title="Cobros en efectivo de ventas del día (sin la base)"><h4>Efectivo ventas</h4><div class="stat-value page-top-stat--in" id="cajaStatCashSales">+' . htmlspecialchars(fmt((float)($totals['cash_sales'] ?? 0), $currency)) . '</div></div>
+<div class="page-top-stat" title="Cobros en Nequi, transferencia, tarjetas y otros (no efectivo)"><h4>Otros medios</h4><div class="stat-value page-top-stat--in" id="cajaStatOtherIncomes">+' . htmlspecialchars(fmt((float)($totals['other_incomes'] ?? 0), $currency)) . '</div></div>
+<div class="page-top-stat"><h4>Egresos</h4><div class="stat-value page-top-stat--out" id="cajaStatExpenses">-' . htmlspecialchars(fmt((float)$totals['expenses'], $currency)) . '</div></div>
+<div class="page-top-stat" title="Base + efectivo del día − egresos (lo que debe haber en el cajón)"><h4>En cajón</h4><div class="stat-value ' . ((($totals['expected_cash'] ?? $totals['balance'] ?? 0) >= 0) ? 'page-top-stat--in' : 'page-top-stat--out') . '" id="cajaStatBalance">' . htmlspecialchars(fmt((float)($totals['expected_cash'] ?? $totals['balance'] ?? 0), $currency)) . '</div></div>';
 }
 ?>
 
@@ -123,6 +142,13 @@ if (!$isPosRole) {
         <?php if ($hours > 22): ?>
         <div class="alert alert-error" style="margin-top:8px;font-size:13px;">
             ⚠️ <strong>¡Atención!</strong> La caja lleva más de 22 horas abierta. Debe cerrarse antes de 24 horas.
+        </div>
+        <?php endif; ?>
+        <?php if ($isAdminViewer): ?>
+        <div class="alert alert-info" style="margin-top:8px;font-size:13px;">
+            Vista administrador: ingresos, egresos y ventas de <strong>todos los usuarios</strong> en una sola caja del negocio
+            <?php if ($openSessionsCount > 1): ?>(<?php echo (int)$openSessionsCount; ?> sesiones abiertas unificadas)<?php endif; ?>.
+            Los movimientos se sincronizan en tiempo real.
         </div>
         <?php endif; ?>
     </div>
@@ -148,10 +174,13 @@ if (!$isPosRole) {
     <button type="button" onclick="openCloseCashModal()" class="btn btn-danger"
             data-balance="<?php echo htmlspecialchars((string)round((float)($totals['expected_cash'] ?? $totals['balance'] ?? 0), 2)); ?>"
             data-opening="<?php echo htmlspecialchars(fmt($openSession['opening_amount'], $currency)); ?>"
-            data-incomes="<?php echo htmlspecialchars(fmt($totals['incomes'], $currency)); ?>"
+            data-cash-sales="<?php echo htmlspecialchars(fmt((float)($totals['cash_sales'] ?? 0), $currency)); ?>"
+            data-other-cash="<?php echo htmlspecialchars(fmt((float)($totals['other_cash_incomes'] ?? 0), $currency)); ?>"
             data-expenses="<?php echo htmlspecialchars(fmt($totals['expenses'], $currency)); ?>"
             data-sales-count="<?php echo (int)($totals['sales_count'] ?? 0); ?>"
             data-sales-total="<?php echo htmlspecialchars(fmt($totals['sales_total'] ?? 0, $currency)); ?>"
+            data-sales-subtotal="<?php echo htmlspecialchars(fmt($totals['sales_subtotal_before_discount'] ?? 0, $currency)); ?>"
+            data-sales-discount="<?php echo htmlspecialchars(fmt($totals['sales_discount_total'] ?? 0, $currency)); ?>"
             data-balance-label="<?php echo htmlspecialchars(fmt((float)($totals['expected_cash'] ?? $totals['balance'] ?? 0), $currency)); ?>"
             id="btnOpenCloseCash">Cerrar Caja</button>
     <?php endif; ?>
@@ -190,7 +219,9 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
          data-thousands="<?php echo htmlspecialchars($currency['thousands'] ?? '.'); ?>"
          data-decimal="<?php echo htmlspecialchars($currency['decimal'] ?? ','); ?>"
          data-prefix="<?php echo htmlspecialchars((string)$invoicePrefix); ?>"
-         data-user="<?php echo htmlspecialchars($userName); ?>">
+         data-user="<?php echo htmlspecialchars($userName); ?>"
+         data-auto-print-ticket="<?php echo !empty($autoPrintTicket) ? '1' : '0'; ?>"
+         data-ticket-print-base="<?php echo htmlspecialchars($ventasBase); ?>">
     <div class="pos-sale card neumorphic">
         <div class="pos-sale-head">
             <div class="pos-sale-meta">
@@ -227,7 +258,7 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                 <div class="pos-discount-row">
                     <div class="pos-discount-left">
                         <label class="pos-label" for="posDiscountPreset" style="margin:0;">Descuento %</label>
-                        <select id="posDiscountPreset" class="form-control" style="width:110px;" title="Descuento sobre el subtotal" data-custom-other="discount_percent">
+                        <select id="posDiscountPreset" class="form-control" style="width:110px;" title="Descuento solo sobre el precio del producto (no afecta el IVA)" data-custom-other="discount_percent">
                             <option value="0" selected>0%</option>
                             <option value="5">5%</option>
                             <option value="6">6%</option>
@@ -313,7 +344,7 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                 </tbody>
             </table>
         </div>
-        <div class="pos-pay-bar" id="posPayBar" hidden>
+        <div class="pos-pay-bar" id="posPayBar">
             <div style="display:flex;flex-wrap:wrap;gap:8px;width:100%;align-items:end;">
                 <div class="form-group" style="margin:0;min-width:120px;">
                     <label style="font-size:12px;">Tipo</label>
@@ -351,7 +382,7 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                     <input type="checkbox" id="posMixedPay" style="width:16px;height:16px;">
                     Pago mixto
                 </label>
-                <button type="button" class="btn btn-success" id="posConfirmPay">Cobrar ahora</button>
+                <button type="button" class="btn btn-success" id="posConfirmPay" disabled>Cobrar ahora</button>
                 <button type="button" class="btn btn-secondary" id="posCancelPay">Cancelar</button>
             </div>
             <div id="posMixedPayWrap" class="pos-mixed-wrap" style="display:none;">
@@ -405,8 +436,12 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
             }
         }
         ?>
-        <?php if ($openItemQuick): ?>
+        <?php
+        $consignmentProducts = $consignmentProducts ?? [];
+        if ($openItemQuick || !empty($consignmentProducts)):
+        ?>
         <div class="pos-open-item-bar">
+            <?php if ($openItemQuick): ?>
             <button type="button"
                     class="btn btn-success pos-open-item-btn"
                     id="posOpenItemBtn"
@@ -418,7 +453,49 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                     title="Venta libre: pide nombre y precio, no descuenta stock">
                 Nuevo P. Comodin
             </button>
-            <span style="font-size:12px;color:var(--color-text-secondary);">Ítem libre · nombre y precio al vender · sin stock</span>
+            <?php endif; ?>
+            <label class="pos-consign-select-wrap" title="Mercancía de terceros (no inventario propio)">
+                <span class="pos-consign-select-label">Consignación</span>
+                <select id="posConsignmentSelect" class="form-control pos-consign-select" <?php echo empty($consignmentProducts) ? 'disabled' : ''; ?>>
+                    <option value="">
+                        <?php echo empty($consignmentProducts)
+                            ? 'Sin productos en consignación'
+                            : 'Agregar consignado… (' . count($consignmentProducts) . ')'; ?>
+                    </option>
+                    <?php foreach ($consignmentProducts as $cp):
+                        $cpLabel = trim(
+                            (($cp['code'] ?? '') !== '' ? ($cp['code'] . ' — ') : '')
+                            . ($cp['name'] ?? '')
+                        );
+                        $cpConsignor = trim((string)($cp['consignor_name'] ?? ''));
+                        $cpStock = (int)($cp['stock'] ?? 0);
+                        $cpPrice = (float)($cp['sale_price'] ?? 0);
+                        $optText = $cpLabel
+                            . ' · stock ' . $cpStock
+                            . ' · ' . fmt($cpPrice, $currency)
+                            . ($cpConsignor !== '' ? (' · ' . $cpConsignor) : '');
+                    ?>
+                    <option value="<?php echo (int)$cp['id']; ?>"
+                            data-id="<?php echo (int)$cp['id']; ?>"
+                            data-name="<?php echo \SoftNova\Core\e((string)($cp['name'] ?? '')); ?>"
+                            data-code="<?php echo \SoftNova\Core\e((string)($cp['code'] ?? '')); ?>"
+                            data-price="<?php echo $cpPrice; ?>"
+                            data-wholesale="<?php echo (float)($cp['wholesale_price'] ?? 0); ?>"
+                            data-cost="<?php echo (float)($cp['purchase_price'] ?? 0); ?>"
+                            data-stock="<?php echo $cpStock; ?>"
+                            data-type="<?php echo htmlspecialchars((string)($cp['product_type'] ?? 'product')); ?>"
+                            data-tax-rate="<?php echo htmlspecialchars((string)($cp['tax_rate'] ?? 0)); ?>"
+                            data-ownership="consignment"
+                            data-consignor-id="<?php echo (int)($cp['consignor_id'] ?? 0); ?>"
+                            data-is-consignment="1">
+                        <?php echo \SoftNova\Core\e($optText); ?>
+                    </option>
+                    <?php endforeach; ?>
+                </select>
+            </label>
+            <span style="font-size:12px;color:var(--color-text-secondary);">
+                <?php if ($openItemQuick): ?>Ítem libre · <?php endif; ?>consignados fuera del inventario propio
+            </span>
         </div>
         <?php endif; ?>
         <?php
@@ -438,8 +515,12 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                  data-name="<?php echo \SoftNova\Core\e((string)$op['name']); ?>"
                  data-code="<?php echo \SoftNova\Core\e((string)($op['code'] ?? '')); ?>"
                  data-price="<?php echo $offerPrice; ?>"
+                 data-cost="<?php echo (float)($op['purchase_price'] ?? 0); ?>"
                  data-stock="<?php echo (int)($op['stock'] ?? 0); ?>"
                  data-type="<?php echo htmlspecialchars((string)($op['product_type'] ?? 'product')); ?>"
+                 data-ownership="<?php echo htmlspecialchars((string)($op['ownership'] ?? 'owned')); ?>"
+                 data-consignor-id="<?php echo (int)($op['consignor_id'] ?? 0); ?>"
+                 data-tax-rate="<?php echo (float)($op['tax_rate'] ?? 0); ?>"
                  data-open-item="0">
                 <div class="pos-result-info">
                     <div class="pos-result-title">
@@ -471,8 +552,12 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                          data-name="<?php echo \SoftNova\Core\e((string)$rp['name']); ?>"
                          data-code="<?php echo \SoftNova\Core\e((string)($rp['code'] ?? '')); ?>"
                          data-price="<?php echo (float)$rp['sale_price']; ?>"
+                         data-cost="<?php echo (float)($rp['purchase_price'] ?? 0); ?>"
                          data-stock="<?php echo (int)$rp['stock']; ?>"
                          data-type="<?php echo htmlspecialchars((string)($rp['product_type'] ?? 'product')); ?>"
+                         data-ownership="<?php echo htmlspecialchars((string)($rp['ownership'] ?? 'owned')); ?>"
+                         data-consignor-id="<?php echo (int)($rp['consignor_id'] ?? 0); ?>"
+                         data-tax-rate="<?php echo (float)($rp['tax_rate'] ?? 0); ?>"
                          data-open-item="0">
                         <div class="pos-result-info">
                             <div class="pos-result-title"><?php echo \SoftNova\Core\e((($rp['code'] ?? '') !== '' ? ($rp['code'] . ' — ') : '') . $rp['name']); ?></div>
@@ -505,13 +590,16 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
         <?php else: ?>
             <div class="table-container"><table>
                 <thead><tr>
-                    <th>Factura</th><th>Cliente</th><th>Fecha</th><th>Total</th><th>Pagado</th><th>Pago</th><th>Estado</th><th>Acciones</th>
+                    <th>Factura</th><th>Cliente</th><?php if ($isAdminViewer): ?><th>Usuario</th><?php endif; ?><th>Fecha</th><th>Total</th><th>Pagado</th><th>Pago</th><th>NC</th><th>Estado</th><th>Acciones</th>
                 </tr></thead>
                 <tbody>
                 <?php foreach ($todaySales as $sale): ?>
                     <tr>
                         <td><strong><?php echo htmlspecialchars($sale['invoice_number']); ?></strong></td>
                         <td><?php echo htmlspecialchars($sale['customer_name'] ?? 'Cliente Final'); ?></td>
+                        <?php if ($isAdminViewer): ?>
+                        <td><?php echo htmlspecialchars((string)($sale['user_name'] ?? '—')); ?></td>
+                        <?php endif; ?>
                         <td><?php echo date('d/m/Y H:i', strtotime($sale['sale_date'])); ?></td>
                         <td style="font-weight:600;"><?php echo fmt((float)$sale['total'], $currency); ?></td>
                         <td><?php echo ($sale['payment_status'] ?? '') === 'paid' ? fmt((float)$sale['total'], $currency) : fmt((float)($sale['paid_amount'] ?? 0), $currency); ?></td>
@@ -522,6 +610,18 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                             ?>">
                                 <?php echo htmlspecialchars(\SoftNova\Services\PaymentMethodCatalog::label((string)($sale['payment_method'] ?? 'cash'))); ?>
                             </span>
+                        </td>
+                        <td>
+                            <?php if ((float)($sale['credit_note_total'] ?? 0) > 0.009): ?>
+                                <span class="badge badge-warning" title="<?php echo htmlspecialchars((string)($sale['credit_note_numbers'] ?? 'Nota crédito')); ?>">
+                                    NC <?php echo fmt((float)$sale['credit_note_total'], $currency); ?>
+                                </span>
+                                <?php if (!empty($sale['credit_note_numbers'])): ?>
+                                    <div style="font-size:11px;color:var(--color-text-secondary);"><?php echo htmlspecialchars((string)$sale['credit_note_numbers']); ?></div>
+                                <?php endif; ?>
+                            <?php else: ?>
+                                <span style="color:var(--color-text-secondary);">—</span>
+                            <?php endif; ?>
                         </td>
                         <td>
                             <?php if (($sale['status'] ?? '') === 'cancelled'): ?>
@@ -537,7 +637,7 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                         <td class="table-actions">
                             <button type="button" onclick="viewDetail(<?php echo (int)$sale['id']; ?>)" class="btn btn-sm btn-info" title="Ver detalle"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg></button>
                             <a href="<?php echo $ventasBase; ?>?action=pdf&id=<?php echo (int)$sale['id']; ?>" class="btn btn-sm btn-secondary" target="_blank" title="PDF carta"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg></a>
-                            <a href="<?php echo $ventasBase; ?>?action=pdf&format=ticket&id=<?php echo (int)$sale['id']; ?>" class="btn btn-sm btn-secondary" target="_blank" title="Ticket 58mm">58mm</a>
+                            <a href="<?php echo $ventasBase; ?>?action=pdf&format=print&id=<?php echo (int)$sale['id']; ?>" class="btn btn-sm btn-secondary" target="_blank" title="Imprimir tirilla 58mm">58mm</a>
                             <button type="button" class="btn btn-sm btn-success" onclick="shareSale(<?php echo (int)$sale['id']; ?>)" title="WhatsApp / Correo">↗</button>
                             <?php if ($canEditPaymentMethod && ($sale['status'] ?? '') !== 'cancelled'): ?>
                                 <button type="button" class="btn btn-sm btn-secondary" title="Editar medio de pago"
@@ -606,8 +706,10 @@ foreach ($payBreakDashboard as $pbRow) {
     </div>
     <?php if (isset($totals['expected_cash'])): ?>
     <p style="margin:12px 0 0;font-size:12px;color:var(--color-text-secondary);">
-        Efectivo esperado en cajón (apertura + ingresos en efectivo − egresos):
-        <strong style="color:#10B981;"><?php echo fmt((float)$totals['expected_cash'], $currency); ?></strong>
+        En cajón = base <?php echo fmt((float)$openSession['opening_amount'], $currency); ?>
+        + efectivo ventas <?php echo fmt((float)($totals['cash_sales'] ?? 0), $currency); ?>
+        − egresos <?php echo fmt((float)$totals['expenses'], $currency); ?>
+        → <strong style="color:#10B981;"><?php echo fmt((float)$totals['expected_cash'], $currency); ?></strong>
         — los demás medios no van al cajón físico.
     </p>
     <?php endif; ?>
@@ -621,14 +723,62 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
 ?>
 <div class="card neumorphic" style="margin-bottom:20px;">
     <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-        <h3>Gastos del día<?php echo $todayExpensesCount > 0 ? ' (' . $todayExpensesCount . ')' : ''; ?></h3>
+        <h3>Gastos del cajón (efectivo)<?php echo $todayExpensesCount > 0 ? ' (' . $todayExpensesCount . ')' : ''; ?></h3>
         <?php if ($todayExpensesCount > 0): ?>
             <span style="font-size:13px;color:#DC2626;font-weight:600;">Total: -<?php echo fmt($todayExpensesTotal, $currency); ?></span>
         <?php endif; ?>
     </div>
     <div class="card-body">
         <?php if (empty($todayExpensesByUser)): ?>
-            <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">No hay gastos registrados hoy</p>
+            <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">No hay egresos en efectivo registrados en esta sesión de caja</p>
+        <?php elseif ($isAdminViewer): ?>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Hora</th>
+                            <th>Usuario</th>
+                            <th>Descripción</th>
+                            <th>Categoría</th>
+                            <th>Pago</th>
+                            <th>Monto</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php
+                    $flatExpenses = [];
+                    foreach ($todayExpensesByUser as $group) {
+                        foreach ($group['items'] as $exp) {
+                            $flatExpenses[] = $exp;
+                        }
+                    }
+                    usort($flatExpenses, static fn($a, $b) => strcmp((string)($b['created_at'] ?? ''), (string)($a['created_at'] ?? '')));
+                    foreach ($flatExpenses as $exp):
+                    ?>
+                        <tr>
+                            <td><?php
+                                $ts = $exp['created_at'] ?? $exp['expense_date'] ?? '';
+                                echo $ts !== '' ? date('H:i', strtotime((string)$ts)) : '—';
+                            ?></td>
+                            <td><?php echo htmlspecialchars((string)($exp['user_name'] ?? '—')); ?></td>
+                            <td>
+                                <strong><?php echo htmlspecialchars((string)$exp['description']); ?></strong>
+                                <?php if (!empty($exp['supplier_name'])): ?>
+                                    <div style="font-size:12px;color:var(--color-text-secondary);"><?php echo htmlspecialchars((string)$exp['supplier_name']); ?></div>
+                                <?php endif; ?>
+                            </td>
+                            <td><?php echo htmlspecialchars((string)($exp['category_label'] ?? 'General')); ?></td>
+                            <td>
+                                <span class="badge badge-info">
+                                    <?php echo htmlspecialchars(\SoftNova\Services\PaymentMethodCatalog::label((string)($exp['payment_method'] ?? 'cash'))); ?>
+                                </span>
+                            </td>
+                            <td style="color:#DC2626;font-weight:600;">-<?php echo fmt((float)$exp['amount'], $currency); ?></td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
         <?php else: ?>
             <?php foreach ($todayExpensesByUser as $group): ?>
                 <div style="margin-bottom:18px;">
@@ -681,42 +831,58 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
     </div>
 </div>
 
-<?php if (!$isPosRole): ?>
-<div class="card neumorphic">
-    <div class="card-header"><h3>📋 Movimientos del Día (<?php echo count($movements); ?>)</h3></div>
+<?php if ($openSession): ?>
+<?php
+$cajaSessionUserId = (int)($openSession['user_id'] ?? 0);
+$cajaSessionUserName = (string)($openSession['user_name'] ?? 'Caja');
+?>
+<div class="card neumorphic" id="cajaMovementsPanel">
+    <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <h3>📋 Movimientos del Día (<span id="cajaMovementsCount"><?php echo count($movements); ?></span>)</h3>
+        <span id="cajaLiveSyncBadge" style="font-size:12px;color:var(--color-text-secondary);">Sincronizando…</span>
+    </div>
     <div class="card-body">
-        <?php if (empty($movements)): ?>
-            <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">No hay movimientos</p>
+        <?php if (!empty($hiddenVoidedCount)): ?>
+            <p id="cajaVoidedNotice" style="margin:0 0 10px;padding:8px 10px;background:#FFF7ED;border:1px solid #FED7AA;border-radius:8px;font-size:12px;color:#9A3412;">
+                Se omitieron <?php echo (int)$hiddenVoidedCount; ?> movimiento(s) de compras/gastos ya anulados (neto $0 en el cajón).
+            </p>
         <?php else: ?>
-            <div class="table-container"><table>
-                <thead><tr><th>Hora</th><th>Tipo</th><th>Descripción</th><th>Monto</th></tr></thead>
-                <tbody><?php foreach($movements as $mov): ?>
-                    <tr><td><?php echo date('H:i',strtotime($mov['created_at'])); ?></td><td><span class="badge <?php echo $mov['type']==='income'?'badge-success':'badge-danger';?>"><?php echo $mov['type']==='income'?'Ingreso':'Egreso';?></span></td><td><?php echo htmlspecialchars($mov['description']);?></td><td style="color:<?php echo $mov['type']==='income'?'#10B981':'#DC2626';?>;font-weight:600;"><?php echo $mov['type']==='income'?'+':'-';?><?php echo fmt($mov['amount'],$currency);?></td></tr>
+            <p id="cajaVoidedNotice" style="display:none;margin:0 0 10px;padding:8px 10px;background:#FFF7ED;border:1px solid #FED7AA;border-radius:8px;font-size:12px;color:#9A3412;"></p>
+        <?php endif; ?>
+        <?php if (empty($movements)): ?>
+            <p id="cajaMovementsEmpty" style="text-align:center;color:var(--color-text-secondary);padding:20px;">No hay movimientos en esta sesión de caja</p>
+            <div class="table-container" id="cajaMovementsTableWrap" style="display:none;"><table>
+                <thead><tr><th>Hora</th><th>Usuario</th><th>Tipo</th><th>Descripción</th><th>Origen</th><th>Monto</th></tr></thead>
+                <tbody id="cajaMovementsBody"></tbody>
+            </table></div>
+        <?php else: ?>
+            <p id="cajaMovementsEmpty" style="display:none;text-align:center;color:var(--color-text-secondary);padding:20px;">No hay movimientos en esta sesión de caja</p>
+            <div class="table-container" id="cajaMovementsTableWrap"><table>
+                <thead><tr><th>Hora</th><th>Usuario</th><th>Tipo</th><th>Descripción</th><th>Origen</th><th>Monto</th></tr></thead>
+                <tbody id="cajaMovementsBody"><?php foreach($movements as $mov): ?>
+                    <tr data-movement-id="<?php echo (int)$mov['id']; ?>">
+                        <td><?php echo date('H:i',strtotime($mov['created_at'])); ?></td>
+                        <td><?php echo htmlspecialchars((string)($mov['user_name'] ?? '—')); ?></td>
+                        <td><span class="badge <?php echo $mov['type']==='income'?'badge-success':'badge-danger';?>"><?php echo $mov['type']==='income'?'Ingreso':'Egreso';?></span></td>
+                        <td><?php echo htmlspecialchars($mov['description']);?></td>
+                        <td><?php if (!empty($mov['origin_url'])): ?><a href="<?php echo htmlspecialchars($mov['origin_url']); ?>"><?php echo htmlspecialchars((string)$mov['origin_label']); ?></a><?php elseif (!empty($mov['origin_label'])): ?><?php echo htmlspecialchars((string)$mov['origin_label']); ?><?php else: ?>—<?php endif; ?></td>
+                        <td style="color:<?php echo $mov['type']==='income'?'#10B981':'#DC2626';?>;font-weight:600;"><?php echo $mov['type']==='income'?'+':'-';?><?php echo fmt($mov['amount'],$currency);?></td>
+                    </tr>
                 <?php endforeach; ?></tbody>
             </table></div>
         <?php endif; ?>
     </div>
 </div>
+<script>
+window.CajaLiveSyncConfig = <?php echo json_encode([
+    'url' => $viewInstance->route('app/caja') . '?action=liveSync',
+    'intervalMs' => 12000,
+    'showTopStats' => !$isPosRole,
+], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES); ?>;
+</script>
 <?php endif; ?>
 
-<!-- Modales de movimiento y cierre -->
-<?php if (!$isPosRole): ?>
-<div id="movementModal" class="modal-overlay" style="display:none;">
-    <div class="modal-content neumorphic" style="max-width:450px;">
-        <div class="modal-header"><h3>Registrar Movimiento</h3><button onclick="document.getElementById('movementModal').style.display='none'" class="modal-close">&times;</button></div>
-        <form method="POST" action="<?php echo $viewInstance->route('app/caja'); ?>?action=movement" data-ajax="true">
-            <?php echo \SoftNova\Core\csrf_field(); ?><input type="hidden" name="session_id" value="<?php echo $openSession['id']; ?>">
-            <div class="modal-body">
-                <div class="form-group"><label>Tipo *</label><select name="type" class="form-control" required><option value="income">Ingreso (+)</option><option value="expense">Egreso (-)</option></select></div>
-                <div class="form-group"><label>Descripción *</label><input type="text" name="description" class="form-control" placeholder="Ej: Pago proveedor..." required></div>
-                <div class="form-group"><label>Monto (<?php echo $currency['symbol']; ?>) *</label><input type="text" name="amount" class="form-control money-input" data-money="1" inputmode="decimal" placeholder="0" required></div>
-            </div>
-            <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('movementModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-primary">Registrar</button></div>
-        </form>
-    </div>
-</div>
-<?php endif; ?>
-
+<!-- Modal de cierre -->
 <div id="closeCashModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:520px;max-height:92vh;overflow-y:auto;">
         <div class="modal-header"><h3>Cerrar Caja</h3><button type="button" onclick="document.getElementById('closeCashModal').style.display='none'" class="modal-close">&times;</button></div>
@@ -727,7 +893,8 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
                 <div class="alert alert-warning" style="margin-bottom:12px;font-size:13px;">
                     <strong>Productos en stock negativo / pendientes</strong>
                     (<?php echo (int)($stockAlert['negative_count'] ?? 0); ?> negativos ·
-                    <?php echo (int)($stockAlert['loan_count'] ?? 0); ?> préstamos ·
+                    <?php echo (int)($stockAlert['loan_count'] ?? 0); ?> préstamos salida ·
+                    <?php echo (int)($stockAlert['loan_received_count'] ?? 0); ?> nos prestaron ·
                     <?php echo (int)($stockAlert['sale_debt_count'] ?? 0); ?> ventas sin stock).
                     Se guardará en las notas del cierre para trazabilidad.
                     <ul style="margin:6px 0 0;padding-left:18px;max-height:130px;overflow:auto;">
@@ -741,10 +908,34 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
                 </div>
                 <?php endif; ?>
                 <div id="closeCashSummary" style="background:var(--bg-body,#f5f5f5);border:1px solid var(--color-border);border-radius:8px;padding:12px;margin-bottom:14px;font-size:13px;">
-                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Apertura</span><strong id="closeSumOpening">—</strong></div>
-                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Ingresos</span><strong id="closeSumIncomes" style="color:#10B981;">—</strong></div>
-                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Egresos</span><strong id="closeSumExpenses" style="color:#DC2626;">—</strong></div>
-                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span>Ventas del dia</span><strong id="closeSumSales">—</strong></div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <span>Base cajón (apertura)<br><span style="font-size:11px;color:var(--color-text-secondary);">Fondo inicial, no es venta</span></span>
+                        <strong id="closeSumOpening">—</strong>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <span>Efectivo de ventas del día</span>
+                        <strong id="closeSumCashSales" style="color:#10B981;">—</strong>
+                    </div>
+                    <div id="closeSumOtherCashRow" style="display:none;justify-content:space-between;margin-bottom:6px;">
+                        <span>Otros ingresos efectivo</span>
+                        <strong id="closeSumOtherCash" style="color:#10B981;">—</strong>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <span>Egresos del cajón</span>
+                        <strong id="closeSumExpenses" style="color:#DC2626;">—</strong>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <span>Sub-total sin descuentos<br><span style="font-size:11px;color:var(--color-text-secondary);">Todos los medios, antes de descuento</span></span>
+                        <strong id="closeSumSubtotal">—</strong>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <span>Descuento total aplicado<br><span style="font-size:11px;color:var(--color-text-secondary);">Todos los medios</span></span>
+                        <strong id="closeSumDiscount" style="color:#B45309;">—</strong>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <span>Ventas facturadas (todos los medios)</span>
+                        <strong id="closeSumSales">—</strong>
+                    </div>
                     <div id="closeSumPayments" style="margin:10px 0;padding:12px;border:1px solid var(--color-border);border-radius:8px;background:#fff;font-size:13px;">
                         <?php
                         $payBreak = $totals['payment_breakdown'] ?? [];
@@ -783,7 +974,7 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
                         <strong id="closeSumBalance" style="color:#10B981;font-size:16px;">—</strong>
                     </div>
                 </div>
-                <p style="margin-bottom:12px;font-size:12px;color:var(--color-text-secondary);">Al cerrar se descargara el reporte PDF. Si no abre, use el historial de reportes.</p>
+                <p style="margin-bottom:12px;font-size:12px;color:var(--color-text-secondary);">Al cerrar podrá descargar o compartir el PDF cuando lo desee (botón PDF en el historial de cierres).</p>
                 <div class="form-group"><label>Monto Final Contado (<?php echo $currency['symbol'];?>) *</label><input type="text" inputmode="decimal" name="closing_amount" id="closingAmountInput" class="form-control money-input" data-money="1" placeholder="0" required></div>
                 <div class="form-group"><label>Notas de cierre</label><textarea name="notes" class="form-control" rows="2" placeholder="Observaciones..."></textarea></div>
             </div>
@@ -833,15 +1024,34 @@ function openCloseCashModal() {
     var btn = document.getElementById('btnOpenCloseCash');
     if (!btn) return;
     var opening = btn.getAttribute('data-opening') || '—';
-    var incomes = btn.getAttribute('data-incomes') || '—';
+    var cashSales = btn.getAttribute('data-cash-sales') || '—';
+    var otherCash = btn.getAttribute('data-other-cash') || '';
     var expenses = btn.getAttribute('data-expenses') || '—';
     var salesCount = btn.getAttribute('data-sales-count') || '0';
     var salesTotal = btn.getAttribute('data-sales-total') || '—';
+    var salesSubtotal = btn.getAttribute('data-sales-subtotal') || '—';
+    var salesDiscount = btn.getAttribute('data-sales-discount') || '—';
     var balanceLabel = btn.getAttribute('data-balance-label') || '—';
     var balance = btn.getAttribute('data-balance') || '0';
     document.getElementById('closeSumOpening').textContent = opening;
-    document.getElementById('closeSumIncomes').textContent = '+' + incomes;
+    document.getElementById('closeSumCashSales').textContent = '+' + cashSales;
+    var otherRow = document.getElementById('closeSumOtherCashRow');
+    var otherEl = document.getElementById('closeSumOtherCash');
+    if (otherRow && otherEl) {
+        var otherRaw = String(otherCash).replace(/[^\d.,\-]/g, '').replace(/\./g, '').replace(',', '.');
+        var otherNum = parseFloat(otherRaw) || 0;
+        if (otherNum > 0.009) {
+            otherRow.style.display = 'flex';
+            otherEl.textContent = '+' + otherCash;
+        } else {
+            otherRow.style.display = 'none';
+        }
+    }
     document.getElementById('closeSumExpenses').textContent = '-' + expenses;
+    var elSub = document.getElementById('closeSumSubtotal');
+    if (elSub) elSub.textContent = salesSubtotal;
+    var elDisc = document.getElementById('closeSumDiscount');
+    if (elDisc) elDisc.textContent = '-' + salesDiscount;
     document.getElementById('closeSumSales').textContent = salesCount + ' / ' + salesTotal;
     document.getElementById('closeSumBalance').textContent = balanceLabel;
     var inp = document.getElementById('closingAmountInput');
@@ -856,9 +1066,10 @@ function openCloseCashModal() {
 
 <!-- Modal Gasto (mismo flujo que módulo Gastos) -->
 <?php
-$financialCats = $financialCats ?? [];
 $operationalCats = $operationalCats ?? [];
 $administrativeCats = $administrativeCats ?? [];
+$managementCats = $managementCats ?? [];
+$customSubgroupSections = $customSubgroupSections ?? [];
 $expenseSuppliers = $expenseSuppliers ?? [];
 if ($canExpense):
 ?>
@@ -888,25 +1099,18 @@ if ($canExpense):
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                     <div class="form-group">
                         <label>Categoria *</label>
-                        <select name="category_id" class="form-control" required data-custom-other="expense_category">
-                            <option value="">Seleccionar…</option>
-                            <optgroup label="Gastos financieros">
-                                <?php foreach ($financialCats as $c): ?>
-                                    <option value="<?php echo (int)$c['id']; ?>"><?php echo htmlspecialchars($c['name']); ?></option>
-                                <?php endforeach; ?>
-                            </optgroup>
-                            <optgroup label="Gastos operativos">
-                                <?php foreach ($operationalCats as $c): ?>
-                                    <option value="<?php echo (int)$c['id']; ?>" <?php echo ($c['code'] ?? '') === 'general' ? 'selected' : ''; ?>><?php echo htmlspecialchars($c['name']); ?></option>
-                                <?php endforeach; ?>
-                            </optgroup>
-                            <optgroup label="Gastos administrativos">
-                                <?php foreach ($administrativeCats as $c): ?>
-                                    <option value="<?php echo (int)$c['id']; ?>"><?php echo htmlspecialchars($c['name']); ?></option>
-                                <?php endforeach; ?>
-                            </optgroup>
-                            <option value="__other__">Otro (agregar nuevo tipo)…</option>
-                        </select>
+                        <?php $viewInstance->partial('expense_category_select', [
+                            'operationalCats' => $operationalCats,
+                            'financialCats' => $financialCats ?? [],
+                            'administrativeCats' => $administrativeCats,
+                            'managementCats' => $managementCats,
+                            'customSubgroupSections' => $customSubgroupSections,
+                            'required' => true,
+                            'allowCustomExpenseCategory' => \SoftNova\Core\TenantMiddleware::getRole() === 'admin',
+                        ]); ?>
+                        <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">
+                            Operativos descuentan caja; contables (administrativos, financieros, gestión) no.
+                        </small>
                     </div>
                     <div class="form-group">
                         <label>Medio de pago</label>
@@ -938,11 +1142,13 @@ if ($canExpense):
                     <label>Notas</label>
                     <textarea name="notes" class="form-control" rows="2"></textarea>
                 </div>
-                <div class="form-group">
-                    <label style="display:flex;align-items:center;gap:8px;">
-                        <input type="checkbox" name="affect_cash" value="1" checked>
-                        Ya pagado (si es efectivo, también registra egreso en caja)
-                    </label>
+                <div class="form-group js-cash-explanation-block" style="display:none;padding:10px 12px;border:1px solid #F59E0B;border-radius:8px;background:rgba(245,158,11,.08);">
+                    <label style="font-weight:600;">Explicación del pago en efectivo *</label>
+                    <input type="text" name="cash_explanation" class="form-control" maxlength="255"
+                           placeholder="Ej. Retiro cajero Bancolombia Calle 80 / efectivo de ahorros">
+                    <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">
+                        Solo gastos contables con efectivo: no descuenta el cajón. Operativos en efectivo sí descuentan caja.
+                    </small>
                 </div>
             </div>
             <div class="modal-footer">
@@ -953,11 +1159,47 @@ if ($canExpense):
     </div>
 </div>
 <?php endif; ?>
+<?php if ($canExpense): ?>
+<script>
+(function () {
+    var form = document.querySelector('#expenseModal form');
+    if (!form || form.dataset.expenseCashBound === '1') return;
+    form.dataset.expenseCashBound = '1';
+    var payEl = form.querySelector('[name="payment_method"]');
+    var catEl = form.querySelector('[name="category_id"]');
+    var explBlock = form.querySelector('.js-cash-explanation-block');
+    var explEl = form.querySelector('[name="cash_explanation"]');
+    function isCashMethod() {
+        if (!payEl) return false;
+        var v = String(payEl.value || '').toLowerCase();
+        return v === 'cash' || v === 'efectivo' || v === '';
+    }
+    function isAccountingCategory() {
+        if (!catEl || catEl.selectedIndex < 0) return false;
+        var opt = catEl.options[catEl.selectedIndex];
+        if (opt.getAttribute('data-accounting') === '1') return true;
+        var k = String(opt.getAttribute('data-kind') || '');
+        return k === 'administrative' || k === 'financial' || k === 'management' || k.indexOf('sg_') === 0;
+    }
+    function syncCashExplanation() {
+        var show = isCashMethod() && isAccountingCategory();
+        if (explBlock) explBlock.style.display = show ? '' : 'none';
+        if (explEl) {
+            explEl.required = show;
+            if (!show) explEl.value = '';
+        }
+    }
+    if (payEl) payEl.addEventListener('change', syncCashExplanation);
+    if (catEl) catEl.addEventListener('change', syncCashExplanation);
+    syncCashExplanation();
+})();
+</script>
+<?php endif; ?>
 
 <?php
 $canLoanFromCaja = !empty($canLoanFromCaja);
 $loanProducts = $loanProducts ?? [];
-$loanReasonsHtml = $loanReasonsHtml ?? \SoftNova\Services\ProductLoan::optionsHtml();
+$loanReasonsHtml = $loanReasonsHtml ?? \SoftNova\Services\ProductLoan::optionsHtml(null, \SoftNova\Core\TenantMiddleware::getDb());
 if ($canLoanFromCaja):
 ?>
 <div id="cajaLoanModal" class="modal-overlay" style="display:none;z-index:1100;">
@@ -1134,15 +1376,9 @@ if ($canLoanFromCaja):
         input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); clearTimeout(timer); run(true); } });
     }
     var qty = document.getElementById('cajaLoanQty');
-    var reason = document.getElementById('cajaLoanReason');
+    var cajaLoanReason = document.getElementById('cajaLoanReason');
     if (qty) qty.addEventListener('input', updateCajaLoanStockHint);
-    if (reason) reason.addEventListener('change', function(){
-        var req = document.getElementById('cajaLoanNoteReq');
-        var note = document.getElementById('cajaLoanNote');
-        var isOther = reason.value === 'otro';
-        if (req) req.style.display = isOther ? 'inline' : 'none';
-        if (note) note.required = isOther;
-    });
+    if (cajaLoanReason && window.SoftNovaCustomSelect) SoftNovaCustomSelect.bind(cajaLoanReason);
     var form = document.getElementById('cajaLoanForm');
     if (form) {
         form.addEventListener('submit', function (e) {
@@ -1264,6 +1500,15 @@ if ($canLoanFromCaja):
                 <label>Precio de venta *</label>
                 <input type="text" id="openItemPrice" class="form-control money-input" data-money="1" inputmode="decimal" placeholder="0">
             </div>
+            <div class="form-group" id="openItemTaxWrap" style="margin-bottom:0;">
+                <label style="display:flex;align-items:center;gap:8px;margin:0;cursor:pointer;font-weight:500;">
+                    <input type="checkbox" id="openItemHasTax" style="width:auto;margin:0;" checked>
+                    <span>Este producto tiene IVA (<span id="openItemTaxRateLabel">19</span>%)</span>
+                </label>
+                <small style="display:block;margin-top:6px;color:var(--color-text-secondary);">
+                    Si lo desmarca, se vende como exento (sin IVA).
+                </small>
+            </div>
         </div>
         <div class="modal-footer">
             <button type="button" class="btn btn-secondary" onclick="document.getElementById('openItemModal').style.display='none'">Cancelar</button>
@@ -1378,6 +1623,11 @@ if ($canLoanFromCaja):
     <div class="modal-content neumorphic" style="max-width:420px;">
         <div class="modal-header"><h3>Enviar recibo</h3><button type="button" class="modal-close" onclick="document.getElementById('shareModal').style.display='none'">&times;</button></div>
         <div class="modal-body">
+            <div class="form-group">
+                <label>WhatsApp (celular)</label>
+                <input type="tel" id="sharePhone" class="form-control" placeholder="Ej. 3001234567" inputmode="tel" autocomplete="tel">
+                <small style="color:var(--color-text-secondary);">Digite el número del cliente. Se abre el chat con el mensaje del recibo.</small>
+            </div>
             <a id="shareWhatsappBtn" href="#" target="_blank" class="btn btn-success" style="width:100%;margin-bottom:10px;">Abrir WhatsApp</a>
             <form method="POST" action="<?php echo $ventasBase; ?>?action=email" data-ajax="true">
                 <?php echo \SoftNova\Core\csrf_field(); ?>
@@ -1394,42 +1644,59 @@ if ($canLoanFromCaja):
 <!-- Historial / reportes de cierres -->
 <?php if (!$isPosRole): ?>
 <?php
-$historyFrom = $historyFrom ?? date('Y-m-d', strtotime('-30 days'));
-$historyTo = $historyTo ?? date('Y-m-d');
+$historyDate = $historyDate ?? '';
 $historySessions = $historySessions ?? [];
 $cajaBase = $viewInstance->route('app/caja');
 ?>
 <div class="card neumorphic" style="margin-top:20px;" id="cierresReportes">
     <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
         <h3>Reportes de cierre</h3>
+        <span style="font-size:12px;color:var(--color-text-secondary);">
+            <?php echo $historyDate !== '' ? 'Día filtrado' : 'Últimos 2 días'; ?>
+        </span>
     </div>
     <div class="card-body">
         <form method="GET" action="<?php echo $cajaBase; ?>" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px;">
             <input type="hidden" name="focus" value="cierresReportes">
             <div class="form-group" style="margin:0;">
-                <label>Desde</label>
-                <input type="date" name="history_from" class="form-control" value="<?php echo htmlspecialchars($historyFrom); ?>">
-            </div>
-            <div class="form-group" style="margin:0;">
-                <label>Hasta</label>
-                <input type="date" name="history_to" class="form-control" value="<?php echo htmlspecialchars($historyTo); ?>">
+                <label>Fecha de cierre</label>
+                <input type="date" name="history_date" class="form-control" value="<?php echo htmlspecialchars($historyDate); ?>">
             </div>
             <button type="submit" class="btn btn-primary">Filtrar</button>
+            <?php if ($historyDate !== ''): ?>
+                <a href="<?php echo $cajaBase; ?>?focus=cierresReportes" class="btn btn-secondary">Ver últimos 2 días</a>
+            <?php endif; ?>
         </form>
         <?php if (empty($historySessions)): ?>
-            <p style="color:var(--color-text-secondary);text-align:center;padding:12px;">No hay cierres en el rango seleccionado.</p>
+            <p style="color:var(--color-text-secondary);text-align:center;padding:12px;">No hay cierres en el período seleccionado.</p>
         <?php else: ?>
         <div class="table-container"><table>
-            <thead><tr><th>Apertura</th><th>Cierre</th><th>Usuario</th><th>Monto Ini.</th><th>Monto Fin</th><th>Dif.</th><th>Acciones</th></tr></thead>
+            <thead><tr><th>Apertura</th><th>Cierre</th><th>Usuario</th><th>Base</th><th>Contado</th><th>Neto día</th><th>Acciones</th></tr></thead>
             <tbody><?php foreach ($historySessions as $h): ?>
-                <?php $diff = (float)($h['closing_amount'] ?? 0) - (float)($h['opening_amount'] ?? 0); ?>
+                <?php
+                $diff = (float)($h['closing_amount'] ?? 0) - (float)($h['opening_amount'] ?? 0);
+                $notesRaw = (string)($h['notes'] ?? '');
+                $isAutoClose = str_contains($notesRaw, '[[AUTO_CLOSE]]')
+                    || stripos($notesRaw, 'Cierre automatico a medianoche') !== false
+                    || stripos($notesRaw, 'Cierre automático a medianoche') !== false;
+                ?>
                 <tr>
                     <td><?php echo date('d/m/Y H:i', strtotime($h['opening_date'])); ?></td>
-                    <td><?php echo !empty($h['closing_date']) ? date('d/m/Y H:i', strtotime($h['closing_date'])) : '—'; ?></td>
-                    <td><?php echo htmlspecialchars($h['user_name'] ?? ''); ?></td>
-                    <td><?php echo fmt($h['opening_amount'], $currency); ?></td>
-                    <td><?php echo fmt($h['closing_amount'] ?? 0, $currency); ?></td>
-                    <td style="color:<?php echo $diff >= 0 ? '#10B981' : '#DC2626'; ?>;"><?php echo ($diff >= 0 ? '+' : '') . fmt($diff, $currency); ?></td>
+                    <td>
+                        <?php echo !empty($h['closing_date']) ? date('d/m/Y H:i', strtotime($h['closing_date'])) : '—'; ?>
+                        <?php if ($isAutoClose): ?>
+                            <div style="font-size:11px;color:#B45309;margin-top:2px;">Cierre automático 23:59</div>
+                        <?php endif; ?>
+                    </td>
+                    <td>
+                        <?php echo htmlspecialchars($h['user_name'] ?? ''); ?>
+                        <?php if ($isAutoClose): ?>
+                            <div style="font-size:11px;color:var(--color-text-secondary);margin-top:2px;">quien abrió (no cerró)</div>
+                        <?php endif; ?>
+                    </td>
+                    <td title="Fondo de apertura (no es venta)"><?php echo fmt($h['opening_amount'], $currency); ?></td>
+                    <td title="Efectivo contado al cierre (base + ventas − egresos)"><?php echo fmt($h['closing_amount'] ?? 0, $currency); ?></td>
+                    <td style="color:<?php echo $diff >= 0 ? '#10B981' : '#DC2626'; ?>;" title="Contado − base (movimiento neto del día en cajón)"><?php echo ($diff >= 0 ? '+' : '') . fmt($diff, $currency); ?></td>
                     <td style="white-space:nowrap;">
                         <a href="<?php echo $cajaBase; ?>?action=pdf&id=<?php echo (int)$h['id']; ?>" class="btn btn-sm btn-info" target="_blank" rel="noopener" title="Descargar PDF">PDF</a>
                         <button type="button" class="btn btn-sm btn-secondary" onclick="cajaShareWhatsapp(<?php echo (int)$h['id']; ?>)" title="Enviar por WhatsApp">WhatsApp</button>
@@ -1498,7 +1765,7 @@ $cajaBase = $viewInstance->route('app/caja');
             <button type="button" class="modal-close" onclick="document.getElementById('cajaShareCloseModal').style.display='none'">&times;</button>
         </div>
         <div class="modal-body">
-            <p style="margin-top:0;">El PDF se descargó. También puede enviar el reporte:</p>
+            <p style="margin-top:0;">Caja cerrada. Descargue o comparta el reporte cuando lo necesite:</p>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
                 <a id="cajaShareClosePdf" href="#" class="btn btn-info" target="_blank" rel="noopener">PDF</a>
                 <button type="button" class="btn btn-secondary" id="cajaShareCloseWa">WhatsApp</button>
@@ -1518,7 +1785,10 @@ $cajaBase = $viewInstance->route('app/caja');
     window.cajaCreditSurchargeRate = <?php echo json_encode((float)($creditSurchargeRate ?? 0)); ?>;
     window.cajaCreditSurchargeDays = <?php echo json_encode((int)($creditSurchargeDays ?? 60)); ?>;
     window.cajaCreditSurchargeTiers = <?php echo json_encode(array_values($creditSurchargeTiers ?? []), JSON_UNESCAPED_UNICODE); ?>;
+    window.cajaQtyDiscountTiers = <?php echo json_encode(array_values($quantityDiscountTiers ?? []), JSON_UNESCAPED_UNICODE); ?>;
     window.cajaTaxRate = <?php echo json_encode((float)($taxRate ?? 0)); ?>;
+    window.cajaTaxEnabled = <?php echo json_encode(!empty($taxEnabled ?? true)); ?>;
+    window.cajaProductTaxEnabled = <?php echo json_encode(!empty($productTaxEnabled ?? false)); ?>;
 
     function cajaShareWhatsapp(sessionId) {
         fetch(window.cajaBase + '?action=report_whatsapp&id=' + sessionId, {
@@ -1761,5 +2031,7 @@ $cajaBasePos = $viewInstance->route('app/caja');
             history.replaceState({}, '', window.location.pathname + (qs ? '?' + qs : '') + window.location.hash);
         }
     })();
+
 </script>
+
 <?php endif; ?>

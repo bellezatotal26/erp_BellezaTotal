@@ -13,9 +13,11 @@ class TenantMiddleware
 
     /** Módulos gestionables en la matriz de permisos (User) */
     public const MANAGED_MODULES = [
-        'dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'clientes', 'proveedores',
+        'dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'consignacion', 'clientes', 'proveedores',
         'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes',
     ];
+
+    private static bool $businessTzApplied = false;
 
     /**
      * Verificar que el usuario esté autenticado como tenant
@@ -35,16 +37,60 @@ class TenantMiddleware
     public static function getDb(): \PDO
     {
         if (\SoftNova\Core\is_standalone()) {
-            return Database::getInstance()->getConnection();
+            $pdo = Database::getInstance()->getConnection();
+            if (!$pdo instanceof \PDO) {
+                throw new \RuntimeException('Sin conexión a base de datos');
+            }
+        } else {
+            $tenantDb = TenantDatabase::getInstance();
+            $dbName = (string)($_SESSION['tenant_db_name'] ?? '');
+            if (
+                !empty($_SESSION['sandbox_mode'])
+                && !empty($_SESSION['sandbox_db_name'])
+            ) {
+                if (empty($_SESSION['tenant_db_name_production']) && $dbName !== '') {
+                    $_SESSION['tenant_db_name_production'] = $dbName;
+                }
+                $dbName = (string)$_SESSION['sandbox_db_name'];
+            }
+            $pdo = $tenantDb->getTenantConnection(
+                $dbName,
+                (string)($_SESSION['tenant_db_user'] ?? ''),
+                (string)($_SESSION['tenant_db_pass'] ?? '')
+            );
         }
 
-        $tenantDb = TenantDatabase::getInstance();
-        
-        return $tenantDb->getTenantConnection(
-            (string)($_SESSION['tenant_db_name'] ?? ''),
-            (string)($_SESSION['tenant_db_user'] ?? ''),
-            (string)($_SESSION['tenant_db_pass'] ?? '')
-        );
+        if (!self::$businessTzApplied) {
+            try {
+                BusinessTimezone::applyFromTenantDb($pdo);
+                self::$businessTzApplied = true;
+            } catch (\Throwable $e) {
+                error_log('TenantMiddleware timezone: ' . $e->getMessage());
+            }
+        }
+
+        return $pdo;
+    }
+
+    /** Reconectar tras operaciones largas (IA, PDF, etc.). */
+    public static function refreshDb(): \PDO
+    {
+        self::$businessTzApplied = false;
+        if (\SoftNova\Core\is_standalone()) {
+            Database::getInstance()->reconnect();
+        } else {
+            $names = array_filter([
+                (string)($_SESSION['tenant_db_name'] ?? ''),
+                (string)($_SESSION['sandbox_db_name'] ?? ''),
+                (string)($_SESSION['tenant_db_name_production'] ?? ''),
+            ]);
+            foreach (array_unique($names) as $name) {
+                if ($name !== '') {
+                    TenantDatabase::getInstance()->forgetTenantConnection($name);
+                }
+            }
+        }
+        return self::getDb();
     }
     
     /**
@@ -87,7 +133,7 @@ class TenantMiddleware
     {
         return [
             'caja' => ['view' => true, 'create' => true, 'edit' => true, 'delete' => false, 'export' => false],
-            'ventas' => ['view' => true, 'create' => true, 'edit' => false, 'delete' => false, 'export' => false],
+            'ventas' => ['view' => true, 'create' => true, 'edit' => false, 'delete' => true, 'export' => false],
             // Crear gasto / préstamo desde Caja sin ver esos módulos.
             'gastos' => ['view' => false, 'create' => true, 'edit' => false, 'delete' => false, 'export' => false],
             'prestamos' => ['view' => false, 'create' => true, 'edit' => false, 'delete' => false, 'export' => false],
@@ -184,11 +230,11 @@ class TenantMiddleware
     private static function rolePermissions(): array
     {
         $admin = [
-            'modules' => ['dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'clientes', 'proveedores', 'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes', 'configuracion'],
+            'modules' => ['dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'consignacion', 'clientes', 'proveedores', 'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes', 'configuracion'],
             'actions' => ['create', 'edit', 'delete', 'view', 'export'],
         ];
         $manager = [
-            'modules' => ['dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'clientes', 'proveedores', 'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes'],
+            'modules' => ['dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'consignacion', 'clientes', 'proveedores', 'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes'],
             'actions' => ['create', 'edit', 'delete', 'view', 'export'],
         ];
         
@@ -360,36 +406,70 @@ class TenantMiddleware
     }
 
     /**
-     * Rehidrata permisos si la sesión quedó a medias (deploy en caliente)
+     * Rehidrata permisos si la sesión quedó a medias (deploy en caliente).
+     * Rol User: siempre recarga desde BD para reflejar cambios del admin sin cerrar sesión.
      */
     private static function ensureHydrated(): void
     {
-        if (array_key_exists('tenant_permissions_map', $_SESSION)) {
-            return;
-        }
         if (empty($_SESSION['tenant_authenticated'])) {
             return;
         }
-        $role = (string)($_SESSION['tenant_user_role'] ?? 'viewer');
+
+        $role = self::normalizeRole((string)($_SESSION['tenant_user_role'] ?? 'viewer'));
+        if ($role === 'user') {
+            self::refreshUserPermissionsFromDb();
+            return;
+        }
+
+        if (array_key_exists('tenant_permissions_map', $_SESSION)) {
+            return;
+        }
+
         $raw = null;
-        // User: recargar JSON de permisos desde BD (null vaciaría el mapa).
-        if (self::normalizeRole($role) === 'user') {
-            try {
-                $uid = (int)($_SESSION['tenant_user_id'] ?? 0);
-                if ($uid > 0) {
-                    $db = self::getDb();
-                    $stmt = $db->prepare('SELECT permissions FROM users WHERE id = ? LIMIT 1');
-                    $stmt->execute([$uid]);
-                    $raw = $stmt->fetchColumn();
-                    if ($raw === false) {
-                        $raw = null;
-                    }
+        self::hydrateSessionPermissions((string)($_SESSION['tenant_user_role'] ?? 'viewer'), $raw);
+    }
+
+    /**
+     * Recarga rol y permisos del usuario externo (rol User) desde la BD del tenant.
+     */
+    private static function refreshUserPermissionsFromDb(): void
+    {
+        static $done = false;
+        if ($done) {
+            return;
+        }
+        $done = true;
+
+        try {
+            $uid = (int)($_SESSION['tenant_user_id'] ?? 0);
+            if ($uid <= 0) {
+                if (!array_key_exists('tenant_permissions_map', $_SESSION)) {
+                    self::hydrateSessionPermissions('user', null);
                 }
-            } catch (\Throwable $e) {
-                error_log('ensureHydrated permissions: ' . $e->getMessage());
+                return;
+            }
+
+            $db = self::getDb();
+            $stmt = $db->prepare('SELECT role, permissions FROM users WHERE id = ? AND status = ? LIMIT 1');
+            $stmt->execute([$uid, 'active']);
+            $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+            if (!$row) {
+                return;
+            }
+
+            self::hydrateSessionPermissions(
+                (string)($row['role'] ?? 'user'),
+                $row['permissions'] ?? null
+            );
+        } catch (\Throwable $e) {
+            error_log('refreshUserPermissionsFromDb: ' . $e->getMessage());
+            if (!array_key_exists('tenant_permissions_map', $_SESSION)) {
+                self::hydrateSessionPermissions(
+                    self::normalizeRole((string)($_SESSION['tenant_user_role'] ?? 'user')),
+                    null
+                );
             }
         }
-        self::hydrateSessionPermissions($role, $raw);
     }
     
     /**

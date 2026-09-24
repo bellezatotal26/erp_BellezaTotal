@@ -6,7 +6,7 @@ use SoftNova\Core\TenantController;
 use SoftNova\Services\AiService;
 
 /**
- * Asistente IA "Seri" — OpenRouter + NVIDIA Nemotron 3 Ultra
+ * Asistente IA "Seri" — OpenRouter (Gemini u otro vía .env)
  */
 class TenantAiController extends TenantController
 {
@@ -39,7 +39,6 @@ class TenantAiController extends TenantController
 
         $this->view('tenant.ai', $this->tenantViewData([
             'aiConfigured' => $ai->isConfigured(),
-            'aiModel' => \SoftNova\Core\config('ai.model', 'nvidia/nemotron-3-ultra-550b-a55b:free'),
             'aiPersonality' => \SoftNova\Core\ai_personality($modules),
             'conversations' => $ai->conversations($this->currentUserId()),
         ]));
@@ -90,7 +89,13 @@ class TenantAiController extends TenantController
             $history
         );
 
-        $ai->saveMessage($conversationId, 'assistant', $reply);
+        // OpenRouter puede tardar > wait_timeout de MySQL; reconectar antes de guardar.
+        $this->refreshDbConnection();
+        try {
+            (new AiService($this->db))->saveMessage($conversationId, 'assistant', $reply);
+        } catch (\Throwable $e) {
+            error_log('AI save assistant message: ' . $e->getMessage());
+        }
 
         $this->json([
             'reply' => $reply,

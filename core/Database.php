@@ -37,12 +37,17 @@ class Database
         if (empty($config['database'])) {
             return;
         }
+
+        $dbName = $this->resolveDatabaseName($config);
+        if ($dbName === '') {
+            return;
+        }
         
         $dsn = sprintf(
             'mysql:host=%s;port=%s;dbname=%s;charset=%s',
             $config['host'],
             $config['port'],
-            $config['database'],
+            $dbName,
             $config['charset']
         );
         
@@ -51,11 +56,58 @@ class Database
                 \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
                 \PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC,
                 \PDO::ATTR_EMULATE_PREPARES => false,
-                \PDO::MYSQL_ATTR_INIT_COMMAND => 'SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci',
+                \PDO::MYSQL_ATTR_INIT_COMMAND => BusinessTimezone::mysqlInitCommand(),
             ]);
         } catch (\PDOException $e) {
-            error_log('Error de conexión a base de datos: ' . $e->getMessage());
+            error_log('Error de conexión a base de datos (' . $dbName . '): ' . $e->getMessage());
+            // Si falló el espejo de sandbox, volver a producción para no dejar el panel caído.
+            if (
+                !empty($_SESSION['sandbox_mode'])
+                && isset($config['database'])
+                && strcasecmp($dbName, (string)$config['database']) !== 0
+            ) {
+                unset($_SESSION['sandbox_mode'], $_SESSION['sandbox_db_name']);
+                try {
+                    $fallback = sprintf(
+                        'mysql:host=%s;port=%s;dbname=%s;charset=%s',
+                        $config['host'],
+                        $config['port'],
+                        $config['database'],
+                        $config['charset']
+                    );
+                    $this->connection = new \PDO($fallback, $config['username'], $config['password'], [
+                        \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+                        \PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC,
+                        \PDO::ATTR_EMULATE_PREPARES => false,
+                        \PDO::MYSQL_ATTR_INIT_COMMAND => BusinessTimezone::mysqlInitCommand(),
+                    ]);
+                    error_log('Sandbox caído: reconectado a producción');
+                } catch (\PDOException $e2) {
+                    error_log('Error de conexión a producción tras fallo sandbox: ' . $e2->getMessage());
+                }
+            }
         }
+    }
+
+    /**
+     * Nombre activo: producción o espejo de caja de arena (sesión).
+     *
+     * @param array<string,mixed> $config
+     */
+    private function resolveDatabaseName(array $config): string
+    {
+        $base = preg_replace('/[^a-zA-Z0-9_]/', '', (string)($config['database'] ?? '')) ?: '';
+        if (
+            !empty($_SESSION['sandbox_mode'])
+            && !empty($_SESSION['sandbox_db_name'])
+            && class_exists(\SoftNova\Services\SandboxService::class)
+        ) {
+            $sb = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$_SESSION['sandbox_db_name']);
+            if ($sb !== '') {
+                return $sb;
+            }
+        }
+        return $base;
     }
     
     /**
@@ -78,6 +130,13 @@ class Database
     public function getConnection(): ?\PDO
     {
         return $this->connection;
+    }
+
+    /** Cierra y abre de nuevo (p. ej. tras llamadas HTTP largas). */
+    public function reconnect(): void
+    {
+        $this->connection = null;
+        $this->connect();
     }
     
     /**

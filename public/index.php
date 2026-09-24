@@ -53,17 +53,60 @@ $sessionConfig = \SoftNova\Core\config('session', []);
 if (!empty($sessionConfig['name'])) {
     session_name($sessionConfig['name']);
 }
+// Caja/almacén: jornada larga. Default 16h (antes 2h provocaba “token expirado”).
+$sessionLifetime = (int)($sessionConfig['lifetime'] ?? 57600);
+if ($sessionLifetime < 28800) {
+    // Mínimo 8h en runtime aunque el config viejo diga 7200.
+    $sessionLifetime = max($sessionLifetime, 57600);
+}
+$sessionPath = $sessionConfig['path'] ?? '/';
+$sessionDomain = $sessionConfig['domain'] ?? '';
+$sessionSecure = (bool)($sessionConfig['secure'] ?? false);
+$sessionHttpOnly = (bool)($sessionConfig['httponly'] ?? true);
+$sessionSameSite = (string)($sessionConfig['samesite'] ?? 'Lax');
+
 session_set_cookie_params([
-    'lifetime' => $sessionConfig['lifetime'] ?? 7200,
-    'path' => $sessionConfig['path'] ?? '/',
-    'domain' => $sessionConfig['domain'] ?? '',
-    'secure' => $sessionConfig['secure'] ?? false,
-    'httponly' => $sessionConfig['httponly'] ?? true,
-    'samesite' => $sessionConfig['samesite'] ?? 'Strict',
+    'lifetime' => $sessionLifetime,
+    'path' => $sessionPath,
+    'domain' => $sessionDomain,
+    'secure' => $sessionSecure,
+    'httponly' => $sessionHttpOnly,
+    'samesite' => $sessionSameSite,
 ]);
+// Alinear GC del servidor con la cookie (evita sesión muerta con pestaña abierta).
+ini_set('session.gc_maxlifetime', (string)max($sessionLifetime, 57600));
 
 // Iniciar sesión
 session_start();
+
+// Regeneración periódica de ID de sesión (mitiga fijación / robo de cookie).
+if (session_status() === PHP_SESSION_ACTIVE && session_id() !== '') {
+    $regenInterval = (int)\SoftNova\Core\config('security.session_security.regenerate_interval', 300);
+    if ($regenInterval < 60) {
+        $regenInterval = 300;
+    }
+    $lastRegen = (int)($_SESSION['_seri_last_regen'] ?? 0);
+    if ($lastRegen <= 0 || (time() - $lastRegen) >= $regenInterval) {
+        @session_regenerate_id(true);
+        $_SESSION['_seri_last_regen'] = time();
+    }
+}
+
+// Ventana deslizante: cada request renueva la cookie mientras haya actividad
+// (empleado en Caja todo el día sin F5).
+if (!headers_sent() && session_status() === PHP_SESSION_ACTIVE && session_id() !== '') {
+    $params = [
+        'expires' => time() + $sessionLifetime,
+        'path' => $sessionPath,
+        'secure' => $sessionSecure,
+        'httponly' => $sessionHttpOnly,
+        'samesite' => $sessionSameSite,
+    ];
+    if ($sessionDomain !== '') {
+        $params['domain'] = $sessionDomain;
+    }
+    setcookie(session_name(), session_id(), $params);
+}
 
 if (!headers_sent()) {
     header('Content-Type: text/html; charset=utf-8');

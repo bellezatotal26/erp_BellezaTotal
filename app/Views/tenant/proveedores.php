@@ -4,64 +4,196 @@ $title = 'Proveedores - ' . ($tenantName ?? 'Sistema');
 $pageTitle = 'Gestión de Proveedores';
 $tenantName = $tenantName ?? 'Mi Empresa'; $userName = $userName ?? 'Usuario';
 $suppliers = $suppliers ?? [];
+$pagination = $pagination ?? null;
+$perPageOptions = $perPageOptions ?? [20, 50, 100, 200];
+$qFilter = $qFilter ?? '';
+$documentTypeFilter = $documentTypeFilter ?? '';
+$allyFilter = $allyFilter ?? '';
+$listQuery = $listQuery ?? [];
+$proveedoresBase = $viewInstance->route('app/proveedores');
 ?>
 <?php echo flashMessage(); ?>
 
-<div style="margin-bottom:20px;">
+<div style="margin-bottom:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
     <button onclick="openModal()" class="btn btn-primary neumorphic-btn">+ Nuevo Proveedor</button>
+    <?php if (\SoftNova\Core\TenantMiddleware::canDo('export', 'proveedores')): ?>
+        <a href="<?php echo $proveedoresBase; ?>?action=export<?php echo $listQuery !== [] ? '&' . http_build_query($listQuery) : ''; ?>"
+           class="btn btn-secondary" title="Exporta el listado filtrado; sin filtros exporta todos los activos">Exportar CSV</a>
+    <?php endif; ?>
+    <div class="inv-view-toggle" role="group" aria-label="Vista de proveedores" style="margin-left:auto;display:flex;gap:6px;">
+        <button type="button" class="btn btn-secondary inv-view-btn is-active" id="provViewGridBtn" onclick="setProveedoresView('grid')" title="Vista en tarjetas">Tarjetas</button>
+        <button type="button" class="btn btn-secondary inv-view-btn" id="provViewListBtn" onclick="setProveedoresView('list')" title="Vista en lista">Lista</button>
+    </div>
 </div>
 
-<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px;">
-    <?php if (empty($suppliers)): ?>
-        <div class="card neumorphic" style="text-align:center;padding:40px;grid-column:1/-1;">
-            <p style="color:var(--color-text-secondary);">No hay proveedores registrados</p>
+<form method="GET" action="<?php echo $proveedoresBase; ?>" class="inv-filters-form" style="margin-bottom:16px;">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+        <div class="form-group" style="margin:0;flex:1;min-width:220px;">
+            <label style="font-size:12px;">Buscar</label>
+            <input type="text" name="q" value="<?php echo htmlspecialchars($qFilter); ?>" class="form-control" placeholder="Nombre, NIT, contacto, teléfono…">
         </div>
-    <?php else: ?>
-        <?php foreach($suppliers as $s): ?>
-            <div class="card neumorphic" style="border-left:5px solid var(--color-primary);padding:20px;">
-                <div style="display:flex;align-items:flex-start;gap:18px;">
-                    <div style="width:90px;height:90px;border-radius:14px;overflow:hidden;flex-shrink:0;background:var(--bg-input);display:flex;align-items:center;justify-content:center;border:2px solid var(--color-border);box-shadow:0 2px 8px rgba(0,0,0,0.06);">
-                        <?php if(!empty($s['image'])): ?>
-                            <img src="<?php echo htmlspecialchars(\SoftNova\Core\media_url($s['image'])); ?>" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
-                            <span style="display:none;font-size:36px;">🏢</span>
-                        <?php else: ?>
-                            <span style="font-size:36px;">🏢</span>
-                        <?php endif; ?>
-                    </div>
-                    <div style="flex:1;min-width:0;">
-                        <h4 style="margin:0 0 6px 0;font-size:16px;color:var(--color-primary);"><?php echo htmlspecialchars($s['name']); ?></h4>
-                        <?php if(!empty($s['contact_name'])): ?>
-                            <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:3px;">👤 <?php echo htmlspecialchars($s['contact_name']); ?></div>
-                        <?php endif; ?>
-                        <?php if(!empty($s['email'])): ?>
-                            <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:3px;">✉️ <?php echo htmlspecialchars($s['email']); ?></div>
-                        <?php endif; ?>
-                        <?php if(!empty($s['phone'])): ?>
-                            <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:3px;">📞 <?php echo htmlspecialchars($s['phone']); ?></div>
-                        <?php endif; ?>
-                        <?php if(!empty($s['is_ally'])): ?>
-                            <div style="margin-top:6px;"><span class="badge badge-success">Aliado · <?php echo number_format((float)($s['discount_percent'] ?? 0), 1); ?>% desc.</span></div>
-                        <?php endif; ?>
-                        <?php if(!empty($s['document_number'])): ?>
-                            <div style="font-size:12px;color:var(--color-text-secondary);margin-top:4px;">
-                                <span class="badge badge-info"><?php echo htmlspecialchars(($s['document_type']??'NIT').': '.($s['document_number']??'')); ?></span>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Tipo doc.</label>
+            <select name="document_type" class="form-control" style="width:auto;">
+                <option value="">Todos</option>
+                <?php foreach (['NIT' => 'NIT', 'CC' => 'C.C', 'CE' => 'C.E', 'RUT' => 'RUT', 'OTROS' => 'OTROS'] as $code => $lab): ?>
+                    <option value="<?php echo $code; ?>" <?php echo $documentTypeFilter === $code ? 'selected' : ''; ?>><?php echo $lab; ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Aliado</label>
+            <select name="ally" class="form-control" style="width:auto;">
+                <option value="">Todos</option>
+                <option value="1" <?php echo $allyFilter === '1' ? 'selected' : ''; ?>>Solo aliados</option>
+                <option value="0" <?php echo $allyFilter === '0' ? 'selected' : ''; ?>>No aliados</option>
+            </select>
+        </div>
+        <input type="hidden" name="per_page" value="<?php echo (int)($pagination['perPage'] ?? 20); ?>">
+        <div style="display:flex;gap:6px;">
+            <button type="submit" class="btn btn-primary">Filtrar</button>
+            <a href="<?php echo $proveedoresBase; ?>" class="btn btn-secondary">Limpiar</a>
+        </div>
+    </div>
+</form>
+
+<?php $hasProvFilters = $qFilter !== '' || $documentTypeFilter !== '' || $allyFilter !== ''; ?>
+<div id="provCatalog" class="prov-catalog prov-catalog--grid">
+    <div class="prov-products-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px;">
+        <?php if (empty($suppliers)): ?>
+            <div class="card neumorphic" style="text-align:center;padding:40px;grid-column:1/-1;">
+                <p style="color:var(--color-text-secondary);">
+                    <?php echo $hasProvFilters ? 'No hay proveedores con esos filtros' : 'No hay proveedores registrados'; ?>
+                </p>
+            </div>
+        <?php else: ?>
+            <?php foreach ($suppliers as $s): ?>
+                <div class="card neumorphic" style="border-left:5px solid var(--color-primary);padding:20px;">
+                    <div style="display:flex;align-items:flex-start;gap:18px;">
+                        <div style="width:90px;height:90px;border-radius:14px;overflow:hidden;flex-shrink:0;background:var(--bg-input);display:flex;align-items:center;justify-content:center;border:2px solid var(--color-border);box-shadow:0 2px 8px rgba(0,0,0,0.06);">
+                            <?php if (!empty($s['image'])): ?>
+                                <img src="<?php echo htmlspecialchars(\SoftNova\Core\media_url($s['image'])); ?>" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+                                <span style="display:none;font-size:36px;">🏢</span>
+                            <?php else: ?>
+                                <span style="font-size:36px;">🏢</span>
+                            <?php endif; ?>
+                        </div>
+                        <div style="flex:1;min-width:0;">
+                            <h4 style="margin:0 0 6px 0;font-size:16px;color:var(--color-primary);"><?php echo htmlspecialchars($s['name']); ?></h4>
+                            <?php if (!empty($s['contact_name'])): ?>
+                                <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:3px;">👤 <?php echo htmlspecialchars($s['contact_name']); ?></div>
+                            <?php endif; ?>
+                            <?php if (!empty($s['email'])): ?>
+                                <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:3px;">✉️ <?php echo htmlspecialchars($s['email']); ?></div>
+                            <?php endif; ?>
+                            <?php if (!empty($s['phone'])): ?>
+                                <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:3px;">📞 <?php echo htmlspecialchars($s['phone']); ?></div>
+                            <?php endif; ?>
+                            <?php if (!empty($s['is_ally'])): ?>
+                                <div style="margin-top:6px;"><span class="badge badge-success">Aliado · <?php echo number_format((float)($s['discount_percent'] ?? 0), 1); ?>% desc.</span></div>
+                            <?php endif; ?>
+                            <?php if (!empty($s['document_number'])): ?>
+                                <div style="font-size:12px;color:var(--color-text-secondary);margin-top:4px;">
+                                    <span class="badge badge-info"><?php echo htmlspecialchars(($s['document_type'] ?? 'NIT') . ': ' . ($s['document_number'] ?? '')); ?></span>
+                                </div>
+                            <?php endif; ?>
+                            <?php if (!empty($s['address'])): ?>
+                                <div style="font-size:11px;color:var(--color-text-secondary);margin-top:4px;line-height:1.3;">📍 <?php echo htmlspecialchars($s['address']); ?></div>
+                            <?php endif; ?>
+                            <div style="margin-top:12px;display:flex;gap:6px;">
+                                <button onclick='openModal(<?php echo htmlspecialchars(json_encode($s)); ?>)' class="btn btn-sm btn-secondary" title="Editar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg> Editar</button>
+                                <form method="POST" action="<?php echo $proveedoresBase; ?>?action=delete" style="display:inline;" data-ajax="true">
+                                    <?php echo \SoftNova\Core\csrf_field(); ?><input type="hidden" name="id" value="<?php echo (int)$s['id']; ?>">
+                                    <button type="submit" data-confirm="Eliminar este proveedor?" class="btn btn-sm btn-danger" title="Eliminar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
+                                </form>
                             </div>
-                        <?php endif; ?>
-                        <?php if(!empty($s['address'])): ?>
-                            <div style="font-size:11px;color:var(--color-text-secondary);margin-top:4px;line-height:1.3;">📍 <?php echo htmlspecialchars($s['address']); ?></div>
-                        <?php endif; ?>
-                        <div style="margin-top:12px;display:flex;gap:6px;">
-                            <button onclick='openModal(<?php echo htmlspecialchars(json_encode($s)); ?>)' class="btn btn-sm btn-secondary" title="Editar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg> Editar</button>
-                            <form method="POST" action="<?php echo $viewInstance->route('app/proveedores'); ?>?action=delete" style="display:inline;" data-ajax="true">
-                                <?php echo \SoftNova\Core\csrf_field(); ?><input type="hidden" name="id" value="<?php echo $s['id']; ?>">
-                                <button type="submit" data-confirm="Eliminar este proveedor?" class="btn btn-sm btn-danger" title="Eliminar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
-                            </form>
                         </div>
                     </div>
                 </div>
-            </div>
-        <?php endforeach; ?>
-    <?php endif; ?>
+            <?php endforeach; ?>
+        <?php endif; ?>
+    </div>
+
+    <div class="card neumorphic prov-products-list" style="display:none;padding:0;overflow:hidden;">
+        <div class="table-container" style="overflow-x:auto;">
+            <table class="prov-list-table" style="min-width:900px;">
+                <thead>
+                    <tr>
+                        <th>Proveedor</th>
+                        <th>Documento</th>
+                        <th>Contacto</th>
+                        <th>Email</th>
+                        <th>Teléfono</th>
+                        <th>Aliado</th>
+                        <th>Dirección</th>
+                        <th style="text-align:right;width:140px;">Acciones</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php if (empty($suppliers)): ?>
+                    <tr>
+                        <td colspan="8" style="text-align:center;padding:32px;color:var(--color-text-secondary);">
+                            <?php echo $hasProvFilters ? 'No hay proveedores con esos filtros' : 'No hay proveedores registrados'; ?>
+                        </td>
+                    </tr>
+                <?php else: ?>
+                    <?php foreach ($suppliers as $s): ?>
+                        <tr>
+                            <td>
+                                <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+                                    <div style="width:36px;height:36px;border-radius:8px;overflow:hidden;flex-shrink:0;background:var(--bg-input);display:flex;align-items:center;justify-content:center;border:1px solid var(--color-border);font-size:16px;">
+                                        <?php if (!empty($s['image'])): ?>
+                                            <img src="<?php echo htmlspecialchars(\SoftNova\Core\media_url($s['image'])); ?>" alt="" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none';this.parentNode.textContent='🏢';">
+                                        <?php else: ?>
+                                            🏢
+                                        <?php endif; ?>
+                                    </div>
+                                    <strong style="color:var(--color-primary);"><?php echo htmlspecialchars((string)$s['name']); ?></strong>
+                                </div>
+                            </td>
+                            <td style="white-space:nowrap;font-size:13px;">
+                                <?php if (!empty($s['document_number'])): ?>
+                                    <?php echo htmlspecialchars((string)($s['document_type'] ?? 'NIT') . ': ' . (string)$s['document_number']); ?>
+                                <?php else: ?>
+                                    <span style="color:var(--color-text-secondary);">—</span>
+                                <?php endif; ?>
+                            </td>
+                            <td style="font-size:13px;"><?php echo htmlspecialchars((string)($s['contact_name'] ?? '')) ?: '<span style="color:var(--color-text-secondary);">—</span>'; ?></td>
+                            <td style="font-size:13px;"><?php echo htmlspecialchars((string)($s['email'] ?? '')) ?: '<span style="color:var(--color-text-secondary);">—</span>'; ?></td>
+                            <td style="font-size:13px;white-space:nowrap;"><?php echo htmlspecialchars((string)($s['phone'] ?? '')) ?: '<span style="color:var(--color-text-secondary);">—</span>'; ?></td>
+                            <td>
+                                <?php if (!empty($s['is_ally'])): ?>
+                                    <span class="badge badge-success"><?php echo number_format((float)($s['discount_percent'] ?? 0), 1); ?>%</span>
+                                <?php else: ?>
+                                    <span style="color:var(--color-text-secondary);">—</span>
+                                <?php endif; ?>
+                            </td>
+                            <td style="font-size:12px;max-width:220px;color:var(--color-text-secondary);">
+                                <?php echo htmlspecialchars((string)($s['address'] ?? '')) ?: '—'; ?>
+                            </td>
+                            <td style="text-align:right;white-space:nowrap;">
+                                <button type="button" onclick='openModal(<?php echo htmlspecialchars(json_encode($s)); ?>)' class="btn btn-sm btn-secondary" title="Editar">Editar</button>
+                                <form method="POST" action="<?php echo $proveedoresBase; ?>?action=delete" style="display:inline;" data-ajax="true">
+                                    <?php echo \SoftNova\Core\csrf_field(); ?><input type="hidden" name="id" value="<?php echo (int)$s['id']; ?>">
+                                    <button type="submit" data-confirm="Eliminar este proveedor?" class="btn btn-sm btn-danger" title="Eliminar">Eliminar</button>
+                                </form>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div style="margin-top:16px;">
+    <?php
+    $paginationBaseUrl = $proveedoresBase;
+    $paginationQuery = $listQuery;
+    $paginationPerPageOptions = $perPageOptions;
+    $viewInstance->partial('pagination', compact('pagination', 'paginationBaseUrl', 'paginationQuery', 'paginationPerPageOptions'));
+    ?>
 </div>
 
 <div id="supplierModal" class="modal-overlay" style="display:none;">
@@ -91,7 +223,28 @@ $suppliers = $suppliers ?? [];
     </div>
 </div>
 
+<style>
+.prov-catalog--list .prov-products-grid { display: none !important; }
+.prov-catalog--list .prov-products-list { display: block !important; }
+.prov-catalog--grid .prov-products-list { display: none !important; }
+.prov-list-table th, .prov-list-table td { vertical-align: middle; }
+</style>
 <script>
+function setProveedoresView(mode, skipSave) {
+    var catalog = document.getElementById('provCatalog');
+    if (!catalog) return;
+    var isList = mode === 'list';
+    catalog.classList.toggle('prov-catalog--list', isList);
+    catalog.classList.toggle('prov-catalog--grid', !isList);
+    var gridBtn = document.getElementById('provViewGridBtn');
+    var listBtn = document.getElementById('provViewListBtn');
+    if (gridBtn) gridBtn.classList.toggle('is-active', !isList);
+    if (listBtn) listBtn.classList.toggle('is-active', isList);
+    if (!skipSave) {
+        try { localStorage.setItem('seri_prov_view_mode', isList ? 'list' : 'grid'); } catch (e) {}
+    }
+}
+
 function openModal(data){
     if(data){
         document.getElementById('modalTitle').textContent='Editar Proveedor';
@@ -115,4 +268,10 @@ function openModal(data){
     document.getElementById('supplierModal').style.display='flex';
 }
 function closeModal(){document.getElementById('supplierModal').style.display='none';}
+
+(function () {
+    var saved = 'grid';
+    try { saved = localStorage.getItem('seri_prov_view_mode') || 'grid'; } catch (e) {}
+    setProveedoresView(saved === 'list' ? 'list' : 'grid', true);
+})();
 </script>

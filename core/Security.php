@@ -93,7 +93,13 @@ class Security
             @chmod($path, 0600);
         }
         $raw = trim((string)@file_get_contents($path));
-        return hash('sha256', $raw !== '' ? $raw : 'softnova-fallback-key', true);
+        if ($raw === '') {
+            // Nunca usar clave literal predecible: regenerar o fallar.
+            $raw = bin2hex(random_bytes(32));
+            @file_put_contents($path, $raw);
+            @chmod($path, 0600);
+        }
+        return hash('sha256', $raw, true);
     }
 
     public static function encrypt(string $plain): string

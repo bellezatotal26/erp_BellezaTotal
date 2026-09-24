@@ -214,16 +214,18 @@ class TenantDatabase
                 \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
                 \PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC,
                 \PDO::ATTR_EMULATE_PREPARES => false,
-                \PDO::MYSQL_ATTR_INIT_COMMAND => 'SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci',
+                \PDO::MYSQL_ATTR_INIT_COMMAND => BusinessTimezone::mysqlInitCommand(),
             ]
         );
         
         return $this->tenantConnections[$key];
     }
-    
-    /**
-     * Remover base de datos del tenant (cuando se elimina)
-     */
+
+    /** Libera la conexión en caché del tenant (reconexión tras idle largo). */
+    public function forgetTenantConnection(string $databaseName): void
+    {
+        unset($this->tenantConnections[$databaseName]);
+    }
     public function dropTenantDatabase(string $databaseName, string $databaseUser = ''): bool
     {
         try {

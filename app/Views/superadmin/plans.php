@@ -4,15 +4,15 @@ $title = 'Super Administrador - Planes';
 $pageTitle = 'Gestión de Planes';
 $userName = $_SESSION['super_admin_name'] ?? 'Super Admin';
 $plans = $plans ?? [];
-$availableModules = ['dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'clientes', 'proveedores', 'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes'];
+$availableModules = ['dashboard', 'caja', 'ventas', 'inventario', 'prestamos', 'consignacion', 'clientes', 'proveedores', 'compras', 'cotizaciones', 'gastos', 'contabilidad', 'nomina', 'reportes'];
 $moduleNames = [
     'dashboard' => 'Dashboard', 'caja' => 'Caja', 'ventas' => 'Ventas',
-    'inventario' => 'Inventario', 'prestamos' => 'Préstamos', 'clientes' => 'Clientes', 'proveedores' => 'Proveedores',
+    'inventario' => 'Inventario', 'prestamos' => 'Préstamos', 'consignacion' => 'Consignación', 'clientes' => 'Clientes', 'proveedores' => 'Proveedores',
     'compras' => 'Compras', 'cotizaciones' => 'Cotizaciones', 'gastos' => 'Gastos', 'contabilidad' => 'Contabilidad',
     'nomina' => 'Nómina', 'reportes' => 'Reportes'
 ];
 $moduleIcons = [
-    'dashboard' => '📊', 'caja' => '💰', 'ventas' => '🛒', 'inventario' => '📦', 'prestamos' => '🔁',
+    'dashboard' => '📊', 'caja' => '💰', 'ventas' => '🛒', 'inventario' => '📦', 'prestamos' => '🔁', 'consignacion' => '📦',
     'clientes' => '👥', 'proveedores' => '🚚', 'compras' => '🚛', 'cotizaciones' => '📝', 'gastos' => '🧾',
     'contabilidad' => '🧮', 'nomina' => '💵', 'reportes' => '📋'
 ];

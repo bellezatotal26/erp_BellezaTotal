@@ -127,7 +127,11 @@ class SiigoConnector implements InvoiceProviderInterface
                 if ($discount > 0) {
                     $line['discount'] = $discount;
                 }
-                if ($taxId > 0) {
+                // Siigo: un tax_id global; omitir en líneas exentas (tax_rate=0).
+                $itemTaxRate = array_key_exists('tax_rate', $item)
+                    ? (float)$item['tax_rate']
+                    : 19.0;
+                if ($taxId > 0 && $itemTaxRate > 0.009) {
                     $line['taxes'] = [['id' => $taxId]];
                 }
                 $siigoItems[] = $line;

@@ -6,14 +6,27 @@ $tenantName = $tenantName ?? 'Mi Empresa';
 $userName = $userName ?? 'Usuario';
 $expenses = $expenses ?? [];
 $suppliers = $suppliers ?? [];
-$categories = $categories ?? [];
-$monthTotal = $monthTotal ?? 0;
+$operationalCats = $operationalCats ?? [];
+$financialCats = $financialCats ?? [];
+$administrativeCats = $administrativeCats ?? [];
+$managementCats = $managementCats ?? [];
+$customSubgroupSections = $customSubgroupSections ?? [];
 $monthFinancial = $monthFinancial ?? 0;
+$monthManagement = $monthManagement ?? 0;
+$monthAccounting = $monthAccounting ?? 0;
+$monthTotal = $monthTotal ?? 0;
 $monthOperational = $monthOperational ?? 0;
 $monthAdministrative = $monthAdministrative ?? 0;
 $kindFilter = $kindFilter ?? '';
+$qFilter = $qFilter ?? '';
+$fromFilter = $fromFilter ?? '';
+$toFilter = $toFilter ?? '';
+$paymentFilter = $paymentFilter ?? '';
+$supplierFilter = (int)($supplierFilter ?? 0);
 $currency = $currency ?? ['symbol' => '$', 'decimals' => 2, 'decimal' => ',', 'thousands' => '.'];
 $pagination = $pagination ?? null;
+$perPageOptions = $perPageOptions ?? [20, 50, 100, 200];
+$listQuery = $listQuery ?? [];
 $paymentMethods = $paymentMethods ?? \SoftNova\Services\PaymentMethodCatalog::all();
 
 function fmtG(float $a, array $c): string
@@ -21,65 +34,132 @@ function fmtG(float $a, array $c): string
     return $c['symbol'] . ' ' . number_format($a, $c['decimals'], $c['decimal'] ?? ',', $c['thousands'] ?? '.');
 }
 
-$financialCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '') === 'financial');
-$operationalCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '') === 'operational');
-$administrativeCats = array_filter($categories, static fn($c) => ($c['kind'] ?? '') === 'administrative');
 $canCreateExpense = \SoftNova\Core\TenantMiddleware::canDo('create', 'gastos');
+$canEditExpense = \SoftNova\Core\TenantMiddleware::canDo('edit', 'gastos');
 $canDeleteExpense = \SoftNova\Core\TenantMiddleware::canDo('delete', 'gastos');
 $canExportExpense = \SoftNova\Core\TenantMiddleware::canDo('export', 'gastos');
+$gastosBase = $viewInstance->route('app/gastos');
 ?>
 <?php echo flashMessage(); ?>
 
 <div class="stats-grid">
     <div class="stat-card neumorphic"><h4>Gastos mes</h4><div class="stat-value" style="color:#DC2626;"><?php echo fmtG((float)$monthTotal, $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Financieros (mes)</h4><div class="stat-value" style="color:#B45309;"><?php echo fmtG((float)$monthFinancial, $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Operativos (mes)</h4><div class="stat-value"><?php echo fmtG((float)$monthOperational, $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Administrativos (mes)</h4><div class="stat-value"><?php echo fmtG((float)$monthAdministrative, $currency); ?></div></div>
+    <div class="stat-card neumorphic"><h4>Operativos (mes)</h4><div class="stat-value" style="color:#0D7C4A;"><?php echo fmtG((float)$monthOperational, $currency); ?></div><small>Descuentan caja</small></div>
+    <div class="stat-card neumorphic stat-card--stack"><h4>Contables (mes)</h4><div class="stat-value"><?php echo fmtG((float)$monthAccounting, $currency); ?></div><small>Adm. <?php echo fmtG((float)$monthAdministrative, $currency); ?> · Fin. <?php echo fmtG((float)$monthFinancial, $currency); ?> · Gest. <?php echo fmtG((float)$monthManagement, $currency); ?></small></div>
 </div>
 
-<div style="display:flex;gap:15px;margin-bottom:20px;flex-wrap:wrap;align-items:center;">
+<div style="display:flex;gap:15px;margin-bottom:16px;flex-wrap:wrap;align-items:center;">
     <?php if ($canCreateExpense): ?>
-    <button onclick="document.getElementById('expenseModal').style.display='flex'" class="btn btn-primary neumorphic-btn" title="Nuevo gasto">Nuevo Gasto</button>
+    <button onclick="resetExpenseForm(); document.getElementById('expenseModal').style.display='flex'" class="btn btn-primary neumorphic-btn" title="Nuevo gasto">Nuevo Gasto</button>
     <?php endif; ?>
     <?php if ($canExportExpense): ?>
-    <a href="<?php echo $viewInstance->route('app/gastos'); ?>?action=export" class="btn btn-secondary" title="Exportar CSV">Exportar CSV</a>
+    <a href="<?php echo $gastosBase; ?>?action=export<?php echo $listQuery !== [] ? '&' . http_build_query($listQuery) : ''; ?>" class="btn btn-secondary" title="Exporta el listado filtrado; sin filtros exporta todo">Exportar CSV</a>
     <?php endif; ?>
-    <form method="GET" action="<?php echo $viewInstance->route('app/gastos'); ?>" style="display:flex;gap:8px;margin:0;align-items:center;">
-        <select name="kind" class="form-control" style="width:auto;" onchange="this.form.submit()">
-            <option value="">Todos los tipos</option>
-            <option value="financial" <?php echo $kindFilter === 'financial' ? 'selected' : ''; ?>>Financieros</option>
-            <option value="operational" <?php echo $kindFilter === 'operational' ? 'selected' : ''; ?>>Operativos</option>
-            <option value="administrative" <?php echo $kindFilter === 'administrative' ? 'selected' : ''; ?>>Administrativos</option>
-        </select>
-    </form>
 </div>
 
+<form method="GET" action="<?php echo $gastosBase; ?>" class="inv-filters-form" style="margin-bottom:16px;">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+        <div class="form-group" style="margin:0;flex:1;min-width:200px;">
+            <label style="font-size:12px;">Buscar</label>
+            <input type="text" name="q" value="<?php echo htmlspecialchars($qFilter); ?>" class="form-control" placeholder="Descripción, proveedor, recibo…">
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Tipo</label>
+            <select name="kind" class="form-control" style="width:auto;">
+                <option value="">Todos los tipos</option>
+                <option value="operational" <?php echo $kindFilter === 'operational' ? 'selected' : ''; ?>>Operativos</option>
+                <option value="accounting" <?php echo $kindFilter === 'accounting' ? 'selected' : ''; ?>>Todos los contables</option>
+                <option value="administrative" <?php echo $kindFilter === 'administrative' ? 'selected' : ''; ?>>Contables — Administrativos</option>
+                <option value="financial" <?php echo $kindFilter === 'financial' ? 'selected' : ''; ?>>Contables — Financieros</option>
+                <option value="management" <?php echo $kindFilter === 'management' ? 'selected' : ''; ?>>Contables — Gestión</option>
+            </select>
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Desde</label>
+            <input type="date" name="from" value="<?php echo htmlspecialchars($fromFilter); ?>" class="form-control">
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Hasta</label>
+            <input type="date" name="to" value="<?php echo htmlspecialchars($toFilter); ?>" class="form-control">
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Método</label>
+            <select name="payment_method" class="form-control" style="width:auto;">
+                <option value="">Todos</option>
+                <?php foreach ($paymentMethods as $code => $label): ?>
+                    <option value="<?php echo htmlspecialchars((string)$code); ?>" <?php echo $paymentFilter === (string)$code ? 'selected' : ''; ?>>
+                        <?php echo htmlspecialchars(is_array($label) ? (string)($label['label'] ?? $code) : (string)$label); ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Proveedor</label>
+            <select name="supplier_id" class="form-control" style="width:auto;max-width:200px;">
+                <option value="0">Todos</option>
+                <?php foreach ($suppliers as $sup): ?>
+                    <option value="<?php echo (int)$sup['id']; ?>" <?php echo $supplierFilter === (int)$sup['id'] ? 'selected' : ''; ?>>
+                        <?php echo htmlspecialchars((string)$sup['name']); ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <input type="hidden" name="per_page" value="<?php echo (int)($pagination['perPage'] ?? 20); ?>">
+        <div style="display:flex;gap:6px;">
+            <button type="submit" class="btn btn-primary">Filtrar</button>
+            <a href="<?php echo $gastosBase; ?>" class="btn btn-secondary">Limpiar</a>
+        </div>
+    </div>
+</form>
+
 <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 14px;">
-    <strong>Financieros:</strong> comisiones banco, datáfono, ventas, 4x1000.
-    <strong>Operativos:</strong> arriendo, servicios, gasolina, etc.
-    <strong>Administrativos:</strong> cámara de comercio, derechos de autor, IVA, ICA, etc.
-    Use <em>Otro</em> en el desplegable para agregar un tipo nuevo de forma permanente.
+    <strong>Operativos:</strong> papelería, alimentos, transporte, mantenimiento — <strong>descuentan caja</strong> si paga en efectivo.
+    <strong>Contables:</strong> administrativos, financieros y de gestión — <strong>no descuentan caja</strong>, se contabilizan y quedan trazados por sub-grupo.
+    Use <em>+ Agregar otro…</em> solo si es administrador (crea tipos permanentes en Configuración).
+    <?php if (\SoftNova\Core\TenantMiddleware::getRole() === 'admin'): ?>
+        Administre el catálogo en <a href="<?php echo $viewInstance->route('app/configuracion'); ?>#gastos-admin">Configuración → Administración de gastos</a>.
+    <?php endif; ?>
 </p>
 
 <div class="card neumorphic">
     <div class="card-header"><h3>Listado de Gastos</h3></div>
     <div class="card-body">
         <?php if (empty($expenses)): ?>
-            <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">No hay gastos registrados</p>
+            <?php
+            $hasFilters = $qFilter !== '' || $kindFilter !== '' || $fromFilter !== '' || $toFilter !== ''
+                || $paymentFilter !== '' || $supplierFilter > 0;
+            ?>
+            <p style="text-align:center;color:var(--color-text-secondary);padding:20px;">
+                <?php echo $hasFilters ? 'No hay gastos con esos filtros' : 'No hay gastos registrados'; ?>
+            </p>
         <?php else: ?>
             <div class="table-container"><table>
-                <thead><tr><th>Fecha</th><th>Descripcion</th><th>Categoria</th><th>Proveedor</th><th>Monto</th><th>Metodo</th><th>Soporte</th><?php if ($canDeleteExpense): ?><th>Acciones</th><?php endif; ?></tr></thead>
+                <thead><tr><th>Fecha</th><th>Usuario</th><th>Descripcion</th><th>Categoria</th><th>Proveedor</th><th>Monto</th><th>Metodo</th><th>Soporte</th><th>Contabilidad</th><?php if ($canEditExpense || $canDeleteExpense): ?><th>Acciones</th><?php endif; ?></tr></thead>
                 <tbody>
                 <?php foreach ($expenses as $exp): ?>
                     <?php
                     $catLabel = $exp['category_label'] ?? ($exp['category'] ?? '');
                     $ck = (string)($exp['category_kind'] ?? '');
-                    $kindBadge = $ck === 'financial' ? 'badge-warning' : ($ck === 'administrative' ? 'badge-info' : 'badge-secondary');
-                    $kindText = $ck === 'financial' ? 'Financiero' : ($ck === 'operational' ? 'Operativo' : ($ck === 'administrative' ? 'Administrativo' : ''));
+                        $kindBadge = match ($ck) {
+                            'operational' => 'badge-success',
+                            'financial' => 'badge-warning',
+                            'management' => 'badge-secondary',
+                            default => \SoftNova\Services\ExpenseCategoryService::isAccountingKind($ck) ? 'badge-info' : 'badge-info',
+                        };
+                        $kindText = match ($ck) {
+                            'operational' => 'Operativo',
+                            'financial' => 'Contable · Financiero',
+                            'management' => 'Contable · Gestión',
+                            'administrative' => 'Contable · Administrativo',
+                            default => str_starts_with($ck, \SoftNova\Services\ExpenseCategoryService::SUBGROUP_KIND_PREFIX)
+                                ? 'Contable · Personalizado'
+                                : '',
+                        };
                     $methodLabel = \SoftNova\Services\PaymentMethodCatalog::label((string)($exp['payment_method'] ?? 'cash'));
                     ?>
                     <tr>
                         <td><?php echo date('d/m/Y', strtotime($exp['expense_date'])); ?></td>
+                        <td><?php echo htmlspecialchars(trim((string)($exp['user_name'] ?? '')) !== '' ? (string)$exp['user_name'] : 'Sin usuario'); ?></td>
                         <td><?php echo htmlspecialchars($exp['description']); ?></td>
                         <td>
                             <?php echo htmlspecialchars($catLabel); ?>
@@ -90,44 +170,71 @@ $canExportExpense = \SoftNova\Core\TenantMiddleware::canDo('export', 'gastos');
                         <td><?php echo htmlspecialchars($methodLabel); ?></td>
                         <td>
                             <?php if (!empty($exp['receipt_path'])): ?>
-                                <a class="btn btn-sm btn-secondary" href="<?php echo $viewInstance->route('app/gastos'); ?>?action=receipt&id=<?php echo (int)$exp['id']; ?>" target="_blank" title="Ver foto/PDF">Ver</a>
+                                <a class="btn btn-sm btn-secondary" href="<?php echo $gastosBase; ?>?action=receipt&id=<?php echo (int)$exp['id']; ?>" target="_blank" title="Ver foto/PDF">Ver</a>
                             <?php else: ?>
                                 —
                             <?php endif; ?>
                         </td>
-                        <?php if ($canDeleteExpense): ?>
+                        <td>
+                            <?php if (!empty($exp['accounting_entry_id'])): ?>
+                                <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$exp['accounting_entry_id']; ?>" title="Ver comprobante contable">
+                                    <?php echo htmlspecialchars((string)($exp['accounting_entry_number'] ?? 'Ver')); ?>
+                                </a>
+                            <?php else: ?>
+                                <span style="font-size:12px;color:var(--color-text-secondary);">Sin asiento</span>
+                            <?php endif; ?>
+                        </td>
+                        <?php if ($canEditExpense || $canDeleteExpense): ?>
                         <td class="table-actions">
-                            <form method="POST" action="<?php echo $viewInstance->route('app/gastos'); ?>?action=delete" style="display:inline;" data-ajax="true">
+                            <?php if ($canEditExpense && empty($exp['accounting_entry_id'])): ?>
+                                <button type="button" class="btn btn-sm btn-secondary" title="Editar"
+                                    onclick='openEditExpense(<?php echo json_encode([
+                                        "id" => (int)$exp["id"],
+                                        "description" => (string)$exp["description"],
+                                        "amount" => (float)$exp["amount"],
+                                        "expense_date" => (string)$exp["expense_date"],
+                                        "category_id" => (int)($exp["category_id"] ?? 0),
+                                        "supplier_id" => (int)($exp["supplier_id"] ?? 0),
+                                        "payment_method" => (string)($exp["payment_method"] ?? "cash"),
+                                        "receipt_number" => (string)($exp["receipt_number"] ?? ""),
+                                        "notes" => (string)($exp["notes"] ?? ""),
+                                    ], JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE); ?>)'>Editar</button>
+                            <?php endif; ?>
+                            <?php if ($canDeleteExpense): ?>
+                            <form method="POST" action="<?php echo $gastosBase; ?>?action=delete" style="display:inline;" data-ajax="true">
                                 <?php echo \SoftNova\Core\csrf_field(); ?>
                                 <input type="hidden" name="id" value="<?php echo (int)$exp['id']; ?>">
-                                <button type="submit" data-confirm="Eliminar gasto?" class="btn btn-sm btn-danger" title="Eliminar">
+                                <button type="submit" data-confirm="¿Anular este gasto? Quedará en historial para trazabilidad contable." class="btn btn-sm btn-danger" title="Anular">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
                                 </button>
                             </form>
+                            <?php endif; ?>
                         </td>
                         <?php endif; ?>
                     </tr>
                 <?php endforeach; ?>
                 </tbody>
             </table></div>
-            <?php
-            $paginationBaseUrl = $viewInstance->route('app/gastos');
-            $paginationQuery = array_filter(['kind' => $kindFilter !== '' ? $kindFilter : null]);
-            $viewInstance->partial('pagination', compact('pagination', 'paginationBaseUrl', 'paginationQuery'));
-            ?>
         <?php endif; ?>
+            <?php
+            $paginationBaseUrl = $gastosBase;
+            $paginationQuery = $listQuery;
+            $paginationPerPageOptions = $perPageOptions;
+            $viewInstance->partial('pagination', compact('pagination', 'paginationBaseUrl', 'paginationQuery', 'paginationPerPageOptions'));
+            ?>
     </div>
 </div>
 
-<?php if ($canCreateExpense): ?>
+<?php if ($canCreateExpense || $canEditExpense): ?>
 <div id="expenseModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:600px;max-height:90vh;overflow-y:auto;">
         <div class="modal-header">
-            <h3>Nuevo Gasto</h3>
+            <h3 id="expenseModalTitle">Nuevo Gasto</h3>
             <button type="button" class="modal-close" onclick="document.getElementById('expenseModal').style.display='none'" title="Cerrar">&times;</button>
         </div>
-        <form method="POST" action="<?php echo $viewInstance->route('app/gastos'); ?>?action=create" data-ajax="true" enctype="multipart/form-data">
+        <form method="POST" action="<?php echo $viewInstance->route('app/gastos'); ?>?action=create" data-ajax="true" enctype="multipart/form-data" id="expenseForm">
             <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="id" id="expenseId" value="0">
             <div class="modal-body">
                 <div class="form-group">
                     <label>Descripcion *</label>
@@ -146,25 +253,15 @@ $canExportExpense = \SoftNova\Core\TenantMiddleware::canDo('export', 'gastos');
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                     <div class="form-group">
                         <label>Categoria *</label>
-                        <select name="category_id" class="form-control" required data-custom-other="expense_category">
-                            <option value="">Seleccionar…</option>
-                            <optgroup label="Gastos financieros">
-                                <?php foreach ($financialCats as $c): ?>
-                                    <option value="<?php echo (int)$c['id']; ?>"><?php echo htmlspecialchars($c['name']); ?></option>
-                                <?php endforeach; ?>
-                            </optgroup>
-                            <optgroup label="Gastos operativos">
-                                <?php foreach ($operationalCats as $c): ?>
-                                    <option value="<?php echo (int)$c['id']; ?>" <?php echo ($c['code'] ?? '') === 'general' ? 'selected' : ''; ?>><?php echo htmlspecialchars($c['name']); ?></option>
-                                <?php endforeach; ?>
-                            </optgroup>
-                            <optgroup label="Gastos administrativos">
-                                <?php foreach ($administrativeCats as $c): ?>
-                                    <option value="<?php echo (int)$c['id']; ?>"><?php echo htmlspecialchars($c['name']); ?></option>
-                                <?php endforeach; ?>
-                            </optgroup>
-                            <option value="__other__">Otro (agregar nuevo tipo)…</option>
-                        </select>
+                        <?php $viewInstance->partial('expense_category_select', [
+                            'operationalCats' => $operationalCats,
+                            'financialCats' => $financialCats,
+                            'administrativeCats' => $administrativeCats,
+                            'managementCats' => $managementCats,
+                            'customSubgroupSections' => $customSubgroupSections,
+                            'required' => true,
+                            'allowCustomExpenseCategory' => \SoftNova\Core\TenantMiddleware::getRole() === 'admin',
+                        ]); ?>
                     </div>
                     <div class="form-group">
                         <label>Medio de pago</label>
@@ -196,11 +293,14 @@ $canExportExpense = \SoftNova\Core\TenantMiddleware::canDo('export', 'gastos');
                     <label>Notas</label>
                     <textarea name="notes" class="form-control" rows="2"></textarea>
                 </div>
-                <div class="form-group">
-                    <label style="display:flex;align-items:center;gap:8px;">
-                        <input type="checkbox" name="affect_cash" value="1" checked>
-                        Ya pagado (si es efectivo, también registra egreso en caja)
-                    </label>
+                <div class="form-group js-cash-explanation-block" style="display:none;padding:10px 12px;border:1px solid #F59E0B;border-radius:8px;background:rgba(245,158,11,.08);">
+                    <label style="font-weight:600;">Explicación del pago en efectivo *</label>
+                    <input type="text" name="cash_explanation" class="form-control" maxlength="255"
+                           placeholder="Ej. Retiro cajero Bancolombia Calle 80 / efectivo de ahorros">
+                    <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">
+                        Solo para gastos <strong>contables</strong> pagados en efectivo: no descuenta el cajón de caja.
+                        Los gastos operativos en efectivo sí descuentan caja automáticamente.
+                    </small>
                 </div>
             </div>
             <div class="modal-footer">
@@ -211,3 +311,88 @@ $canExportExpense = \SoftNova\Core\TenantMiddleware::canDo('export', 'gastos');
     </div>
 </div>
 <?php endif; ?>
+<script>
+function parseExpenseNotes(notes) {
+    var raw = String(notes || '');
+    var m = raw.match(/^Efectivo:\s*([^|]+)(?:\s*\|\s*(.*))?$/);
+    if (m) {
+        return { cashExplanation: m[1].trim(), notes: (m[2] || '').trim() };
+    }
+    return { cashExplanation: '', notes: raw };
+}
+function resetExpenseForm() {
+    var form = document.getElementById('expenseForm');
+    if (!form) return;
+    form.reset();
+    form.action = '<?php echo $viewInstance->route('app/gastos'); ?>?action=create';
+    document.getElementById('expenseModalTitle').textContent = 'Nuevo Gasto';
+    document.getElementById('expenseId').value = '0';
+    var dateEl = form.querySelector('[name="expense_date"]');
+    if (dateEl) dateEl.value = '<?php echo date('Y-m-d'); ?>';
+    if (typeof syncCashExplanation === 'function') syncCashExplanation();
+}
+function openEditExpense(row) {
+    resetExpenseForm();
+    var form = document.getElementById('expenseForm');
+    if (!form) return;
+    document.getElementById('expenseModalTitle').textContent = 'Editar gasto';
+    document.getElementById('expenseId').value = String(row.id || 0);
+    form.action = '<?php echo $viewInstance->route('app/gastos'); ?>?action=edit';
+    form.querySelector('[name="description"]').value = row.description || '';
+    var amt = form.querySelector('[name="amount"]');
+    if (amt) amt.value = window.SeriMoney ? SeriMoney.format(row.amount || 0) : String(row.amount || 0);
+    form.querySelector('[name="expense_date"]').value = (row.expense_date || '').substr(0, 10);
+    var parsed = parseExpenseNotes(row.notes || '');
+    var cat = form.querySelector('[name="category_id"]');
+    if (cat) {
+        cat.value = row.category_id ? String(row.category_id) : '';
+        if (typeof cat.dispatchEvent === 'function') cat.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    var sup = form.querySelector('[name="supplier_id"]');
+    if (sup) sup.value = row.supplier_id ? String(row.supplier_id) : '';
+    var pay = form.querySelector('[name="payment_method"]');
+    if (pay) {
+        pay.value = row.payment_method || 'cash';
+        if (typeof pay.dispatchEvent === 'function') pay.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    form.querySelector('[name="receipt_number"]').value = row.receipt_number || '';
+    form.querySelector('[name="notes"]').value = parsed.notes;
+    var cashExpl = form.querySelector('[name="cash_explanation"]');
+    if (cashExpl) cashExpl.value = parsed.cashExplanation;
+    document.getElementById('expenseModal').style.display = 'flex';
+    if (typeof syncCashExplanation === 'function') syncCashExplanation();
+}
+(function () {
+    var form = document.querySelector('#expenseModal form');
+    if (!form || form.dataset.expenseCashBound === '1') return;
+    form.dataset.expenseCashBound = '1';
+    var payEl = form.querySelector('[name="payment_method"]');
+    var catEl = form.querySelector('[name="category_id"]');
+    var explBlock = form.querySelector('.js-cash-explanation-block');
+    var explEl = form.querySelector('[name="cash_explanation"]');
+    function isCashMethod() {
+        if (!payEl) return false;
+        var v = String(payEl.value || '').toLowerCase();
+        return v === 'cash' || v === 'efectivo' || v === '';
+    }
+    function isAccountingCategory() {
+        if (!catEl || catEl.selectedIndex < 0) return false;
+        var opt = catEl.options[catEl.selectedIndex];
+        if (opt.getAttribute('data-accounting') === '1') return true;
+        var k = String(opt.getAttribute('data-kind') || '');
+        return k === 'administrative' || k === 'financial' || k === 'management' || k.indexOf('sg_') === 0;
+    }
+    function syncCashExplanation() {
+        var show = isCashMethod() && isAccountingCategory();
+        if (explBlock) explBlock.style.display = show ? '' : 'none';
+        if (explEl) {
+            explEl.required = show;
+            if (!show) explEl.value = '';
+        }
+    }
+    window.syncCashExplanation = syncCashExplanation;
+    if (payEl) payEl.addEventListener('change', syncCashExplanation);
+    if (catEl) catEl.addEventListener('change', syncCashExplanation);
+    syncCashExplanation();
+})();
+</script>

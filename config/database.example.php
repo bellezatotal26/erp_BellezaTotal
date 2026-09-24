@@ -15,6 +15,9 @@ return [
             'charset' => 'utf8mb4',
             'collation' => 'utf8mb4_unicode_ci',
             'prefix' => '',
+            // Opcional: nombre fijo del espejo de pruebas (caja de arena).
+            // Si se omite, se usa {database}_sandbox
+            // 'sandbox_database' => 'nombre_bd_sandbox',
         ],
     ],
 ];

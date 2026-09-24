@@ -105,6 +105,20 @@ foreach ($tenants as $tenant) {
         }
 
         try {
+            new \SoftNova\Services\SalesDocumentService($pdo);
+            echo "  ✓ columnas documentos de venta (payment_terms, etc.) listas\n";
+        } catch (\Exception $e) {
+            echo '  ⚠ sales document schema: ' . $e->getMessage() . "\n";
+        }
+
+        try {
+            \SoftNova\Services\SupplyChainSchema::ensure($pdo);
+            echo "  ✓ columnas caja/compras (expected_amount, etc.) listas\n";
+        } catch (\Exception $e) {
+            echo '  ⚠ supply chain schema: ' . $e->getMessage() . "\n";
+        }
+
+        try {
             $mgr = new \SoftNova\Services\Integrations\IntegrationManager($pdo);
             $mgr->ensureSaleExternalColumns();
             echo "  ✓ columnas FE en sales listas\n";

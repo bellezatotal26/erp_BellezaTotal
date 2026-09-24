@@ -321,6 +321,33 @@ $csrf = \SoftNova\Core\csrf_token();
                                     <a href="<?php echo $viewInstance->route('app/inventario'); ?>" class="btn btn-sm btn-secondary">Ver inventario</a>
                                 </div>
                             <?php endif; ?>
+                        <?php elseif ($wid === 'today_sold_products'): ?>
+                            <?php
+                            $todaySoldProducts = $todaySoldProducts ?? [];
+                            ?>
+                            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">Más vendidos · hoy</p>
+                            <?php if (empty($todaySoldProducts)): ?>
+                                <p class="dashboard-empty">Sin ventas de productos hoy</p>
+                            <?php else: ?>
+                                <div class="table-container">
+                                    <table>
+                                        <thead><tr><th>#</th><th>Producto</th><th>Unid.</th><th>Ventas</th></tr></thead>
+                                        <tbody>
+                                        <?php foreach ($todaySoldProducts as $i => $p): ?>
+                                            <tr>
+                                                <td><?php echo $i + 1; ?></td>
+                                                <td><?php echo htmlspecialchars((string)($p['name'] ?? '')); ?></td>
+                                                <td><span class="badge badge-success"><?php echo (int)($p['total_qty'] ?? 0); ?></span></td>
+                                                <td><?php echo formatCurrencyDashboard($p['total_sales'] ?? 0); ?></td>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                        </tbody>
+                                    </table>
+                                </div>
+                                <div style="margin-top:10px;">
+                                    <a href="<?php echo $viewInstance->route('app/reportes'); ?>" class="btn btn-sm btn-secondary">Ver reportes</a>
+                                </div>
+                            <?php endif; ?>
                         <?php endif; ?>
                     </div>
                 </section>

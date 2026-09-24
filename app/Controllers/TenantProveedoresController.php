@@ -37,17 +37,59 @@ class TenantProveedoresController extends TenantController
             return;
         }
         
-        $total = (int)$this->query("SELECT COUNT(*) as c FROM suppliers WHERE status = 'active'")->fetch()['c'];
-        $pagination = $this->paginate($total);
+        $q = trim((string)$this->request->get('q', ''));
+        $documentType = trim((string)$this->request->get('document_type', ''));
+        $ally = trim((string)$this->request->get('ally', ''));
+        $allowedDocs = ['CC', 'CE', 'NIT', 'PPT', 'OTROS', 'RUT'];
+        if ($documentType !== '' && !in_array($documentType, $allowedDocs, true)) {
+            $documentType = '';
+        }
+        if (!in_array($ally, ['1', '0'], true)) {
+            $ally = '';
+        }
+
+        $where = ["status = 'active'"];
+        $params = [];
+        if ($q !== '') {
+            $like = '%' . $q . '%';
+            $where[] = '(name LIKE ? OR contact_name LIKE ? OR document_number LIKE ?
+                OR email LIKE ? OR phone LIKE ? OR address LIKE ?)';
+            array_push($params, $like, $like, $like, $like, $like, $like);
+        }
+        if ($documentType !== '') {
+            $where[] = 'document_type = ?';
+            $params[] = $documentType;
+        }
+        if ($ally === '1') {
+            $where[] = 'COALESCE(is_ally, 0) = 1';
+        } elseif ($ally === '0') {
+            $where[] = 'COALESCE(is_ally, 0) = 0';
+        }
+        $whereSql = 'WHERE ' . implode(' AND ', $where);
+
+        $per = $this->resolvePerPage();
+        $total = (int)$this->query("SELECT COUNT(*) as c FROM suppliers {$whereSql}", $params)->fetch()['c'];
+        $pagination = $this->paginate($total, $per['perPage']);
         
         $suppliers = $this->query(
-            "SELECT * FROM suppliers WHERE status = 'active' ORDER BY name ASC
-             LIMIT {$pagination['perPage']} OFFSET {$pagination['offset']}"
+            "SELECT * FROM suppliers {$whereSql} ORDER BY name ASC
+             LIMIT {$pagination['perPage']} OFFSET {$pagination['offset']}",
+            $params
         )->fetchAll();
         
         $this->view('tenant.proveedores', $this->tenantViewData([
             'suppliers' => $suppliers,
             'pagination' => $pagination,
+            'perPageOptions' => $per['options'],
+            'qFilter' => $q,
+            'documentTypeFilter' => $documentType,
+            'allyFilter' => $ally,
+            'listQuery' => array_filter([
+                'q' => $q !== '' ? $q : null,
+                'document_type' => $documentType !== '' ? $documentType : null,
+                'ally' => $ally !== '' ? $ally : null,
+                'per_page' => $per['perPage'] !== 20 ? (string)$per['perPage'] : null,
+            ], static fn($v) => $v !== null && $v !== ''),
         ]));
     }
     
@@ -173,22 +215,61 @@ class TenantProveedoresController extends TenantController
     
     private function exportSuppliers(): void
     {
+        $q = trim((string)$this->request->get('q', ''));
+        $documentType = trim((string)$this->request->get('document_type', ''));
+        $ally = trim((string)$this->request->get('ally', ''));
+        $allowedDocs = ['CC', 'CE', 'NIT', 'PPT', 'OTROS', 'RUT'];
+        if ($documentType !== '' && !in_array($documentType, $allowedDocs, true)) {
+            $documentType = '';
+        }
+        if (!in_array($ally, ['1', '0'], true)) {
+            $ally = '';
+        }
+
+        $where = ["status = 'active'"];
+        $params = [];
+        if ($q !== '') {
+            $like = '%' . $q . '%';
+            $where[] = '(name LIKE ? OR contact_name LIKE ? OR document_number LIKE ?
+                OR email LIKE ? OR phone LIKE ? OR address LIKE ?)';
+            array_push($params, $like, $like, $like, $like, $like, $like);
+        }
+        if ($documentType !== '') {
+            $where[] = 'document_type = ?';
+            $params[] = $documentType;
+        }
+        if ($ally === '1') {
+            $where[] = 'COALESCE(is_ally, 0) = 1';
+        } elseif ($ally === '0') {
+            $where[] = 'COALESCE(is_ally, 0) = 0';
+        }
+        $whereSql = 'WHERE ' . implode(' AND ', $where);
+
         $rows = $this->query(
-            "SELECT name, document_type, document_number, contact_name, email, phone, status
-             FROM suppliers ORDER BY name"
+            "SELECT name, document_type, document_number, contact_name, email, phone,
+                    address, COALESCE(is_ally, 0) AS is_ally, COALESCE(discount_percent, 0) AS discount_percent
+             FROM suppliers {$whereSql} ORDER BY name",
+            $params
         )->fetchAll();
         
         $csvRows = [];
         foreach ($rows as $r) {
             $csvRows[] = [
-                $r['name'], $r['document_type'], $r['document_number'], $r['contact_name'],
-                $r['email'], $r['phone'], $r['status'],
+                $r['name'],
+                $r['document_type'],
+                $r['document_number'],
+                $r['contact_name'],
+                $r['email'],
+                $r['phone'],
+                $r['address'] ?? '',
+                (int)$r['is_ally'] === 1 ? 'Si' : 'No',
+                $r['discount_percent'],
             ];
         }
         
         $this->exportCsv(
             'proveedores_' . date('Ymd_His') . '.csv',
-            ['Nombre', 'Tipo Doc', 'Documento', 'Contacto', 'Email', 'Telefono', 'Estado'],
+            ['Nombre', 'Tipo Doc', 'Documento', 'Contacto', 'Email', 'Telefono', 'Direccion', 'Aliado', 'Descuento %'],
             $csvRows
         );
     }

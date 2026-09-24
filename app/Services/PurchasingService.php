@@ -88,6 +88,12 @@ class PurchasingService
             if (!isset($cols['early_payment_discount_amount'])) {
                 $alters[] = 'ADD COLUMN early_payment_discount_amount DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER early_payment_discount_pct';
             }
+            if (!isset($cols['commercial_discount_pct'])) {
+                $alters[] = 'ADD COLUMN commercial_discount_pct DECIMAL(5,2) NOT NULL DEFAULT 0 AFTER early_payment_discount_amount';
+            }
+            if (!isset($cols['commercial_discount_amount'])) {
+                $alters[] = 'ADD COLUMN commercial_discount_amount DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER commercial_discount_pct';
+            }
             if (!isset($cols['due_date'])) {
                 $alters[] = 'ADD COLUMN due_date DATE NULL AFTER expected_date';
             }
@@ -148,6 +154,50 @@ class PurchasingService
     }
 
     /**
+     * Totales de OC/factura: bruto − desc. comercial (siempre) − desc. pronto pago (si aplica %).
+     * El comercial acepta % o monto en moneda (si monto > 0, manda el monto).
+     *
+     * @return array{
+     *   gross:float,commercial_pct:float,commercial_amount:float,
+     *   early_pct:float,early_amount:float,total:float
+     * }
+     */
+    public static function resolvePurchaseDiscounts(
+        float $subtotal,
+        float $tax,
+        float $earlyPct = 0.0,
+        float $commercialPct = 0.0,
+        float $commercialAmountInput = 0.0
+    ): array {
+        $subtotal = round(max(0, $subtotal), 2);
+        $tax = round(max(0, $tax), 2);
+        $gross = round($subtotal + $tax, 2);
+        $earlyPct = max(0, min(100, round($earlyPct, 2)));
+        $commercialPct = max(0, min(100, round($commercialPct, 2)));
+        $commercialAmountInput = max(0, round($commercialAmountInput, 2));
+
+        // Si hay monto en $, prevalece; el % guardado queda en 0 para no recalcular mal después.
+        $amountWins = $commercialAmountInput > 0.009;
+        $commercialAmt = $amountWins
+            ? min($commercialAmountInput, $gross)
+            : round($gross * ($commercialPct / 100), 2);
+        $storeCommercialPct = $amountWins ? 0.0 : $commercialPct;
+
+        $remaining = max(0, round($gross - $commercialAmt, 2));
+        $earlyAmt = round($remaining * ($earlyPct / 100), 2);
+        $total = max(0, round($remaining - $earlyAmt, 2));
+
+        return [
+            'gross' => $gross,
+            'commercial_pct' => $storeCommercialPct,
+            'commercial_amount' => $commercialAmt,
+            'early_pct' => $earlyPct,
+            'early_amount' => $earlyAmt,
+            'total' => $total,
+        ];
+    }
+
+    /**
      * @param array<int,array{product_id?:int,product_name?:string,quantity:int,unit_cost:float,tax_rate?:float}> $items
      */
     public function createOrder(
@@ -162,7 +212,9 @@ class PurchasingService
         ?string $dueDate = null,
         ?string $invoiceDate = null,
         ?string $invoiceNumber = null,
-        bool $autoApplyAllyDiscount = true
+        bool $autoApplyAllyDiscount = true,
+        float $commercialDiscountPct = 0.0,
+        float $commercialDiscountAmount = 0.0
     ): int {
         if (!in_array($status, ['draft', 'ordered'], true)) {
             $status = 'ordered';
@@ -198,13 +250,12 @@ class PurchasingService
         foreach ($items as $item) {
             $qty = (int)($item['quantity'] ?? 0);
             $cost = round((float)($item['unit_cost'] ?? 0), 2);
-            $rate = round(max(0, (float)($item['tax_rate'] ?? 0)), 2);
+            $productId = !empty($item['product_id']) ? (int)$item['product_id'] : null;
             if ($qty <= 0 || $cost < 0) {
                 continue;
             }
             $lineSub = round($qty * $cost, 2);
-            $lineTax = round($lineSub * ($rate / 100), 2);
-            $productId = !empty($item['product_id']) ? (int)$item['product_id'] : null;
+            [$rate, $lineTax] = $this->resolveItemTax($item, $lineSub, $productId, $productMeta);
             $name = trim((string)($item['product_name'] ?? ''));
             if ($name === '' && $productId) {
                 $name = (string)($productMeta[$productId]['name']
@@ -237,35 +288,78 @@ class PurchasingService
 
         $gross = round($subtotal + $tax, 2);
         $earlyPaymentDiscountPct = max(0, min(100, round($earlyPaymentDiscountPct, 2)));
-        $discountAmt = round($gross * ($earlyPaymentDiscountPct / 100), 2);
-        $total = round($gross - $discountAmt, 2);
+        $commercialDiscountPct = max(0, min(100, round($commercialDiscountPct, 2)));
+        $commercialDiscountAmount = max(0, round($commercialDiscountAmount, 2));
+        $disc = self::resolvePurchaseDiscounts(
+            $subtotal,
+            $tax,
+            $earlyPaymentDiscountPct,
+            $commercialDiscountPct,
+            $commercialDiscountAmount
+        );
+        $discountAmt = $disc['early_amount'];
+        $commercialAmt = $disc['commercial_amount'];
+        $commercialDiscountPct = $disc['commercial_pct'];
+        $total = $disc['total'];
 
         $orderNumber = $this->nextOrderNumber($orderDate);
-        $this->query(
-            "INSERT INTO purchase_orders
-                (order_number, supplier_id, status, order_date, warehouse_date, expected_date, due_date,
-                 subtotal, tax, total, early_payment_discount_pct, early_payment_discount_amount,
-                 invoice_number, invoice_date, notes, created_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                $orderNumber,
-                $supplierId,
-                $status,
-                $orderDate,
-                $warehouseDate,
-                $expectedDate,
-                $dueDate,
-                round($subtotal, 2),
-                round($tax, 2),
-                $total,
-                $earlyPaymentDiscountPct,
-                $discountAmt,
-                $invoiceNumber,
-                $invoiceDate,
-                $notes !== '' ? $notes : null,
-                $_SESSION['tenant_user_id'] ?? null,
-            ]
-        );
+        try {
+            $this->query(
+                "INSERT INTO purchase_orders
+                    (order_number, supplier_id, status, order_date, warehouse_date, expected_date, due_date,
+                     subtotal, tax, total, early_payment_discount_pct, early_payment_discount_amount,
+                     commercial_discount_pct, commercial_discount_amount,
+                     invoice_number, invoice_date, notes, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    $orderNumber,
+                    $supplierId,
+                    $status,
+                    $orderDate,
+                    $warehouseDate,
+                    $expectedDate,
+                    $dueDate,
+                    round($subtotal, 2),
+                    round($tax, 2),
+                    $total,
+                    $earlyPaymentDiscountPct,
+                    $discountAmt,
+                    $commercialDiscountPct,
+                    $commercialAmt,
+                    $invoiceNumber,
+                    $invoiceDate,
+                    $notes !== '' ? $notes : null,
+                    $_SESSION['tenant_user_id'] ?? null,
+                ]
+            );
+        } catch (\Throwable $e) {
+            // Instala sin columnas comerciales aún.
+            $this->query(
+                "INSERT INTO purchase_orders
+                    (order_number, supplier_id, status, order_date, warehouse_date, expected_date, due_date,
+                     subtotal, tax, total, early_payment_discount_pct, early_payment_discount_amount,
+                     invoice_number, invoice_date, notes, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    $orderNumber,
+                    $supplierId,
+                    $status,
+                    $orderDate,
+                    $warehouseDate,
+                    $expectedDate,
+                    $dueDate,
+                    round($subtotal, 2),
+                    round($tax, 2),
+                    $total,
+                    $earlyPaymentDiscountPct,
+                    $discountAmt,
+                    $invoiceNumber,
+                    $invoiceDate,
+                    $notes !== '' ? $notes : null,
+                    $_SESSION['tenant_user_id'] ?? null,
+                ]
+            );
+        }
         $orderId = (int)$this->db->lastInsertId();
 
         $stmt = $this->db->prepare(
@@ -293,6 +387,70 @@ class PurchasingService
         }
 
         return $orderId;
+    }
+
+    /**
+     * Resuelve tasa e IVA de línea. Si viene tax_amount (p.ej. prorrateo de IVA personalizado),
+     * ese monto manda y la tasa se deriva para trazabilidad.
+     *
+     * @return array{0: float, 1: float} [tax_rate, tax_amount]
+     */
+    private function resolveItemTax(array $item, float $lineSub, ?int $productId, array $productMeta): array
+    {
+        if (array_key_exists('tax_amount', $item) && $item['tax_amount'] !== '' && $item['tax_amount'] !== null) {
+            $lineTax = round(max(0, (float)$item['tax_amount']), 2);
+            $rate = $lineSub > 0.009 ? round(($lineTax / $lineSub) * 100, 4) : 0.0;
+            return [$rate, $lineTax];
+        }
+        if (array_key_exists('tax_rate', $item) && $item['tax_rate'] !== '' && $item['tax_rate'] !== null) {
+            $rate = round(max(0, (float)$item['tax_rate']), 2);
+        } else {
+            $rate = round(max(0, (float)($productMeta[$productId]['tax_rate'] ?? 0)), 2);
+        }
+        return [$rate, round($lineSub * ($rate / 100), 2)];
+    }
+
+    /**
+     * Prorratea un IVA de documento entre líneas por peso de subtotal (último renglón absorbe centavos).
+     *
+     * @param list<array<string,mixed>> $items
+     * @return list<array<string,mixed>>
+     */
+    public static function applyTaxOverrideToLines(array $items, float $taxOverride): array
+    {
+        $taxOverride = round(max(0, $taxOverride), 2);
+        $bases = [];
+        $sumBase = 0.0;
+        foreach ($items as $i => $item) {
+            $qty = max(0, (float)($item['quantity'] ?? 0));
+            $cost = max(0, (float)($item['unit_cost'] ?? 0));
+            $base = round($qty * $cost, 2);
+            $bases[$i] = $base;
+            $sumBase += $base;
+        }
+        $assigned = 0.0;
+        $keys = array_keys($bases);
+        $lastIdx = $keys !== [] ? (int)end($keys) : -1;
+        foreach ($items as $i => &$item) {
+            $base = $bases[$i] ?? 0.0;
+            if ($taxOverride <= 0 || $sumBase <= 0.009) {
+                $share = 0.0;
+            } elseif ($i === $lastIdx) {
+                $share = round($taxOverride - $assigned, 2);
+            } else {
+                $remaining = round($taxOverride - $assigned, 2);
+                $share = round($taxOverride * ($base / $sumBase), 2);
+                if ($share > $remaining) {
+                    $share = $remaining;
+                }
+                $share = max(0.0, $share);
+                $assigned = round($assigned + $share, 2);
+            }
+            $item['tax_amount'] = round(max(0, $share), 2);
+            $item['tax_rate'] = $base > 0.009 ? round(($share / $base) * 100, 4) : 0.0;
+        }
+        unset($item);
+        return $items;
     }
 
     private function validExpiry(?string $date): ?string
@@ -378,7 +536,7 @@ class PurchasingService
         }
         $placeholders = implode(',', array_fill(0, count($productIds), '?'));
         $rows = $this->query(
-            "SELECT id, code, barcode, name FROM products WHERE id IN ($placeholders)",
+            "SELECT id, code, barcode, name, COALESCE(tax_rate, 0) AS tax_rate FROM products WHERE id IN ($placeholders)",
             $productIds
         )->fetchAll();
         $out = [];
@@ -387,6 +545,7 @@ class PurchasingService
                 'code' => $row['code'] ?? null,
                 'barcode' => $row['barcode'] ?? null,
                 'name' => $row['name'] ?? null,
+                'tax_rate' => (float)($row['tax_rate'] ?? 0),
             ];
         }
         return $out;
@@ -416,9 +575,9 @@ class PurchasingService
      * @param string $dueFilter overdue|due_today|due_soon|no_due|''
      * @return list<array<string,mixed>>
      */
-    public function listOrders(int $limit = 50, int $offset = 0, string $status = '', string $dueFilter = ''): array
+    public function listOrders(int $limit = 50, int $offset = 0, string $status = '', string $dueFilter = '', array $filters = []): array
     {
-        [$whereSql, $params] = $this->orderFilters($status, $dueFilter);
+        [$whereSql, $params] = $this->orderFilters($status, $dueFilter, $filters);
         $limit = max(1, min(200, $limit));
         $offset = max(0, $offset);
         $orderBy = $dueFilter !== ''
@@ -436,19 +595,22 @@ class PurchasingService
         )->fetchAll();
     }
 
-    public function countOrders(string $status = '', string $dueFilter = ''): int
+    public function countOrders(string $status = '', string $dueFilter = '', array $filters = []): int
     {
-        [$whereSql, $params] = $this->orderFilters($status, $dueFilter);
+        [$whereSql, $params] = $this->orderFilters($status, $dueFilter, $filters);
         return (int)$this->query(
-            "SELECT COUNT(*) FROM purchase_orders po {$whereSql}",
+            "SELECT COUNT(*) FROM purchase_orders po
+             LEFT JOIN suppliers s ON s.id = po.supplier_id
+             {$whereSql}",
             $params
         )->fetchColumn();
     }
 
     /**
+     * @param array{q?:string,supplier_id?:int,from?:string,to?:string} $filters
      * @return array{0:string,1:list<mixed>}
      */
-    private function orderFilters(string $status, string $dueFilter): array
+    private function orderFilters(string $status, string $dueFilter, array $filters = []): array
     {
         $where = ['1=1'];
         $params = [];
@@ -480,12 +642,46 @@ class PurchasingService
         } elseif ($dueFilter === 'no_due') {
             $where[] = 'po.due_date IS NULL';
         }
+        $this->appendListSearchFilters($where, $params, $filters, 'order_date');
         return ['WHERE ' . implode(' AND ', $where), $params];
     }
 
     private function balancePendingSql(): string
     {
         return "po.total - COALESCE(po.paid_total, 0) - COALESCE(po.credit_total, 0) > 0.009";
+    }
+
+    /**
+     * Filtros comunes de búsqueda / proveedor / fechas para OC y facturas.
+     *
+     * @param list<string> $where
+     * @param list<mixed> $params
+     * @param array{q?:string,supplier_id?:int,from?:string,to?:string} $filters
+     */
+    private function appendListSearchFilters(array &$where, array &$params, array $filters, string $dateColumn): void
+    {
+        $q = trim((string)($filters['q'] ?? ''));
+        if ($q !== '') {
+            $like = '%' . $q . '%';
+            $where[] = '(po.order_number LIKE ? OR po.invoice_number LIKE ? OR s.name LIKE ?
+                OR po.notes LIKE ? OR CAST(po.id AS CHAR) LIKE ?)';
+            array_push($params, $like, $like, $like, $like, $like);
+        }
+        $supplierId = (int)($filters['supplier_id'] ?? 0);
+        if ($supplierId > 0) {
+            $where[] = 'po.supplier_id = ?';
+            $params[] = $supplierId;
+        }
+        $from = trim((string)($filters['from'] ?? ''));
+        $to = trim((string)($filters['to'] ?? ''));
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $from)) {
+            $where[] = "COALESCE(po.{$dateColumn}, po.order_date) >= ?";
+            $params[] = $from;
+        }
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $to)) {
+            $where[] = "COALESCE(po.{$dateColumn}, po.order_date) <= ?";
+            $params[] = $to;
+        }
     }
 
     /**
@@ -544,13 +740,12 @@ class PurchasingService
         foreach ($items as $item) {
             $qty = (int)($item['quantity'] ?? 0);
             $cost = round((float)($item['unit_cost'] ?? 0), 2);
-            $rate = round(max(0, (float)($item['tax_rate'] ?? 0)), 2);
+            $productId = !empty($item['product_id']) ? (int)$item['product_id'] : null;
             if ($qty <= 0 || $cost < 0) {
                 continue;
             }
             $lineSub = round($qty * $cost, 2);
-            $lineTax = round($lineSub * ($rate / 100), 2);
-            $productId = !empty($item['product_id']) ? (int)$item['product_id'] : null;
+            [$rate, $lineTax] = $this->resolveItemTax($item, $lineSub, $productId, $productMeta);
             $name = trim((string)($item['product_name'] ?? ''));
             if ($name === '' && $productId) {
                 $name = (string)($productMeta[$productId]['name']
@@ -582,9 +777,19 @@ class PurchasingService
         }
 
         $earlyPct = (float)($order['early_payment_discount_pct'] ?? 0);
-        $gross = round($subtotal + $tax, 2);
-        $discountAmt = round($gross * ($earlyPct / 100), 2);
-        $total = round($gross - $discountAmt, 2);
+        $commercialPct = (float)($order['commercial_discount_pct'] ?? 0);
+        $commercialAmtIn = (float)($order['commercial_discount_amount'] ?? 0);
+        // Si ya hay monto comercial guardado sin %, úsalo como entrada fija.
+        $disc = self::resolvePurchaseDiscounts(
+            $subtotal,
+            $tax,
+            $earlyPct,
+            $commercialPct,
+            $commercialPct > 0.009 ? 0.0 : $commercialAmtIn
+        );
+        $discountAmt = $disc['early_amount'];
+        $commercialAmt = $disc['commercial_amount'];
+        $total = $disc['total'];
 
         $this->query("DELETE FROM purchase_order_items WHERE purchase_order_id = ?", [$orderId]);
         $stmt = $this->db->prepare(
@@ -611,12 +816,72 @@ class PurchasingService
             ]);
         }
 
-        $this->query(
-            "UPDATE purchase_orders SET subtotal = ?, tax = ?, total = ?,
-                early_payment_discount_amount = ?
-             WHERE id = ?",
-            [round($subtotal, 2), round($tax, 2), $total, $discountAmt, $orderId]
-        );
+        try {
+            $this->query(
+                "UPDATE purchase_orders SET subtotal = ?, tax = ?, total = ?,
+                    early_payment_discount_amount = ?,
+                    commercial_discount_amount = ?
+                 WHERE id = ?",
+                [round($subtotal, 2), round($tax, 2), $total, $discountAmt, $commercialAmt, $orderId]
+            );
+        } catch (\Throwable $e) {
+            $this->query(
+                "UPDATE purchase_orders SET subtotal = ?, tax = ?, total = ?,
+                    early_payment_discount_amount = ?
+                 WHERE id = ?",
+                [round($subtotal, 2), round($tax, 2), $total, $discountAmt, $orderId]
+            );
+        }
+    }
+
+    /**
+     * Actualiza cabecera e ítems de una OC pendiente (borrador u ordenada).
+     *
+     * @param list<array{product_id?:int,product_name?:string,quantity:int,unit_cost:float,tax_rate?:float}> $items
+     */
+    public function updatePendingOrder(
+        int $orderId,
+        ?int $supplierId,
+        string $orderDate,
+        ?string $expectedDate,
+        string $notes,
+        array $items,
+        string $status = 'ordered'
+    ): void {
+        $order = $this->getOrder($orderId);
+        if (!$order) {
+            throw new \RuntimeException('Orden de compra no encontrada');
+        }
+        if (!in_array($order['status'], ['draft', 'ordered'], true)) {
+            throw new \RuntimeException('Solo se editan OC pendientes de recibir');
+        }
+        if (!in_array($status, ['draft', 'ordered'], true)) {
+            $status = (string)$order['status'];
+        }
+        if (empty($items)) {
+            throw new \InvalidArgumentException('Agregue al menos un producto a la orden');
+        }
+        $this->db->beginTransaction();
+        try {
+            $this->replaceOrderItems($orderId, $items);
+            $this->query(
+                "UPDATE purchase_orders SET supplier_id = ?, order_date = ?, expected_date = ?, notes = ?, status = ? WHERE id = ?",
+                [
+                    $supplierId ?: null,
+                    $orderDate !== '' ? $orderDate : date('Y-m-d'),
+                    $expectedDate !== '' ? $expectedDate : null,
+                    $notes !== '' ? $notes : null,
+                    $status,
+                    $orderId,
+                ]
+            );
+            $this->db->commit();
+        } catch (\Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
     }
 
     /**
@@ -624,9 +889,9 @@ class PurchasingService
      *
      * @return list<array<string,mixed>>
      */
-    public function listInvoices(int $limit = 50, int $offset = 0, string $paymentFilter = '', string $dueFilter = ''): array
+    public function listInvoices(int $limit = 50, int $offset = 0, string $paymentFilter = '', string $dueFilter = '', array $filters = []): array
     {
-        [$whereSql, $params] = $this->invoiceFilters($paymentFilter, $dueFilter);
+        [$whereSql, $params] = $this->invoiceFilters($paymentFilter, $dueFilter, $filters);
         $limit = max(1, min(200, $limit));
         $offset = max(0, $offset);
         return $this->query(
@@ -641,43 +906,66 @@ class PurchasingService
         )->fetchAll();
     }
 
-    public function countInvoices(string $paymentFilter = '', string $dueFilter = ''): int
+    public function countInvoices(string $paymentFilter = '', string $dueFilter = '', array $filters = []): int
     {
-        [$whereSql, $params] = $this->invoiceFilters($paymentFilter, $dueFilter);
+        [$whereSql, $params] = $this->invoiceFilters($paymentFilter, $dueFilter, $filters);
         return (int)$this->query(
-            "SELECT COUNT(*) FROM purchase_orders po {$whereSql}",
+            "SELECT COUNT(*) FROM purchase_orders po
+             LEFT JOIN suppliers s ON s.id = po.supplier_id
+             {$whereSql}",
             $params
         )->fetchColumn();
     }
 
     /**
+     * @param array{q?:string,supplier_id?:int,from?:string,to?:string} $filters
      * @return array{0:string,1:list<mixed>}
      */
-    private function invoiceFilters(string $paymentFilter, string $dueFilter): array
+    private function invoiceFilters(string $paymentFilter, string $dueFilter, array $filters = []): array
     {
-        $where = ["po.status = 'received'"];
-        $params = [];
         $paymentFilter = strtolower(trim($paymentFilter));
-        if ($paymentFilter === 'pending' || $paymentFilter === 'partial' || $paymentFilter === 'paid') {
-            $where[] = 'po.payment_status = ?';
-            $params[] = $paymentFilter;
-        } elseif ($paymentFilter === 'unpaid') {
-            $where[] = "COALESCE(po.payment_mode, 'payable') = 'payable'";
-            $where[] = $this->balancePendingSql();
-        } elseif ($paymentFilter === 'paid_only') {
-            $where[] = 'po.total - COALESCE(po.paid_total, 0) - COALESCE(po.credit_total, 0) <= 0.009';
+        $params = [];
+
+        // Facturas activas + anuladas post-recepción (trazabilidad). Cancelaciones de OC
+        // abiertas (nunca recibidas) siguen fuera de este panel.
+        if ($paymentFilter === 'voided') {
+            $where = [
+                "po.status = 'cancelled'",
+                $this->postReceiveVoidSql('po'),
+            ];
+        } else {
+            $where = [
+                "(po.status = 'received' OR (po.status = 'cancelled' AND " . $this->postReceiveVoidSql('po') . '))',
+            ];
+            if ($paymentFilter === 'pending' || $paymentFilter === 'partial' || $paymentFilter === 'paid') {
+                $where[] = "po.status = 'received'";
+                $where[] = 'po.payment_status = ?';
+                $params[] = $paymentFilter;
+            } elseif ($paymentFilter === 'unpaid') {
+                $where[] = "po.status = 'received'";
+                $where[] = "COALESCE(po.payment_mode, 'payable') = 'payable'";
+                $where[] = $this->balancePendingSql();
+            } elseif ($paymentFilter === 'paid_only') {
+                $where[] = "po.status = 'received'";
+                $where[] = 'po.total - COALESCE(po.paid_total, 0) - COALESCE(po.credit_total, 0) <= 0.009';
+            } elseif ($paymentFilter === 'active') {
+                $where = ["po.status = 'received'"];
+            }
         }
 
         $dueFilter = strtolower(trim($dueFilter));
         if ($dueFilter === 'overdue') {
+            $where[] = "po.status = 'received'";
             $where[] = 'po.due_date IS NOT NULL AND po.due_date < CURDATE()';
             $where[] = "COALESCE(po.payment_mode, 'payable') = 'payable'";
             $where[] = $this->balancePendingSql();
         } elseif ($dueFilter === 'due_today') {
+            $where[] = "po.status = 'received'";
             $where[] = 'po.due_date = CURDATE()';
             $where[] = "COALESCE(po.payment_mode, 'payable') = 'payable'";
             $where[] = $this->balancePendingSql();
         } elseif ($dueFilter === 'due_soon') {
+            $where[] = "po.status = 'received'";
             $where[] = 'po.due_date IS NOT NULL AND po.due_date >= CURDATE() AND po.due_date <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)';
             $where[] = "COALESCE(po.payment_mode, 'payable') = 'payable'";
             $where[] = $this->balancePendingSql();
@@ -685,7 +973,19 @@ class PurchasingService
             $where[] = 'po.due_date IS NULL';
         }
 
+        $this->appendListSearchFilters($where, $params, $filters, 'invoice_date');
         return ['WHERE ' . implode(' AND ', $where), $params];
+    }
+
+    /** Condición SQL: OC cancelada después de haber sido factura/recibida. */
+    private function postReceiveVoidSql(string $alias = 'po'): string
+    {
+        return "(
+            {$alias}.voided_at IS NOT NULL
+            OR COALESCE({$alias}.notes,'') LIKE '%ANULADA POST-RECEPCIÓN%'
+            OR COALESCE({$alias}.notes,'') LIKE '%[[NC_FULL%'
+            OR COALESCE({$alias}.credit_total,0) > 0.009
+        )";
     }
 
     /**
@@ -695,7 +995,12 @@ class PurchasingService
      * Actualiza metadatos de factura/pago sobre una OC aún no recibida
      * (vencimiento, fecha factura, descuento pronto pago).
      *
-     * @param array{due_date?:?string,invoice_date?:?string,invoice_number?:?string,early_payment_discount_pct?:float|string|null} $meta
+     * @param array{
+     *   due_date?:?string,invoice_date?:?string,invoice_number?:?string,
+     *   early_payment_discount_pct?:float|string|null,
+     *   commercial_discount_pct?:float|string|null,
+     *   commercial_discount_amount?:float|string|null
+     * } $meta
      */
     public function applyInvoiceMeta(int $orderId, array $meta): void
     {
@@ -723,23 +1028,66 @@ class PurchasingService
             ? max(0, min(100, round((float)$meta['early_payment_discount_pct'], 2)))
             : (float)($order['early_payment_discount_pct'] ?? 0);
 
+        $commercialPct = array_key_exists('commercial_discount_pct', $meta)
+            && $meta['commercial_discount_pct'] !== ''
+            && $meta['commercial_discount_pct'] !== null
+            ? max(0, min(100, round((float)$meta['commercial_discount_pct'], 2)))
+            : (float)($order['commercial_discount_pct'] ?? 0);
+
+        // Monto $: si no viene en meta, conservar el de la OC cuando no hay % (monto fijo).
+        if (array_key_exists('commercial_discount_amount', $meta)
+            && $meta['commercial_discount_amount'] !== ''
+            && $meta['commercial_discount_amount'] !== null
+        ) {
+            $commercialAmtIn = max(0, round((float)$meta['commercial_discount_amount'], 2));
+        } elseif ($commercialPct > 0.009) {
+            $commercialAmtIn = 0.0;
+        } else {
+            $commercialAmtIn = max(0, round((float)($order['commercial_discount_amount'] ?? 0), 2));
+        }
+
         $subtotal = (float)($order['subtotal'] ?? 0);
         $tax = (float)($order['tax'] ?? 0);
-        $gross = round($subtotal + $tax, 2);
-        $discountAmt = round($gross * ($earlyPct / 100), 2);
-        $total = round($gross - $discountAmt, 2);
-
-        $this->query(
-            "UPDATE purchase_orders SET
-                due_date = ?,
-                invoice_date = ?,
-                invoice_number = COALESCE(?, invoice_number),
-                early_payment_discount_pct = ?,
-                early_payment_discount_amount = ?,
-                total = ?
-             WHERE id = ?",
-            [$dueDate, $invoiceDate, $invoiceNumber, $earlyPct, $discountAmt, $total, $orderId]
+        $disc = self::resolvePurchaseDiscounts(
+            $subtotal,
+            $tax,
+            $earlyPct,
+            $commercialPct,
+            $commercialAmtIn
         );
+
+        try {
+            $this->query(
+                "UPDATE purchase_orders SET
+                    due_date = ?,
+                    invoice_date = ?,
+                    invoice_number = COALESCE(?, invoice_number),
+                    early_payment_discount_pct = ?,
+                    early_payment_discount_amount = ?,
+                    commercial_discount_pct = ?,
+                    commercial_discount_amount = ?,
+                    total = ?
+                 WHERE id = ?",
+                [
+                    $dueDate, $invoiceDate, $invoiceNumber,
+                    $earlyPct, $disc['early_amount'],
+                    $disc['commercial_pct'], $disc['commercial_amount'],
+                    $disc['total'], $orderId,
+                ]
+            );
+        } catch (\Throwable $e) {
+            $this->query(
+                "UPDATE purchase_orders SET
+                    due_date = ?,
+                    invoice_date = ?,
+                    invoice_number = COALESCE(?, invoice_number),
+                    early_payment_discount_pct = ?,
+                    early_payment_discount_amount = ?,
+                    total = ?
+                 WHERE id = ?",
+                [$dueDate, $invoiceDate, $invoiceNumber, $earlyPct, $disc['early_amount'], $disc['total'], $orderId]
+            );
+        }
     }
 
     public function receiveOrder(
@@ -767,6 +1115,15 @@ class PurchasingService
 
         $this->db->beginTransaction();
         try {
+            // Candado: evita doble recepción concurrente (stock duplicado).
+            $locked = $this->query(
+                "SELECT id, status FROM purchase_orders WHERE id = ? FOR UPDATE",
+                [$orderId]
+            )->fetch();
+            if (!$locked || !in_array((string)($locked['status'] ?? ''), ['draft', 'ordered'], true)) {
+                throw new \RuntimeException('Solo se pueden recibir órdenes en borrador u ordenadas');
+            }
+
             foreach ($order['items'] as $item) {
                 $productId = (int)($item['product_id'] ?? 0);
                 $qty = (int)$item['quantity'];
@@ -782,14 +1139,27 @@ class PurchasingService
                 }
 
                 $debtCover = null;
+                $invoiceUnitCost = round((float)($item['unit_cost'] ?? 0), 2);
+                $isBonus = $invoiceUnitCost <= 0.009;
+                // Factura: bonificación a $0. Inventario: conservar costo (no diluir WAC).
+                $unitCost = $isBonus
+                    ? $this->resolveBonusInventoryCost($order, $item, $productId)
+                    : $invoiceUnitCost;
+                $note = 'OC ' . $order['order_number'] . ($invoiceNumber !== '' ? (' / Factura ' . $invoiceNumber) : '');
+                if ($isBonus) {
+                    $note .= ' · Bonificación (factura $0';
+                    if ($unitCost > 0.009) {
+                        $note .= ' · inventario valorizado a ' . number_format($unitCost, 2, '.', '');
+                    }
+                }
                 $movementId = $stock->increase(
                     $productId,
                     $qty,
                     'purchase_order',
                     $orderId,
-                    'OC ' . $order['order_number'] . ($invoiceNumber !== '' ? (' / Factura ' . $invoiceNumber) : ''),
+                    $note,
                     'in',
-                    (float)$item['unit_cost'],
+                    $unitCost,
                     $order['supplier_id'] ? (int)$order['supplier_id'] : null,
                     $paymentMode,
                     true,
@@ -808,13 +1178,35 @@ class PurchasingService
                 if ($debtCover && (int)($debtCover['covered'] ?? 0) > 0) {
                     $debtAlerts[] = $stock->formatDebtCoverAlert($qty, $debtCover);
                 }
+                $loanRecvQty = $stock->openReceivedLoanQty($productId);
+                if ($loanRecvQty > 0) {
+                    $stockNow = (int)$this->query(
+                        "SELECT stock FROM products WHERE id = ? LIMIT 1",
+                        [$productId]
+                    )->fetchColumn();
+                    $pname = trim((string)($item['product_name'] ?? $item['name'] ?? ''));
+                    if ($pname === '') {
+                        $pname = (string)$this->query(
+                            "SELECT name FROM products WHERE id = ? LIMIT 1",
+                            [$productId]
+                        )->fetchColumn();
+                    }
+                    if ($pname === '') {
+                        $pname = '#' . $productId;
+                    }
+                    $debtAlerts[] = $pname . ': tiene ' . $loanRecvQty
+                        . ' ud(s) de préstamo recibido pendiente. Stock ahora ' . $stockNow
+                        . '. Al devolver ese préstamo el stock bajará a '
+                        . max(0, $stockNow - $loanRecvQty)
+                        . ' (préstamo + compra no se cancelan solos).';
+                }
                 $this->query(
                     "UPDATE purchase_order_items SET received_qty = quantity WHERE id = ?",
                     [(int)$item['id']]
                 );
             }
 
-            $this->query(
+            $upd = $this->query(
                 "UPDATE purchase_orders
                  SET status = 'received',
                      warehouse_date = ?,
@@ -823,7 +1215,7 @@ class PurchasingService
                      notes = CASE WHEN ? = '' THEN notes ELSE CONCAT(IFNULL(notes,''), IF(notes IS NULL OR notes='', '', ' | '), ?) END,
                      received_at = NOW(),
                      received_by = ?
-                 WHERE id = ?",
+                 WHERE id = ? AND status IN ('draft', 'ordered')",
                 [
                     $warehouseDate,
                     $invoiceNumber !== '' ? $invoiceNumber : null,
@@ -834,10 +1226,17 @@ class PurchasingService
                     $orderId,
                 ]
             );
+            if ($upd->rowCount() < 1) {
+                throw new \RuntimeException('La orden ya fue recibida por otro proceso');
+            }
 
-            $this->db->commit();
+            if ($this->db->inTransaction()) {
+                $this->db->commit();
+            }
         } catch (\Throwable $e) {
-            $this->db->rollBack();
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
             throw $e;
         }
 
@@ -855,11 +1254,268 @@ class PurchasingService
             error_log('Vínculo producto-proveedor OC ' . $orderId . ': ' . $e->getMessage());
         }
 
+        TenantAuditService::safeLog(
+            $this->db,
+            'receive',
+            'compras',
+            'Factura/OC recibida: ' . (string)($order['order_number'] ?? '')
+                . ($invoiceNumber !== '' ? (' / Factura ' . $invoiceNumber) : '')
+                . ' · ' . count($movementIds) . ' mov. stock'
+                . ' · total=' . number_format((float)($order['total'] ?? 0), 0, '.', ''),
+            'purchase_order',
+            $orderId,
+            [
+                'invoice_number' => $invoiceNumber,
+                'warehouse_date' => $warehouseDate,
+                'payment_mode' => $paymentMode,
+                'movement_ids' => $movementIds,
+            ]
+        );
+
         return [
             'order_id' => $orderId,
             'movement_ids' => $movementIds,
             'debt_alerts' => $debtAlerts,
         ];
+    }
+
+    /**
+     * Costo de inventario para una línea bonificada (factura $0).
+     * Prioridad: línea pagada del mismo producto en la OC → costo actual del catálogo → último costo proveedor.
+     *
+     * @param array<string,mixed> $order
+     * @param array<string,mixed> $item
+     */
+    private function resolveBonusInventoryCost(array $order, array $item, int $productId): float
+    {
+        $itemId = (int)($item['id'] ?? 0);
+        foreach ($order['items'] ?? [] as $other) {
+            if ((int)($other['product_id'] ?? 0) !== $productId) {
+                continue;
+            }
+            if ($itemId > 0 && (int)($other['id'] ?? 0) === $itemId) {
+                continue;
+            }
+            $sibling = round((float)($other['unit_cost'] ?? 0), 2);
+            if ($sibling > 0.009) {
+                return $sibling;
+            }
+        }
+
+        try {
+            $row = $this->query(
+                "SELECT purchase_price FROM products WHERE id = ? LIMIT 1",
+                [$productId]
+            )->fetch();
+            $catalog = round((float)($row['purchase_price'] ?? 0), 2);
+            if ($catalog > 0.009) {
+                return $catalog;
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        $supplierId = (int)($order['supplier_id'] ?? 0);
+        if ($supplierId > 0) {
+            try {
+                $last = $this->query(
+                    "SELECT last_cost FROM product_suppliers
+                     WHERE product_id = ? AND supplier_id = ? AND COALESCE(last_cost, 0) > 0
+                     LIMIT 1",
+                    [$productId, $supplierId]
+                )->fetchColumn();
+                $lastCost = round((float)$last, 2);
+                if ($lastCost > 0.009) {
+                    return $lastCost;
+                }
+            } catch (\Throwable $e) {
+                // ignore
+            }
+        }
+
+        return 0.0;
+    }
+
+    /**
+     * Resta del pedido abierto las cantidades ya facturadas en otra OC (recepción parcial).
+     *
+     * @param list<array{product_id?:int|null,quantity?:int|float,product_name?:string,barcode?:string}> $receivedLines
+     * @return array{remaining_qty:int,closed:bool,lines_updated:int}
+     */
+    public function deductOpenOrderQuantities(int $orderId, array $receivedLines, string $note = ''): array
+    {
+        $order = $this->getOrder($orderId);
+        if (!$order) {
+            throw new \RuntimeException('Orden de compra origen no encontrada');
+        }
+        if (!in_array($order['status'], ['draft', 'ordered'], true)) {
+            throw new \RuntimeException('La OC origen no está abierta para recepción parcial');
+        }
+
+        $deductByProduct = [];
+        $deductByBarcode = [];
+        $deductByName = [];
+        foreach ($receivedLines as $line) {
+            $qty = (int)round((float)($line['quantity'] ?? 0));
+            if ($qty <= 0) {
+                continue;
+            }
+            $pid = (int)($line['product_id'] ?? 0);
+            $barcode = trim((string)($line['barcode'] ?? ''));
+            $name = mb_strtolower(trim((string)($line['product_name'] ?? $line['description'] ?? '')));
+            if ($pid > 0) {
+                $deductByProduct[$pid] = ($deductByProduct[$pid] ?? 0) + $qty;
+            } elseif ($barcode !== '') {
+                $deductByBarcode[$barcode] = ($deductByBarcode[$barcode] ?? 0) + $qty;
+            } elseif ($name !== '') {
+                $deductByName[$name] = ($deductByName[$name] ?? 0) + $qty;
+            }
+        }
+
+        $linesUpdated = 0;
+        $remainingQty = 0;
+        $subtotal = 0.0;
+        $tax = 0.0;
+        $ownTx = !$this->db->inTransaction();
+        if ($ownTx) {
+            $this->db->beginTransaction();
+        }
+
+        try {
+            foreach ($order['items'] as $item) {
+                $itemId = (int)$item['id'];
+                $have = (int)$item['quantity'];
+                $pid = (int)($item['product_id'] ?? 0);
+                $barcode = trim((string)($item['barcode'] ?? ''));
+                $name = mb_strtolower(trim((string)($item['product_name'] ?? '')));
+                $take = 0;
+
+                if ($pid > 0 && ($deductByProduct[$pid] ?? 0) > 0) {
+                    $take = min($have, $deductByProduct[$pid]);
+                    $deductByProduct[$pid] -= $take;
+                } elseif ($barcode !== '' && ($deductByBarcode[$barcode] ?? 0) > 0) {
+                    $take = min($have, $deductByBarcode[$barcode]);
+                    $deductByBarcode[$barcode] -= $take;
+                } elseif ($name !== '' && ($deductByName[$name] ?? 0) > 0) {
+                    $take = min($have, $deductByName[$name]);
+                    $deductByName[$name] -= $take;
+                }
+
+                $newQty = $have - $take;
+                if ($take > 0) {
+                    $linesUpdated++;
+                }
+
+                if ($newQty <= 0) {
+                    $this->query("DELETE FROM purchase_order_items WHERE id = ?", [$itemId]);
+                    continue;
+                }
+
+                $cost = round((float)$item['unit_cost'], 2);
+                $rate = round((float)($item['tax_rate'] ?? 0), 2);
+                $lineSub = round($newQty * $cost, 2);
+                $lineTax = round($lineSub * ($rate / 100), 2);
+                $this->query(
+                    "UPDATE purchase_order_items
+                     SET quantity = ?, subtotal = ?, tax_amount = ?, line_total = ?
+                     WHERE id = ?",
+                    [$newQty, $lineSub, $lineTax, round($lineSub + $lineTax, 2), $itemId]
+                );
+                $remainingQty += $newQty;
+                $subtotal += $lineSub;
+                $tax += $lineTax;
+            }
+
+            $closed = false;
+            if ($remainingQty <= 0) {
+                $this->cancelOrder(
+                    $orderId,
+                    $note !== '' ? $note : 'Cerrada: cantidades cubiertas por factura parcial'
+                );
+                $closed = true;
+            } else {
+                $earlyPct = (float)($order['early_payment_discount_pct'] ?? 0);
+                $commercialPct = (float)($order['commercial_discount_pct'] ?? 0);
+                $commercialAmtIn = (float)($order['commercial_discount_amount'] ?? 0);
+                $disc = self::resolvePurchaseDiscounts(
+                    $subtotal,
+                    $tax,
+                    $earlyPct,
+                    $commercialPct,
+                    $commercialPct > 0.009 ? 0.0 : $commercialAmtIn
+                );
+                try {
+                    $this->query(
+                        "UPDATE purchase_orders SET subtotal = ?, tax = ?, total = ?,
+                            early_payment_discount_amount = ?,
+                            commercial_discount_amount = ?,
+                            notes = CONCAT(COALESCE(notes,''),
+                                CASE WHEN COALESCE(notes,'') = '' THEN '' ELSE ' | ' END, ?)
+                         WHERE id = ?",
+                        [
+                            round($subtotal, 2),
+                            round($tax, 2),
+                            $disc['total'],
+                            $disc['early_amount'],
+                            $disc['commercial_amount'],
+                            $note !== '' ? $note : 'Recepción parcial aplicada',
+                            $orderId,
+                        ]
+                    );
+                } catch (\Throwable $e) {
+                    $this->query(
+                        "UPDATE purchase_orders SET subtotal = ?, tax = ?, total = ?,
+                            early_payment_discount_amount = ?,
+                            notes = CONCAT(COALESCE(notes,''),
+                                CASE WHEN COALESCE(notes,'') = '' THEN '' ELSE ' | ' END, ?)
+                         WHERE id = ?",
+                        [
+                            round($subtotal, 2),
+                            round($tax, 2),
+                            $disc['total'],
+                            $disc['early_amount'],
+                            $note !== '' ? $note : 'Recepción parcial aplicada',
+                            $orderId,
+                        ]
+                    );
+                }
+            }
+
+            // Cantidades de la factura que no alcanzaron a cruzarse contra la OC origen.
+            $excess = [];
+            foreach ($deductByProduct as $pid => $left) {
+                if ($left > 0) {
+                    $excess[] = ['product_id' => (int)$pid, 'qty' => (int)$left];
+                }
+            }
+            foreach ($deductByBarcode as $bc => $left) {
+                if ($left > 0) {
+                    $excess[] = ['barcode' => (string)$bc, 'qty' => (int)$left];
+                }
+            }
+            foreach ($deductByName as $nm => $left) {
+                if ($left > 0) {
+                    $excess[] = ['name' => (string)$nm, 'qty' => (int)$left];
+                }
+            }
+
+            if ($ownTx) {
+                $this->db->commit();
+            }
+
+            return [
+                'remaining_qty' => $remainingQty,
+                'closed' => $closed,
+                'lines_updated' => $linesUpdated,
+                'order_number' => (string)($order['order_number'] ?? ''),
+                'excess' => $excess,
+            ];
+        } catch (\Throwable $e) {
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
     }
 
     public function cancelOrder(int $orderId, string $reason = ''): void
@@ -929,20 +1585,36 @@ class PurchasingService
      */
     public function syncCashForSupplierPayment(int $paymentId): string
     {
-        $payment = $this->query(
-            "SELECT sp.id, sp.amount, sp.payment_method, sp.status,
-                    po.order_number, s.name supplier_name
-             FROM supplier_payments sp
-             LEFT JOIN purchase_orders po ON po.id = sp.purchase_order_id
-             LEFT JOIN suppliers s ON s.id = sp.supplier_id
-             WHERE sp.id = ?",
-            [$paymentId]
-        )->fetch();
+        try {
+            $payment = $this->query(
+                "SELECT sp.id, sp.amount, sp.payment_method, sp.status,
+                        sp.cash_from_drawer, po.order_number, s.name supplier_name
+                 FROM supplier_payments sp
+                 LEFT JOIN purchase_orders po ON po.id = sp.purchase_order_id
+                 LEFT JOIN suppliers s ON s.id = sp.supplier_id
+                 WHERE sp.id = ?",
+                [$paymentId]
+            )->fetch();
+        } catch (\Throwable $e) {
+            $payment = $this->query(
+                "SELECT sp.id, sp.amount, sp.payment_method, sp.status,
+                        po.order_number, s.name supplier_name
+                 FROM supplier_payments sp
+                 LEFT JOIN purchase_orders po ON po.id = sp.purchase_order_id
+                 LEFT JOIN suppliers s ON s.id = sp.supplier_id
+                 WHERE sp.id = ?",
+                [$paymentId]
+            )->fetch();
+        }
         if (!$payment || ($payment['status'] ?? 'applied') === 'cancelled') {
             return '';
         }
         if (!PaymentMethodCatalog::affectsCash((string)($payment['payment_method'] ?? ''))) {
             return '';
+        }
+        // Efectivo fuera del cajón: no descuenta la caja abierta.
+        if (array_key_exists('cash_from_drawer', $payment) && (int)$payment['cash_from_drawer'] === 0) {
+            return 'Efectivo fuera del cajón: no se descontó de la caja abierta.';
         }
         $amount = round((float)$payment['amount'], 2);
         $label = 'Abono proveedor'
@@ -958,7 +1630,7 @@ class PurchasingService
     public function syncCashForCreditNote(int $creditNoteId): string
     {
         $note = $this->query(
-            "SELECT cn.id, cn.total, cn.credit_number, cn.status,
+            "SELECT cn.id, cn.total, cn.credit_number, cn.status, cn.purchase_order_id,
                     po.payment_mode, po.order_number
              FROM purchase_credit_notes cn
              JOIN purchase_orders po ON po.id = cn.purchase_order_id
@@ -971,13 +1643,95 @@ class PurchasingService
         if ((string)($note['payment_mode'] ?? '') !== 'cash') {
             return '';
         }
+        $orderId = (int)($note['purchase_order_id'] ?? 0);
+        // Solo reingresa a cajón si la compra efectivamente egresó del cajón.
+        if ($orderId > 0 && !$this->hasCashMovementRef('purchase_order', $orderId)) {
+            return 'Aviso: la compra en efectivo no tuvo egreso de cajón; la NC no ingresó efectivo a caja.';
+        }
         $total = round((float)$note['total'], 2);
         if ($total <= 0.009) {
             return '';
         }
-        $label = 'Nota crédito compra ' . ($note['credit_number'] ?? ('#' . $creditNoteId))
+        $label = 'Reverso anulación compra ' . ($note['credit_number'] ?? ('#' . $creditNoteId))
             . (!empty($note['order_number']) ? ' / OC ' . $note['order_number'] : '');
         return $this->postCashMovement($total, $label, 'income', 'purchase_credit_note', $creditNoteId);
+    }
+
+    /**
+     * Devuelve a caja el egreso de un abono a proveedor (tras cancelarlo en anulación).
+     */
+    public function syncCashReverseForSupplierPayment(int $paymentId): string
+    {
+        $payment = $this->query(
+            "SELECT sp.id, sp.amount, sp.payment_method, sp.status,
+                    po.order_number, s.name supplier_name
+             FROM supplier_payments sp
+             LEFT JOIN purchase_orders po ON po.id = sp.purchase_order_id
+             LEFT JOIN suppliers s ON s.id = sp.supplier_id
+             WHERE sp.id = ?",
+            [$paymentId]
+        )->fetch();
+        if (!$payment || ($payment['status'] ?? '') !== 'cancelled') {
+            return '';
+        }
+        if (!PaymentMethodCatalog::affectsCash((string)($payment['payment_method'] ?? ''))) {
+            return '';
+        }
+        if (!$this->hasCashMovementRef('supplier_payment', $paymentId)) {
+            return '';
+        }
+        if ($this->hasCashMovementRef('supplier_payment_cancel', $paymentId)) {
+            return '';
+        }
+        $amount = round((float)$payment['amount'], 2);
+        if ($amount <= 0.009) {
+            return '';
+        }
+        $label = 'Reverso abono proveedor'
+            . (!empty($payment['order_number']) ? ' OC ' . $payment['order_number'] : '')
+            . (!empty($payment['supplier_name']) ? ' · ' . $payment['supplier_name'] : '');
+        return $this->postCashMovement($amount, $label, 'income', 'supplier_payment_cancel', $paymentId);
+    }
+
+    /**
+     * Cancela abonos applied de una OC (para anulación). Contabilidad/caja las revierte el controller.
+     *
+     * @return list<array{id:int,amount:float,payment_method:string}>
+     */
+    private function cancelAppliedPaymentsForVoid(int $orderId, string $reason): array
+    {
+        $rows = [];
+        try {
+            $rows = $this->query(
+                "SELECT id, amount, payment_method FROM supplier_payments
+                 WHERE purchase_order_id = ? AND status = 'applied'
+                 ORDER BY id",
+                [$orderId]
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            return [];
+        }
+        $out = [];
+        $note = 'ANULACIÓN OC: ' . ($reason !== '' ? $reason : date('Y-m-d H:i'));
+        foreach ($rows as $row) {
+            $id = (int)($row['id'] ?? 0);
+            if ($id <= 0) {
+                continue;
+            }
+            $this->query(
+                "UPDATE supplier_payments
+                 SET status = 'cancelled',
+                     notes = CONCAT(IFNULL(notes,''), IF(notes IS NULL OR notes='', '', ' | '), ?)
+                 WHERE id = ? AND status = 'applied'",
+                [$note, $id]
+            );
+            $out[] = [
+                'id' => $id,
+                'amount' => round((float)($row['amount'] ?? 0), 2),
+                'payment_method' => (string)($row['payment_method'] ?? ''),
+            ];
+        }
+        return $out;
     }
 
     /**
@@ -1002,7 +1756,10 @@ class PurchasingService
             return 'Aviso: no hay caja abierta; el movimiento de efectivo no se registró en el cajón (sí en contabilidad).';
         }
         try {
-            $cash->registerMovement($amount, $description, $type, $referenceType, $referenceId);
+            $ok = $cash->registerMovement($amount, $description, $type, $referenceType, $referenceId);
+            if ($ok === false) {
+                return 'Aviso: no se pudo registrar el movimiento en caja física.';
+            }
             return $type === 'expense'
                 ? 'Egreso de caja registrado.'
                 : 'Ingreso a caja registrado.';
@@ -1031,6 +1788,7 @@ class PurchasingService
      * Solo aplica a órdenes recibidas que quedaron como cuenta por pagar.
      *
      * @param array{path?:string,mime?:string,original?:string}|null $receipt Adjunto del comprobante
+     * @param array{cash_from_drawer?:bool,cash_source_note?:string} $options
      * @return array{payment_id:int,paid_total:float,balance:float,payment_status:string}
      */
     public function registerPayment(
@@ -1040,7 +1798,8 @@ class PurchasingService
         string $paymentMethod = 'cash',
         string $reference = '',
         string $notes = '',
-        ?array $receipt = null
+        ?array $receipt = null,
+        array $options = []
     ): array {
         SupplyChainSchema::ensure($this->db);
 
@@ -1063,16 +1822,6 @@ class PurchasingService
             throw new \InvalidArgumentException('El abono debe ser mayor a cero');
         }
 
-        $balance = $this->orderBalance($orderId);
-        if ($balance <= 0.009) {
-            throw new \RuntimeException('Esta orden ya está pagada en su totalidad');
-        }
-        if ($amount - $balance > 0.009) {
-            throw new \InvalidArgumentException(
-                'El abono supera el saldo pendiente (' . number_format($balance, 2, ',', '.') . ')'
-            );
-        }
-
         $stock = new StockService($this->db);
         $paymentDate = $stock->normalizeDate($paymentDate);
 
@@ -1080,45 +1829,137 @@ class PurchasingService
         $receiptMime = isset($receipt['mime']) ? substr(trim((string)$receipt['mime']), 0, 80) : '';
         $receiptName = isset($receipt['original']) ? substr(trim((string)$receipt['original']), 0, 255) : '';
 
+        $isCash = PaymentMethodCatalog::affectsCash($paymentMethod !== '' ? $paymentMethod : 'cash');
+        $cashFromDrawer = $isCash
+            ? (array_key_exists('cash_from_drawer', $options) ? (bool)$options['cash_from_drawer'] : true)
+            : true;
+        $cashSourceNote = substr(trim((string)($options['cash_source_note'] ?? '')), 0, 255);
+        if ($isCash && !$cashFromDrawer && mb_strlen($cashSourceNote) < 5) {
+            throw new \InvalidArgumentException(
+                'Indique de dónde salió el efectivo (mín. 5 caracteres). No se descontará de la caja.'
+            );
+        }
+        if ($isCash && !$cashFromDrawer) {
+            $extra = 'Efectivo fuera del cajón: ' . $cashSourceNote;
+            $notes = trim($notes !== '' ? ($notes . ' · ' . $extra) : $extra);
+            $notes = substr($notes, 0, 255);
+        }
+
         $this->db->beginTransaction();
         try {
+            // Bloqueo + revalidación de saldo dentro de la TX (evita sobre-abono por doble clic).
             $this->query(
-                "INSERT INTO supplier_payments
-                    (supplier_id, purchase_order_id, payment_date, amount,
-                     payment_method, reference, notes,
-                     receipt_path, receipt_mime, receipt_original_name, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (int)$order['supplier_id'],
-                    $orderId,
-                    $paymentDate,
-                    $amount,
-                    $paymentMethod !== '' ? $paymentMethod : 'cash',
-                    $reference !== '' ? $reference : null,
-                    $notes !== '' ? $notes : null,
-                    $receiptPath !== '' ? $receiptPath : null,
-                    $receiptMime !== '' ? $receiptMime : null,
-                    $receiptName !== '' ? $receiptName : null,
-                    $_SESSION['tenant_user_id'] ?? null,
-                ]
-            );
+                "SELECT id FROM purchase_orders WHERE id = ? FOR UPDATE",
+                [$orderId]
+            )->fetch();
+            $balance = $this->orderBalance($orderId);
+            if ($balance <= 0.009) {
+                throw new \RuntimeException('Esta orden ya está pagada en su totalidad');
+            }
+            if ($amount - $balance > 0.009) {
+                throw new \InvalidArgumentException(
+                    'El abono supera el saldo pendiente (' . number_format($balance, 2, ',', '.') . ')'
+                );
+            }
+
+            try {
+                $this->query(
+                    "INSERT INTO supplier_payments
+                        (supplier_id, purchase_order_id, payment_date, amount,
+                         payment_method, cash_from_drawer, cash_source_note, reference, notes,
+                         receipt_path, receipt_mime, receipt_original_name, created_by)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (int)$order['supplier_id'],
+                        $orderId,
+                        $paymentDate,
+                        $amount,
+                        $paymentMethod !== '' ? $paymentMethod : 'cash',
+                        $cashFromDrawer ? 1 : 0,
+                        (!$cashFromDrawer && $cashSourceNote !== '') ? $cashSourceNote : null,
+                        $reference !== '' ? $reference : null,
+                        $notes !== '' ? $notes : null,
+                        $receiptPath !== '' ? $receiptPath : null,
+                        $receiptMime !== '' ? $receiptMime : null,
+                        $receiptName !== '' ? $receiptName : null,
+                        $_SESSION['tenant_user_id'] ?? null,
+                    ]
+                );
+            } catch (\Throwable $e) {
+                // Installs sin columnas nuevas: insert clásico.
+                if (!str_contains($e->getMessage(), 'cash_from_drawer')
+                    && !str_contains($e->getMessage(), 'cash_source_note')
+                ) {
+                    throw $e;
+                }
+                $this->query(
+                    "INSERT INTO supplier_payments
+                        (supplier_id, purchase_order_id, payment_date, amount,
+                         payment_method, reference, notes,
+                         receipt_path, receipt_mime, receipt_original_name, created_by)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (int)$order['supplier_id'],
+                        $orderId,
+                        $paymentDate,
+                        $amount,
+                        $paymentMethod !== '' ? $paymentMethod : 'cash',
+                        $reference !== '' ? $reference : null,
+                        $notes !== '' ? $notes : null,
+                        $receiptPath !== '' ? $receiptPath : null,
+                        $receiptMime !== '' ? $receiptMime : null,
+                        $receiptName !== '' ? $receiptName : null,
+                        $_SESSION['tenant_user_id'] ?? null,
+                    ]
+                );
+            }
             $paymentId = (int)$this->db->lastInsertId();
             $status = $this->refreshPaymentStatus($orderId);
-            $this->db->commit();
+            if ($this->db->inTransaction()) {
+                $this->db->commit();
+            }
         } catch (\Throwable $e) {
-            $this->db->rollBack();
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
             // Compatibilidad si la columna aún no migró: reintentar sin adjunto.
             if ($receiptPath !== '' && str_contains($e->getMessage(), 'receipt_path')) {
-                return $this->registerPayment($orderId, $amount, $paymentDate, $paymentMethod, $reference, $notes, null);
+                return $this->registerPayment(
+                    $orderId,
+                    $amount,
+                    $paymentDate,
+                    $paymentMethod,
+                    $reference,
+                    $notes,
+                    null,
+                    $options
+                );
             }
             throw $e;
         }
+
+        TenantAuditService::safeLog(
+            $this->db,
+            'payment',
+            'compras',
+            'Abono a proveedor OC #' . $orderId . ' · monto=' . number_format($amount, 0, '.', '')
+                . ' · ' . $paymentMethod,
+            'purchase_order',
+            $orderId,
+            [
+                'payment_id' => $paymentId,
+                'amount' => $amount,
+                'payment_method' => $paymentMethod,
+                'balance' => $status['balance'],
+            ]
+        );
 
         return [
             'payment_id' => $paymentId,
             'paid_total' => $status['paid_total'],
             'balance' => $status['balance'],
             'payment_status' => $status['payment_status'],
+            'cash_from_drawer' => $cashFromDrawer,
         ];
     }
 
@@ -1175,8 +2016,9 @@ class PurchasingService
         $credited = round((float)$row['credited'], 2);
 
         // Los modos distintos de 'payable' se pagaron de contado al recibir.
+        // Tras una NC, el "pagado" efectivo es el bruto menos lo acreditado (evita saldo negativo ficticio).
         if ((string)($row['payment_mode'] ?? 'payable') !== 'payable') {
-            $paid = $total;
+            $paid = max(0.0, round($total - $credited, 2));
         }
 
         $balance = round($total - $paid - $credited, 2);
@@ -1338,7 +2180,17 @@ class PurchasingService
             $unitCost = round((float)$item['unit_cost'], 2);
             $rate = round((float)$item['tax_rate'], 2);
             $lineSub = round($qty * $unitCost, 2);
-            $lineTax = round($lineSub * ($rate / 100), 2);
+            // Preferir tax_amount de la OC (IVA personalizado / prorrateo) sobre % recalculado.
+            $origQty = max(0, (int)($item['received_qty'] ?? $item['quantity'] ?? 0));
+            $origTax = round((float)($item['tax_amount'] ?? 0), 2);
+            if ($origTax > 0.009 && $origQty > 0) {
+                $lineTax = round($origTax * ($qty / $origQty), 2);
+                if ($lineSub > 0.009) {
+                    $rate = round(($lineTax / $lineSub) * 100, 4);
+                }
+            } else {
+                $lineTax = round($lineSub * ($rate / 100), 2);
+            }
             $normalized[] = [
                 'purchase_order_item_id' => $poiId,
                 'product_id' => !empty($item['product_id']) ? (int)$item['product_id'] : null,
@@ -1361,19 +2213,49 @@ class PurchasingService
         $subtotal = round($subtotal, 2);
         $tax = round($tax, 2);
         $gross = round($subtotal + $tax, 2);
-        // Misma base que la OC: si hubo descuento pronto pago / aliado, prorratearlo en la NC.
-        $discountPct = max(0, min(100, (float)($order['early_payment_discount_pct'] ?? 0)));
-        $discountAmt = round($gross * ($discountPct / 100), 2);
-        $total = round($gross - $discountAmt, 2);
+        // Prorratear descuentos de la OC (comercial + pronto pago) sobre el tramo acreditado.
+        $orderSub = round((float)($order['subtotal'] ?? 0), 2);
+        $orderTax = round((float)($order['tax'] ?? 0), 2);
+        $orderGross = round($orderSub + $orderTax, 2);
+        $share = $orderGross > 0.009 ? min(1.0, $gross / $orderGross) : 1.0;
+        $commercialPct = (float)($order['commercial_discount_pct'] ?? 0);
+        $commercialAmtIn = $commercialPct > 0.009
+            ? 0.0
+            : round((float)($order['commercial_discount_amount'] ?? 0) * $share, 2);
+        $disc = self::resolvePurchaseDiscounts(
+            $subtotal,
+            $tax,
+            (float)($order['early_payment_discount_pct'] ?? 0),
+            $commercialPct,
+            $commercialAmtIn
+        );
+        $total = $disc['total'];
+        $discountAmt = round($disc['commercial_amount'] + $disc['early_amount'], 2);
         if ($discountAmt > 0.009) {
             $reason = trim($reason);
-            $discNote = 'Desc. OC ' . rtrim(rtrim(number_format($discountPct, 2, '.', ''), '0'), '.') . '%';
+            $parts = [];
+            if ($disc['commercial_amount'] > 0.009) {
+                $parts[] = 'Desc. comercial';
+            }
+            if ($disc['early_amount'] > 0.009) {
+                $parts[] = 'Desc. pronto pago '
+                    . rtrim(rtrim(number_format($disc['early_pct'], 2, '.', ''), '0'), '.') . '%';
+            }
+            $discNote = implode(' + ', $parts);
             $reason = $reason !== '' ? ($reason . ' · ' . $discNote) : $discNote;
         }
         $creditNumber = $this->nextCreditNumber($creditDate);
 
         $this->db->beginTransaction();
         try {
+            $locked = $this->query(
+                "SELECT id, status FROM purchase_orders WHERE id = ? FOR UPDATE",
+                [$orderId]
+            )->fetch();
+            if (!$locked || (string)($locked['status'] ?? '') !== 'received') {
+                throw new \RuntimeException('Solo se emiten notas de crédito sobre órdenes ya recibidas');
+            }
+
             $this->query(
                 "INSERT INTO purchase_credit_notes
                     (credit_number, purchase_order_id, supplier_id, credit_date, reason,
@@ -1428,11 +2310,32 @@ class PurchasingService
             }
 
             $status = $this->refreshPaymentStatus($orderId);
-            $this->db->commit();
+            $this->markOrderIfFullyCredited($orderId, $affectsStock);
+            if ($this->db->inTransaction()) {
+                $this->db->commit();
+            }
         } catch (\Throwable $e) {
-            $this->db->rollBack();
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
             throw $e;
         }
+
+        TenantAuditService::safeLog(
+            $this->db,
+            'cancel',
+            'compras',
+            'Nota de crédito ' . $creditNumber . ' · OC ' . (string)($order['order_number'] ?? '')
+                . ' · total=' . number_format($total, 0, '.', '')
+                . ($affectsStock ? ' · con salida stock' : ' · sin stock'),
+            'purchase_credit_note',
+            $creditNoteId,
+            [
+                'purchase_order_id' => $orderId,
+                'affects_stock' => $affectsStock,
+                'total' => $total,
+            ]
+        );
 
         return [
             'credit_note_id' => $creditNoteId,
@@ -1440,7 +2343,301 @@ class PurchasingService
             'total' => $total,
             'balance' => $status['balance'],
             'payment_status' => $status['payment_status'],
+            'fully_credited' => $this->isOrderFullyCredited($orderId),
         ];
+    }
+
+    /**
+     * ¿La OC quedó sin cantidad acreditable (devolución completa de ítems)?
+     */
+    public function isOrderFullyCredited(int $orderId): bool
+    {
+        $order = $this->getOrder($orderId);
+        if (!$order || ($order['status'] ?? '') === 'cancelled') {
+            return ($order['status'] ?? '') === 'cancelled';
+        }
+        $creditTotal = round((float)($order['credit_total'] ?? 0), 2);
+        $orderTotal = round((float)($order['total'] ?? 0), 2);
+        if ($orderTotal > 0.009 && $creditTotal + 0.009 >= $orderTotal) {
+            return true;
+        }
+        foreach ($order['items'] as $item) {
+            $received = (int)($item['received_qty'] ?? $item['quantity'] ?? 0);
+            $already = (int)($item['credited_qty'] ?? 0);
+            if ($received - $already > 0) {
+                return false;
+            }
+        }
+        return !empty($order['items']);
+    }
+
+    /**
+     * Guarda observaciones internas de una factura/OC (columna review_notes).
+     *
+     * @return array{order_id:int,review_notes:string,changed:bool}
+     */
+    public function saveReviewNotes(int $orderId, string $notes): array
+    {
+        $order = $this->query(
+            "SELECT id, order_number, invoice_number, invoice_import_id, COALESCE(review_notes,'') AS review_notes
+             FROM purchase_orders WHERE id = ? LIMIT 1",
+            [$orderId]
+        )->fetch();
+        if (!$order) {
+            throw new \RuntimeException('Factura/OC no encontrada');
+        }
+
+        $notes = trim(str_replace(["\r\n", "\r"], "\n", $notes));
+        if (function_exists('mb_substr')) {
+            $notes = mb_substr($notes, 0, 2000);
+        } else {
+            $notes = substr($notes, 0, 2000);
+        }
+        $prev = trim((string)($order['review_notes'] ?? ''));
+        if ($prev === $notes) {
+            return [
+                'order_id' => $orderId,
+                'review_notes' => $notes,
+                'changed' => false,
+            ];
+        }
+
+        try {
+            $this->query(
+                "UPDATE purchase_orders SET review_notes = NULLIF(?, '') WHERE id = ?",
+                [$notes, $orderId]
+            );
+        } catch (\Throwable $e) {
+            throw new \RuntimeException(
+                'No se pudo guardar la observación. Ejecute la migración de columnas (review_notes).'
+            );
+        }
+
+        $importId = (int)($order['invoice_import_id'] ?? 0);
+        $label = $notes === ''
+            ? 'Observación eliminada'
+            : ($prev === '' ? 'Observación agregada' : 'Observación actualizada');
+        $detail = $notes !== '' ? $notes : ($prev !== '' ? ('Antes: ' . $prev) : '');
+        try {
+            (new PurchaseInvoiceImportService($this->db))->logLifecycleEvent(
+                $importId > 0 ? $importId : null,
+                $orderId,
+                'invoice_observation',
+                $label,
+                $detail,
+                [
+                    'source' => 'facturas_list',
+                    'order_number' => (string)($order['order_number'] ?? ''),
+                    'invoice_number' => (string)($order['invoice_number'] ?? ''),
+                ]
+            );
+        } catch (\Throwable $e) {
+            // Trazabilidad opcional
+        }
+
+        TenantAuditService::safeLog(
+            $this->db,
+            'note',
+            'compras',
+            $label . ': OC ' . (string)($order['order_number'] ?? '')
+                . ($notes !== '' ? (' — ' . mb_substr($notes, 0, 120)) : ''),
+            'purchase_order',
+            $orderId,
+            ['review_notes' => $notes]
+        );
+
+        return [
+            'order_id' => $orderId,
+            'review_notes' => $notes,
+            'changed' => true,
+        ];
+    }
+
+    /**
+     * Marca en notas si la factura quedó totalmente acreditada (devolución).
+     */
+    private function markOrderIfFullyCredited(int $orderId, bool $affectsStock): void
+    {
+        if (!$this->isOrderFullyCredited($orderId)) {
+            return;
+        }
+        $tag = $affectsStock ? '[[NC_FULL_RETURN]]' : '[[NC_FULL_ADJUST]]';
+        $this->query(
+            "UPDATE purchase_orders
+             SET notes = CASE
+                    WHEN COALESCE(notes,'') LIKE ? THEN notes
+                    ELSE CONCAT(IFNULL(notes,''), IF(notes IS NULL OR notes='', '', ' | '), ?)
+                 END
+             WHERE id = ?",
+            ['%' . $tag . '%', $tag . ' Devolución/NC total ' . date('Y-m-d H:i'), $orderId]
+        );
+    }
+
+    /**
+     * Anula una OC ya recibida por error: NC total con salida de stock,
+     * asiento inverso (vía postPurchaseCreditNote), caja si aplica, y status cancelled.
+     * Si había abonos, los cancela automáticamente (el controller revierte contabilidad/caja).
+     *
+     * @return array{
+     *   credit_note_id:int,credit_number:string,total:float,
+     *   order_id:int,order_number:string,reversed_payments:list<array>,already_credited?:bool
+     * }
+     */
+    public function voidReceivedOrder(int $orderId, string $reason = ''): array
+    {
+        SupplyChainSchema::ensure($this->db);
+        $order = $this->getOrder($orderId);
+        if (!$order) {
+            throw new \RuntimeException('Orden de compra no encontrada');
+        }
+        if (($order['status'] ?? '') === 'cancelled') {
+            throw new \RuntimeException('Esta OC ya está anulada/cancelada');
+        }
+        if (($order['status'] ?? '') !== 'received') {
+            throw new \RuntimeException('Solo se pueden anular facturas/OC ya recibidas. Use Cancelar si aún está abierta.');
+        }
+
+        $reason = trim($reason);
+        if ($reason === '') {
+            $reason = 'Error de recepción';
+        }
+        if (mb_strlen($reason) < 3) {
+            throw new \InvalidArgumentException('Indique un motivo de anulación (mín. 3 caracteres)');
+        }
+
+        // Validar cantidades ANTES de tocar abonos (evita estado a medias si falla la NC).
+        $lines = [];
+        foreach ($order['items'] as $item) {
+            $poiId = (int)($item['id'] ?? 0);
+            $received = (int)($item['received_qty'] ?? $item['quantity'] ?? 0);
+            $already = (int)($item['credited_qty'] ?? 0);
+            $available = $received - $already;
+            if ($poiId <= 0 || $available <= 0) {
+                continue;
+            }
+            $lines[] = [
+                'purchase_order_item_id' => $poiId,
+                'quantity' => $available,
+            ];
+        }
+        $alreadyFullyCredited = $lines === [] && $this->isOrderFullyCredited($orderId);
+        if ($lines === [] && !$alreadyFullyCredited) {
+            throw new \RuntimeException('No hay cantidades recibidas para anular en esta OC');
+        }
+
+        // Abonos: se cancelan aquí; el controller revierte asiento/caja de cada uno.
+        $reversedPayments = $this->cancelAppliedPaymentsForVoid($orderId, $reason);
+        if ($reversedPayments !== []) {
+            try {
+                $this->refreshPaymentStatus($orderId);
+            } catch (\Throwable $e) {
+                // continue
+            }
+        }
+
+        if ($alreadyFullyCredited) {
+            $this->finalizeVoidedOrder($orderId, $reason);
+            return [
+                'credit_note_id' => 0,
+                'credit_number' => '',
+                'total' => 0.0,
+                'order_id' => $orderId,
+                'order_number' => (string)($order['order_number'] ?? ''),
+                'already_credited' => true,
+                'reversed_payments' => $reversedPayments,
+            ];
+        }
+
+        $fullReason = 'ANULACIÓN OC: ' . $reason;
+        try {
+            $result = $this->createCreditNote($orderId, $lines, $fullReason, true, date('Y-m-d'), '');
+        } catch (\Throwable $e) {
+            // Restaurar abonos si la NC no se creó (evita CxP fantasma).
+            $this->restorePaymentsAfterFailedVoid($reversedPayments);
+            try {
+                $this->refreshPaymentStatus($orderId);
+            } catch (\Throwable $ignore) {
+            }
+            throw $e;
+        }
+        $this->finalizeVoidedOrder($orderId, $fullReason);
+
+        TenantAuditService::safeLog(
+            $this->db,
+            'cancel',
+            'compras',
+            'Anulación factura/OC ' . (string)($order['order_number'] ?? '') . ': ' . mb_substr($fullReason, 0, 160),
+            'purchase_order',
+            $orderId,
+            [
+                'credit_note_id' => (int)$result['credit_note_id'],
+                'reason' => $fullReason,
+            ],
+            'warning'
+        );
+
+        return [
+            'credit_note_id' => (int)$result['credit_note_id'],
+            'credit_number' => (string)$result['credit_number'],
+            'total' => (float)$result['total'],
+            'order_id' => $orderId,
+            'order_number' => (string)($order['order_number'] ?? ''),
+            'already_credited' => false,
+            'reversed_payments' => $reversedPayments,
+        ];
+    }
+
+    /** @param list<array{id:int,amount?:float,payment_method?:string}> $payments */
+    private function restorePaymentsAfterFailedVoid(array $payments): void
+    {
+        foreach ($payments as $p) {
+            $id = (int)($p['id'] ?? 0);
+            if ($id <= 0) {
+                continue;
+            }
+            try {
+                $this->query(
+                    "UPDATE supplier_payments SET status = 'applied' WHERE id = ? AND status = 'cancelled'",
+                    [$id]
+                );
+            } catch (\Throwable $e) {
+                // best-effort
+            }
+        }
+    }
+
+    private function finalizeVoidedOrder(int $orderId, string $reason): void
+    {
+        $note = 'ANULADA POST-RECEPCIÓN: ' . ($reason !== '' ? $reason : date('Y-m-d H:i'));
+        $voidReason = mb_substr($reason !== '' ? $reason : $note, 0, 255);
+        // Prefijo en notes + voided_at dedicado (trazabilidad aunque notes se trunque).
+        try {
+            $this->query(
+                "UPDATE purchase_orders
+                 SET status = 'cancelled',
+                     payment_status = 'paid',
+                     voided_at = COALESCE(voided_at, NOW()),
+                     void_reason = COALESCE(NULLIF(void_reason,''), ?),
+                     notes = CONCAT(?, IF(IFNULL(notes,'') = '', '', ' | '), IFNULL(notes,''))
+                 WHERE id = ? AND status IN ('received','cancelled')",
+                [$voidReason, $note, $orderId]
+            );
+        } catch (\Throwable $e) {
+            $this->query(
+                "UPDATE purchase_orders
+                 SET status = 'cancelled',
+                     payment_status = 'paid',
+                     notes = CONCAT(?, IF(IFNULL(notes,'') = '', '', ' | '), IFNULL(notes,''))
+                 WHERE id = ? AND status IN ('received','cancelled')",
+                [$note, $orderId]
+            );
+        }
+        // Si ya estaba cancelled, igual refrescar saldos.
+        try {
+            $this->refreshPaymentStatus($orderId);
+        } catch (\Throwable $e) {
+            // ignore
+        }
     }
 
     /**
@@ -1649,7 +2846,11 @@ class PurchasingService
         $limit = max(1, min(200, $limit));
         $params = [$from, $to];
         $where = "DATE(COALESCE(po.invoice_date, po.warehouse_date, po.order_date, po.created_at)) BETWEEN ? AND ?
-                  AND po.status <> 'cancelled'";
+                  AND (po.status = 'received' OR (po.status = 'cancelled' AND (
+                        COALESCE(po.notes,'') LIKE '%ANULADA POST-RECEPCIÓN%'
+                     OR COALESCE(po.notes,'') LIKE '%[[NC_FULL%'
+                     OR COALESCE(po.credit_total,0) > 0.009
+                  )))";
         $q = trim($q);
         if ($q !== '') {
             $where .= " AND (po.order_number LIKE ? OR po.invoice_number LIKE ? OR s.name LIKE ?)";
@@ -1681,7 +2882,7 @@ class PurchasingService
     }
 
     /**
-     * Timeline de hitos de una factura/OC (sin tabla nueva).
+     * Timeline de hitos de una factura/OC (reconstruido + bitácora interna).
      * @return array{order:?array,events:list<array<string,mixed>>}
      */
     public function invoiceTimeline(int $orderId): array
@@ -1731,28 +2932,170 @@ class PurchasingService
             );
         }
 
-        if (!empty($order['invoice_import_id'])) {
+        $importId = (int)($order['invoice_import_id'] ?? 0);
+        $loggedTypes = [];
+
+        // Bitácora explícita de movimientos internos (carga, edición, revisión…).
+        try {
+            $lifecycleSql = "SELECT e.event_type, e.label, e.detail, e.meta_json, e.created_at, u.name AS actor_name
+                 FROM purchase_invoice_lifecycle_events e
+                 LEFT JOIN users u ON u.id = e.actor_user_id
+                 WHERE e.purchase_order_id = ?";
+            $lifecycleParams = [$orderId];
+            if ($importId > 0) {
+                $lifecycleSql .= " OR e.import_id = ?";
+                $lifecycleParams[] = $importId;
+            }
+            $lifecycleSql .= " ORDER BY e.created_at ASC, e.id ASC";
+            $lifecycleRows = $this->query($lifecycleSql, $lifecycleParams)->fetchAll();
+            foreach ($lifecycleRows as $row) {
+                $type = (string)($row['event_type'] ?? 'lifecycle');
+                $loggedTypes[$type] = true;
+                $detail = trim((string)($row['detail'] ?? ''));
+                $actor = trim((string)($row['actor_name'] ?? ''));
+                if ($actor !== '') {
+                    $detail = $detail !== '' ? ($detail . ' · ' . $actor) : ('Por ' . $actor);
+                }
+                $meta = [];
+                if (!empty($row['meta_json'])) {
+                    $decoded = json_decode((string)$row['meta_json'], true);
+                    if (is_array($decoded)) {
+                        $meta = $decoded;
+                    }
+                }
+                $push(
+                    $events,
+                    (string)($row['created_at'] ?? ''),
+                    $type,
+                    (string)($row['label'] ?? 'Movimiento interno'),
+                    $detail,
+                    null,
+                    $meta
+                );
+            }
+        } catch (\Throwable $e) {
+            // Tabla aún no migrada
+        }
+
+        if ($importId > 0) {
             try {
                 $imp = $this->query(
-                    "SELECT id, invoice_number, status, created_at, confirmed_at
+                    "SELECT id, invoice_number, status, source, original_name, file_path,
+                            created_at, updated_at, confirmed_at, discarded_at, parse_notes,
+                            created_by, discarded_by
                      FROM purchase_invoice_imports WHERE id = ?",
-                    [(int)$order['invoice_import_id']]
+                    [$importId]
                 )->fetch();
                 if ($imp) {
-                    $push(
-                        $events,
-                        (string)($imp['created_at'] ?? $createdAt),
-                        'invoice_import',
-                        'Factura importada / OCR',
-                        trim(($imp['invoice_number'] ?? '') . ' · estado ' . ($imp['status'] ?? '')),
-                        null,
-                        ['import_id' => (int)$imp['id']]
-                    );
-                    if (!empty($imp['confirmed_at'])) {
-                        $push($events, (string)$imp['confirmed_at'], 'invoice_confirm', 'Importación confirmada', 'Se generó la OC desde el borrador');
+                    $srcLabel = PurchaseInvoiceImportService::sourceLabel((string)($imp['source'] ?? ''));
+                    $fileName = trim((string)($imp['original_name'] ?? ''));
+                    $invNo = trim((string)($imp['invoice_number'] ?? ''));
+                    $createdImp = (string)($imp['created_at'] ?? $createdAt);
+
+                    if (empty($loggedTypes['invoice_uploaded']) && empty($loggedTypes['invoice_import'])) {
+                        $push(
+                            $events,
+                            $createdImp,
+                            'invoice_uploaded',
+                            'Factura cargada al sistema',
+                            trim(
+                                $srcLabel
+                                . ($fileName !== '' ? ' · ' . $fileName : '')
+                                . ($invNo !== '' ? ' · Nº ' . $invNo : '')
+                            ),
+                            null,
+                            ['import_id' => (int)$imp['id'], 'source' => $imp['source'] ?? null]
+                        );
+                    }
+
+                    if (empty($loggedTypes['invoice_pending'])) {
+                        $push(
+                            $events,
+                            $createdImp,
+                            'invoice_pending',
+                            'Pendiente de revisión',
+                            'Borrador en cola hasta confirmar o descartar'
+                        );
+                    }
+
+                    $updatedAt = (string)($imp['updated_at'] ?? '');
+                    $confirmedAt = (string)($imp['confirmed_at'] ?? '');
+                    $discardedAt = (string)($imp['discarded_at'] ?? '');
+                    if (
+                        empty($loggedTypes['invoice_edited'])
+                        && $updatedAt !== ''
+                        && $updatedAt !== $createdImp
+                        && strtotime($updatedAt) > (strtotime($createdImp) + 45)
+                    ) {
+                        // Solo si hubo edición real antes de confirmar/descartar (o sin esos timestamps).
+                        $editCutoff = null;
+                        if ($confirmedAt !== '') {
+                            $editCutoff = strtotime($confirmedAt);
+                        } elseif ($discardedAt !== '') {
+                            $editCutoff = strtotime($discardedAt);
+                        }
+                        $updatedTs = strtotime($updatedAt);
+                        if ($editCutoff === null || ($updatedTs !== false && $updatedTs < $editCutoff - 5)) {
+                            $push(
+                                $events,
+                                $updatedAt,
+                                'invoice_edited',
+                                'Borrador editado en revisión',
+                                'Se detectó modificación del borrador antes de cerrar el ciclo'
+                            );
+                        }
+                    }
+
+                    if (empty($loggedTypes['invoice_confirm']) && $confirmedAt !== '') {
+                        $push(
+                            $events,
+                            $confirmedAt,
+                            'invoice_confirm',
+                            'Importación confirmada',
+                            'Se generó la OC desde el borrador'
+                        );
+                    }
+
+                    if (empty($loggedTypes['invoice_discarded']) && $discardedAt !== '') {
+                        $push(
+                            $events,
+                            $discardedAt,
+                            'invoice_discarded',
+                            'Borrador descartado',
+                            trim((string)($imp['parse_notes'] ?? ''))
+                        );
                     }
                 }
             } catch (\Throwable $e) {
+                // Esquema parcial: fallback mínimo
+                try {
+                    $imp = $this->query(
+                        "SELECT id, invoice_number, status, created_at, confirmed_at
+                         FROM purchase_invoice_imports WHERE id = ?",
+                        [$importId]
+                    )->fetch();
+                    if ($imp && empty($loggedTypes['invoice_uploaded']) && empty($loggedTypes['invoice_import'])) {
+                        $push(
+                            $events,
+                            (string)($imp['created_at'] ?? $createdAt),
+                            'invoice_uploaded',
+                            'Factura cargada al sistema',
+                            trim(($imp['invoice_number'] ?? '') . ' · estado ' . ($imp['status'] ?? '')),
+                            null,
+                            ['import_id' => (int)$imp['id']]
+                        );
+                    }
+                    if ($imp && empty($loggedTypes['invoice_confirm']) && !empty($imp['confirmed_at'])) {
+                        $push(
+                            $events,
+                            (string)$imp['confirmed_at'],
+                            'invoice_confirm',
+                            'Importación confirmada',
+                            'Se generó la OC desde el borrador'
+                        );
+                    }
+                } catch (\Throwable $e2) {
+                }
             }
         }
 
@@ -1766,13 +3109,55 @@ class PurchasingService
             );
         }
 
-        if (!empty($order['invoice_number']) || !empty($order['invoice_date']) || !empty($order['invoice_path'])) {
+        // Tres fechas del ciclo (documento / CxP / bodega) — siempre visibles en timeline.
+        $invDateOnly = substr(trim((string)($order['invoice_date'] ?? '')), 0, 10);
+        $dueDateOnly = substr(trim((string)($order['due_date'] ?? '')), 0, 10);
+        $whDateOnly = substr(trim((string)($order['warehouse_date'] ?? '')), 0, 10);
+        $invNo = trim((string)($order['invoice_number'] ?? ''));
+
+        if ($invDateOnly !== '' && $invDateOnly !== '0000-00-00') {
             $push(
                 $events,
-                (string)($order['invoice_date'] ?? $order['received_at'] ?? $order['warehouse_date'] ?? $createdAt),
+                $invDateOnly,
+                'date_invoice',
+                'Fecha de factura',
+                trim(
+                    'Fecha impresa en el documento del proveedor'
+                    . ($invNo !== '' ? ' · Nº ' . $invNo : '')
+                )
+            );
+        }
+        if ($dueDateOnly !== '' && $dueDateOnly !== '0000-00-00') {
+            $push(
+                $events,
+                $dueDateOnly,
+                'date_due',
+                'Vencimiento de pago',
+                'Fecha límite de pago / cuentas por pagar'
+            );
+        }
+        if ($whDateOnly !== '' && $whDateOnly !== '0000-00-00') {
+            $push(
+                $events,
+                $whDateOnly,
+                'date_warehouse',
+                'Recepción de bodega',
+                'Fecha de ingreso a inventario y del asiento contable'
+            );
+        }
+
+        if (!empty($order['invoice_number']) || !empty($order['invoice_path'])) {
+            $push(
+                $events,
+                (string)($order['received_at'] ?? $order['confirmed_at'] ?? $order['warehouse_date'] ?? $createdAt),
                 'invoice',
-                'Factura proveedor registrada',
-                trim(($order['invoice_number'] ?? 'Sin número') . (!empty($order['invoice_path']) ? ' · con adjunto' : ''))
+                'Factura registrada en el sistema',
+                trim(
+                    ($invNo !== '' ? $invNo : 'Sin número')
+                    . ($invDateOnly !== '' ? ' · Doc. ' . $invDateOnly : '')
+                    . ($dueDateOnly !== '' ? ' · Vence ' . $dueDateOnly : '')
+                    . (!empty($order['invoice_path']) ? ' · con adjunto' : '')
+                )
             );
         }
 
@@ -1781,8 +3166,12 @@ class PurchasingService
                 $events,
                 (string)($order['received_at'] ?? $order['warehouse_date'] ?? $order['order_date']),
                 'received',
-                'Mercancía recibida',
-                'Fecha bodega: ' . substr((string)($order['warehouse_date'] ?? '—'), 0, 10),
+                'Mercancía recibida / confirmada',
+                trim(
+                    'Bodega: ' . ($whDateOnly !== '' ? $whDateOnly : '—')
+                    . ($invDateOnly !== '' ? ' · Factura: ' . $invDateOnly : '')
+                    . ($dueDateOnly !== '' ? ' · Vence: ' . $dueDateOnly : '')
+                ),
                 (float)($order['total'] ?? 0)
             );
         }
@@ -1801,18 +3190,28 @@ class PurchasingService
 
         try {
             $stock = $this->query(
-                "SELECT movement_date, created_at, type, quantity, notes
+                "SELECT movement_date, created_at, type, quantity, notes, reference_type, reference_id
                  FROM stock_movements
-                 WHERE reference_type = 'purchase_order' AND reference_id = ?
+                 WHERE (reference_type = 'purchase_order' AND reference_id = ?)
+                    OR (reference_type = 'purchase_credit_note' AND reference_id IN (
+                        SELECT id FROM purchase_credit_notes WHERE purchase_order_id = ?
+                    ))
+                    OR (reference_type = 'purchase_cancel' AND reference_id = ?)
                  ORDER BY COALESCE(movement_date, created_at), id",
-                [$orderId]
+                [$orderId, $orderId, $orderId]
             )->fetchAll();
             foreach ($stock as $sm) {
+                $refType = (string)($sm['reference_type'] ?? '');
+                $label = match ($refType) {
+                    'purchase_credit_note' => 'Salida por nota de crédito / devolución',
+                    'purchase_cancel' => 'Reverso inventario (anulación)',
+                    default => 'Movimiento de inventario',
+                };
                 $push(
                     $events,
                     (string)($sm['movement_date'] ?? $sm['created_at']),
                     'stock',
-                    'Movimiento de inventario',
+                    $label,
                     trim(($sm['type'] ?? '') . ' · cant. ' . (int)($sm['quantity'] ?? 0) . ' ' . ($sm['notes'] ?? ''))
                 );
             }
@@ -1821,6 +3220,22 @@ class PurchasingService
 
         foreach ($this->orderPayments($orderId) as $p) {
             $payStatus = (string)($p['status'] ?? 'applied');
+            if ($payStatus === 'cancelled') {
+                $push(
+                    $events,
+                    (string)($p['updated_at'] ?? $p['payment_date'] ?? $p['created_at'] ?? ''),
+                    'payment_void',
+                    'Abono cancelado (anulación)',
+                    trim(
+                        ($p['payment_method'] ?? '')
+                        . ' ' . ($p['reference'] ?? '')
+                        . ' · ' . ($p['notes'] ?? '')
+                    ),
+                    (float)($p['amount'] ?? 0),
+                    ['payment_id' => (int)($p['id'] ?? 0)]
+                );
+                continue;
+            }
             if ($payStatus !== '' && $payStatus !== 'applied') {
                 continue;
             }
@@ -1839,29 +3254,84 @@ class PurchasingService
             if (($n['status'] ?? 'posted') !== 'posted') {
                 continue;
             }
+            $affects = (int)($n['affects_stock'] ?? 1) === 1;
+            $reason = (string)($n['reason'] ?? '');
+            $isVoidNc = str_contains(mb_strtoupper($reason), 'ANULACIÓN OC');
             $push(
                 $events,
                 (string)($n['credit_date'] ?? $n['created_at'] ?? ''),
                 'credit_note',
-                'Nota de crédito',
-                trim(($n['credit_number'] ?? '') . ' · ' . ($n['reason'] ?? '')),
+                $isVoidNc
+                    ? 'NC por anulación de factura'
+                    : ($affects ? 'Nota de crédito / devolución' : 'Nota de crédito (ajuste comercial)'),
+                trim(
+                    ($n['credit_number'] ?? '')
+                    . ' · ' . $reason
+                    . ($affects ? ' · afecta inventario' : ' · sin stock')
+                    . (!empty($n['accounting_entry_number'])
+                        ? (' · asiento ' . $n['accounting_entry_number'])
+                        : (!empty($n['accounting_entry_id']) ? (' · asiento #' . $n['accounting_entry_id']) : ' · asiento pendiente'))
+                ),
                 (float)($n['total'] ?? 0),
                 ['credit_note_id' => (int)($n['id'] ?? 0)]
             );
         }
 
         if (($order['status'] ?? '') === 'cancelled') {
+            $notes = (string)($order['notes'] ?? '');
+            $isPostReceive = str_contains($notes, 'ANULADA POST-RECEPCIÓN') || str_contains($notes, '[[NC_FULL');
+            $voidReason = '';
+            if (preg_match('/ANULADA POST-RECEPCIÓN:\s*(.+)$/u', $notes, $m)) {
+                $voidReason = trim($m[1]);
+                if (preg_match('/ANULACIÓN OC:\s*(.+)$/u', $voidReason, $m2)) {
+                    $voidReason = trim($m2[1]);
+                }
+            }
+            $voidAt = (string)($order['voided_at'] ?? $order['updated_at'] ?? $createdAt);
             $push(
                 $events,
-                (string)($order['updated_at'] ?? $createdAt),
+                $voidAt,
                 'cancelled',
-                'Orden cancelada',
-                ''
+                $isPostReceive ? 'Factura anulada' : 'Orden cancelada',
+                $isPostReceive
+                    ? trim(
+                        'Queda en historial como anulada (no activa).'
+                        . ($voidReason !== '' ? ' Motivo: ' . $voidReason : '')
+                    )
+                    : ''
             );
         }
 
+        $orderReviewNotes = trim((string)($order['review_notes'] ?? ''));
+        if ($orderReviewNotes !== '' && empty($loggedTypes['invoice_observation'])) {
+            $push(
+                $events,
+                (string)($order['received_at'] ?? $order['warehouse_date'] ?? $createdAt),
+                'invoice_observation',
+                'Nota / observación',
+                $orderReviewNotes
+            );
+        }
+
+        // Deduplicar eventos casi idénticos (mismo tipo + segundo).
+        $seen = [];
+        $deduped = [];
+        foreach ($events as $ev) {
+            $key = ($ev['type'] ?? '') . '|' . substr((string)($ev['at'] ?? ''), 0, 19) . '|' . ($ev['label'] ?? '');
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+            $deduped[] = $ev;
+        }
+        $events = $deduped;
+
         usort($events, static function ($a, $b) {
-            return strcmp((string)$a['at'], (string)$b['at']);
+            $cmp = strcmp((string)$a['at'], (string)$b['at']);
+            if ($cmp !== 0) {
+                return $cmp;
+            }
+            return strcmp((string)($a['type'] ?? ''), (string)($b['type'] ?? ''));
         });
 
         $order['payments'] = $this->orderPayments($orderId);

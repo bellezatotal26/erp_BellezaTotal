@@ -108,6 +108,17 @@ class TenantConfigController extends Controller
             return;
         }
 
+        if ($action === 'sandboxEnter' && $this->request->method() === 'POST') {
+            \SoftNova\Core\TenantMiddleware::authorize('configuracion', 'edit');
+            $this->sandboxEnter();
+            return;
+        }
+        if ($action === 'sandboxExit' && $this->request->method() === 'POST') {
+            \SoftNova\Core\TenantMiddleware::authorize('configuracion', 'edit');
+            $this->sandboxExit();
+            return;
+        }
+
         if ($action === 'createUser' && $this->request->method() === 'POST') {
             $this->createTeamUser();
             return;
@@ -124,6 +135,32 @@ class TenantConfigController extends Controller
             $this->processJobs();
             return;
         }
+
+        if ($action === 'auditDetail' && $this->request->method() === 'GET') {
+            $this->auditDetailJson();
+            return;
+        }
+
+        if ($action === 'expenseCategorySave' && $this->request->method() === 'POST') {
+            $this->saveExpenseCategory();
+            return;
+        }
+        if ($action === 'expenseCategoryDelete' && $this->request->method() === 'POST') {
+            $this->deleteExpenseCategory();
+            return;
+        }
+        if ($action === 'expenseCategoryMove' && $this->request->method() === 'POST') {
+            $this->moveExpenseCategory();
+            return;
+        }
+        if ($action === 'expenseSubgroupSave' && $this->request->method() === 'POST') {
+            $this->saveExpenseSubgroup();
+            return;
+        }
+        if ($action === 'expenseSubgroupDelete' && $this->request->method() === 'POST') {
+            $this->deleteExpenseSubgroup();
+            return;
+        }
         
         // Cargar settings actuales
         $settings = [];
@@ -131,6 +168,13 @@ class TenantConfigController extends Controller
         foreach ($rows as $row) {
             $settings[$row['setting_key']] = $row['setting_value'];
         }
+
+        if (empty($settings['timezone'])) {
+            $defaultTz = \SoftNova\Core\BusinessTimezone::DEFAULT;
+            $this->upsertSetting('timezone', $defaultTz);
+            $settings['timezone'] = $defaultTz;
+        }
+        \SoftNova\Core\BusinessTimezone::applyFromTenantDb($this->db);
         
         // Auto-backup lazy al entrar a configuracion
         $this->runScheduledBackupIfDue($settings);
@@ -185,6 +229,65 @@ class TenantConfigController extends Controller
             }
             unset($tu);
         }
+
+        $auditLogs = [];
+        $auditPagination = ['page' => 1, 'perPage' => 25, 'total' => 0, 'totalPages' => 1];
+        $auditFilterOptions = ['modules' => [], 'actions' => [], 'users' => []];
+        $auditAnomalies = [];
+        $auditFilters = [
+            'module' => trim((string)$this->request->get('audit_module', '')),
+            'action' => trim((string)$this->request->get('audit_action', '')),
+            'user_id' => (int)$this->request->get('audit_user', 0),
+            'q' => trim((string)$this->request->get('audit_q', '')),
+            'from' => trim((string)$this->request->get('audit_from', '')),
+            'to' => trim((string)$this->request->get('audit_to', '')),
+            'severity' => trim((string)$this->request->get('audit_severity', '')),
+        ];
+        $auditModuleOptions = [];
+        $auditActionOptions = [];
+        if ($isAdmin) {
+            try {
+                $auditSvcClass = \SoftNova\Services\TenantAuditService::class;
+                if (class_exists($auditSvcClass) && method_exists($auditSvcClass, 'listLogs')) {
+                    $auditSvc = new $auditSvcClass($this->db);
+                    $auditPage = max(1, (int)$this->request->get('audit_page', 1));
+                    $auditResult = $auditSvc->listLogs($auditFilters, $auditPage, 25);
+                    $auditLogs = $auditResult['items'];
+                    $auditPagination = $auditResult['pagination'];
+                    $auditFilterOptions = $auditSvc->filterOptions();
+                    $auditAnomalies = $auditSvc->detectAnomalies(
+                        $auditFilters['from'] !== '' ? $auditFilters['from'] : null,
+                        $auditFilters['to'] !== '' ? $auditFilters['to'] : null,
+                        20
+                    );
+                    foreach ($auditLogs as &$logRow) {
+                        $logRow['module_label'] = $auditSvcClass::moduleLabel((string)($logRow['module'] ?? ''));
+                        $logRow['action_label'] = $auditSvcClass::actionLabel((string)($logRow['action'] ?? ''));
+                        $entityType = isset($logRow['entity_type']) ? (string)$logRow['entity_type'] : '';
+                        $entityId = (int)($logRow['entity_id'] ?? 0);
+                        $logRow['entity_url'] = $auditSvcClass::entityUrl(
+                            $entityType !== '' ? $entityType : null,
+                            $entityId > 0 ? $entityId : null
+                        );
+                    }
+                    unset($logRow);
+                    foreach ($auditFilterOptions['modules'] as $mod) {
+                        $auditModuleOptions[] = [
+                            'value' => (string)$mod,
+                            'label' => $auditSvcClass::moduleLabel((string)$mod),
+                        ];
+                    }
+                    foreach ($auditFilterOptions['actions'] as $act) {
+                        $auditActionOptions[] = [
+                            'value' => (string)$act,
+                            'label' => $auditSvcClass::actionLabel((string)$act),
+                        ];
+                    }
+                }
+            } catch (\Throwable $e) {
+                error_log('config audit list: ' . $e->getMessage());
+            }
+        }
         
         // Info de suscripción desde BD maestra
         $tenantId = $_SESSION['tenant_id'] ?? 0;
@@ -224,10 +327,25 @@ class TenantConfigController extends Controller
             'ja' => ['flag' => '🇯🇵', 'name' => '日本語'],
         ];
         
+        $expenseCategories = [];
+        $expenseSubgroups = [];
+        if ($isAdmin) {
+            try {
+                $expCatSvc = new \SoftNova\Services\ExpenseCategoryService($this->db);
+                $expenseCategories = $expCatSvc->listAll(true);
+                $expenseSubgroups = $expCatSvc->listSubgroups(true);
+            } catch (\Throwable $e) {
+                $expenseCategories = [];
+                $expenseSubgroups = [];
+            }
+        }
+
         $this->view('tenant.config', [
             'settings' => $settings,
             'currencies' => $currencies,
             'languages' => $languages,
+            'timezones' => \SoftNova\Core\BusinessTimezone::options(),
+            'businessClock' => \SoftNova\Core\BusinessTimezone::clientPayload($this->db),
             'currentUser' => $currentUser,
             'subscription' => $subscription,
             'backups' => $backups,
@@ -241,7 +359,48 @@ class TenantConfigController extends Controller
             'teamRoleLabels' => \SoftNova\Core\TenantMiddleware::teamRoleLabels(),
             'tenantName' => $_SESSION['tenant_name'] ?? 'Mi Empresa',
             'userName' => $_SESSION['tenant_user_name'] ?? 'Usuario',
+            'auditLogs' => $auditLogs,
+            'auditPagination' => $auditPagination,
+            'auditFilterOptions' => $auditFilterOptions,
+            'auditFilters' => $auditFilters,
+            'auditModuleOptions' => $auditModuleOptions,
+            'auditActionOptions' => $auditActionOptions,
+            'auditAnomalies' => $auditAnomalies,
+            'expenseCategories' => $expenseCategories,
+            'expenseSubgroups' => $expenseSubgroups,
+            'sandboxStatus' => \SoftNova\Services\SandboxService::status(),
         ]);
+    }
+
+    private function auditDetailJson(): void
+    {
+        if (\SoftNova\Core\TenantMiddleware::getRole() !== 'admin') {
+            $this->json(['success' => false, 'message' => 'No autorizado'], 403);
+            return;
+        }
+
+        $id = (int)$this->request->get('id', 0);
+        if ($id <= 0) {
+            $this->json(['success' => false, 'message' => 'Registro inválido'], 400);
+            return;
+        }
+
+        try {
+            $detail = (new \SoftNova\Services\TenantAuditService($this->db))->getDetail($id);
+            if (!$detail || empty($detail['log'])) {
+                $this->json(['success' => false, 'message' => 'Registro no encontrado'], 404);
+                return;
+            }
+            $this->json([
+                'success' => true,
+                'log' => $detail['log'],
+                'related' => $detail['related'] ?? [],
+                'anomalies' => $detail['anomalies'] ?? [],
+            ]);
+        } catch (\Throwable $e) {
+            error_log('auditDetail #' . $id . ': ' . $e->getMessage());
+            $this->json(['success' => false, 'message' => 'Error al cargar el registro'], 500);
+        }
     }
 
     private function ensureUsersSchema(): void
@@ -341,6 +500,7 @@ class TenantConfigController extends Controller
                 [$name, $email, $hash, $role, $perms]
             );
             $newId = (int)$this->db->lastInsertId();
+            $this->syncTeamUserToMaster($email, $name, $role, $perms, $hash);
             (new \SoftNova\Services\TenantAuditService($this->db))->log(
                 'create',
                 'usuarios',
@@ -408,15 +568,16 @@ class TenantConfigController extends Controller
             }
 
             $perms = $this->buildPermissionsFromPost($role);
+            $passwordHash = null;
             if ($password !== '') {
                 if (strlen($password) < 6) {
                     $this->respond(false, 'La contraseña debe tener al menos 6 caracteres', '/app/configuracion#usuarios');
                     return;
                 }
-                $hash = Security::hashPassword($password);
+                $passwordHash = Security::hashPassword($password);
                 $this->query(
                     "UPDATE users SET name = ?, email = ?, role = ?, permissions = ?, password = ? WHERE id = ?",
-                    [$name, $email, $role, $perms, $hash, $id]
+                    [$name, $email, $role, $perms, $passwordHash, $id]
                 );
             } else {
                 $this->query(
@@ -430,6 +591,8 @@ class TenantConfigController extends Controller
                 \SoftNova\Core\TenantMiddleware::hydrateSessionPermissions($role, $perms);
             }
 
+            $this->syncTeamUserToMaster($email, $name, $role, $perms, $passwordHash);
+
             (new \SoftNova\Services\TenantAuditService($this->db))->log(
                 'update',
                 'usuarios',
@@ -442,6 +605,45 @@ class TenantConfigController extends Controller
         } catch (\Throwable $e) {
             error_log('editTeamUser: ' . $e->getMessage());
             $this->respond(false, 'No se pudo guardar el usuario: ' . $e->getMessage(), '/app/configuracion#usuarios');
+        }
+    }
+
+    /**
+     * Sincroniza usuario externo con tenant_users (login SaaS) cuando no es standalone.
+     */
+    private function syncTeamUserToMaster(
+        string $email,
+        string $name,
+        string $role,
+        string $permissionsJson,
+        ?string $passwordHash = null
+    ): void {
+        if (\SoftNova\Core\is_standalone()) {
+            return;
+        }
+
+        $tenantId = (int)($_SESSION['tenant_id'] ?? 0);
+        if ($tenantId <= 0 || trim($email) === '') {
+            return;
+        }
+
+        try {
+            $masterDb = \SoftNova\Core\Database::getInstance();
+            if ($passwordHash !== null) {
+                $masterDb->query(
+                    "UPDATE tenant_users SET name = ?, role = ?, permissions = ?, password = ?
+                     WHERE email = ? AND tenant_id = ?",
+                    [$name, $role, $permissionsJson, $passwordHash, $email, $tenantId]
+                );
+            } else {
+                $masterDb->query(
+                    "UPDATE tenant_users SET name = ?, role = ?, permissions = ?
+                     WHERE email = ? AND tenant_id = ?",
+                    [$name, $role, $permissionsJson, $email, $tenantId]
+                );
+            }
+        } catch (\Throwable $e) {
+            error_log('syncTeamUserToMaster: ' . $e->getMessage());
         }
     }
 
@@ -482,8 +684,8 @@ class TenantConfigController extends Controller
         }
         
         $fields = [
-            'currency', 'company_name', 'tax_name', 'tax_rate', 'invoice_prefix',
-            'low_stock_alert', 'language', 'webhook_sale_url',
+            'currency', 'company_name', 'tax_name', 'tax_enabled', 'product_tax_enabled', 'tax_rate', 'invoice_prefix',
+            'low_stock_alert', 'language', 'timezone', 'webhook_sale_url',
             'company_nit', 'company_address', 'company_phone', 'company_email',
             'ean_prefix', 'ean_next', 'ean_length', 'ean_check_digit',
             'sku_prefix', 'sku_next', 'sku_pad',
@@ -492,6 +694,13 @@ class TenantConfigController extends Controller
         foreach ($fields as $field) {
             $value = $this->request->post($field);
             if ($value !== null) {
+                if ($field === 'timezone') {
+                    $value = \SoftNova\Core\BusinessTimezone::normalize((string)$value);
+                    if (!isset(\SoftNova\Core\BusinessTimezone::options()[$value])) {
+                        // Acepta IANA válida aunque no esté en la lista corta
+                        $value = \SoftNova\Core\BusinessTimezone::normalize($value);
+                    }
+                }
                 if ($field === 'webhook_sale_url') {
                     $value = trim((string)$value);
                     if ($value !== '' && !filter_var($value, FILTER_VALIDATE_URL)) {
@@ -521,6 +730,33 @@ class TenantConfigController extends Controller
                 }
                 if ($field === 'ean_check_digit') {
                     $value = ((string)$value === '0') ? '0' : '1';
+                }
+                if ($field === 'tax_enabled') {
+                    $value = in_array(strtolower(trim((string)$value)), ['1', 'true', 'on', 'yes'], true) ? '1' : '0';
+                }
+                if ($field === 'product_tax_enabled') {
+                    $value = in_array(strtolower(trim((string)$value)), ['1', 'true', 'on', 'yes'], true) ? '1' : '0';
+                }
+                if ($field === 'tax_rate') {
+                    $raw = trim((string)$value);
+                    if ($raw === '') {
+                        $value = '0';
+                    } else {
+                        $rate = (float)$raw;
+                        if ($rate < 0) {
+                            $rate = 0.0;
+                        }
+                        if ($rate > 100) {
+                            $rate = 100.0;
+                        }
+                        $value = rtrim(rtrim(number_format($rate, 2, '.', ''), '0'), '.') ?: '0';
+                    }
+                }
+                if ($field === 'tax_name') {
+                    $value = trim((string)$value);
+                    if ($value === '') {
+                        $value = 'IVA';
+                    }
                 }
                 if ($field === 'sku_prefix') {
                     $value = substr(trim((string)$value), 0, 40);
@@ -559,6 +795,12 @@ class TenantConfigController extends Controller
         }
 
         \SoftNova\Services\SettingsCache::invalidate();
+        // Reaplicar zona horaria al instante si se cambió.
+        try {
+            \SoftNova\Core\BusinessTimezone::applyFromTenantDb($this->db);
+        } catch (\Throwable $e) {
+            // ignore
+        }
         
         $this->respond(true, 'Configuración guardada exitosamente', '/app/configuracion');
     }
@@ -638,10 +880,7 @@ class TenantConfigController extends Controller
             return;
         }
         
-        $dbName = (string)($_SESSION['tenant_db_name'] ?? '');
-        if ($dbName === '') {
-            $dbName = (string)\SoftNova\Core\config('database.default.database', '');
-        }
+        $dbName = $this->resolveOperationalDbName();
         if ($dbName === '') {
             $this->respond(false, 'No se encontro la base de datos del tenant');
             return;
@@ -744,13 +983,92 @@ class TenantConfigController extends Controller
             return;
         }
 
+        $sandboxNote = \SoftNova\Services\SandboxService::isActive()
+            ? ' (solo afectó la caja de arena, no producción)'
+            : '';
         $msg = sprintf(
-            'Base de datos limpiada: %d tabla(s) vaciadas, %d usuario(s) eliminado(s). Conservado: %s',
+            'Base de datos limpiada: %d tabla(s) vaciadas, %d usuario(s) eliminado(s). Conservado: %s%s',
             (int)$result['truncated'],
             (int)$result['users_deleted'],
-            (string)$result['kept_user_email']
+            (string)$result['kept_user_email'],
+            $sandboxNote
         );
         $this->respond(true, $msg, '/app/configuracion');
+    }
+
+    /** Activa modo caja de arena (clona producción a espejo). */
+    private function sandboxEnter(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/configuracion')) {
+            return;
+        }
+        if (!$this->requireAdmin()) {
+            return;
+        }
+        if (!$this->verifyAdminPassword((string)($this->request->post('confirm_password') ?? ''))) {
+            $this->respond(false, 'Contraseña incorrecta. No se activó la caja de arena.', '/app/configuracion');
+            return;
+        }
+
+        $refresh = (string)$this->request->post('refresh', '1') !== '0';
+        try {
+            $result = \SoftNova\Services\SandboxService::enter($refresh);
+            $this->db = \SoftNova\Core\TenantMiddleware::refreshDb();
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/configuracion');
+            return;
+        }
+
+        if (empty($result['success'])) {
+            $this->respond(false, $result['message'] ?? 'No se pudo activar la caja de arena', '/app/configuracion');
+            return;
+        }
+
+        $this->respond(true, $result['message'], '/app/configuracion');
+    }
+
+    /** Sale de la caja de arena y vuelve a producción. */
+    private function sandboxExit(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/configuracion')) {
+            return;
+        }
+        if (!$this->requireAdmin()) {
+            return;
+        }
+
+        $drop = (string)$this->request->post('drop_sandbox', '0') === '1';
+        if ($drop) {
+            if (!$this->verifyAdminPassword((string)($this->request->post('confirm_password') ?? ''))) {
+                $this->respond(false, 'Contraseña incorrecta. No se eliminó el espejo.', '/app/configuracion');
+                return;
+            }
+        }
+
+        try {
+            $result = \SoftNova\Services\SandboxService::exitMode($drop);
+            $this->db = \SoftNova\Core\TenantMiddleware::refreshDb();
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/configuracion');
+            return;
+        }
+
+        $this->respond(true, $result['message'] ?? 'Volvió a producción', '/app/configuracion');
+    }
+
+    private function resolveOperationalDbName(): string
+    {
+        if (\SoftNova\Services\SandboxService::isActive()) {
+            $active = \SoftNova\Services\SandboxService::activeDbName();
+            if ($active !== '') {
+                return $active;
+            }
+        }
+        $dbName = (string)($_SESSION['tenant_db_name'] ?? '');
+        if ($dbName === '') {
+            $dbName = (string)\SoftNova\Core\config('database.default.database', '');
+        }
+        return $dbName;
     }
     
     private function backupDelete(): void
@@ -789,7 +1107,7 @@ class TenantConfigController extends Controller
             return;
         }
         
-        $dbName = (string)($_SESSION['tenant_db_name'] ?? '');
+        $dbName = $this->resolveOperationalDbName();
         if ($dbName === '') {
             $this->respond(false, 'No se encontro la base de datos del tenant');
             return;
@@ -865,7 +1183,14 @@ class TenantConfigController extends Controller
     private function runScheduledBackupIfDue(array &$settings): void
     {
         try {
-            $dbName = (string)($_SESSION['tenant_db_name'] ?? '');
+            // No programar backups automáticos mientras la sesión está en caja de arena.
+            if (\SoftNova\Services\SandboxService::isActive()) {
+                return;
+            }
+            $dbName = \SoftNova\Services\SandboxService::productionDbName();
+            if ($dbName === '') {
+                $dbName = (string)($_SESSION['tenant_db_name'] ?? '');
+            }
             if ($dbName === '') {
                 return;
             }
@@ -1172,5 +1497,115 @@ class TenantConfigController extends Controller
     private function getSetting(string $key, string $default = ''): string
     {
         return \SoftNova\Services\SettingsCache::get($this->db, $key, $default);
+    }
+
+    private function requireAdminForExpenseCatalog(): bool
+    {
+        if (TenantMiddleware::getRole() !== 'admin') {
+            $this->respond(false, 'Solo administradores pueden gestionar categorías de gasto', '/app/configuracion#gastos-admin');
+            return false;
+        }
+        TenantMiddleware::authorize('configuracion', 'edit');
+        return true;
+    }
+
+    private function saveExpenseCategory(): void
+    {
+        if (!$this->requireAdminForExpenseCatalog()) {
+            return;
+        }
+        if (!$this->validateCsrfOrFail('/app/configuracion#gastos-admin')) {
+            return;
+        }
+        try {
+            $svc = new \SoftNova\Services\ExpenseCategoryService($this->db);
+            $id = $svc->saveCategory([
+                'id' => (int)$this->request->post('id', 0),
+                'name' => (string)$this->request->post('name', ''),
+                'kind' => (string)$this->request->post('kind', 'operational'),
+                'account_code' => (string)$this->request->post('account_code', ''),
+                'sort_order' => (int)$this->request->post('sort_order', 0),
+            ]);
+            $msg = (int)$this->request->post('id', 0) > 0 ? 'Categoría actualizada' : 'Categoría creada';
+            $this->respond(true, $msg, '/app/configuracion#gastos-admin');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/configuracion#gastos-admin');
+        }
+    }
+
+    private function deleteExpenseCategory(): void
+    {
+        if (!$this->requireAdminForExpenseCatalog()) {
+            return;
+        }
+        if (!$this->validateCsrfOrFail('/app/configuracion#gastos-admin')) {
+            return;
+        }
+        $id = (int)$this->request->post('id', 0);
+        try {
+            (new \SoftNova\Services\ExpenseCategoryService($this->db))->deactivate($id);
+            $this->respond(true, 'Categoría eliminada del listado', '/app/configuracion#gastos-admin');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/configuracion#gastos-admin');
+        }
+    }
+
+    private function moveExpenseCategory(): void
+    {
+        if (!$this->requireAdminForExpenseCatalog()) {
+            return;
+        }
+        if (!$this->validateCsrfOrFail('/app/configuracion#gastos-admin')) {
+            return;
+        }
+        $id = (int)$this->request->post('id', 0);
+        $kind = (string)$this->request->post('kind', '');
+        try {
+            (new \SoftNova\Services\ExpenseCategoryService($this->db))->setKind($id, $kind);
+            $svc = new \SoftNova\Services\ExpenseCategoryService($this->db);
+            $label = $svc->resolveKindGroupLabel($kind);
+            $this->respond(true, 'Movido a ' . $label, '/app/configuracion#gastos-admin');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/configuracion#gastos-admin');
+        }
+    }
+
+    private function saveExpenseSubgroup(): void
+    {
+        if (!$this->requireAdminForExpenseCatalog()) {
+            return;
+        }
+        if (!$this->validateCsrfOrFail('/app/configuracion#gastos-admin')) {
+            return;
+        }
+        try {
+            $svc = new \SoftNova\Services\ExpenseCategoryService($this->db);
+            $id = $svc->saveSubgroup([
+                'id' => (int)$this->request->post('id', 0),
+                'name' => (string)$this->request->post('name', ''),
+                'account_code' => (string)$this->request->post('account_code', ''),
+            ]);
+            $msg = (int)$this->request->post('id', 0) > 0 ? 'Sub-grupo actualizado' : 'Sub-grupo contable creado';
+            $this->respond(true, $msg, '/app/configuracion#gastos-admin');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/configuracion#gastos-admin');
+        }
+    }
+
+    private function deleteExpenseSubgroup(): void
+    {
+        if (!$this->requireAdminForExpenseCatalog()) {
+            return;
+        }
+        if (!$this->validateCsrfOrFail('/app/configuracion#gastos-admin')) {
+            return;
+        }
+        $id = (int)$this->request->post('id', 0);
+        try {
+            (new \SoftNova\Services\ExpenseCategoryService($this->db))->deactivateSubgroup($id);
+            $this->respond(true, 'Sub-grupo ocultado del listado', '/app/configuracion#gastos-admin');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/configuracion#gastos-admin');
+        }
     }
 }

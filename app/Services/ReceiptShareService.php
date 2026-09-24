@@ -50,6 +50,11 @@ class ReceiptShareService
         }
         $lines[] = 'Cliente: ' . ($sale['customer_name'] ?? 'Cliente Final');
         $delivery = max(0.0, (float)($sale['delivery_fee'] ?? 0));
+        if ($delivery <= 0.009 && preg_match('/Domicilio:\s*([\d.,]+)/i', (string)($sale['notes'] ?? ''), $m)) {
+            $delivery = function_exists('\\SoftNova\\Core\\parse_money')
+                ? \SoftNova\Core\parse_money($m[1])
+                : (float)str_replace(',', '.', $m[1]);
+        }
         if ($delivery > 0.009) {
             $lines[] = 'Domicilio: ' . $sym . ' ' . number_format($delivery, $dec, ',', '.');
         }

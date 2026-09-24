@@ -109,7 +109,11 @@ if (!function_exists('fmtN')) {
 </div>
 
 <?php elseif ($tab === 'run_detail' && $detail): ?>
-<?php $run = $detail['run']; $items = $detail['items']; ?>
+<?php
+$run = $detail['run'];
+$items = $detail['items'];
+$accountingEntry = $accountingEntry ?? null;
+?>
 <div style="margin-bottom:12px;"><a class="btn btn-secondary" href="<?php echo $base; ?>?tab=runs">← Volver</a></div>
 <div class="card neumorphic" style="margin-bottom:16px;">
     <div class="card-header"><h3><?php echo htmlspecialchars($run['run_number']); ?> · <?php echo htmlspecialchars($run['period_label']); ?></h3></div>
@@ -125,17 +129,22 @@ if (!function_exists('fmtN')) {
             <div><span style="color:var(--color-text-secondary);">Primas</span><div><?php echo fmtN((float)($run['prima_total'] ?? 0), $currency); ?></div></div>
             <div><span style="color:var(--color-text-secondary);">Cesantías</span><div><?php echo fmtN((float)($run['cesantias_total'] ?? 0), $currency); ?></div></div>
             <div><span style="color:var(--color-text-secondary);">Incapacidades</span><div><?php echo fmtN((float)($run['incapacity_total'] ?? 0), $currency); ?></div></div>
+            <div><span style="color:var(--color-text-secondary);">HE / dominicales</span><div><?php echo fmtN((float)($run['overtime_total'] ?? 0), $currency); ?></div></div>
+            <?php if (!empty($accountingEntry['id'])): ?>
+            <div><span style="color:var(--color-text-secondary);">Contabilidad</span><div>
+                <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$accountingEntry['id']; ?>">
+                    <?php echo htmlspecialchars((string)($accountingEntry['entry_number'] ?? 'Ver asiento')); ?>
+                </a>
+            </div></div>
+            <?php endif; ?>
         </div>
-        <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;">
+        <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
             <a class="btn btn-secondary" target="_blank" href="<?php echo $base; ?>?action=pdf&amp;id=<?php echo (int)$run['id']; ?>">PDF liquidación</a>
         <?php if (($run['status'] ?? '') === 'draft' && $canEdit): ?>
                 <form method="POST" action="<?php echo $base; ?>?action=pay_run" data-ajax="true" style="display:inline;">
                     <?php echo \SoftNova\Core\csrf_field(); ?>
                     <input type="hidden" name="id" value="<?php echo (int)$run['id']; ?>">
-                    <?php if (($run['payment_method'] ?? '') === 'cash'): ?>
-                        <label style="margin-right:10px;"><input type="checkbox" name="affect_cash" value="1"> Afectar caja</label>
-                    <?php endif; ?>
-                    <button class="btn btn-primary" type="submit" onclick="return confirm('¿Contabilizar asiento detallado (SS/parafiscales) y marcar como pagada?')">Contabilizar y pagar</button>
+                    <button class="btn btn-primary" type="submit" onclick="return confirm('¿Contabilizar nómina y marcar como pagada? No descuenta el cajón de caja.')">Contabilizar y pagar</button>
                 </form>
                 <form method="POST" action="<?php echo $base; ?>?action=cancel_run" data-ajax="true" style="display:inline;">
                     <?php echo \SoftNova\Core\csrf_field(); ?>
@@ -148,14 +157,19 @@ if (!function_exists('fmtN')) {
 </div>
 <div class="card neumorphic">
     <div class="card-body"><div class="table-container"><table>
-        <thead><tr><th>Empleado</th><th>Días</th><th>Inc.</th><th>Devengado</th><th>Prima</th><th>Cesantías</th><th>Salud</th><th>Pensión</th><th>Neto</th><th></th></tr></thead>
+        <thead><tr><th>Empleado</th><th>Días</th><th>Inc.</th><th>Devengado</th><th>HE/Dom.</th><th>Prima</th><th>Cesantías</th><th>Salud</th><th>Pensión</th><th>Neto</th><th></th></tr></thead>
         <tbody>
         <?php foreach ($items as $it): ?>
+            <?php
+            $otTotal = (float)($it['other_earnings'] ?? 0);
+            $devengado = (float)$it['salary_base'] + (float)($it['transport_aid'] ?? 0) + (float)($it['incapacity_pay'] ?? 0) + $otTotal;
+            ?>
             <tr>
                 <td><?php echo htmlspecialchars($it['employee_name']); ?></td>
                 <td><?php echo (int)$it['days_worked']; ?></td>
                 <td><?php echo (int)($it['incapacity_days'] ?? 0); ?></td>
-                <td><?php echo fmtN((float)$it['salary_base'] + (float)($it['transport_aid'] ?? 0) + (float)($it['incapacity_pay'] ?? 0), $currency); ?></td>
+                <td><?php echo fmtN($devengado, $currency); ?></td>
+                <td><?php echo $otTotal > 0 ? fmtN($otTotal, $currency) : '-'; ?></td>
                 <td><?php echo fmtN((float)($it['prima'] ?? 0), $currency); ?></td>
                 <td><?php echo fmtN((float)($it['cesantias'] ?? 0) + (float)($it['cesantias_interest'] ?? 0), $currency); ?></td>
                 <td><?php echo fmtN((float)$it['health_employee'], $currency); ?></td>
@@ -165,6 +179,11 @@ if (!function_exists('fmtN')) {
                     <a class="btn btn-sm btn-secondary" target="_blank" href="<?php echo $base; ?>?action=payslip&amp;run_id=<?php echo (int)$run['id']; ?>&amp;item_id=<?php echo (int)$it['id']; ?>">PDF</a>
                     <?php if (($run['status'] ?? '') === 'draft' && $canEdit): ?>
                         <button type="button" class="btn btn-sm btn-secondary" onclick="editIncapacity(<?php echo (int)$it['id']; ?>,<?php echo (int)$run['id']; ?>,<?php echo (int)($it['incapacity_days'] ?? 0); ?>,'<?php echo htmlspecialchars($it['incapacity_type'] ?? 'enfermedad', ENT_QUOTES); ?>')">Inc.</button>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="editOvertime(<?php echo (int)$it['id']; ?>,<?php echo (int)$run['id']; ?>,<?php echo json_encode([
+                            'day' => (float)($it['overtime_day_hours'] ?? 0),
+                            'night' => (float)($it['overtime_night_hours'] ?? 0),
+                            'dom' => (float)($it['dominical_hours'] ?? 0),
+                        ], JSON_HEX_APOS | JSON_HEX_QUOT); ?>)">HE/Dom.</button>
                     <?php endif; ?>
                 </td>
             </tr>
@@ -172,7 +191,9 @@ if (!function_exists('fmtN')) {
         </tbody>
     </table></div>
     <p style="font-size:12px;color:var(--color-text-secondary);margin-top:10px;">
-        Al pagar se genera asiento: Débito nómina + aportes patronales · Crédito salud/pensión/ARL/caja/SENA/ICBF por pagar · Crédito banco/caja por el neto.
+        En borrador puede ajustar incapacidad y horas extras/dominicales por empleado. HE diurna +25%, nocturna +75%, dominical/festivo +75% (configurable en Parámetros).
+        Al pagar se genera asiento contable detallado (sueldos, aportes patronales, SS/parafiscales por pagar) y queda en auditoría.
+        <strong>La nómina no descuenta el cajón físico de Caja/POS</strong> (pago por transferencia o fuera del cajón).
     </p>
     </div>
 </div>
@@ -196,11 +217,16 @@ if (!function_exists('fmtN')) {
             <div class="form-group"><label>% SENA</label><input class="form-control" type="number" step="0.01" name="sena_employer_rate" value="<?php echo htmlspecialchars((string)$params['sena_employer_rate']); ?>"></div>
             <div class="form-group"><label>% ICBF</label><input class="form-control" type="number" step="0.01" name="icbf_employer_rate" value="<?php echo htmlspecialchars((string)$params['icbf_employer_rate']); ?>"></div>
             <div class="form-group"><label>% Incapacidad (días 3+)</label><input class="form-control" type="number" step="0.01" name="incapacity_rate" value="<?php echo htmlspecialchars((string)$params['incapacity_rate']); ?>"></div>
+            <div class="form-group"><label>Horas mensuales (base HE)</label><input class="form-control" type="number" step="0.01" min="1" name="payroll_monthly_hours" value="<?php echo htmlspecialchars((string)($params['payroll_monthly_hours'] ?? 240)); ?>"></div>
+            <div class="form-group"><label>% Recargo HE diurna (HED)</label><input class="form-control" type="number" step="0.01" name="overtime_day_rate" value="<?php echo htmlspecialchars((string)($params['overtime_day_rate'] ?? 25)); ?>"></div>
+            <div class="form-group"><label>% Recargo HE nocturna (HEN)</label><input class="form-control" type="number" step="0.01" name="overtime_night_rate" value="<?php echo htmlspecialchars((string)($params['overtime_night_rate'] ?? 75)); ?>"></div>
+            <div class="form-group"><label>% Recargo dominical/festivo</label><input class="form-control" type="number" step="0.01" name="dominical_rate" value="<?php echo htmlspecialchars((string)($params['dominical_rate'] ?? 75)); ?>"></div>
             <div class="form-group" style="grid-column:1/-1;"><button class="btn btn-primary" type="submit">Guardar parámetros</button></div>
         </form>
         <?php endif; ?>
         <p style="font-size:12px;margin-top:12px;color:var(--color-text-secondary);">
             Prima ≈ medio salario (semestre). Cesantías = provisión mensual salario/12 + interés. Incapacidad: días 1-2 al 100%, resto al %.
+            Valor hora = salario ÷ horas mensuales. HE y dominicales cotizan a salud/pensión.
             Contabilidad: CxP salud (237005), pensión (238030), ARL, caja, SENA, ICBF.
         </p>
     </div>
@@ -251,7 +277,7 @@ if (!function_exists('fmtN')) {
                 <div class="form-group"><label><input type="checkbox" name="include_cesantias" value="1"> Incluir cesantías (provisión mes)</label></div>
                 <div class="form-group" style="grid-column:1/-1;"><label><input type="checkbox" name="include_parafiscales" value="1" checked> Parafiscales (caja, SENA, ICBF) + ARL</label></div>
                 <div class="form-group" style="grid-column:1/-1;"><label>Notas</label><input class="form-control" name="notes"></div>
-                <p style="grid-column:1/-1;font-size:12px;color:var(--color-text-secondary);margin:0;">La incapacidad se puede ajustar después en el detalle de cada empleado.</p>
+                <p style="grid-column:1/-1;font-size:12px;color:var(--color-text-secondary);margin:0;">La incapacidad y las horas extras/dominicales se ajustan después en el detalle de cada empleado.</p>
             </div></div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('runModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-primary">Calcular</button></div>
         </form>
@@ -294,6 +320,14 @@ function editIncapacity(itemId, runId, days, type) {
     document.getElementById('incType').value = type || 'enfermedad';
     document.getElementById('incapacityModal').style.display = 'flex';
 }
+function editOvertime(itemId, runId, data) {
+    document.getElementById('otItemId').value = itemId;
+    document.getElementById('otRunId').value = runId;
+    document.getElementById('otDayHours').value = data.day || 0;
+    document.getElementById('otNightHours').value = data.night || 0;
+    document.getElementById('otDomHours').value = data.dom || 0;
+    document.getElementById('overtimeModal').style.display = 'flex';
+}
 </script>
 <div id="incapacityModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:420px;">
@@ -313,6 +347,28 @@ function editIncapacity(itemId, runId, days, type) {
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('incapacityModal').style.display='none'">Cerrar</button>
+                <button type="submit" class="btn btn-primary">Recalcular</button>
+            </div>
+        </form>
+    </div>
+</div>
+<div id="overtimeModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:460px;">
+        <div class="modal-header"><h3>Horas extras y dominicales</h3><button type="button" class="modal-close" onclick="document.getElementById('overtimeModal').style.display='none'">&times;</button></div>
+        <form method="POST" action="<?php echo $base; ?>?action=save_overtime" data-ajax="true">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="item_id" id="otItemId">
+            <input type="hidden" name="run_id" id="otRunId">
+            <div class="modal-body">
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 12px;">
+                    Ingrese las horas del periodo. El valor se calcula con el salario del empleado y los recargos configurados en Parámetros.
+                </p>
+                <div class="form-group"><label>HE diurnas (HED)</label><input class="form-control" type="number" min="0" step="0.25" name="overtime_day_hours" id="otDayHours" value="0"></div>
+                <div class="form-group"><label>HE nocturnas (HEN)</label><input class="form-control" type="number" min="0" step="0.25" name="overtime_night_hours" id="otNightHours" value="0"></div>
+                <div class="form-group"><label>Horas dominical / festivo</label><input class="form-control" type="number" min="0" step="0.25" name="dominical_hours" id="otDomHours" value="0"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('overtimeModal').style.display='none'">Cerrar</button>
                 <button type="submit" class="btn btn-primary">Recalcular</button>
             </div>
         </form>

@@ -9,18 +9,22 @@ $dateTo = $dateTo ?? date('Y-m-d');
 $accounts = $accounts ?? [];
 $entries = $entries ?? [];
 $trialBalance = $trialBalance ?? [];
+$trialReport = $trialReport ?? null;
+$monthlyBalance = $monthlyBalance ?? ['year' => (int)date('Y'), 'months' => [], 'totals' => [], 'chart' => []];
+$balanceYear = (int)($balanceYear ?? ($monthlyBalance['year'] ?? date('Y')));
+$trialAccountType = $trialAccountType ?? '';
+$trialQ = $trialQ ?? '';
+$trialIncludeZero = !empty($trialIncludeZero);
 $statements = $statements ?? [];
 $ledger = $ledger ?? [];
 $periods = $periods ?? [];
 $selectedAccountId = $selectedAccountId ?? 0;
 $integrationStatuses = $integrationStatuses ?? [];
-$catalogStatuses = $catalogStatuses ?? [];
 $activeProvider = $activeProvider ?? null;
 $selectedProvider = (string)($_GET['provider'] ?? ($activeProvider ?: 'alegra'));
-if (!isset($integrationStatuses[$selectedProvider]) && !isset($catalogStatuses[$selectedProvider])) {
+if (!isset($integrationStatuses[$selectedProvider])) {
     $selectedProvider = 'alegra';
 }
-$isCatalogProvider = isset($catalogStatuses[$selectedProvider]);
 $canCreate = \SoftNova\Core\TenantMiddleware::canDo('create', 'contabilidad');
 $canEdit = \SoftNova\Core\TenantMiddleware::canDo('edit', 'contabilidad');
 $canExport = \SoftNova\Core\TenantMiddleware::canDo('export', 'contabilidad');
@@ -29,7 +33,6 @@ $purchaseSummary = $purchaseSummary ?? ['cnt' => 0, 'total' => 0];
 $expenseByType = $expenseByType ?? [];
 $traceMovements = $traceMovements ?? [];
 $accountAudit = $accountAudit ?? ['settings' => [], 'notes' => [], 'fixed' => [], 'missing' => []];
-$mlOAuthRedirect = $mlOAuthRedirect ?? '';
 
 function acctFmt(float $amount, array $currency): string
 {
@@ -53,10 +56,11 @@ $tabs = [
     'compras' => 'Compras',
     'gastos' => 'Gastos',
     'invoice-trace' => 'Trazabilidad facturas',
+    'vat' => 'Libro IVA',
     'trace' => 'Inventario',
     'entries' => 'Libro diario',
     'ledger' => 'Libro mayor',
-    'trial' => 'Balance de prueba',
+    'trial' => 'Balance',
     'statements' => 'Estados financieros',
     'accounts' => 'Plan de cuentas',
     'commissions' => 'Comisiones',
@@ -65,21 +69,18 @@ $tabs = [
 ];
 $invoiceTraceOrders = $invoiceTraceOrders ?? [];
 $invoiceTraceQ = $invoiceTraceQ ?? '';
+$vatBook = $vatBook ?? null;
 $statusLabelsPo = [
     'draft' => 'Borrador',
     'ordered' => 'Ordenada',
     'received' => 'Recibida',
-    'cancelled' => 'Cancelada',
+    'cancelled' => 'Anulada',
 ];
 $commissionCfg = $commissionCfg ?? [];
 $commissionList = $commissionList ?? ['rows' => [], 'pending' => 0, 'paid' => 0, 'cancelled' => 0];
 $commissionUsers = $commissionUsers ?? [];
 $kindFilter = (string)($_GET['kind'] ?? '');
 $statusFilterComm = (string)($_GET['status'] ?? '');
-$catalogProviders = ['woocommerce', 'mercadolibre'];
-if (in_array($selectedProvider, $catalogProviders, true)) {
-    // ok
-}
 $accountOptions = '';
 foreach ($accounts as $account) {
     if ($account['status'] !== 'active' || empty($account['accepts_entries'])) {
@@ -131,6 +132,19 @@ foreach ($accounts as $account) {
             <?php endif; ?>
             <div class="form-group" style="margin:0;"><label>Desde</label><input class="form-control" type="date" name="from" value="<?php echo htmlspecialchars($dateFrom); ?>"></div>
             <div class="form-group" style="margin:0;"><label>Hasta</label><input class="form-control" type="date" name="to" value="<?php echo htmlspecialchars($dateTo); ?>"></div>
+            <?php if ($tab === 'trial'): ?>
+                <div class="form-group" style="margin:0;min-width:120px;">
+                    <label>Año</label>
+                    <select name="year" class="form-control">
+                        <?php
+                        $yNow = (int)date('Y');
+                        for ($y = $yNow; $y >= $yNow - 6; $y--):
+                        ?>
+                            <option value="<?php echo $y; ?>" <?php echo $balanceYear === $y ? 'selected' : ''; ?>><?php echo $y; ?></option>
+                        <?php endfor; ?>
+                    </select>
+                </div>
+            <?php endif; ?>
             <?php if ($tab === 'invoice-trace'): ?>
                 <div class="form-group" style="margin:0;min-width:220px;flex:1;">
                     <label>Buscar</label>
@@ -152,11 +166,16 @@ foreach ($accounts as $account) {
             <?php if ((int)($pendingSync ?? 0) > 0): ?>
                 <span style="font-size:13px;color:#DC2626;font-weight:600;">
                     <?php echo (int)$pendingSync; ?> operación(es) sin comprobante contable
+                    <?php if ((int)($pendingQueue ?? 0) > 0): ?>
+                        <span style="font-weight:500;color:var(--color-text-secondary);">
+                            (<?php echo (int)$pendingQueue; ?> en cola de reintento)
+                        </span>
+                    <?php endif; ?>
                 </span>
             <?php endif; ?>
             <form method="POST" action="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=sync" data-ajax="true">
                 <?php echo \SoftNova\Core\csrf_field(); ?>
-                <button type="submit" class="btn btn-secondary" onclick="return confirm('¿Contabilizar las operaciones anteriores que aún no tienen asiento? Incluye ventas, abonos, gastos, compras, movimientos de inventario y caja.')">
+                <button type="submit" class="btn btn-secondary" onclick="return confirm('¿Contabilizar las operaciones anteriores que aún no tienen asiento? Incluye ventas, abonos, NC, gastos, compras, inventario, caja y la cola de reintentos.')">
                     Sincronizar operaciones existentes
                 </button>
             </form>
@@ -207,13 +226,15 @@ foreach ($accounts as $account) {
                 <p class="dashboard-empty">No hay movimientos contables en el periodo.</p>
             <?php else: ?>
                 <div class="table-container"><table>
-                    <thead><tr><th>Comprobante</th><th>Fecha</th><th>Concepto</th><th>Debe</th><th>Haber</th></tr></thead>
+                    <thead><tr><th>Comprobante</th><th>Fecha</th><th>Concepto</th><th>Usuario</th><th>Debe</th><th>Haber</th><th></th></tr></thead>
                     <tbody><?php foreach ($dashboardEntries as $entry): ?><tr>
-                        <td><button type="button" class="btn btn-sm btn-secondary" onclick="showAccountingEntry(<?php echo (int)$entry['id']; ?>)"><?php echo htmlspecialchars($entry['entry_number']); ?></button></td>
+                        <td><?php echo htmlspecialchars($entry['entry_number']); ?></td>
                         <td><?php echo date('d/m/Y', strtotime($entry['entry_date'])); ?></td>
                         <td><?php echo htmlspecialchars($entry['description']); ?></td>
+                        <td><?php echo htmlspecialchars((string)($entry['created_by_name'] ?? '—')); ?></td>
                         <td><?php echo acctFmt((float)$entry['total_debit'], $currency); ?></td>
                         <td><?php echo acctFmt((float)$entry['total_credit'], $currency); ?></td>
+                        <td><button type="button" class="btn btn-sm btn-info" onclick="showAccountingEntry(<?php echo (int)$entry['id']; ?>)">Ver detalle</button></td>
                     </tr><?php endforeach; ?></tbody>
                 </table></div>
             <?php endif; ?>
@@ -232,17 +253,19 @@ foreach ($accounts as $account) {
     </div>
     <div class="card neumorphic"><div class="card-body">
         <div class="table-container"><table>
-            <thead><tr><th>Comprobante</th><th>Fecha</th><th>Concepto</th><th>Origen</th><th>Debe</th><th>Haber</th><th>Estado</th></tr></thead>
+            <thead><tr><th>Comprobante</th><th>Fecha</th><th>Concepto</th><th>Origen</th><th>Usuario</th><th>Debe</th><th>Haber</th><th>Estado</th><th></th></tr></thead>
             <tbody>
-            <?php if (!$entries): ?><tr><td colspan="7" class="dashboard-empty">Sin comprobantes</td></tr><?php endif; ?>
+            <?php if (!$entries): ?><tr><td colspan="9" class="dashboard-empty">Sin comprobantes</td></tr><?php endif; ?>
             <?php foreach ($entries as $entry): ?><tr>
-                <td><button type="button" class="btn btn-sm btn-secondary" onclick="showAccountingEntry(<?php echo (int)$entry['id']; ?>)"><?php echo htmlspecialchars($entry['entry_number']); ?></button></td>
+                <td><?php echo htmlspecialchars($entry['entry_number']); ?></td>
                 <td><?php echo date('d/m/Y', strtotime($entry['entry_date'])); ?></td>
                 <td><?php echo htmlspecialchars($entry['description']); ?></td>
                 <td><?php echo htmlspecialchars($entry['source_type'] ?: 'Manual'); ?></td>
+                <td><?php echo htmlspecialchars((string)($entry['created_by_name'] ?? '—')); ?></td>
                 <td><?php echo acctFmt((float)$entry['total_debit'], $currency); ?></td>
                 <td><?php echo acctFmt((float)$entry['total_credit'], $currency); ?></td>
                 <td><span class="badge <?php echo $entry['status'] === 'posted' ? 'badge-success' : 'badge-warning'; ?>"><?php echo htmlspecialchars($entry['status']); ?></span></td>
+                <td><button type="button" class="btn btn-sm btn-info" onclick="showAccountingEntry(<?php echo (int)$entry['id']; ?>)">Ver detalle</button></td>
             </tr><?php endforeach; ?>
             </tbody>
         </table></div>
@@ -273,25 +296,268 @@ foreach ($accounts as $account) {
     </div></div>
 
 <?php elseif ($tab === 'trial'): ?>
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
-        <h3 style="margin:0;">Balance de prueba</h3>
-        <?php if ($canExport): ?><a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=export&report=trial-balance&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">Exportar CSV</a><?php endif; ?>
+    <?php
+    $mb = $monthlyBalance;
+    $mt = $mb['totals'] ?? [];
+    $exportUrl = $viewInstance->route('app/contabilidad')
+        . '?action=export&report=monthly-balance&year=' . (int)$balanceYear;
+    $fmtCell = static function (float $v, array $currency): string {
+        if (abs($v) < 0.009) {
+            return '—';
+        }
+        $neg = $v < 0;
+        $txt = acctFmt(abs($v), $currency);
+        return $neg ? ('− ' . $txt) : $txt;
+    };
+    $chartJson = json_encode(
+        $mb['chart'] ?? [],
+        JSON_UNESCAPED_UNICODE | JSON_NUMERIC_CHECK | JSON_HEX_TAG | JSON_HEX_AMP
+    );
+    $balWarnings = $mb['meta']['warnings'] ?? [];
+    ?>
+    <style>
+        .bal-table thead th{font-size:14px;font-weight:700;color:#000;white-space:nowrap;vertical-align:bottom;padding:10px 12px;}
+        .bal-group-facturas{background:#FB923C;color:#000;text-align:center;}
+        .bal-group-utilidad{background:#86EFAC;color:#000;text-align:center;}
+        .bal-th-util{background:#4ADE80;color:#000;}
+        .bal-th-base{background:#86EFAC;color:#000;}
+        .bal-total-ingresos{background:#991B1B;color:#fff;font-weight:700;}
+        .bal-totals-row td{font-weight:700;background:#F8FAFC;font-size:13px;}
+        .bal-charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-bottom:16px;}
+        .bal-chart-card{min-height:280px;}
+        .bal-chart-card .card-body{position:relative;height:240px;}
+        .bal-chart-card canvas{max-height:240px;}
+        .bal-chart-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--color-text-secondary);font-size:13px;}
+    </style>
+
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+        <div>
+            <h3 style="margin:0 0 4px;">Balance <?php echo (int)$balanceYear; ?></h3>
+            <p style="margin:0;font-size:13px;color:var(--color-text-secondary);max-width:720px;">
+                Resumen mensual: ventas completadas (menos NC), costo de venta, facturas de compra recibidas y utilidades
+                (bruta = ingresos − costo; operacional = bruta − gastos operativos; neta = operacional − gastos fijos/financieros).
+            </p>
+            <?php if (!empty($balWarnings)): ?>
+                <p style="margin:8px 0 0;font-size:12px;color:#B45309;">
+                    Algunas fuentes no respondieron (<?php echo htmlspecialchars(implode(', ', $balWarnings)); ?>). Revise logs si los totales lucen incompletos.
+                </p>
+            <?php endif; ?>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <?php if ($canExport): ?>
+                <a class="btn btn-secondary" href="<?php echo htmlspecialchars($exportUrl); ?>">Exportar CSV</a>
+            <?php endif; ?>
+        </div>
     </div>
-    <div class="card neumorphic"><div class="card-body"><div class="table-container"><table>
-        <thead><tr><th>Código</th><th>Cuenta</th><th>Saldo inicial</th><th>Debe</th><th>Haber</th><th>Saldo final</th></tr></thead>
-        <tbody>
-        <?php $sumDebit = $sumCredit = 0.0; ?>
-        <?php if (!$trialBalance): ?><tr><td colspan="6" class="dashboard-empty">Sin movimientos</td></tr><?php endif; ?>
-        <?php foreach ($trialBalance as $row): $sumDebit += (float)$row['debit']; $sumCredit += (float)$row['credit']; ?><tr>
-            <td><?php echo htmlspecialchars($row['code']); ?></td><td><?php echo htmlspecialchars($row['name']); ?></td>
-            <td><?php echo acctFmt((float)$row['opening_balance'], $currency); ?></td>
-            <td><?php echo acctFmt((float)$row['debit'], $currency); ?></td>
-            <td><?php echo acctFmt((float)$row['credit'], $currency); ?></td>
-            <td><?php echo acctFmt((float)$row['closing_balance'], $currency); ?></td>
-        </tr><?php endforeach; ?>
-        </tbody>
-        <tfoot><tr><th colspan="3">Totales del periodo</th><th><?php echo acctFmt($sumDebit, $currency); ?></th><th><?php echo acctFmt($sumCredit, $currency); ?></th><th></th></tr></tfoot>
-    </table></div></div></div>
+
+    <div class="stats-grid" style="margin-bottom:16px;">
+        <div class="stat-card neumorphic">
+            <h4>Ingresos año</h4>
+            <div class="stat-value" style="font-size:20px;color:#991B1B;"><?php echo acctFmt((float)($mt['ingresos'] ?? 0), $currency); ?></div>
+        </div>
+        <div class="stat-card neumorphic">
+            <h4>Costo de venta</h4>
+            <div class="stat-value" style="font-size:20px;"><?php echo acctFmt((float)($mt['costo_venta'] ?? 0), $currency); ?></div>
+        </div>
+        <div class="stat-card neumorphic">
+            <h4>Utilidad bruta</h4>
+            <div class="stat-value" style="font-size:20px;color:#059669;"><?php echo $fmtCell((float)($mt['utilidad_bruta'] ?? 0), $currency); ?></div>
+        </div>
+        <div class="stat-card neumorphic">
+            <h4>Utilidad neta</h4>
+            <div class="stat-value" style="font-size:20px;color:<?php echo ((float)($mt['utilidad_neta'] ?? 0) >= 0) ? '#059669' : '#DC2626'; ?>;">
+                <?php echo $fmtCell((float)($mt['utilidad_neta'] ?? 0), $currency); ?>
+            </div>
+        </div>
+    </div>
+
+    <div class="bal-charts">
+        <div class="card neumorphic bal-chart-card">
+            <div class="card-header"><h3 style="margin:0;font-size:15px;">Ingresos vs costo de venta</h3></div>
+            <div class="card-body"><canvas id="balChartIncome" aria-label="Gráfico ingresos vs costo"></canvas></div>
+        </div>
+        <div class="card neumorphic bal-chart-card">
+            <div class="card-header"><h3 style="margin:0;font-size:15px;">Utilidades del año</h3></div>
+            <div class="card-body"><canvas id="balChartProfit" aria-label="Gráfico utilidades"></canvas></div>
+        </div>
+        <div class="card neumorphic bal-chart-card">
+            <div class="card-header"><h3 style="margin:0;font-size:15px;">Facturas vs pagos a proveedores</h3></div>
+            <div class="card-body"><canvas id="balChartInvoices" aria-label="Gráfico facturas vs pagos"></canvas></div>
+        </div>
+    </div>
+
+    <div class="card neumorphic" style="margin-bottom:16px;">
+        <div class="card-body" style="padding:0;">
+            <div class="table-container" style="overflow-x:auto;">
+                <table class="bal-table" style="min-width:1100px;">
+                    <thead>
+                        <tr>
+                            <th rowspan="2" class="bal-th-base">Mes</th>
+                            <th rowspan="2" class="bal-th-base">Ingresos</th>
+                            <th rowspan="2" class="bal-th-base">Costo de venta</th>
+                            <th colspan="6" class="bal-group-facturas">Facturas</th>
+                            <th colspan="3" class="bal-group-utilidad">Utilidad</th>
+                        </tr>
+                        <tr>
+                            <th class="bal-group-facturas">Total</th>
+                            <th class="bal-group-facturas">Contado</th>
+                            <th class="bal-group-facturas">Crédito</th>
+                            <th class="bal-group-facturas">$ Fact. Pagadas</th>
+                            <th class="bal-group-facturas">Dctos X Pagos</th>
+                            <th class="bal-group-facturas">Pendientes</th>
+                            <th class="bal-th-util">Bruta</th>
+                            <th class="bal-th-util">Operacional</th>
+                            <th class="bal-th-util">Neta</th>
+                        </tr>
+                        <tr class="bal-totals-row">
+                            <td></td>
+                            <td class="bal-total-ingresos" style="text-align:right;"><?php echo acctFmt((float)($mt['ingresos'] ?? 0), $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)($mt['costo_venta'] ?? 0), $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)($mt['facturas_total'] ?? 0), $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)($mt['facturas_contado'] ?? 0), $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)($mt['facturas_credito'] ?? 0), $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)($mt['facturas_pagadas'] ?? 0), $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)($mt['facturas_descuentos'] ?? 0), $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)($mt['facturas_pendientes'] ?? 0), $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)($mt['utilidad_bruta'] ?? 0), $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)($mt['utilidad_operacional'] ?? 0), $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)($mt['utilidad_neta'] ?? 0), $currency); ?></td>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php foreach (($mb['months'] ?? []) as $row): ?>
+                        <tr>
+                            <td><strong><?php echo htmlspecialchars((string)$row['month_label']); ?></strong></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)$row['ingresos'], $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)$row['costo_venta'], $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)$row['facturas_total'], $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)$row['facturas_contado'], $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)$row['facturas_credito'], $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)$row['facturas_pagadas'], $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)$row['facturas_descuentos'], $currency); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtCell((float)$row['facturas_pendientes'], $currency); ?></td>
+                            <td style="text-align:right;background:rgba(187,247,208,.25);"><?php echo $fmtCell((float)$row['utilidad_bruta'], $currency); ?></td>
+                            <td style="text-align:right;background:rgba(187,247,208,.25);"><?php echo $fmtCell((float)$row['utilidad_operacional'], $currency); ?></td>
+                            <td style="text-align:right;background:rgba(187,247,208,.35);font-weight:600;color:<?php echo ((float)$row['utilidad_neta'] >= 0) ? 'inherit' : '#DC2626'; ?>;">
+                                <?php echo $fmtCell((float)$row['utilidad_neta'], $currency); ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script src="<?php echo $viewInstance->asset('js/chart.umd.min.js'); ?>"></script>
+    <script>
+    (function(){
+        var data = <?php echo $chartJson ?: '{}'; ?>;
+        if (!data || !data.labels) return;
+
+        function sumArr(arr) {
+            if (!arr || !arr.length) return 0;
+            var t = 0;
+            for (var i = 0; i < arr.length; i++) t += Number(arr[i]) || 0;
+            return t;
+        }
+        var hasIncome = Math.abs(sumArr(data.ingresos)) + Math.abs(sumArr(data.costo_venta)) > 0.009;
+        var hasProfit = Math.abs(sumArr(data.utilidad_bruta)) + Math.abs(sumArr(data.utilidad_operacional)) + Math.abs(sumArr(data.utilidad_neta)) > 0.009;
+        var hasInv = Math.abs(sumArr(data.facturas_total)) + Math.abs(sumArr(data.facturas_pagadas)) > 0.009;
+
+        function showEmpty(canvasId) {
+            var canvas = document.getElementById(canvasId);
+            if (!canvas || !canvas.parentNode) return;
+            canvas.style.display = 'none';
+            var empty = document.createElement('div');
+            empty.className = 'bal-chart-empty';
+            empty.textContent = 'Sin movimientos en este año';
+            canvas.parentNode.appendChild(empty);
+        }
+
+        if (!window.Chart) {
+            showEmpty('balChartIncome');
+            showEmpty('balChartProfit');
+            showEmpty('balChartInvoices');
+            return;
+        }
+
+        var moneyTick = function(v){
+            try {
+                return new Intl.NumberFormat('es-CO', {notation:'compact', compactDisplay:'short'}).format(v);
+            } catch (e) { return v; }
+        };
+        var commonOpts = {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { position: 'bottom' },
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) {
+                            var raw = Number(ctx.parsed.y || 0);
+                            try {
+                                return (ctx.dataset.label || '') + ': ' +
+                                    new Intl.NumberFormat('es-CO', {style:'currency', currency:'COP', maximumFractionDigits:0}).format(raw);
+                            } catch (e) {
+                                return (ctx.dataset.label || '') + ': ' + raw;
+                            }
+                        }
+                    }
+                }
+            },
+            scales: { y: { ticks: { callback: moneyTick } } }
+        };
+
+        function mount(id, cfg, hasData) {
+            var el = document.getElementById(id);
+            if (!el) return;
+            if (!hasData) { showEmpty(id); return; }
+            if (el._balChart) {
+                try { el._balChart.destroy(); } catch (e) {}
+            }
+            el._balChart = new Chart(el, cfg);
+        }
+
+        mount('balChartIncome', {
+            type: 'bar',
+            data: {
+                labels: data.labels,
+                datasets: [
+                    { label: 'Ingresos', data: data.ingresos, backgroundColor: 'rgba(153,27,27,0.75)', borderRadius: 4 },
+                    { label: 'Costo de venta', data: data.costo_venta, backgroundColor: 'rgba(100,116,139,0.55)', borderRadius: 4 }
+                ]
+            },
+            options: commonOpts
+        }, hasIncome);
+
+        mount('balChartProfit', {
+            type: 'line',
+            data: {
+                labels: data.labels,
+                datasets: [
+                    { label: 'Bruta', data: data.utilidad_bruta, borderColor: '#059669', backgroundColor: 'rgba(5,150,105,0.15)', tension: 0.3, fill: true },
+                    { label: 'Operacional', data: data.utilidad_operacional, borderColor: '#2563EB', backgroundColor: 'rgba(37,99,235,0.08)', tension: 0.3, fill: false },
+                    { label: 'Neta', data: data.utilidad_neta, borderColor: '#0F766E', backgroundColor: 'rgba(15,118,110,0.08)', tension: 0.3, fill: false }
+                ]
+            },
+            options: commonOpts
+        }, hasProfit);
+
+        mount('balChartInvoices', {
+            type: 'bar',
+            data: {
+                labels: data.labels,
+                datasets: [
+                    { label: 'Facturas (total)', data: data.facturas_total, backgroundColor: 'rgba(251,146,60,0.8)', borderRadius: 4 },
+                    { label: 'Pagadas', data: data.facturas_pagadas, backgroundColor: 'rgba(13,124,74,0.65)', borderRadius: 4 }
+                ]
+            },
+            options: commonOpts
+        }, hasInv);
+    })();
+    </script>
 
 <?php elseif ($tab === 'statements'): ?>
     <div class="accounting-statements">
@@ -454,7 +720,54 @@ foreach ($accounts as $account) {
                         '<button type="button" class="btn btn-sm btn-danger" onclick="this.closest(\'.credit-tier-row\').remove()" title="Quitar">✕</button>';
                     wrap.appendChild(row);
                 }
+                function addQtyDiscountTier() {
+                    var wrap = document.getElementById('qtyDiscountTiers');
+                    if (!wrap) return;
+                    var row = document.createElement('div');
+                    row.className = 'qty-discount-tier-row';
+                    row.style.cssText = 'display:flex;gap:10px;align-items:end;flex-wrap:wrap;';
+                    row.innerHTML =
+                        '<div class="form-group" style="margin:0;"><label>Mayor a (unidades)</label>' +
+                        '<input class="form-control" style="width:130px;" type="number" min="1" max="1000000" step="1" name="qty_discount_qty[]" value="10"></div>' +
+                        '<div class="form-group" style="margin:0;"><label>% descuento</label>' +
+                        '<input class="form-control" style="width:110px;" type="number" min="0" max="100" step="0.01" name="qty_discount_rates[]" value="0"></div>' +
+                        '<button type="button" class="btn btn-sm btn-danger" onclick="this.closest(\'.qty-discount-tier-row\').remove()" title="Quitar">✕</button>';
+                    wrap.appendChild(row);
+                }
                 </script>
+
+                <h4 style="margin:22px 0 10px;">Descuento por cantidad (cualquier producto)</h4>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">
+                    Si en Caja un producto supera X unidades, se aplica automáticamente el % de descuento sobre su precio.
+                    Aplica a <strong>cualquier</strong> producto. Si varios tramos aplican, gana el de más unidades
+                    (ej. 25 uds con tramos 10→5% y 20→8% usa 8%).
+                </p>
+                <div id="qtyDiscountTiers" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px;">
+                    <?php
+                    $qtyTiersUi = $commissionCfg['quantity_discount_tiers'] ?? [];
+                    if (empty($qtyTiersUi)) {
+                        $qtyTiersUi = [
+                            ['min_qty' => 10, 'rate' => 0],
+                            ['min_qty' => 20, 'rate' => 0],
+                            ['min_qty' => 50, 'rate' => 0],
+                        ];
+                    }
+                    foreach ($qtyTiersUi as $qt):
+                    ?>
+                    <div class="qty-discount-tier-row" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;">
+                        <div class="form-group" style="margin:0;">
+                            <label>Mayor a (unidades)</label>
+                            <input class="form-control" style="width:130px;" type="number" min="1" max="1000000" step="1" name="qty_discount_qty[]" value="<?php echo (int)$qt['min_qty']; ?>">
+                        </div>
+                        <div class="form-group" style="margin:0;">
+                            <label>% descuento</label>
+                            <input class="form-control" style="width:110px;" type="number" min="0" max="100" step="0.01" name="qty_discount_rates[]" value="<?php echo htmlspecialchars((string)$qt['rate']); ?>">
+                        </div>
+                        <button type="button" class="btn btn-sm btn-danger" onclick="this.closest('.qty-discount-tier-row').remove()" title="Quitar">✕</button>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+                <button type="button" class="btn btn-sm btn-secondary" onclick="addQtyDiscountTier()">+ Agregar tramo</button>
                 <button type="submit" class="btn btn-primary" style="margin-top:12px;">Guardar parámetros</button>
             </form>
             <?php else: ?>
@@ -567,6 +880,9 @@ foreach ($accounts as $account) {
                 <div class="form-group" style="margin:0;min-width:220px;"><label>Notas</label><input class="form-control" name="notes"></div>
                 <button class="btn btn-primary" type="submit">Actualizar periodo</button>
             </form>
+            <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 14px;">
+                Cerrar un periodo <strong>bloquea nuevos asientos</strong> en ese mes. No genera asiento de cierre a utilidad del ejercicio (Fase 1).
+            </p>
         <?php endif; ?>
         <div class="table-container"><table><thead><tr><th>Periodo</th><th>Estado</th><th>Cerrado por</th><th>Fecha</th><th>Notas</th></tr></thead><tbody>
             <?php if (!$periods): ?><tr><td colspan="5" class="dashboard-empty">Todos los periodos están abiertos</td></tr><?php endif; ?>
@@ -591,7 +907,7 @@ foreach ($accounts as $account) {
         </div>
         <div class="card-body">
             <p style="color:var(--color-text-secondary);margin-top:0;">
-                Ciclo de vida de cada factura/OC: creación, recepción, asiento, abonos y notas de crédito.
+                Ciclo de vida de cada factura/OC: fechas (factura, vencimiento, bodega), carga, revisión, recepción, asiento, abonos y notas de crédito.
             </p>
             <?php if (empty($invoiceTraceOrders)): ?>
                 <p style="color:var(--color-text-secondary);">No hay facturas/OC en el periodo.</p>
@@ -627,9 +943,20 @@ foreach ($accounts as $account) {
                                         </div>
                                     </td>
                                     <td><?php echo htmlspecialchars($o['supplier_name'] ?? '—'); ?></td>
-                                    <td style="font-size:12px;">
-                                        Fact: <?php echo !empty($o['invoice_date']) ? date('d/m/Y', strtotime((string)$o['invoice_date'])) : '—'; ?><br>
-                                        Bodega: <?php echo !empty($o['warehouse_date']) ? date('d/m/Y', strtotime((string)$o['warehouse_date'])) : '—'; ?>
+                                    <td style="font-size:12px;line-height:1.45;">
+                                        <?php
+                                        $fmtTraceDate = static function ($v): string {
+                                            $v = trim((string)$v);
+                                            if ($v === '' || str_starts_with($v, '0000-00-00')) {
+                                                return '—';
+                                            }
+                                            $ts = strtotime($v);
+                                            return $ts ? date('d/m/Y', $ts) : '—';
+                                        };
+                                        ?>
+                                        <div><strong>Fact:</strong> <?php echo htmlspecialchars($fmtTraceDate($o['invoice_date'] ?? '')); ?></div>
+                                        <div><strong>Vence:</strong> <?php echo htmlspecialchars($fmtTraceDate($o['due_date'] ?? '')); ?></div>
+                                        <div><strong>Bodega:</strong> <?php echo htmlspecialchars($fmtTraceDate($o['warehouse_date'] ?? '')); ?></div>
                                     </td>
                                     <td>
                                         <?php echo acctFmt((float)$o['total'], $currency); ?>
@@ -687,7 +1014,18 @@ foreach ($accounts as $account) {
                     '<strong>' + esc(o.supplier_name || 'Sin proveedor') + '</strong>'
                     + ' · Factura ' + esc(o.invoice_number || '—')
                     + ' · Total ' + sym + parseFloat(o.total || 0).toFixed(dec)
-                    + (o.balance != null ? (' · Saldo ' + sym + parseFloat(o.balance || 0).toFixed(dec)) : '');
+                    + (o.balance != null ? (' · Saldo ' + sym + parseFloat(o.balance || 0).toFixed(dec)) : '')
+                    + '<div style="margin-top:10px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;">'
+                    + '<div style="padding:8px 10px;border-radius:8px;background:rgba(30,58,138,0.08);border:1px solid rgba(30,58,138,0.2);">'
+                    + '<div style="font-size:11px;color:var(--color-text-secondary);">Fecha de factura</div>'
+                    + '<div style="font-weight:700;color:#1e3a8a;">' + esc(formatTimelineAt(o.invoice_date)) + '</div></div>'
+                    + '<div style="padding:8px 10px;border-radius:8px;background:rgba(180,83,9,0.08);border:1px solid rgba(180,83,9,0.25);">'
+                    + '<div style="font-size:11px;color:var(--color-text-secondary);">Vencimiento de pago</div>'
+                    + '<div style="font-weight:700;color:#B45309;">' + esc(formatTimelineAt(o.due_date)) + '</div></div>'
+                    + '<div style="padding:8px 10px;border-radius:8px;background:rgba(4,120,87,0.08);border:1px solid rgba(4,120,87,0.25);">'
+                    + '<div style="font-size:11px;color:var(--color-text-secondary);">Recepción de bodega</div>'
+                    + '<div style="font-weight:700;color:#047857;">' + esc(formatTimelineAt(o.warehouse_date)) + '</div></div>'
+                    + '</div>';
                 var list = document.getElementById('invoiceTimelineList');
                 list.innerHTML = '';
                 if (!events.length) {
@@ -769,7 +1107,7 @@ foreach ($accounts as $account) {
 
 <?php elseif ($tab === 'trace'): ?>
     <div class="card neumorphic">
-        <div class="card-header"><h3>Trazabilidad de inventario (periodo)</h3></div>
+        <div class="card-header"><h3>Movimientos de inventario (periodo)</h3></div>
         <div class="card-body">
             <?php if (empty($traceMovements)): ?>
                 <p style="color:var(--color-text-secondary);">Sin movimientos en el periodo.</p>
@@ -793,6 +1131,93 @@ foreach ($accounts as $account) {
         </div>
     </div>
 
+<?php elseif ($tab === 'vat'): ?>
+    <?php
+    $vb = is_array($vatBook) ? $vatBook : [];
+    $docs = $vb['documents'] ?? [];
+    $led = $vb['ledger'] ?? [];
+    $acc = $vb['accounts'] ?? ['generated' => '240801', 'deductible' => '240802'];
+    $fmtMoney = static function ($n): string {
+        return '$' . number_format((float)$n, 2, ',', '.');
+    };
+    ?>
+    <div class="card neumorphic" style="margin-bottom:16px;">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+            <h3 style="margin:0;">Libro IVA</h3>
+            <a class="btn btn-sm btn-secondary"
+               href="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=export&report=vat&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">
+                Exportar CSV
+            </a>
+        </div>
+        <div class="card-body">
+            <p style="color:var(--color-text-secondary);margin-top:0;">
+                Cruza IVA de documentos (ventas/compras/NC) con saldos de las cuentas
+                <?php echo htmlspecialchars((string)$acc['generated']); ?> (generado) y
+                <?php echo htmlspecialchars((string)$acc['deductible']); ?> (descontable).
+                Es una ayuda operativa; valide con su contador antes de declarar.
+            </p>
+            <?php if (!empty($vb['warnings'])): ?>
+                <div class="alert alert-warning" style="margin-bottom:14px;">
+                    <?php foreach ($vb['warnings'] as $w): ?>
+                        <div><?php echo htmlspecialchars((string)$w); ?></div>
+                    <?php endforeach; ?>
+                </div>
+            <?php endif; ?>
+            <div class="table-container" style="margin-bottom:18px;">
+                <table>
+                    <thead><tr><th>Concepto</th><th style="text-align:right;">Documentos</th><th style="text-align:right;">Libro contable</th></tr></thead>
+                    <tbody>
+                        <tr>
+                            <td>IVA generado (ventas − NC)</td>
+                            <td style="text-align:right;"><?php echo $fmtMoney($docs['sales_net'] ?? 0); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtMoney($led['generated_net'] ?? 0); ?></td>
+                        </tr>
+                        <tr>
+                            <td>IVA descontable (compras − NC)</td>
+                            <td style="text-align:right;"><?php echo $fmtMoney($docs['purchases_net'] ?? 0); ?></td>
+                            <td style="text-align:right;"><?php echo $fmtMoney($led['deductible_net'] ?? 0); ?></td>
+                        </tr>
+                        <tr>
+                            <td><strong>Saldo a pagar / a favor</strong></td>
+                            <td style="text-align:right;"><strong><?php echo $fmtMoney($docs['balance_to_pay'] ?? 0); ?></strong></td>
+                            <td style="text-align:right;"><strong><?php echo $fmtMoney($led['balance'] ?? 0); ?></strong></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="table-container" style="margin-bottom:18px;">
+                <table>
+                    <thead><tr><th>Detalle documentos</th><th style="text-align:right;">Monto</th></tr></thead>
+                    <tbody>
+                        <tr><td>IVA ventas</td><td style="text-align:right;"><?php echo $fmtMoney($docs['sales_tax'] ?? 0); ?></td></tr>
+                        <tr><td>IVA NC ventas</td><td style="text-align:right;"><?php echo $fmtMoney($docs['sales_credit_tax'] ?? 0); ?></td></tr>
+                        <tr><td>IVA compras</td><td style="text-align:right;"><?php echo $fmtMoney($docs['purchases_tax'] ?? 0); ?></td></tr>
+                        <tr><td>IVA NC compras</td><td style="text-align:right;"><?php echo $fmtMoney($docs['purchases_credit_tax'] ?? 0); ?></td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <h4 style="margin:0 0 10px;">Ventas por tarifa (líneas)</h4>
+            <?php if (empty($vb['by_rate'])): ?>
+                <p style="color:var(--color-text-secondary);">Sin desglose por tarifa en el periodo (o columnas aún no migradas).</p>
+            <?php else: ?>
+                <div class="table-container">
+                    <table>
+                        <thead><tr><th>Tarifa %</th><th style="text-align:right;">Base</th><th style="text-align:right;">IVA</th></tr></thead>
+                        <tbody>
+                        <?php foreach ($vb['by_rate'] as $r): ?>
+                            <tr>
+                                <td><?php echo number_format((float)($r['rate'] ?? 0), 2, ',', '.'); ?>%</td>
+                                <td style="text-align:right;"><?php echo $fmtMoney($r['base'] ?? 0); ?></td>
+                                <td style="text-align:right;"><?php echo $fmtMoney($r['tax'] ?? 0); ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
 <?php elseif ($tab === 'integrations'): ?>
     <?php
     $providerMeta = [
@@ -800,15 +1225,18 @@ foreach ($accounts as $account) {
         'siigo' => 'Emite documentos electrónicos vía Siigo Nube API.',
         'factus' => 'API especializada en facturación electrónica Colombia.',
         'dian' => 'Datos fiscales para emisión directa. Requiere ser Proveedor Tecnológico o factura gratuita DIAN.',
-        'woocommerce' => 'Importa productos de su tienda WooCommerce al inventario (canal: WooCommerce).',
-        'mercadolibre' => 'Importa publicaciones activas de Mercado Libre al inventario (canal: Mercado Libre).',
     ];
+    $st = $integrationStatuses[$selectedProvider] ?? [];
+    $form = $st['form'] ?? [];
+    $routeBase = $viewInstance->route('app/contabilidad');
+    $saveAction = 'save-integration';
+    $testAction = 'integration-test';
     ?>
     <div class="alert alert-info" style="margin-bottom:16px;">
-        Hay dos tipos de integración:
-        <strong>1) Facturación electrónica</strong> (Alegra/Siigo/Factus) y
-        <strong>2) Catálogo e-commerce</strong> (WooCommerce / Mercado Libre → Inventario).
-        Las credenciales se guardan por empresa (cifradas).
+        Configure aquí la <strong>facturación electrónica</strong> (Alegra / Siigo / Factus / DIAN).
+        WooCommerce y Mercado Libre se gestionan en
+        <a href="<?php echo $viewInstance->route('app/inventario'); ?>?integrations=1"><strong>Inventario → Integraciones</strong></a>.
+        Las credenciales se guardan cifradas por empresa.
     </div>
 
     <div class="card neumorphic" style="margin-bottom:18px;">
@@ -821,9 +1249,9 @@ foreach ($accounts as $account) {
                     <label>Usar para facturación electrónica</label>
                     <select class="form-control" name="provider">
                         <option value="">Ninguno</option>
-                        <?php foreach ($integrationStatuses as $code => $st): ?>
+                        <?php foreach ($integrationStatuses as $code => $stOpt): ?>
                             <option value="<?php echo htmlspecialchars($code); ?>" <?php echo $activeProvider === $code ? 'selected' : ''; ?>>
-                                <?php echo htmlspecialchars($st['label'] ?? $code); ?>
+                                <?php echo htmlspecialchars($stOpt['label'] ?? $code); ?>
                             </option>
                         <?php endforeach; ?>
                     </select>
@@ -838,43 +1266,16 @@ foreach ($accounts as $account) {
 
     <h4 style="margin:8px 0 10px;">Facturación electrónica</h4>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;">
-        <?php foreach ($integrationStatuses as $code => $st): ?>
+        <?php foreach ($integrationStatuses as $code => $stOpt): ?>
             <a class="btn <?php echo $selectedProvider === $code ? 'btn-primary' : 'btn-secondary'; ?>"
                href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=integrations&provider=<?php echo urlencode($code); ?>">
-                <?php echo htmlspecialchars($st['label'] ?? $code); ?>
-                <?php if (!empty($st['active'])): ?><span class="badge badge-success" style="margin-left:6px;">Activo</span><?php endif; ?>
+                <?php echo htmlspecialchars($stOpt['label'] ?? $code); ?>
+                <?php if (!empty($stOpt['active'])): ?><span class="badge badge-success" style="margin-left:6px;">Activo</span><?php endif; ?>
             </a>
         <?php endforeach; ?>
+        <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/inventario'); ?>?integrations=1">Integraciones e-commerce (Inventario)</a>
     </div>
 
-    <h4 style="margin:8px 0 10px;">Catálogo e-commerce → Inventario</h4>
-    <p style="font-size:13px;color:var(--color-text-secondary);margin-top:0;">
-        Configure WooCommerce o Mercado Libre aquí; luego importe desde Inventario.
-    </p>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
-        <?php if (empty($catalogStatuses)): ?>
-            <div class="alert alert-warning">No se cargaron conectores de catálogo. Verifique que el código desplegado incluye CatalogSyncService.</div>
-        <?php endif; ?>
-        <?php foreach ($catalogStatuses as $code => $st): ?>
-            <a class="btn <?php echo $selectedProvider === $code ? 'btn-primary' : 'btn-secondary'; ?>"
-               href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=integrations&provider=<?php echo urlencode($code); ?>">
-                <?php echo htmlspecialchars($st['label'] ?? $code); ?>
-                <span class="badge badge-info" style="margin-left:6px;">Catálogo</span>
-                <?php if (!empty($st['enabled']) && !empty($st['configured'])): ?>
-                    <span class="badge badge-success" style="margin-left:4px;">Listo</span>
-                <?php endif; ?>
-            </a>
-        <?php endforeach; ?>
-        <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/inventario'); ?>">Ir a Inventario</a>
-    </div>
-
-    <?php
-    $st = $isCatalogProvider ? ($catalogStatuses[$selectedProvider] ?? []) : ($integrationStatuses[$selectedProvider] ?? []);
-    $form = $st['form'] ?? [];
-    $routeBase = $viewInstance->route('app/contabilidad');
-    $saveAction = $isCatalogProvider ? 'save-catalog-integration' : 'save-integration';
-    $testAction = $isCatalogProvider ? 'catalog-test' : 'integration-test';
-    ?>
     <div class="card neumorphic">
         <div class="card-header">
             <h3><?php echo htmlspecialchars($st['label'] ?? $selectedProvider); ?></h3>
@@ -903,63 +1304,15 @@ foreach ($accounts as $account) {
                     <div class="form-group">
                         <label><input type="checkbox" name="enabled" value="1" <?php echo !empty($form['enabled']) && $form['enabled'] !== '0' ? 'checked' : ''; ?>> Habilitar conector</label>
                     </div>
-                    <?php if (!$isCatalogProvider): ?>
                     <div class="form-group">
                         <label><input type="checkbox" name="make_active" value="1" <?php echo $activeProvider === $selectedProvider ? 'checked' : ''; ?>> Marcar como proveedor activo</label>
                     </div>
                     <div class="form-group">
                         <label><input type="checkbox" name="sync_sales" value="1" <?php echo !empty($form['sync_sales']) && $form['sync_sales'] !== '0' ? 'checked' : ''; ?>> Sincronizar ventas</label>
                     </div>
-                    <?php endif; ?>
                 </div>
 
-                <?php if ($selectedProvider === 'woocommerce'): ?>
-                    <div class="form-grid">
-                        <div class="form-group" style="grid-column:1/-1;"><label>URL de la tienda</label><input class="form-control" name="store_url" value="<?php echo htmlspecialchars($form['store_url'] ?? ''); ?>" placeholder="https://mitienda.com"></div>
-                        <div class="form-group"><label>Consumer Key</label><input class="form-control" name="consumer_key" value="<?php echo htmlspecialchars($form['consumer_key'] ?? ''); ?>" autocomplete="off"></div>
-                        <div class="form-group"><label>Consumer Secret <?php if (!empty($form['consumer_secret_set'])): ?><small>(guardado)</small><?php endif; ?></label><input class="form-control" type="password" name="consumer_secret" placeholder="<?php echo !empty($form['consumer_secret_set']) ? 'Dejar vacío para conservar' : 'Secret'; ?>" autocomplete="new-password"></div>
-                        <div class="form-group" style="grid-column:1/-1;"><label>Política de stock (quién manda)</label>
-                            <?php $auth = $form['stock_authority'] ?? ($st['stock_authority'] ?? 'create_only'); ?>
-                            <select class="form-control" name="stock_authority">
-                                <option value="create_only" <?php echo $auth === 'create_only' ? 'selected' : ''; ?>>Solo al crear (recomendado) — updates no tocan stock ERP</option>
-                                <option value="erp" <?php echo $auth === 'erp' ? 'selected' : ''; ?>>ERP manda — nunca sincroniza cantidades</option>
-                                <option value="store" <?php echo $auth === 'store' ? 'selected' : ''; ?>>Tienda manda — ajusta stock local al remoto</option>
-                            </select>
-                        </div>
-                    </div>
-                    <p style="font-size:12px;color:var(--color-text-secondary);">WooCommerce → Ajustes → Avanzado → REST API. Luego Inventario → Importar WooCommerce.</p>
-
-                <?php elseif ($selectedProvider === 'mercadolibre'): ?>
-                    <div class="form-grid">
-                        <div class="form-group"><label>Client ID (App ML)</label><input class="form-control" name="client_id" value="<?php echo htmlspecialchars($form['client_id'] ?? ''); ?>" autocomplete="off"></div>
-                        <div class="form-group"><label>Client Secret <?php if (!empty($form['client_secret_set'])): ?><small>(guardado)</small><?php endif; ?></label><input class="form-control" type="password" name="client_secret" placeholder="<?php echo !empty($form['client_secret_set']) ? 'Dejar vacío para conservar' : 'Secret'; ?>" autocomplete="new-password"></div>
-                        <div class="form-group" style="grid-column:1/-1;"><label>Redirect URI (registre esta URL en su app ML)</label>
-                            <input class="form-control" readonly value="<?php echo htmlspecialchars($mlOAuthRedirect); ?>">
-                        </div>
-                        <div class="form-group"><label>Site ID</label><input class="form-control" name="site_id" value="<?php echo htmlspecialchars($form['site_id'] ?? 'MCO'); ?>"></div>
-                        <div class="form-group"><label>User ID</label><input class="form-control" name="user_id" value="<?php echo htmlspecialchars($form['user_id'] ?? ''); ?>" placeholder="Se completa con OAuth"></div>
-                        <div class="form-group" style="grid-column:1/-1;"><label>Access Token (manual / legado) <?php if (!empty($form['access_token_set'])): ?><small>(guardado)</small><?php endif; ?></label><input class="form-control" type="password" name="access_token" placeholder="<?php echo !empty($form['access_token_set']) ? 'Dejar vacío para conservar' : 'Opcional si usa OAuth'; ?>" autocomplete="new-password"></div>
-                        <div class="form-group" style="grid-column:1/-1;"><label>Refresh Token <?php if (!empty($form['refresh_token_set'])): ?><small>(guardado)</small><?php endif; ?></label><input class="form-control" type="password" name="refresh_token" placeholder="<?php echo !empty($form['refresh_token_set']) ? 'Dejar vacío para conservar' : 'Se guarda con OAuth'; ?>" autocomplete="new-password"></div>
-                        <div class="form-group" style="grid-column:1/-1;"><label>Política de stock</label>
-                            <?php $auth = $form['stock_authority'] ?? ($st['stock_authority'] ?? 'create_only'); ?>
-                            <select class="form-control" name="stock_authority">
-                                <option value="create_only" <?php echo $auth === 'create_only' ? 'selected' : ''; ?>>Solo al crear (recomendado)</option>
-                                <option value="erp" <?php echo $auth === 'erp' ? 'selected' : ''; ?>>ERP manda</option>
-                                <option value="store" <?php echo $auth === 'store' ? 'selected' : ''; ?>>ML manda (ajusta stock local)</option>
-                            </select>
-                        </div>
-                    </div>
-                    <?php if ($canEdit): ?>
-                        <p style="margin:10px 0;">
-                            <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=ml-oauth-start">Conectar con Mercado Libre (OAuth)</a>
-                            <?php if (!empty($st['meta']['token_expires_at'])): ?>
-                                <small style="margin-left:8px;color:var(--color-text-secondary);">Expira: <?php echo htmlspecialchars($st['meta']['token_expires_at']); ?><?php echo !empty($st['meta']['has_refresh']) ? ' · refresh activo' : ''; ?></small>
-                            <?php endif; ?>
-                        </p>
-                    <?php endif; ?>
-                    <p style="font-size:12px;color:var(--color-text-secondary);">El sistema renueva el access_token automáticamente con refresh_token cuando vence o responde 401.</p>
-
-                <?php elseif ($selectedProvider === 'alegra'): ?>
+                <?php if ($selectedProvider === 'alegra'): ?>
                     <div class="form-grid">
                         <div class="form-group"><label>Email Alegra</label><input class="form-control" name="email" value="<?php echo htmlspecialchars($form['email'] ?? ''); ?>" autocomplete="off"></div>
                         <div class="form-group"><label>Token API <?php if (!empty($form['token_set'])): ?><small>(guardado)</small><?php endif; ?></label><input class="form-control" type="password" name="token" placeholder="<?php echo !empty($form['token_set']) ? 'Dejar vacío para conservar' : 'Token'; ?>" autocomplete="new-password"></div>
@@ -1101,6 +1454,17 @@ foreach ($accounts as $account) {
 <script>
 var accountingAccountOptions = <?php echo json_encode($accountOptions); ?>;
 var accountingCurrency = <?php echo json_encode($currency); ?>;
+var gastosReceiptBase = <?php echo json_encode($viewInstance->route('app/gastos')); ?>;
+
+function openModal(id) {
+    var el = typeof id === 'string' ? document.getElementById(id) : id;
+    if (el) el.style.display = 'flex';
+}
+
+function closeModal(id) {
+    var el = typeof id === 'string' ? document.getElementById(id) : id;
+    if (el) el.style.display = 'none';
+}
 
 function accountingMoney(value) {
     return (accountingCurrency.symbol || '$') + ' ' + Number(value || 0).toLocaleString('es-CO', {
@@ -1164,6 +1528,116 @@ function editAccountingAccount(account) {
     openModal('accountModal');
 }
 
+function renderExpenseSourceDocument(doc) {
+    if (!doc || doc.type !== 'expense') return '';
+    var html = '<div style="margin-bottom:14px;padding:12px 14px;border:1px solid var(--color-border);border-radius:8px;background:var(--color-bg-secondary,#f8fafc);">';
+    html += '<h4 style="margin:0 0 10px;font-size:15px;">Documento de gasto</h4>';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:13px;margin-bottom:10px;">';
+    html += '<div><span style="color:var(--color-text-secondary);">Concepto</span><br><strong>' + escapeAccounting(doc.description) + '</strong></div>';
+    html += '<div><span style="color:var(--color-text-secondary);">Monto</span><br><strong>' + accountingMoney(doc.amount) + '</strong></div>';
+    html += '<div><span style="color:var(--color-text-secondary);">Categoría</span><br>' + escapeAccounting(doc.category || '—') + '</div>';
+    html += '<div><span style="color:var(--color-text-secondary);">Medio de pago</span><br>' + escapeAccounting(doc.payment_label || doc.payment_method || '—') + '</div>';
+    if (doc.supplier_name) {
+        html += '<div><span style="color:var(--color-text-secondary);">Proveedor</span><br>' + escapeAccounting(doc.supplier_name) + '</div>';
+    }
+    if (doc.receipt_number) {
+        html += '<div><span style="color:var(--color-text-secondary);">N° comprobante</span><br>' + escapeAccounting(doc.receipt_number) + '</div>';
+    }
+    html += '</div>';
+    if (doc.cash_explanation) {
+        html += '<p style="margin:0 0 8px;padding:8px 10px;border-left:3px solid #F59E0B;background:rgba(245,158,11,.08);font-size:13px;">';
+        html += '<strong>Explicación del efectivo:</strong> ' + escapeAccounting(doc.cash_explanation) + '</p>';
+    } else if (doc.notes) {
+        html += '<p style="margin:0 0 8px;font-size:13px;color:var(--color-text-secondary);"><strong>Notas:</strong> ' + escapeAccounting(doc.notes) + '</p>';
+    }
+    if (doc.has_receipt) {
+        var receiptUrl = gastosReceiptBase + '?action=receipt&id=' + encodeURIComponent(doc.id);
+        var mime = String(doc.receipt_mime || '');
+        if (mime.indexOf('image/') === 0) {
+            html += '<div style="margin-top:8px;"><span style="font-size:12px;color:var(--color-text-secondary);">Comprobante adjunto</span><br>';
+            html += '<a href="' + receiptUrl + '" target="_blank" rel="noopener"><img src="' + receiptUrl + '" alt="Comprobante" style="max-width:100%;max-height:260px;margin-top:6px;border-radius:6px;border:1px solid var(--color-border);"></a></div>';
+        } else {
+            html += '<p style="margin:8px 0 0;"><a class="btn btn-sm btn-secondary" href="' + receiptUrl + '" target="_blank" rel="noopener">Ver comprobante adjunto (PDF/archivo)</a></p>';
+        }
+    }
+    html += '</div>';
+    return html;
+}
+
+function renderSaleSourceDocument(doc) {
+    if (!doc || doc.type !== 'sale') return '';
+    var html = '<div style="margin-bottom:14px;padding:12px 14px;border:1px solid var(--color-border);border-radius:8px;background:var(--color-bg-secondary,#f8fafc);">';
+    html += '<h4 style="margin:0 0 10px;font-size:15px;">Documento de venta</h4>';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:13px;">';
+    html += '<div><span style="color:var(--color-text-secondary);">Factura</span><br><strong>' + escapeAccounting(doc.invoice_number || ('#' + doc.id)) + '</strong></div>';
+    html += '<div><span style="color:var(--color-text-secondary);">Total</span><br><strong>' + accountingMoney(doc.total) + '</strong></div>';
+    if (doc.customer_name) {
+        html += '<div><span style="color:var(--color-text-secondary);">Cliente</span><br>' + escapeAccounting(doc.customer_name) + '</div>';
+    }
+    html += '<div><span style="color:var(--color-text-secondary);">Medio de pago</span><br>' + escapeAccounting(doc.payment_label || doc.payment_method || '—') + '</div>';
+    html += '<div><span style="color:var(--color-text-secondary);">Estado pago</span><br>' + escapeAccounting(doc.payment_status || '—') + '</div>';
+    html += '</div></div>';
+    return html;
+}
+
+function renderSalePaymentSourceDocument(doc) {
+    if (!doc || doc.type !== 'sale_payment') return '';
+    var html = '<div style="margin-bottom:14px;padding:12px 14px;border:1px solid var(--color-border);border-radius:8px;background:var(--color-bg-secondary,#f8fafc);">';
+    html += '<h4 style="margin:0 0 10px;font-size:15px;">Abono de venta</h4>';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:13px;">';
+    html += '<div><span style="color:var(--color-text-secondary);">Factura</span><br><strong>' + escapeAccounting(doc.invoice_number || '—') + '</strong></div>';
+    html += '<div><span style="color:var(--color-text-secondary);">Monto abono</span><br><strong>' + accountingMoney(doc.amount) + '</strong></div>';
+    html += '<div><span style="color:var(--color-text-secondary);">Medio</span><br>' + escapeAccounting(doc.payment_label || doc.payment_method || '—') + '</div>';
+    if (doc.notes) {
+        html += '<div><span style="color:var(--color-text-secondary);">Notas</span><br>' + escapeAccounting(doc.notes) + '</div>';
+    }
+    html += '</div></div>';
+    return html;
+}
+
+function renderSaleCreditNoteSourceDocument(doc) {
+    if (!doc || doc.type !== 'sale_credit_note') return '';
+    var html = '<div style="margin-bottom:14px;padding:12px 14px;border:1px solid var(--color-border);border-radius:8px;background:var(--color-bg-secondary,#f8fafc);">';
+    html += '<h4 style="margin:0 0 10px;font-size:15px;">Nota de crédito de venta</h4>';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:13px;">';
+    html += '<div><span style="color:var(--color-text-secondary);">NC</span><br><strong>' + escapeAccounting(doc.credit_number || ('#' + doc.id)) + '</strong></div>';
+    html += '<div><span style="color:var(--color-text-secondary);">Total</span><br><strong>' + accountingMoney(doc.total) + '</strong></div>';
+    if (doc.invoice_number) {
+        html += '<div><span style="color:var(--color-text-secondary);">Venta</span><br>' + escapeAccounting(doc.invoice_number) + '</div>';
+    }
+    if (doc.customer_name) {
+        html += '<div><span style="color:var(--color-text-secondary);">Cliente</span><br>' + escapeAccounting(doc.customer_name) + '</div>';
+    }
+    html += '<div><span style="color:var(--color-text-secondary);">Stock</span><br>' + (doc.affects_stock ? 'Reingreso' : 'Sin reingreso') + '</div>';
+    if (doc.reason) {
+        html += '<div><span style="color:var(--color-text-secondary);">Motivo</span><br>' + escapeAccounting(doc.reason) + '</div>';
+    }
+    html += '</div></div>';
+    return html;
+}
+
+function renderCashMovementSourceDocument(doc) {
+    if (!doc || doc.type !== 'cash_movement') return '';
+    var html = '<div style="margin-bottom:14px;padding:12px 14px;border:1px solid var(--color-border);border-radius:8px;background:var(--color-bg-secondary,#f8fafc);">';
+    html += '<h4 style="margin:0 0 10px;font-size:15px;">Movimiento de caja</h4>';
+    html += '<p style="margin:0;font-size:13px;"><strong>' + escapeAccounting(doc.description) + '</strong> · ' + accountingMoney(doc.amount) + '</p>';
+    if (doc.user_name) {
+        html += '<p style="margin:6px 0 0;font-size:12px;color:var(--color-text-secondary);">Usuario: ' + escapeAccounting(doc.user_name) + '</p>';
+    }
+    html += '</div>';
+    return html;
+}
+
+function renderSourceDocument(doc) {
+    if (!doc || !doc.type) return '';
+    if (doc.type === 'expense') return renderExpenseSourceDocument(doc);
+    if (doc.type === 'sale') return renderSaleSourceDocument(doc);
+    if (doc.type === 'sale_payment') return renderSalePaymentSourceDocument(doc);
+    if (doc.type === 'sale_credit_note') return renderSaleCreditNoteSourceDocument(doc);
+    if (doc.type === 'cash_movement') return renderCashMovementSourceDocument(doc);
+    return '';
+}
+
 function showAccountingEntry(id) {
     var url = <?php echo json_encode($viewInstance->route('app/contabilidad')); ?> + '?action=entry&id=' + encodeURIComponent(id);
     document.getElementById('entryDetailBody').innerHTML = '<p class="dashboard-empty">Cargando...</p>';
@@ -1174,8 +1648,16 @@ function showAccountingEntry(id) {
             if (!data.success) throw new Error(data.message || 'No se pudo cargar');
             var entry = data.entry;
             document.getElementById('entryDetailTitle').textContent = entry.entry_number + ' · ' + entry.description;
-            var html = '<p><strong>Fecha:</strong> ' + entry.entry_date + ' &nbsp; <strong>Estado:</strong> ' + entry.status + '</p>';
-            html += '<div class="table-container"><table><thead><tr><th>Cuenta</th><th>Detalle</th><th>Tercero</th><th>Debe</th><th>Haber</th></tr></thead><tbody>';
+            var html = '<p style="margin:0 0 10px;"><strong>Fecha:</strong> ' + escapeAccounting(entry.entry_date) + ' &nbsp; <strong>Estado:</strong> ' + escapeAccounting(entry.status) + '</p>';
+            if (entry.source_document) {
+                html += renderSourceDocument(entry.source_document);
+            }
+            html += '<p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 8px;">';
+            html += '<strong>Partida doble (PUC):</strong> cada fila es un movimiento contable. ';
+            html += '<strong>Debe (cargo)</strong> registra el gasto; <strong>Haber (abono)</strong> indica de dónde salió el dinero ';
+            html += '(<em>Banco</em> = retiro/transferencia; <em>Caja general</em> = cajón físico del POS). ';
+            html += 'La suma Debe y Haber debe ser igual.</p>';
+            html += '<div class="table-container"><table><thead><tr><th>Cuenta</th><th>Detalle</th><th>Tercero</th><th>Debe (cargo)</th><th>Haber (abono)</th></tr></thead><tbody>';
             entry.lines.forEach(function(line){
                 html += '<tr><td>' + escapeAccounting(line.account_code + ' - ' + line.account_name) + '</td><td>' + escapeAccounting(line.description || '') + '</td><td>' + escapeAccounting(line.third_party_name || '-') + '</td><td>' + accountingMoney(line.debit) + '</td><td>' + accountingMoney(line.credit) + '</td></tr>';
             });
@@ -1219,6 +1701,11 @@ document.addEventListener('DOMContentLoaded', function(){
     if (tbody && !tbody.children.length) {
         addAccountingLine();
         addAccountingLine();
+    }
+    var params = new URLSearchParams(window.location.search);
+    var entryId = parseInt(params.get('entry_id') || params.get('entry') || '0', 10);
+    if (entryId > 0 && typeof showAccountingEntry === 'function') {
+        showAccountingEntry(entryId);
     }
 });
 </script>

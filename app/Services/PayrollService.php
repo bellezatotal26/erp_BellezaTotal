@@ -44,6 +44,10 @@ class PayrollService
             'sena_employer_rate' => '2',
             'icbf_employer_rate' => '3',
             'incapacity_rate' => '66.67',
+            'payroll_monthly_hours' => '240',
+            'overtime_day_rate' => '25',
+            'overtime_night_rate' => '75',
+            'dominical_rate' => '75',
             'payroll_expense_account' => '510503',
             'payroll_employer_expense_account' => '510506',
             'payroll_payable_account' => '250505',
@@ -213,7 +217,39 @@ class PayrollService
     }
 
     /**
-     * @param array{include_prima?:bool,include_cesantias?:bool,include_parafiscales?:bool,incapacity?:array<int,array{days?:int,type?:string}>} $options
+     * @param array{day_hours?:float,night_hours?:float,dominical_hours?:float} $otCfg
+     * @return array{day_hours:float,night_hours:float,dominical_hours:float,day_amount:float,night_amount:float,dominical_amount:float,total:float,hourly_rate:float}
+     */
+    private function calculateOvertime(float $salary, array $otCfg, array $params): array
+    {
+        $monthlyHours = max(1.0, (float)($params['payroll_monthly_hours'] ?? 240));
+        $hourly = $salary / $monthlyHours;
+        $dayHours = max(0.0, round((float)($otCfg['day_hours'] ?? 0), 2));
+        $nightHours = max(0.0, round((float)($otCfg['night_hours'] ?? 0), 2));
+        $domHours = max(0.0, round((float)($otCfg['dominical_hours'] ?? 0), 2));
+        $hedRate = (float)($params['overtime_day_rate'] ?? 25);
+        $henRate = (float)($params['overtime_night_rate'] ?? 75);
+        $domRate = (float)($params['dominical_rate'] ?? 75);
+
+        $dayAmount = round($dayHours * $hourly * (1 + $hedRate / 100), 2);
+        $nightAmount = round($nightHours * $hourly * (1 + $henRate / 100), 2);
+        $domAmount = round($domHours * $hourly * (1 + $domRate / 100), 2);
+        $total = round($dayAmount + $nightAmount + $domAmount, 2);
+
+        return [
+            'day_hours' => $dayHours,
+            'night_hours' => $nightHours,
+            'dominical_hours' => $domHours,
+            'day_amount' => $dayAmount,
+            'night_amount' => $nightAmount,
+            'dominical_amount' => $domAmount,
+            'total' => $total,
+            'hourly_rate' => round($hourly, 2),
+        ];
+    }
+
+    /**
+     * @param array{include_prima?:bool,include_cesantias?:bool,include_parafiscales?:bool,incapacity?:array<int,array{days?:int,type?:string}>,overtime?:array<int|string,array{day_hours?:float,night_hours?:float,dominical_hours?:float}>} $options
      * @return array<string,float|int|string>
      */
     public function calculateEmployeeLine(array $employee, int $daysWorked = 30, array $options = []): array
@@ -229,6 +265,9 @@ class PayrollService
         $salary = (float)$employee['salary'];
         $daily = $salary / 30;
         $base = round($daily * $workedDays, 2);
+
+        $otCfg = $options['overtime'][$empId] ?? $options['overtime'][(string)$empId] ?? [];
+        $ot = $this->calculateOvertime($salary, $otCfg, $p);
 
         // Incapacidad: días 1-2 al 100% (empleador); resto al % configurado (EPS/ARL según tipo)
         $incapPay = 0.0;
@@ -258,8 +297,9 @@ class PayrollService
             $cesInterest = round($cesantias * 0.12 / 12, 2);
         }
 
-        // Base cotización: salario devengado (sin auxilio transporte ni prima excepcional simplificada)
-        $ibc = $base > 0 ? $base : round($daily * max(1, $incapDays > 0 ? min($incapDays, $periodDays) : $periodDays), 2);
+        // Base cotización: salario + HE/dominicales (sin auxilio transporte ni prima)
+        $ibcBase = $base > 0 ? $base : round($daily * max(1, $incapDays > 0 ? min($incapDays, $periodDays) : $periodDays), 2);
+        $ibc = round($ibcBase + $ot['total'], 2);
 
         $healthEmp = round($ibc * (float)$p['health_employee_rate'] / 100, 2);
         $pensionEmp = round($ibc * (float)$p['pension_employee_rate'] / 100, 2);
@@ -274,7 +314,7 @@ class PayrollService
             $icbf = round($ibc * (float)$p['icbf_employer_rate'] / 100, 2);
         }
 
-        $gross = round($base + $transport + $prima + $cesantias + $cesInterest + $incapPay, 2);
+        $gross = round($base + $transport + $prima + $cesantias + $cesInterest + $incapPay + $ot['total'], 2);
         $deductions = round($healthEmp + $pensionEmp, 2);
         $net = round($gross - $deductions, 2);
         $name = trim(($employee['first_name'] ?? '') . ' ' . ($employee['last_name'] ?? ''));
@@ -291,7 +331,13 @@ class PayrollService
             'prima' => $prima,
             'cesantias' => $cesantias,
             'cesantias_interest' => $cesInterest,
-            'other_earnings' => 0.0,
+            'overtime_day_hours' => $ot['day_hours'],
+            'overtime_day_amount' => $ot['day_amount'],
+            'overtime_night_hours' => $ot['night_hours'],
+            'overtime_night_amount' => $ot['night_amount'],
+            'dominical_hours' => $ot['dominical_hours'],
+            'dominical_amount' => $ot['dominical_amount'],
+            'other_earnings' => $ot['total'],
             'health_employee' => $healthEmp,
             'pension_employee' => $pensionEmp,
             'other_deductions' => 0.0,
@@ -372,7 +418,9 @@ class PayrollService
             $this->db->commit();
             return $runId;
         } catch (\Throwable $e) {
-            $this->db->rollBack();
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
             throw $e;
         }
     }
@@ -383,20 +431,25 @@ class PayrollService
             "INSERT INTO payroll_items
                 (payroll_run_id, employee_id, employee_name, salary_base, days_worked, incapacity_days,
                  incapacity_pay, incapacity_type, transport_aid, prima, cesantias, cesantias_interest,
-                 other_earnings, health_employee, pension_employee, other_deductions,
+                 other_earnings, overtime_day_hours, overtime_day_amount, overtime_night_hours, overtime_night_amount,
+                 dominical_hours, dominical_amount,
+                 health_employee, pension_employee, other_deductions,
                  health_employer, pension_employer, arl_employer, caja_employer, sena_employer, icbf_employer,
                  gross_pay, net_pay)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
 
-        $gross = $ded = $net = $employer = $primaT = $cesT = $incT = $paraT = 0.0;
+        $gross = $ded = $net = $employer = $primaT = $cesT = $incT = $paraT = $otT = 0.0;
         foreach ($employees as $emp) {
             $line = $this->calculateEmployeeLine($emp, $daysWorked, $calcOpts);
             $ins->execute([
                 $runId, $line['employee_id'], $line['employee_name'], $line['salary_base'], $line['days_worked'],
                 $line['incapacity_days'], $line['incapacity_pay'], $line['incapacity_type'],
                 $line['transport_aid'], $line['prima'], $line['cesantias'], $line['cesantias_interest'],
-                $line['other_earnings'], $line['health_employee'], $line['pension_employee'], $line['other_deductions'],
+                $line['other_earnings'], $line['overtime_day_hours'], $line['overtime_day_amount'],
+                $line['overtime_night_hours'], $line['overtime_night_amount'],
+                $line['dominical_hours'], $line['dominical_amount'],
+                $line['health_employee'], $line['pension_employee'], $line['other_deductions'],
                 $line['health_employer'], $line['pension_employer'], $line['arl_employer'],
                 $line['caja_employer'], $line['sena_employer'], $line['icbf_employer'],
                 $line['gross_pay'], $line['net_pay'],
@@ -409,20 +462,21 @@ class PayrollService
             $primaT += $line['prima'];
             $cesT += $line['cesantias'] + $line['cesantias_interest'];
             $incT += $line['incapacity_pay'];
+            $otT += $line['other_earnings'];
         }
 
         $this->query(
             "UPDATE payroll_runs SET gross_total=?, deductions_total=?, net_total=?, employer_total=?,
-                prima_total=?, cesantias_total=?, incapacity_total=?, parafiscal_total=? WHERE id=?",
+                prima_total=?, cesantias_total=?, incapacity_total=?, overtime_total=?, parafiscal_total=? WHERE id=?",
             [
                 round($gross, 2), round($ded, 2), round($net, 2), round($employer, 2),
-                round($primaT, 2), round($cesT, 2), round($incT, 2), round($paraT, 2), $runId,
+                round($primaT, 2), round($cesT, 2), round($incT, 2), round($otT, 2), round($paraT, 2), $runId,
             ]
         );
     }
 
-    /** Actualiza incapacidad de un ítem en borrador y recalcula la línea. */
-    public function updateItemIncapacity(int $itemId, int $incapDays, string $incapType = 'enfermedad'): void
+    /** Recalcula una línea en borrador conservando incapacidad y HE/dominicales salvo override. */
+    private function recalcPayrollItem(int $itemId, ?array $incapOverride = null, ?array $otOverride = null): void
     {
         $item = $this->query(
             "SELECT pi.*, pr.status, pr.days_worked AS run_days, pr.include_prima, pr.include_cesantias, pr.include_parafiscales
@@ -434,32 +488,66 @@ class PayrollService
             throw new \RuntimeException('Ítem no encontrado');
         }
         if (($item['status'] ?? '') !== 'draft') {
-            throw new \RuntimeException('Solo se edita incapacidad en liquidaciones en borrador');
+            throw new \RuntimeException('Solo se edita en liquidaciones en borrador');
         }
         $emp = $this->query('SELECT * FROM employees WHERE id=?', [(int)$item['employee_id']])->fetch();
         if (!$emp) {
             throw new \RuntimeException('Empleado no encontrado');
         }
+
+        $incapDays = $incapOverride !== null
+            ? max(0, (int)($incapOverride['days'] ?? 0))
+            : (int)($item['incapacity_days'] ?? 0);
+        $incapType = $incapOverride !== null
+            ? (string)($incapOverride['type'] ?? 'enfermedad')
+            : (string)($item['incapacity_type'] ?? 'enfermedad');
+        $ot = $otOverride ?? [
+            'day_hours' => (float)($item['overtime_day_hours'] ?? 0),
+            'night_hours' => (float)($item['overtime_night_hours'] ?? 0),
+            'dominical_hours' => (float)($item['dominical_hours'] ?? 0),
+        ];
+
         $line = $this->calculateEmployeeLine($emp, (int)$item['run_days'], [
             'include_prima' => !empty($item['include_prima']),
             'include_cesantias' => !empty($item['include_cesantias']),
             'include_parafiscales' => !empty($item['include_parafiscales']),
             'incapacity' => [(int)$emp['id'] => ['days' => $incapDays, 'type' => $incapType]],
+            'overtime' => [(int)$emp['id'] => $ot],
         ]);
         $this->query(
             "UPDATE payroll_items SET salary_base=?, days_worked=?, incapacity_days=?, incapacity_pay=?, incapacity_type=?,
-                transport_aid=?, prima=?, cesantias=?, cesantias_interest=?, health_employee=?, pension_employee=?,
-                health_employer=?, pension_employer=?, arl_employer=?, caja_employer=?, sena_employer=?, icbf_employer=?,
-                gross_pay=?, net_pay=? WHERE id=?",
+                transport_aid=?, prima=?, cesantias=?, cesantias_interest=?, other_earnings=?,
+                overtime_day_hours=?, overtime_day_amount=?, overtime_night_hours=?, overtime_night_amount=?,
+                dominical_hours=?, dominical_amount=?,
+                health_employee=?, pension_employee=?, health_employer=?, pension_employer=?, arl_employer=?,
+                caja_employer=?, sena_employer=?, icbf_employer=?, gross_pay=?, net_pay=? WHERE id=?",
             [
                 $line['salary_base'], $line['days_worked'], $line['incapacity_days'], $line['incapacity_pay'], $line['incapacity_type'],
-                $line['transport_aid'], $line['prima'], $line['cesantias'], $line['cesantias_interest'],
+                $line['transport_aid'], $line['prima'], $line['cesantias'], $line['cesantias_interest'], $line['other_earnings'],
+                $line['overtime_day_hours'], $line['overtime_day_amount'], $line['overtime_night_hours'], $line['overtime_night_amount'],
+                $line['dominical_hours'], $line['dominical_amount'],
                 $line['health_employee'], $line['pension_employee'], $line['health_employer'], $line['pension_employer'],
                 $line['arl_employer'], $line['caja_employer'], $line['sena_employer'], $line['icbf_employer'],
                 $line['gross_pay'], $line['net_pay'], $itemId,
             ]
         );
         $this->recalcRunTotals((int)$item['payroll_run_id']);
+    }
+
+    /** Actualiza incapacidad de un ítem en borrador y recalcula la línea. */
+    public function updateItemIncapacity(int $itemId, int $incapDays, string $incapType = 'enfermedad'): void
+    {
+        $this->recalcPayrollItem($itemId, ['days' => $incapDays, 'type' => $incapType], null);
+    }
+
+    /** Actualiza horas extras y dominicales de un ítem en borrador. */
+    public function updateItemOvertime(int $itemId, float $dayHours, float $nightHours, float $dominicalHours): void
+    {
+        $this->recalcPayrollItem($itemId, null, [
+            'day_hours' => max(0, $dayHours),
+            'night_hours' => max(0, $nightHours),
+            'dominical_hours' => max(0, $dominicalHours),
+        ]);
     }
 
     private function recalcRunTotals(int $runId): void
@@ -469,16 +557,17 @@ class PayrollService
                     COALESCE(SUM(net_pay),0) n,
                     COALESCE(SUM(health_employer+pension_employer+arl_employer),0) e,
                     COALESCE(SUM(prima),0) p, COALESCE(SUM(cesantias+cesantias_interest),0) c,
-                    COALESCE(SUM(incapacity_pay),0) i, COALESCE(SUM(caja_employer+sena_employer+icbf_employer),0) pf
+                    COALESCE(SUM(incapacity_pay),0) i, COALESCE(SUM(other_earnings),0) ot,
+                    COALESCE(SUM(caja_employer+sena_employer+icbf_employer),0) pf
              FROM payroll_items WHERE payroll_run_id=?",
             [$runId]
         )->fetch();
         $this->query(
             "UPDATE payroll_runs SET gross_total=?, deductions_total=?, net_total=?, employer_total=?,
-                prima_total=?, cesantias_total=?, incapacity_total=?, parafiscal_total=? WHERE id=?",
+                prima_total=?, cesantias_total=?, incapacity_total=?, overtime_total=?, parafiscal_total=? WHERE id=?",
             [
                 (float)$sum['g'], (float)$sum['d'], (float)$sum['n'], (float)$sum['e'],
-                (float)$sum['p'], (float)$sum['c'], (float)$sum['i'], (float)$sum['pf'], $runId,
+                (float)$sum['p'], (float)$sum['c'], (float)$sum['i'], (float)$sum['ot'], (float)$sum['pf'], $runId,
             ]
         );
     }
@@ -503,7 +592,7 @@ class PayrollService
         return ['run' => $run, 'items' => $items];
     }
 
-    public function postAndPay(int $runId, bool $affectCash = false): void
+    public function postAndPay(int $runId): array
     {
         $detail = $this->runDetail($runId);
         if (!$detail) {
@@ -523,6 +612,9 @@ class PayrollService
 
         $this->db->beginTransaction();
         try {
+            $accounting = new AccountingService($this->db);
+            $entryId = $accounting->postPayrollRun($runId, true);
+
             $this->query(
                 "INSERT INTO expenses
                     (description, amount, category, expense_date, payment_method, notes, user_id)
@@ -533,34 +625,34 @@ class PayrollService
                     'payroll',
                     $run['pay_date'],
                     $run['payment_method'] ?: 'transfer',
-                    'Liquidación ' . $run['run_number'] . ' · bruto ' . $run['gross_total']
+                    'Liquidación ' . $run['run_number'] . ' · asiento contable #' . $entryId
+                        . ' · bruto ' . $run['gross_total']
                         . ' · aportes emp. ' . $run['employer_total']
-                        . ' · parafiscales ' . ($run['parafiscal_total'] ?? 0),
+                        . ' · parafiscales ' . ($run['parafiscal_total'] ?? 0)
+                        . ' · no descuenta cajón POS',
                     $run['user_id'] ?? ($_SESSION['tenant_user_id'] ?? null),
                 ]
             );
             $expenseId = (int)$this->db->lastInsertId();
 
-            $accounting = new AccountingService($this->db);
-            try {
-                $accounting->postPayrollRun($runId, $affectCash && ($run['payment_method'] ?? '') === 'cash');
-            } catch (\Throwable $e) {
-                error_log('Payroll detailed accounting: ' . $e->getMessage());
-                // Fallback: asiento simple del gasto neto
-                try {
-                    $accounting->postExpense($expenseId, $affectCash && ($run['payment_method'] ?? '') === 'cash');
-                } catch (\Throwable $e2) {
-                    error_log('Payroll expense fallback: ' . $e2->getMessage());
-                }
-            }
-
             $this->query(
                 "UPDATE payroll_runs SET status='paid', expense_id=? WHERE id=?",
                 [$expenseId, $runId]
             );
-            $this->db->commit();
+            if ($this->db->inTransaction()) {
+                $this->db->commit();
+            }
+
+            return [
+                'expense_id' => $expenseId,
+                'accounting_entry_id' => $entryId,
+                'run_number' => (string)$run['run_number'],
+                'net_total' => $net,
+            ];
         } catch (\Throwable $e) {
-            $this->db->rollBack();
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
             throw $e;
         }
     }

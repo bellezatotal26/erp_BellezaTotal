@@ -1,5 +1,8 @@
 <IfModule mod_rewrite.c>
     RewriteEngine On
+
+    # Manifest estático → dinámico (rutas correctas en subdirectorio / public/)
+    RewriteRule ^manifest\.webmanifest$ manifest.php [L]
     
     # Redirigir todo lo que no sea un archivo o directorio a index.php
     RewriteCond %{REQUEST_FILENAME} !-f
@@ -9,6 +12,19 @@
 
 # Proteger archivos sensibles
 <FilesMatch "\.(env|log|sql)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+<Files "error_log">
+    Order allow,deny
+    Deny from all
+</Files>
+<FilesMatch "^(error_log|\.env)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+# Scripts de mantenimiento: nunca servir aunque existan en disco
+<FilesMatch "^_(diag|migrate|repair)_">
     Order allow,deny
     Deny from all
 </FilesMatch>

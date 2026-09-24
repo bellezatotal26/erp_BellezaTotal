@@ -263,10 +263,15 @@ class ProductSupplierService
 
         $linked = 0;
         foreach ($rows as $row) {
-            $this->link((int)$row['product_id'], (int)$row['supplier_id'], [
-                'last_cost' => (float)$row['unit_cost'],
+            $cost = round((float)$row['unit_cost'], 2);
+            $payload = [
                 'last_purchase_date' => substr((string)$row['order_date'], 0, 10),
-            ]);
+            ];
+            // No pisar último costo útil con bonificaciones a $0.
+            if ($cost > 0.009) {
+                $payload['last_cost'] = $cost;
+            }
+            $this->link((int)$row['product_id'], (int)$row['supplier_id'], $payload);
             $linked++;
         }
 

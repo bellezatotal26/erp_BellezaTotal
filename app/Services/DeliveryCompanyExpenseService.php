@@ -20,7 +20,7 @@ class DeliveryCompanyExpenseService
 
     /**
      * Registra el aporte de la empresa al domicilio como gasto "Transporte".
-     * Afecta caja física (egreso) porque la empresa está pagando ese tramo.
+     * Afecta caja física (egreso) cuando hay sesión de caja abierta.
      *
      * @return int ID del gasto o 0 si no aplica
      */
@@ -29,11 +29,20 @@ class DeliveryCompanyExpenseService
         string $invoiceNumber,
         float $companyAmount,
         ?int $userId = null,
-        bool $affectCash = true
+        ?bool $affectCash = null
     ): int {
         $companyAmount = round(max(0, $companyAmount), 2);
         if ($saleId <= 0 || $companyAmount <= 0.009) {
             return 0;
+        }
+
+        $cashSvc = new CashService($this->db);
+        $hasOpenSession = $cashSvc->getOpenSession() !== null;
+        if ($affectCash === null) {
+            $affectCash = $hasOpenSession;
+        } elseif ($affectCash && !$hasOpenSession) {
+            error_log('DeliveryCompanyExpense venta ' . $saleId . ': sin caja abierta, egreso no registrado en cajón');
+            $affectCash = false;
         }
 
         $cats = new ExpenseCategoryService($this->db);
@@ -76,16 +85,15 @@ class DeliveryCompanyExpenseService
         }
 
         if ($affectCash) {
-            try {
-                (new CashService($this->db))->registerMovement(
-                    $companyAmount,
-                    'Gasto: ' . $description,
-                    'expense',
-                    'expense',
-                    $expenseId
-                );
-            } catch (\Throwable $e) {
-                error_log('DeliveryCompanyExpense cash ' . $expenseId . ': ' . $e->getMessage());
+            $moved = $cashSvc->registerMovement(
+                $companyAmount,
+                'Gasto: ' . $description,
+                'expense',
+                'expense',
+                $expenseId
+            );
+            if (!$moved) {
+                error_log('DeliveryCompanyExpense cash ' . $expenseId . ': no se pudo registrar egreso en caja');
             }
         }
 

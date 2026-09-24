@@ -38,6 +38,7 @@ class TenantNominaController extends TenantController
                 'cancel_run' => $this->cancelRun(),
                 'save_params' => $this->saveParams(),
                 'save_incapacity' => $this->saveIncapacity(),
+                'save_overtime' => $this->saveOvertime(),
                 default => $this->respond(false, 'Acción inválida', '/app/nomina'),
             };
             return;
@@ -186,14 +187,42 @@ class TenantNominaController extends TenantController
         }
     }
 
+    private function saveOvertime(): void
+    {
+        TenantMiddleware::authorize('nomina', 'edit');
+        try {
+            $itemId = (int)$this->request->post('item_id', 0);
+            $runId = (int)$this->request->post('run_id', 0);
+            $this->payroll->updateItemOvertime(
+                $itemId,
+                (float)$this->request->post('overtime_day_hours', 0),
+                (float)$this->request->post('overtime_night_hours', 0),
+                (float)$this->request->post('dominical_hours', 0)
+            );
+            $this->respond(true, 'Horas extras y dominicales actualizadas', '/app/nomina?tab=runs&action=run_detail&id=' . $runId);
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/nomina?tab=runs');
+        }
+    }
+
     private function payRun(): void
     {
         TenantMiddleware::authorize('nomina', 'edit');
         try {
             $id = (int)$this->request->post('id', 0);
-            $affectCash = $this->request->post('affect_cash') === '1';
-            $this->payroll->postAndPay($id, $affectCash);
-            $this->respond(true, 'Nómina contabilizada (asiento SS + gasto) y marcada como pagada', '/app/nomina?tab=runs&action=run_detail&id=' . $id);
+            $result = $this->payroll->postAndPay($id);
+            $entryId = (int)($result['accounting_entry_id'] ?? 0);
+            $msg = 'Nómina contabilizada (asiento #' . $entryId . ') y marcada como pagada. No descuenta el cajón de caja.';
+            (new \SoftNova\Services\TenantAuditService($this->db))->log(
+                'pay',
+                'nomina',
+                'Nómina pagada: ' . ($result['run_number'] ?? '') . ' · neto '
+                    . number_format((float)($result['net_total'] ?? 0), 0, ',', '.')
+                    . ' · asiento contable #' . $entryId,
+                'payroll_run',
+                $id
+            );
+            $this->respond(true, $msg, '/app/nomina?tab=runs&action=run_detail&id=' . $id);
         } catch (\Throwable $e) {
             $this->respond(false, $e->getMessage(), '/app/nomina?tab=runs');
         }
@@ -217,6 +246,7 @@ class TenantNominaController extends TenantController
             'smmlv', 'transport_aid', 'health_employee_rate', 'pension_employee_rate',
             'health_employer_rate', 'pension_employer_rate', 'arl_employer_rate',
             'caja_employer_rate', 'sena_employer_rate', 'icbf_employer_rate', 'incapacity_rate',
+            'payroll_monthly_hours', 'overtime_day_rate', 'overtime_night_rate', 'dominical_rate',
         ];
         $stmt = $this->db->prepare(
             "INSERT INTO accounting_settings (setting_key, setting_value) VALUES (?, ?)
@@ -236,12 +266,20 @@ class TenantNominaController extends TenantController
             $this->respond(false, 'Liquidación no encontrada', '/app/nomina?tab=runs');
             return;
         }
+        $accountingEntry = $this->query(
+            "SELECT id, entry_number FROM accounting_entries
+             WHERE source_type = 'payroll' AND source_id = ? AND status = 'posted' AND source_event = 'created'
+             ORDER BY id DESC LIMIT 1",
+            [$id]
+        )->fetch() ?: null;
+
         $this->view('tenant.nomina', $this->tenantViewData([
             'tab' => 'run_detail',
             'employees' => [],
             'runs' => [],
             'params' => $this->payroll->params(),
             'detail' => $detail,
+            'accountingEntry' => $accountingEntry,
             'q' => '',
             'statusFilter' => '',
             'activeCount' => 0,

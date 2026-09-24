@@ -39,17 +39,40 @@ function prepareCancelSale() {
         return false;
     }
     var sel = document.getElementById('cancelReasonSelect');
-    var other = document.getElementById('cancelReasonOther');
     if (!sel || !sel.value) {
         if (typeof showAlert === 'function') showAlert('Seleccione el motivo de eliminación', 'warning');
         return false;
     }
     if (window.SoftNovaCustomSelect && SoftNovaCustomSelect.isOther(sel.value)) {
-        if (typeof showAlert === 'function') showAlert('Complete la opción "Otro" o elija un motivo de la lista', 'warning');
+        if (typeof showAlert === 'function') showAlert('Use la opción Otro del listado para registrar el motivo', 'warning');
         return false;
     }
+    var other = document.getElementById('cancelReasonOther');
     if (other) other.value = '';
     return true;
+}
+
+function buildWhatsAppShareLink(waUrl, phone, text) {
+    var digits = String(phone || '').replace(/\D+/g, '');
+    if (digits.length === 10) digits = '57' + digits;
+    var encoded = encodeURIComponent(text || '');
+    if (digits !== '') {
+        return 'https://wa.me/' + digits + '?text=' + encoded;
+    }
+    if (waUrl && waUrl.indexOf('text=') >= 0) {
+        return waUrl;
+    }
+    return 'https://wa.me/?text=' + encoded;
+}
+
+function updateShareWhatsappLink() {
+    var btn = document.getElementById('shareWhatsappBtn');
+    var phoneEl = document.getElementById('sharePhone');
+    if (!btn) return;
+    var phone = phoneEl ? phoneEl.value : '';
+    var baseUrl = btn.getAttribute('data-wa-base') || btn.href || '#';
+    var text = btn.getAttribute('data-wa-text') || '';
+    btn.href = buildWhatsAppShareLink(baseUrl, phone, text);
 }
 
 function toggleCredit() {
@@ -67,13 +90,22 @@ function onPaymentTermsChange() {
     var saleDate = document.getElementById('saleDate');
     var due = document.getElementById('dueDate');
     if (!terms || !saleDate || !due) return;
-    var base = saleDate.value || new Date().toISOString().slice(0,10);
-    var d = new Date(base + 'T12:00:00');
-    if (terms.value === 'cash') { /* same day */ }
-    else if (terms.value === 'net_15') d.setDate(d.getDate() + 15);
-    else if (terms.value === 'net_30') d.setDate(d.getDate() + 30);
-    else if (terms.value === 'overdue') d.setDate(d.getDate() - 1);
-    due.value = d.toISOString().slice(0,10);
+    var ymd = window.SeriDate ? SeriDate.localYmd() : (function () {
+        var d = new Date();
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    })();
+    var base = saleDate.value || ymd;
+    var days = 0;
+    if (terms.value === 'net_15') days = 15;
+    else if (terms.value === 'net_30') days = 30;
+    else if (terms.value === 'overdue') days = -1;
+    if (window.SeriDate) {
+        due.value = SeriDate.addDaysYmd(base, days);
+    } else {
+        var d = new Date(base + 'T12:00:00');
+        d.setDate(d.getDate() + days);
+        due.value = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
 }
 
 function shareSale(id) {
@@ -81,26 +113,48 @@ function shareSale(id) {
         .then(function(r) { return r.json(); })
         .then(function(d) {
             if (!d.success) return showAlert(d.message || 'Error', 'error');
-            document.getElementById('shareSaleId').value = id;
-            document.getElementById('shareEmail').value = d.customer_email || '';
+            var shareId = document.getElementById('shareSaleId');
+            var shareEmail = document.getElementById('shareEmail');
+            var shareModal = document.getElementById('shareModal');
+            if (!shareId || !shareEmail || !shareModal) {
+                return showAlert('No se pudo abrir el modal de compartir', 'error');
+            }
+            shareId.value = id;
+            shareEmail.value = d.customer_email || '';
+            var phoneEl = document.getElementById('sharePhone');
+            if (phoneEl) {
+                phoneEl.value = d.customer_phone || '';
+                phoneEl.oninput = updateShareWhatsappLink;
+            }
             var btn = document.getElementById('shareWhatsappBtn');
+            if (!btn) {
+                shareModal.style.display = 'flex';
+                return;
+            }
             var ticketUrl = d.ticket_pdf_url || '';
             var waUrl = d.whatsapp_url || '#';
-            btn.href = waUrl;
+            var shareText = d.text || '';
+            btn.setAttribute('data-wa-base', waUrl);
+            btn.setAttribute('data-wa-text', shareText);
+            updateShareWhatsappLink();
             btn.onclick = function(ev) {
+                updateShareWhatsappLink();
                 if (typeof sharePdfToWhatsApp === 'function' && ticketUrl) {
                     ev.preventDefault();
                     sharePdfToWhatsApp({
                         pdfUrl: ticketUrl,
-                        waLink: waUrl,
-                        text: d.text || '',
+                        waLink: btn.href,
+                        text: shareText,
                         title: 'Ticket de venta',
                         filename: 'Ticket_' + id + '.pdf'
                     });
                     return false;
                 }
             };
-            document.getElementById('shareModal').style.display = 'flex';
+            shareModal.style.display = 'flex';
+        })
+        .catch(function() {
+            if (typeof showAlert === 'function') showAlert('No se pudo cargar datos para compartir', 'error');
         });
 }
 
@@ -158,6 +212,7 @@ function addProduct(ev) {
         code: o.dataset.code || '',
         is_open_item: o.dataset.openItem
     }));
+    var isConsignment = o.dataset.consignment === '1' || o.dataset.ownership === 'consignment';
     if (isNaN(stock)) stock = 0;
 
     if (openItem) {
@@ -165,13 +220,18 @@ function addProduct(ev) {
             showAlert('Actualice app.js para vender el comodín', 'error');
             return;
         }
-        requestOpenItemDetails(function (customName, customPrice) {
+        requestOpenItemDetails(function (customName, customPrice, hasTax) {
+            var taxEnabled = !(window.cajaTaxEnabled === false || window.cajaTaxEnabled === 0 || window.cajaTaxEnabled === '0');
+            var globalRate = Number(window.cajaTaxRate || 0);
+            if (isNaN(globalRate) || globalRate < 0) globalRate = 0;
+            var rate = (taxEnabled && hasTax !== false) ? globalRate : 0;
             saleItems.push({
                 product_id: id,
                 product_name: customName,
                 quantity: qty,
                 unit_price: customPrice,
                 subtotal: qty * customPrice,
+                tax_rate: rate,
                 stock: 0,
                 product_type: 'service',
                 is_open_item: true,
@@ -181,7 +241,7 @@ function addProduct(ev) {
             document.getElementById('productQty').value = 1;
             renderItems();
             updateStockHint();
-            showAlert(customName + ' agregado (comodín · sin stock)', 'info');
+            showAlert(customName + ' agregado (comodín · ' + (rate > 0 ? 'con IVA' : 'sin IVA') + ' · sin stock)', 'info');
             if (typeof animateAddToCart === 'function') {
                 var fromEl = (ev && ev.target) ? ev.target : document.getElementById('addProductBtn');
                 animateAddToCart(fromEl && fromEl.closest ? (fromEl.closest('.btn') || fromEl) : fromEl);
@@ -198,6 +258,7 @@ function addProduct(ev) {
             ex.quantity += qty;
             ex.subtotal = ex.quantity * ex.unit_price;
             ex.stock = stock;
+            ex.is_consignment = isConsignment;
             if (reason) {
                 ex.stock_oversell_reason = reason;
                 ex.stock_oversell_note = note || '';
@@ -211,6 +272,7 @@ function addProduct(ev) {
                 subtotal: qty * price,
                 stock: stock,
                 product_type: o.dataset.type || 'product',
+                is_consignment: isConsignment,
                 stock_oversell_reason: reason || '',
                 stock_oversell_note: note || ''
             });
@@ -228,6 +290,10 @@ function addProduct(ev) {
     }
 
     if (!isService && nextQty > Math.max(0, stock)) {
+        if (isConsignment) {
+            showAlert(name + ': stock consignado insuficiente (disp. ' + stock + '). No se permite sobreventa.', 'error');
+            return;
+        }
         requestOversellReason(name, stock, nextQty, commit);
         return;
     }
@@ -286,6 +352,9 @@ function renderItems() {
             : '';
         if (it.is_open_item) {
             oversellBadge += ' <span class="badge badge-info">Comodín</span>';
+        }
+        if (it.is_consignment) {
+            oversellBadge += ' <span class="badge badge-info">Consignación</span>';
         }
         var stockCell = it.is_open_item
             ? '<td style="color:var(--color-text-secondary);">—</td>'
@@ -793,6 +862,36 @@ function openSaleCreditNoteModal(id) {
         })
         .catch(function() { showAlert('No se pudo cargar la venta', 'error'); });
 }
+
+document.addEventListener('DOMContentLoaded', function() {
+    var form = document.getElementById('saleCreditNoteForm');
+    if (!form || form.dataset.scnBound) return;
+    form.dataset.scnBound = '1';
+    form.addEventListener('submit', function(e) {
+        var code = document.getElementById('scnReasonCode');
+        if (code && !code.value) {
+            e.preventDefault();
+            e.stopPropagation();
+            showAlert('Seleccione el motivo de la nota de crédito', 'warning');
+            return false;
+        }
+        var qtyInputs = form.querySelectorAll('input[name="quantity[]"]:not([disabled])');
+        var totalQty = 0;
+        qtyInputs.forEach(function(inp) {
+            totalQty += parseInt(inp.value, 10) || 0;
+        });
+        if (totalQty <= 0) {
+            e.preventDefault();
+            e.stopPropagation();
+            showAlert('Indique al menos una cantidad a devolver', 'warning');
+            return false;
+        }
+        var stock = document.getElementById('scnAffectsStock');
+        if (stock && (code.value === 'expired' || code.value === 'broken')) {
+            stock.checked = false;
+        }
+    }, true);
+});
 
 function printInvoice(id) {
     viewDetail(id);

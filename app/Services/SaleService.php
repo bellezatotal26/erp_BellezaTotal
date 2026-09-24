@@ -98,6 +98,11 @@ class SaleService
         } catch (\Throwable $e) {
             // ignore
         }
+        try {
+            (new ConsignmentService($this->db, $this->stock))->ensureSchema();
+        } catch (\Throwable $e) {
+            error_log('cancelSale consign schema: ' . $e->getMessage());
+        }
         
         $this->db->beginTransaction();
         try {
@@ -123,7 +128,23 @@ class SaleService
             }
 
             // Anular deudas de sobreventa antes de devolver stock (evitar cubrir otras deudas).
+            try {
+                (new ConsignmentService($this->db, $this->stock))->assertSaleCancellable($saleId);
+            } catch (\RuntimeException $e) {
+                throw $e;
+            } catch (\Throwable $e) {
+                error_log('assert consign cancel: ' . $e->getMessage());
+            }
             $this->stock->cancelDebtsForSale($saleId);
+            try {
+                (new ConsignmentService($this->db, $this->stock))->voidSaleDebts($saleId);
+            } catch (\Throwable $e) {
+                // assertSaleCancellable ya se evaluó arriba; rethrow si es liquidación
+                if (str_contains($e->getMessage(), 'ya liquidadas')) {
+                    throw $e;
+                }
+                error_log('void consign debts: ' . $e->getMessage());
+            }
 
             $items = $this->query("SELECT * FROM sale_items WHERE sale_id = ?", [$saleId])->fetchAll();
             foreach ($items as $item) {

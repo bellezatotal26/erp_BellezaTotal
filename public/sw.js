@@ -1,19 +1,26 @@
-/* Seri ERP — Service Worker POS (Fase B)
- * Cachea el shell estático y la última página de caja para continuidad sin red.
- * Las APIs (ventas/caja) van network-first; no se cachean respuestas mutables.
+/* Seri ERP — Service Worker POS (PWA escritorio + offline Caja)
+ * Cachea shell estático y la última página de caja (solo para uso offline).
+ * APIs (ventas/caja) van network-first; no se cachean respuestas mutables.
+ * Al logout: SERI_CLEAR_SENSITIVE borra caches de páginas (CSRF/sesión).
+ * Al recuperar red: notifica a clientes para sincronizar cola de ventas.
  */
-var CACHE_VERSION = 'seri-pos-v4';
+var CACHE_VERSION = 'seri-pos-v12';
 var SHELL_CACHE = CACHE_VERSION + '-shell';
 var PAGE_CACHE = CACHE_VERSION + '-pages';
 
 var SHELL_ASSETS = [
   './assets/css/style.css',
   './assets/js/app.js',
+  './assets/js/money-input.js',
   './assets/js/caja.js',
   './assets/js/ventas.js',
   './assets/js/barcode.js',
   './assets/js/pos-offline.js',
-  './manifest.webmanifest'
+  './assets/img/pwa-icon-192.png',
+  './assets/img/pwa-icon-512.png',
+  './assets/img/pwa-icon-maskable-512.png',
+  './assets/img/favicon-32.png',
+  './manifest.php'
 ];
 
 self.addEventListener('install', function (event) {
@@ -22,7 +29,6 @@ self.addEventListener('install', function (event) {
       return cache.addAll(SHELL_ASSETS.map(function (u) {
         return new Request(u, { cache: 'reload' });
       })).catch(function () {
-        // Algunos assets pueden faltar en deploys parciales; no bloquear install.
         return Promise.all(SHELL_ASSETS.map(function (u) {
           return cache.add(u).catch(function () { return null; });
         }));
@@ -54,11 +60,35 @@ function isApiRequest(url) {
 }
 
 function isCajaNavigation(url) {
-  return /\/app\/caja\/?$/.test(url.pathname) || /\/app\/caja\/?$/.test(url.href.replace(url.origin, ''));
+  return /\/app\/caja\/?$/.test(url.pathname)
+    || /\/app\/caja\/?(\?|$)/.test(url.pathname + url.search)
+    || /\/app\/caja\/?$/.test(url.href.replace(url.origin, '').split('?')[0]);
 }
 
 function isStaticAsset(url) {
-  return /\/assets\/(css|js)\//.test(url.pathname) || /manifest\.webmanifest$/.test(url.pathname);
+  return /\/assets\/(css|js|img)\//.test(url.pathname)
+    || /manifest\.(webmanifest|php)$/.test(url.pathname);
+}
+
+function notifyClientsToSync() {
+  return self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (clients) {
+    clients.forEach(function (client) {
+      try {
+        client.postMessage({ type: 'SERI_POS_SYNC' });
+      } catch (e) { /* ignore */ }
+    });
+  });
+}
+
+function clearSensitiveCaches() {
+  return caches.keys().then(function (keys) {
+    return Promise.all(keys.filter(function (k) {
+      // Páginas HTML (CSRF/sesión) y cualquier cache de páginas previa.
+      return k.indexOf('-pages') !== -1 || k === PAGE_CACHE;
+    }).map(function (k) {
+      return caches.delete(k);
+    }));
+  });
 }
 
 self.addEventListener('fetch', function (event) {
@@ -72,16 +102,13 @@ self.addEventListener('fetch', function (event) {
     return;
   }
 
-  // Solo mismo origen.
   if (url.origin !== self.location.origin) return;
 
-  // APIs y mutaciones: siempre red, sin cache.
   if (isApiRequest(url)) {
     return;
   }
 
   if (isStaticAsset(url)) {
-    // Network-first: en demos/deploys el JS/CSS nuevo debe ganar al cache viejo.
     event.respondWith(
       fetch(req).then(function (res) {
         if (res && res.ok) {
@@ -100,17 +127,22 @@ self.addEventListener('fetch', function (event) {
     return;
   }
 
-  // Solo Caja: network-first + shell offline. No interceptar el resto de /app/.
   if ((req.mode === 'navigate' || (req.headers.get('accept') || '').indexOf('text/html') !== -1)
       && isCajaNavigation(url)) {
     event.respondWith(
       fetch(req).then(function (res) {
-        if (res && res.ok) {
-          var copy = res.clone();
+        // Solo cachear caja si la respuesta es OK y el usuario sigue autenticado
+        // (evita cachear login/redirects).
+        if (res && res.ok && res.url && res.url.indexOf('/login') === -1) {
+          // Clonar ANTES de cache.put: el body solo se puede leer una vez.
+          var pageCopy = res.clone();
+          var shellCopy = res.clone();
           caches.open(PAGE_CACHE).then(function (cache) {
-            cache.put(req, copy);
-            cache.put('seri-caja-offline-shell', copy.clone()).catch(function () {});
-          });
+            return Promise.all([
+              cache.put(req, pageCopy),
+              cache.put('seri-caja-offline-shell', shellCopy)
+            ]);
+          }).catch(function () {});
         }
         return res;
       }).catch(function () {
@@ -139,7 +171,26 @@ self.addEventListener('fetch', function (event) {
 });
 
 self.addEventListener('message', function (event) {
-  if (event.data && event.data.type === 'SKIP_WAITING') {
+  if (!event.data) return;
+  if (event.data.type === 'SKIP_WAITING') {
     self.skipWaiting();
+  }
+  if (event.data.type === 'SERI_POS_SYNC_NOW') {
+    event.waitUntil(notifyClientsToSync());
+  }
+  if (event.data.type === 'SERI_CLEAR_SENSITIVE') {
+    event.waitUntil(clearSensitiveCaches());
+  }
+});
+
+self.addEventListener('sync', function (event) {
+  if (event.tag === 'seri-pos-sync') {
+    event.waitUntil(notifyClientsToSync());
+  }
+});
+
+self.addEventListener('periodicsync', function (event) {
+  if (event.tag === 'seri-pos-catalog') {
+    event.waitUntil(notifyClientsToSync());
   }
 });

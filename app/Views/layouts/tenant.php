@@ -4,7 +4,24 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="csrf-token" content="<?php echo htmlspecialchars(\SoftNova\Core\csrf_token()); ?>">
-    <meta name="theme-color" content="#0F766E">
+    <meta name="session-ping-url" content="<?php echo htmlspecialchars($viewInstance->route('app/notifications') . '?action=ping'); ?>">
+    <?php
+    $layoutPrimaryColor = '';
+    $themeDb = null;
+    try {
+        $themeDb = \SoftNova\Core\TenantMiddleware::getDb();
+        $tc = $themeDb->prepare("SELECT setting_value FROM settings WHERE setting_key = 'primary_color'");
+        $tc->execute();
+        $layoutPrimaryColor = (string)($tc->fetchColumn() ?: '');
+    } catch (\Throwable $e) { /* silencioso */ }
+    $layoutThemeColor = \SoftNova\Core\normalize_theme_hex($layoutPrimaryColor, '#000000');
+    ?>
+    <meta name="theme-color" content="<?php echo htmlspecialchars($layoutThemeColor); ?>">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="BT Caja">
+    <meta name="application-name" content="BT Caja">
     <?php
     $layoutCurrency = $currency ?? ['symbol' => '$', 'decimals' => 2, 'thousands' => '.', 'decimal' => ','];
     ?>
@@ -12,6 +29,23 @@
     <meta name="currency-decimals" content="<?php echo (int)($layoutCurrency['decimals'] ?? 2); ?>">
     <meta name="currency-thousands" content="<?php echo htmlspecialchars((string)($layoutCurrency['thousands'] ?? '.')); ?>">
     <meta name="currency-decimal" content="<?php echo htmlspecialchars((string)($layoutCurrency['decimal'] ?? ',')); ?>">
+    <?php
+    $layoutBusinessClock = ['timezone' => 'America/Bogota', 'date' => date('Y-m-d'), 'time' => date('H:i:s'), 'now' => date('Y-m-d H:i:s')];
+    try {
+        $tzDb = $themeDb ?? \SoftNova\Core\TenantMiddleware::getDb();
+        $layoutBusinessClock = \SoftNova\Core\BusinessTimezone::clientPayload($tzDb);
+    } catch (\Throwable $e) {
+        $layoutBusinessClock = \SoftNova\Core\BusinessTimezone::clientPayload(null);
+    }
+    ?>
+    <meta name="seri-timezone" content="<?php echo htmlspecialchars((string)$layoutBusinessClock['timezone']); ?>">
+    <meta name="seri-business-date" content="<?php echo htmlspecialchars((string)$layoutBusinessClock['date']); ?>">
+    <script>
+    window.SERI_TIMEZONE = <?php echo json_encode((string)$layoutBusinessClock['timezone'], JSON_UNESCAPED_UNICODE); ?>;
+    window.SERI_BUSINESS_DATE = <?php echo json_encode((string)$layoutBusinessClock['date'], JSON_UNESCAPED_UNICODE); ?>;
+    window.SERI_BUSINESS_TIME = <?php echo json_encode((string)$layoutBusinessClock['time'], JSON_UNESCAPED_UNICODE); ?>;
+    window.SERI_BUSINESS_NOW = <?php echo json_encode((string)$layoutBusinessClock['now'], JSON_UNESCAPED_UNICODE); ?>;
+    </script>
     <title><?php echo htmlspecialchars($title ?? 'Seri ERP'); ?></title>
     <?php echo \SoftNova\Core\og_meta_tags($title ?? null); ?>
     <link rel="stylesheet" href="<?php echo $viewInstance->asset('css/style.css'); ?>">
@@ -31,21 +65,28 @@
     <link rel="manifest" href="<?php echo htmlspecialchars($manifestUrl); ?>">
     <meta name="sw-url" content="<?php echo htmlspecialchars($swUrl); ?>">
     <meta name="sw-scope" content="<?php echo htmlspecialchars($swScope); ?>">
-    <link rel="apple-touch-icon" href="<?php echo htmlspecialchars(\SoftNova\Core\base_url(ltrim($publicPrefix . '/assets/img/pwa-icon-192.png', '/'))); ?>">
+    <link rel="icon" href="<?php echo $viewInstance->asset('img/favicon.ico'); ?>" sizes="any">
+    <link rel="icon" type="image/png" sizes="16x16" href="<?php echo $viewInstance->asset('img/favicon-16.png'); ?>">
+    <link rel="icon" type="image/png" sizes="32x32" href="<?php echo $viewInstance->asset('img/favicon-32.png'); ?>">
+    <link rel="icon" type="image/png" sizes="192x192" href="<?php echo $viewInstance->asset('img/pwa-icon-192.png'); ?>">
+    <link rel="apple-touch-icon" sizes="180x180" href="<?php echo $viewInstance->asset('img/apple-touch-icon.png'); ?>">
     <?php if (!empty($needBarcode)): ?>
     <script src="<?php echo $viewInstance->asset('js/barcode.js'); ?>"></script>
     <?php endif; ?>
     <?php
-    try {
-        $themeDb = \SoftNova\Core\TenantMiddleware::getDb();
-        $tc = $themeDb->prepare("SELECT setting_value FROM settings WHERE setting_key = 'primary_color'");
-        $tc->execute();
-        $primaryColor = $tc->fetchColumn() ?: '';
-        echo \SoftNova\Core\theme_color_style($primaryColor);
-    } catch (\Exception $e) { /* silencioso */ }
+    echo \SoftNova\Core\theme_color_style($layoutPrimaryColor);
     ?>
 </head>
 <body>
+    <?php
+    $layoutSandboxActive = !empty($_SESSION['sandbox_mode']);
+    if ($layoutSandboxActive):
+    ?>
+    <div id="sandboxModeBanner" style="position:sticky;top:0;z-index:9999;background:#B45309;color:#fff;padding:10px 16px;text-align:center;font-weight:700;font-size:14px;letter-spacing:0.02em;box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+        MODO CAJA DE ARENA — Los cambios de esta sesión son de prueba y no afectan producción
+        <a href="<?php echo htmlspecialchars($viewInstance->route('app/configuracion')); ?>" style="color:#fff;text-decoration:underline;margin-left:12px;font-weight:600;">Salir en Configuración</a>
+    </div>
+    <?php endif; ?>
     <div class="app-layout">
         <?php $viewInstance->partial('tenant_sidebar', [
             'tenantName' => $tenantName ?? 'Sistema',
@@ -200,7 +241,7 @@
             </div>
             
             <footer class="app-footer">
-                <p>Seri ERP &copy; 2026 | Osgo Support</p>
+                <p>Software Belleza Total | 2026</p>
             </footer>
         </div>
     </div>
@@ -276,13 +317,24 @@
         })();
         
         function updateDateTime() {
-            const now = new Date();
-            const optionsDate = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
-            const optionsTime = { hour: '2-digit', minute: '2-digit', second: '2-digit' };
-            const dateEl = document.getElementById('currentDate');
-            const timeEl = document.getElementById('currentTime');
-            if (dateEl) dateEl.textContent = now.toLocaleDateString('es-ES', optionsDate);
-            if (timeEl) timeEl.textContent = now.toLocaleTimeString('es-ES', optionsTime);
+            var tz = window.SERI_TIMEZONE || 'America/Bogota';
+            var now = new Date();
+            var optionsDate = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: tz };
+            var optionsTime = { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: tz, hour12: false };
+            var dateEl = document.getElementById('currentDate');
+            var timeEl = document.getElementById('currentTime');
+            try {
+                if (dateEl) dateEl.textContent = now.toLocaleDateString('es-CO', optionsDate);
+                if (timeEl) timeEl.textContent = now.toLocaleTimeString('es-CO', optionsTime);
+                if (window.SeriDate) {
+                    window.SERI_BUSINESS_DATE = SeriDate.localYmd(now);
+                    window.SERI_BUSINESS_TIME = SeriDate.localHis(now);
+                    window.SERI_BUSINESS_NOW = window.SERI_BUSINESS_DATE + ' ' + window.SERI_BUSINESS_TIME;
+                }
+            } catch (e) {
+                if (dateEl) dateEl.textContent = now.toLocaleDateString('es-ES');
+                if (timeEl) timeEl.textContent = now.toLocaleTimeString('es-ES');
+            }
         }
         updateDateTime();
         setInterval(updateDateTime, 1000);
@@ -452,9 +504,17 @@
             }
             
             function poll(forceList) {
-                fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' } })
+                fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' }, credentials: 'same-origin' })
                     .then(function(r) { return r.json(); })
                     .then(function(data) {
+                        if (window.SeriCsrf && typeof SeriCsrf.refreshFromPayload === 'function') {
+                            SeriCsrf.refreshFromPayload(data);
+                        } else if (data && data.csrf_token) {
+                            var meta = document.querySelector('meta[name="csrf-token"]');
+                            if (meta) meta.setAttribute('content', data.csrf_token);
+                            csrf = data.csrf_token;
+                        }
+                        if (data && data.csrf_token) csrf = data.csrf_token;
                         applyBadge(data.badge || 0);
                         handlePopups(data.popups || []);
                         if (forceList || menu.style.display !== 'none') {
@@ -545,6 +605,9 @@
     <script src="<?php echo $viewInstance->asset('js/app.js'); ?>"></script>
     <script src="<?php echo $viewInstance->asset('js/pos-offline.js'); ?>"></script>
     <script>
+    if (window.SeriCsrf && typeof SeriCsrf.startKeepAlive === 'function') {
+        SeriCsrf.startKeepAlive();
+    }
     if (window.SeriPosOffline && typeof SeriPosOffline.registerServiceWorker === 'function') {
         SeriPosOffline.registerServiceWorker();
     }

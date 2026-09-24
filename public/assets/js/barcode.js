@@ -288,16 +288,17 @@
             return false;
         });
 
-        // Inventario
+        // Inventario: pistola → EAN (no SKU)
         onScan(function (code) {
             var onInv = /inventario/i.test(location.pathname || '') || /inventario/i.test(location.href || '');
             if (!onInv) return false;
 
             if (modalVisible('productModal')) {
-                var codeInput = document.getElementById('prodCode');
-                if (codeInput) {
-                    codeInput.value = code;
-                    if (typeof showAlert === 'function') showAlert('Código/SKU: ' + code, 'success');
+                var eanInput = document.getElementById('prodBarcode');
+                if (eanInput) {
+                    eanInput.value = code;
+                    try { eanInput.focus(); eanInput.select(); } catch (err) { /* ignore */ }
+                    if (typeof showAlert === 'function') showAlert('EAN: ' + code, 'success');
                     return true;
                 }
             }

@@ -9,3 +9,10 @@
     Order deny,allow
     Deny from all
 </IfModule>
+
+# Defensa extra si el servidor ignora Require: nunca ejecutar scripts aquí.
+<FilesMatch "\.(?i:php|phtml|phar|pl|py|cgi|asp|aspx|js\.map)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+</FilesMatch>

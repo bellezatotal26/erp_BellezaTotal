@@ -1,0 +1,6 @@
+# Imports de facturas/CSV — solo acceso vía aplicación, nunca directo por URL.
+Deny from all
+
+<FilesMatch "\.(?i:php|phtml|phar|pl|py|cgi)$">
+    Deny from all
+</FilesMatch>

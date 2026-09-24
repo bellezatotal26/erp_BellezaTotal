@@ -35,6 +35,7 @@ $allModules = [
     'ventas'    => ['route' => 'app/ventas', 'label' => 'Ventas', 'icon' => 'cart'],
     'inventario'=> ['route' => 'app/inventario', 'label' => 'Inventario', 'icon' => 'box'],
     'prestamos' => ['route' => 'app/prestamos', 'label' => 'Préstamos', 'icon' => 'loan'],
+    'consignacion' => ['route' => 'app/consignacion', 'label' => 'Consignación', 'icon' => 'consign'],
     'compras'   => ['route' => 'app/compras', 'label' => 'Compras', 'icon' => 'truck'],
     'clientes'  => ['route' => 'app/clientes', 'label' => 'Clientes', 'icon' => 'users'],
     'proveedores'=>['route' => 'app/proveedores', 'label' => 'Proveedores', 'icon' => 'truck'],
@@ -65,6 +66,7 @@ function tenantIcon(string $name): string {
         'help' => '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>',
         'payroll' => '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="18" rx="2"></rect><line x1="6" y1="8" x2="18" y2="8"></line><line x1="6" y1="12" x2="18" y2="12"></line><line x1="6" y1="16" x2="14" y2="16"></line><circle cx="18" cy="18" r="3"></circle><line x1="18" y1="16" x2="18" y2="20"></line><line x1="16" y1="18" x2="20" y2="18"></line></svg>',
         'loan' => '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 3h5v5"></path><path d="M8 21H3v-5"></path><path d="M21 3l-9 9"></path><path d="M3 21l9-9"></path><rect x="8" y="8" width="8" height="8" rx="1"></rect></svg>',
+        'consign' => '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>',
         default => '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle></svg>',
     };
 }
@@ -87,10 +89,11 @@ function tenantIcon(string $name): string {
                 if ($userRole === 'pos' && $key !== 'caja') {
                     continue;
                 }
-                // Plan: Préstamos va con Inventario si el plan aún no lista "prestamos".
+                // Plan: Préstamos / Consignación van con Inventario si el plan aún no los lista.
                 $planAccess = $showAll
                     || in_array($key, $allowedModules, true)
-                    || ($key === 'prestamos' && in_array('inventario', $allowedModules, true));
+                    || ($key === 'prestamos' && in_array('inventario', $allowedModules, true))
+                    || ($key === 'consignacion' && in_array('inventario', $allowedModules, true));
                 $roleAccess = \SoftNova\Core\TenantMiddleware::canAccess($key);
                 if ($planAccess && $roleAccess):
                 ?>

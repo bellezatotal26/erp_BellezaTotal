@@ -14,6 +14,7 @@ use SoftNova\Services\SalePaymentSplitter;
 use SoftNova\Services\SalesDocumentService;
 use SoftNova\Services\SupplyChainSchema;
 use SoftNova\Services\Integrations\IntegrationManager;
+use function SoftNova\Core\base_url;
 
 class TenantVentasController extends TenantController
 {
@@ -160,11 +161,25 @@ class TenantVentasController extends TenantController
         $todayTotal = (float)($todayStats['t'] ?? 0);
         $todayCount = (int)($todayStats['c'] ?? 0);
         
-        $products = $this->query(
-            "SELECT id, name, code, sale_price, stock FROM products
-             WHERE status = 'active'
-             ORDER BY name"
-        )->fetchAll();
+        try {
+            $products = $this->query(
+                "SELECT id, name, code, sale_price, stock,
+                        COALESCE(product_type,'product') AS product_type,
+                        COALESCE(ownership,'owned') AS ownership,
+                        consignor_id
+                 FROM products
+                 WHERE status = 'active'
+                 ORDER BY name"
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $products = $this->query(
+                "SELECT id, name, code, sale_price, stock,
+                        COALESCE(product_type,'product') AS product_type
+                 FROM products
+                 WHERE status = 'active'
+                 ORDER BY name"
+            )->fetchAll();
+        }
         
         $customers = $this->query(
             "SELECT id, name, first_name, last_name, document_number, document_type
@@ -334,8 +349,8 @@ class TenantVentasController extends TenantController
             $cashChange = \SoftNova\Core\parse_money($m[1]);
             $sale['cash_change'] = $cashChange;
         }
-        if ($cashReceived > 0.009 && $cashChange <= 0.009) {
-            $cashChange = max(0, round($cashReceived - (float)($sale['total'] ?? 0), 2));
+        if ($cashReceived > 0.009) {
+            $cashChange = \SoftNova\Core\cash_change_amount($cashReceived, (float)($sale['total'] ?? 0), $cashChange);
             $sale['cash_change'] = $cashChange;
         }
         
@@ -427,13 +442,39 @@ class TenantVentasController extends TenantController
             } catch (\Throwable $e) {
                 $accountingOk = false;
                 error_log('Contabilidad NC venta ' . $result['credit_note_id'] . ': ' . $e->getMessage());
+                try {
+                    $this->accounting->enqueuePending(
+                        'post_sale_credit_note',
+                        'sale_credit_note',
+                        (int)$result['credit_note_id'],
+                        $e->getMessage()
+                    );
+                } catch (\Throwable $ignore) {
+                }
             }
 
             $cashNote = $svc->syncCash((int)$result['credit_note_id']);
 
+            try {
+                (new \SoftNova\Services\TenantAuditService($this->db))->log(
+                    'create',
+                    'ventas',
+                    'NC ' . $result['credit_number'] . ' por ' . $this->formatMoney($result['total'])
+                        . ' · venta #' . $saleId
+                        . ($affectsStock ? ' · con reingreso stock' : ' · sin reingreso stock'),
+                    'sale_credit_note',
+                    (int)$result['credit_note_id']
+                );
+            } catch (\Throwable $e) {
+                error_log('audit NC venta: ' . $e->getMessage());
+            }
+
             $message = 'Nota de crédito ' . $result['credit_number']
                 . ' por ' . $this->formatMoney($result['total']) . '.';
-            if ($affectsStock) {
+            // affects_stock puede haberse forzado a false (vencido/roto) en el servicio.
+            $noteRow = $svc->getCreditNote((int)$result['credit_note_id']);
+            $stockIn = (int)($noteRow['affects_stock'] ?? ($affectsStock ? 1 : 0)) === 1;
+            if ($stockIn) {
                 $message .= ' Producto(s) reingresados al inventario.';
             } else {
                 $message .= ' Sin reingreso de inventario (p. ej. vencido/roto).';
@@ -450,6 +491,7 @@ class TenantVentasController extends TenantController
                 'pdf_url' => $pdfUrl,
                 'credit_note_id' => (int)$result['credit_note_id'],
                 'credit_number' => $result['credit_number'],
+                'allocation' => $result['allocation'] ?? null,
             ]);
         } catch (\Throwable $e) {
             $this->respond(false, $e->getMessage(), '/app/ventas');
@@ -519,10 +561,11 @@ class TenantVentasController extends TenantController
         if (!$this->validateCsrf()) {
             $this->json([
                 'success' => false,
-                'message' => 'Token de seguridad inválido o expirado. Recargue Caja e intente de nuevo.',
+                'message' => 'Token de seguridad desfasado. Reintentando automáticamente…',
                 'results' => [],
                 'summary' => ['ok' => 0, 'conflict' => 0, 'retry' => 0, 'idempotent' => 0],
                 'code' => 'csrf',
+                'csrf_token' => \SoftNova\Core\Security::generateCsrfToken(),
             ], 419);
             return;
         }
@@ -619,6 +662,17 @@ class TenantVentasController extends TenantController
         } catch (\Throwable $e) {
             error_log('ensureSaleRuntimeSchema lots: ' . $e->getMessage());
         }
+        try {
+            // Consignación: CREATE/ALTER antes de TX de venta (MySQL DDL = COMMIT implícito).
+            (new \SoftNova\Services\ConsignmentService($this->db))->ensureSchema();
+        } catch (\Throwable $e) {
+            error_log('ensureSaleRuntimeSchema consignacion: ' . $e->getMessage());
+        }
+        try {
+            new \SoftNova\Services\AccountingService($this->db);
+        } catch (\Throwable $e) {
+            error_log('ensureSaleRuntimeSchema accounting: ' . $e->getMessage());
+        }
     }
 
     private function createSale(): void
@@ -713,6 +767,8 @@ class TenantVentasController extends TenantController
         if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $saleDate)) {
             $saleDate = date('Y-m-d');
         }
+        // Día de negocio (America/Bogota u otra TZ configurada). Bloquea día futuro por UTC del cliente.
+        $saleDate = \SoftNova\Core\BusinessTimezone::clampBusinessDate($saleDate, $this->db);
         $dueDateInput = trim((string)$this->request->post('due_date', ''));
         $receivedDate = trim((string)$this->request->post('received_date', ''));
         $dueDate = preg_match('/^\d{4}-\d{2}-\d{2}$/', $dueDateInput)
@@ -787,6 +843,9 @@ class TenantVentasController extends TenantController
             return;
         }
 
+        // Agrupa cantidades del mismo producto (excepto comodín) para no aprobar 3+3 con stock 5.
+        $items = $this->aggregateCartItemsByProduct($items);
+
         $prefix = \SoftNova\Services\SalesDocumentService::prefixFor($documentType);
         if ($documentType === 'invoice') {
             $prefix = $this->getSetting('invoice_prefix', 'FAC-');
@@ -795,6 +854,15 @@ class TenantVentasController extends TenantController
         
         $subtotal = 0;
         $validItems = [];
+        $qtyDiscountNotes = [];
+        $qtyDiscountSvc = null;
+        try {
+            $qtyDiscountSvc = new \SoftNova\Services\CommissionService($this->db);
+        } catch (\Throwable $e) {
+            $qtyDiscountSvc = null;
+        }
+        \SoftNova\Services\TaxService::ensureSchema($this->db);
+        $defaultTax = \SoftNova\Services\TaxService::defaultRate($this->db);
         foreach ($items as $item) {
             $productId = (int)($item['product_id'] ?? 0);
             $quantity = (int)($item['quantity'] ?? 0);
@@ -810,6 +878,10 @@ class TenantVentasController extends TenantController
             }
             $isOpenItem = \SoftNova\Services\OpenItemProduct::isOpenItem($product);
             $catalogPrice = round((float)($product['sale_price'] ?? 0), 2);
+            $wholesalePrice = round((float)($product['wholesale_price'] ?? 0), 2);
+            if ($saleChannel === 'wholesale' && $wholesalePrice > 0.009) {
+                $catalogPrice = $wholesalePrice;
+            }
             $postedPrice = array_key_exists('unit_price', $item)
                 ? round((float)$item['unit_price'], 2)
                 : $catalogPrice;
@@ -817,6 +889,7 @@ class TenantVentasController extends TenantController
                 $postedPrice = 0.0;
             }
             $lineName = (string)$product['name'];
+            $qtyDiscApplied = false;
             if ($isOpenItem) {
                 try {
                     $lineName = \SoftNova\Services\OpenItemProduct::sanitizeLineName(
@@ -827,30 +900,89 @@ class TenantVentasController extends TenantController
                     $this->respond(false, $e->getMessage(), '/app/ventas');
                     return;
                 }
+            } elseif ($qtyDiscountSvc) {
+                // Descuento automático por cantidad (misma regla que Caja).
+                $priceManual = !empty($item['price_manual'])
+                    || (string)($item['price_manual'] ?? '') === '1'
+                    || (string)($item['price_manual'] ?? '') === 'true';
+                $resolvedQty = $qtyDiscountSvc->resolveQuantityDiscount($quantity);
+                if (!$priceManual && !empty($resolvedQty['matched'])) {
+                    $rate = (float)$resolvedQty['rate'];
+                    $postedPrice = round($catalogPrice * (1 - $rate / 100), 2);
+                    $qtyDiscApplied = true;
+                    $qtyDiscountNotes[$resolvedQty['min_qty'] . ':' . $rate] = true;
+                } elseif ($priceManual && !empty($resolvedQty['matched'])) {
+                    // Precio manual: se respeta, pero nunca sincroniza catálogo.
+                    $qtyDiscApplied = true;
+                }
             }
             $up = $postedPrice;
             $is = $up * $quantity;
             $subtotal += $is;
+            $unitCost = $isOpenItem ? 0.0 : round((float)($product['purchase_price'] ?? 0), 2);
+            if (!$isOpenItem && !\SoftNova\Services\ProductPriceGuard::saleExceedsCost($up, $unitCost)) {
+                $this->respond(
+                    false,
+                    \SoftNova\Services\ProductPriceGuard::message((string)$product['name'], $up, $unitCost),
+                    str_contains((string)($_SERVER['HTTP_REFERER'] ?? ''), '/app/caja') ? '/app/caja' : '/app/ventas'
+                );
+                return;
+            }
+            $catalogList = round((float)($product['sale_price'] ?? 0), 2);
+            if (
+                !$isOpenItem
+                && $saleChannel !== 'wholesale'
+                && !\SoftNova\Services\ProductPriceGuard::saleExceedsCost($catalogList, $unitCost)
+            ) {
+                $this->respond(
+                    false,
+                    \SoftNova\Services\ProductPriceGuard::message((string)$product['name'], $catalogList, $unitCost),
+                    str_contains((string)($_SERVER['HTTP_REFERER'] ?? ''), '/app/caja') ? '/app/caja' : '/app/ventas'
+                );
+                return;
+            }
+            $lineTaxRate = \SoftNova\Services\TaxService::resolveProductRate(
+                $product,
+                $defaultTax,
+                $this->db,
+                $isOpenItem,
+                $isOpenItem ? ($item['tax_rate'] ?? null) : null
+            );
             $validItems[] = [
                 'product_id' => $productId,
                 'product_name' => $lineName,
                 'quantity' => $quantity,
                 'unit_price' => $up,
                 'catalog_price' => $catalogPrice,
-                // Nunca actualizar precio de catálogo del comodín.
-                'sync_catalog_price' => !$isOpenItem && abs($up - $catalogPrice) >= 0.01,
-                'unit_cost' => $isOpenItem ? 0.0 : (float)($product['purchase_price'] ?? 0),
+                // Nunca actualizar precio de catálogo desde una venta POS.
+                // Un precio negociado o con descuento por cantidad no debe envenenar sale_price.
+                'sync_catalog_price' => false,
+                'unit_cost' => $unitCost,
                 'subtotal' => $is,
+                'tax_rate' => $lineTaxRate,
                 'product_type' => $isOpenItem ? 'service' : ($product['product_type'] ?? 'product'),
                 'stock' => (int)($product['stock'] ?? 0),
                 'stock_oversell_reason' => '',
                 'stock_oversell_note' => '',
                 'is_open_item' => $isOpenItem,
+                'is_consignment' => (($product['ownership'] ?? 'owned') === 'consignment'),
+                'consignor_id' => (($product['ownership'] ?? 'owned') === 'consignment')
+                    ? (int)($product['consignor_id'] ?? 0)
+                    : 0,
             ];
             $lastIdx = count($validItems) - 1;
             $isService = ($validItems[$lastIdx]['product_type'] ?? 'product') === 'service';
             $available = (int)($product['stock'] ?? 0);
             if (!$isService && $quantity > max(0, $available)) {
+                if (!empty($validItems[$lastIdx]['is_consignment'])) {
+                    $this->respond(
+                        false,
+                        'Stock consignado insuficiente para ' . $product['name']
+                        . ' (disponible: ' . $available . '). No se permite sobreventa de consignación.',
+                        '/app/ventas'
+                    );
+                    return;
+                }
                 try {
                     $parsed = \SoftNova\Services\StockOversell::parse(
                         $item['stock_oversell_reason'] ?? ($item['oversell_reason'] ?? null),
@@ -880,9 +1012,16 @@ class TenantVentasController extends TenantController
         }
         
         $discount = round($subtotal * ($discountPercent / 100), 2);
-        $taxable = max(0, $subtotal - $discount);
-        $taxRate = (float)$this->getSetting('tax_rate', '0');
-        $tax = round($taxable * ($taxRate / 100), 2);
+        $taxBreakdown = \SoftNova\Services\TaxService::applyDocumentDiscountAndTax($validItems, $discountPercent);
+        $tax = (float)$taxBreakdown['tax'];
+        $taxable = (float)$taxBreakdown['taxable'];
+        $validItems = $taxBreakdown['lines'];
+        try {
+            \SoftNova\Services\TaxService::assertHeaderMatchesLines($tax, $validItems);
+        } catch (\RuntimeException $e) {
+            $this->respond(false, $e->getMessage(), '/app/ventas');
+            return;
+        }
 
         $creditSurcharge = 0.0;
         $creditSurchargeRate = 0.0;
@@ -906,6 +1045,15 @@ class TenantVentasController extends TenantController
         if ($discountPercent > 0) {
             $discountNote = 'Descuento ' . rtrim(rtrim(number_format($discountPercent, 2, '.', ''), '0'), '.') . '%';
             $notes = $notes !== '' ? ($notes . ' · ' . $discountNote) : $discountNote;
+        }
+        if (!empty($qtyDiscountNotes)) {
+            $parts = [];
+            foreach (array_keys($qtyDiscountNotes) as $key) {
+                [$mq, $rt] = array_pad(explode(':', (string)$key, 2), 2, '0');
+                $parts[] = '>' . (int)$mq . 'ud ' . rtrim(rtrim(number_format((float)$rt, 2, '.', ''), '0'), '.') . '%';
+            }
+            $qNote = 'Desc. cantidad: ' . implode(', ', $parts);
+            $notes = $notes !== '' ? ($notes . ' · ' . $qNote) : $qNote;
         }
         if ($saleChannel === 'wholesale') {
             $notes = $notes !== '' ? ($notes . ' · Venta al por mayor') : 'Venta al por mayor';
@@ -950,6 +1098,20 @@ class TenantVentasController extends TenantController
             $notes = $notes !== '' ? ($notes . ' · ' . $payPlan['label']) : $payPlan['label'];
         }
 
+        $cashDueForChange = (float)($payPlan['cash_total'] ?? 0);
+        if ($cashDueForChange <= 0.009 && ($paymentMethod === 'cash' || PaymentMethodCatalog::affectsCash($paymentMethod))) {
+            $cashDueForChange = $paymentType === 'credit' ? min($initialPayment, $total) : $total;
+        }
+        if ($cashReceived !== null && $cashReceived > 0.009) {
+            $cashChange = \SoftNova\Core\cash_change_amount(
+                $cashReceived,
+                $cashDueForChange > 0.009 ? $cashDueForChange : $total,
+                $cashChange
+            );
+        } else {
+            $cashChange = null;
+        }
+
         // Efectivo requiere caja abierta (igual que sync offline) para no descuadrar arqueo.
         if ((float)($payPlan['cash_total'] ?? 0) > 0.009) {
             $openCash = $this->query(
@@ -981,6 +1143,7 @@ class TenantVentasController extends TenantController
                         $documentType,
                         $customerId,
                         $_SESSION['tenant_user_id'],
+                        // Fecha+hora local del servidor (timezone app). El día viene de sale_date (local).
                         $saleDate . ' ' . date('H:i:s'),
                         $dueDate,
                         $receivedDate !== '' ? $receivedDate : null,
@@ -1029,12 +1192,15 @@ class TenantVentasController extends TenantController
             $saleId = (int)$this->db->lastInsertId();
             
             foreach ($validItems as $vi) {
+                $isConsignment = !empty($vi['is_consignment']);
                 try {
                     $this->query(
                         "INSERT INTO sale_items
-                            (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal,
+                            (sale_id, product_id, product_name, quantity, unit_price, unit_cost,
+                             is_consignment, consignor_id, subtotal, tax_rate, tax_amount,
+                             discount_amount, taxable,
                              stock_oversell_reason, stock_oversell_note)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         [
                             $saleId,
                             $vi['product_id'],
@@ -1042,17 +1208,68 @@ class TenantVentasController extends TenantController
                             $vi['quantity'],
                             $vi['unit_price'],
                             $vi['unit_cost'] ?? 0,
+                            $isConsignment ? 1 : 0,
+                            $isConsignment && !empty($vi['consignor_id']) ? (int)$vi['consignor_id'] : null,
                             $vi['subtotal'],
+                            round((float)($vi['tax_rate'] ?? 0), 2),
+                            round((float)($vi['tax_amount'] ?? 0), 2),
+                            round((float)($vi['discount_amount'] ?? 0), 2),
+                            round((float)($vi['taxable'] ?? $vi['subtotal'] ?? 0), 2),
                             $vi['stock_oversell_reason'] !== '' ? $vi['stock_oversell_reason'] : null,
                             $vi['stock_oversell_note'] !== '' ? $vi['stock_oversell_note'] : null,
                         ]
                     );
                 } catch (\Throwable $e) {
-                    $this->query(
-                        "INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        [$saleId, $vi['product_id'], $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['unit_cost'] ?? 0, $vi['subtotal']]
-                    );
+                    try {
+                        $this->query(
+                            "INSERT INTO sale_items
+                                (sale_id, product_id, product_name, quantity, unit_price, unit_cost,
+                                 is_consignment, consignor_id, subtotal, tax_rate, tax_amount,
+                                 stock_oversell_reason, stock_oversell_note)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                $saleId,
+                                $vi['product_id'],
+                                $vi['product_name'],
+                                $vi['quantity'],
+                                $vi['unit_price'],
+                                $vi['unit_cost'] ?? 0,
+                                $isConsignment ? 1 : 0,
+                                $isConsignment && !empty($vi['consignor_id']) ? (int)$vi['consignor_id'] : null,
+                                $vi['subtotal'],
+                                round((float)($vi['tax_rate'] ?? 0), 2),
+                                round((float)($vi['tax_amount'] ?? 0), 2),
+                                $vi['stock_oversell_reason'] !== '' ? $vi['stock_oversell_reason'] : null,
+                                $vi['stock_oversell_note'] !== '' ? $vi['stock_oversell_note'] : null,
+                            ]
+                        );
+                    } catch (\Throwable $e2) {
+                    try {
+                        $this->query(
+                            "INSERT INTO sale_items
+                                (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal,
+                                 stock_oversell_reason, stock_oversell_note)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                $saleId,
+                                $vi['product_id'],
+                                $vi['product_name'],
+                                $vi['quantity'],
+                                $vi['unit_price'],
+                                $vi['unit_cost'] ?? 0,
+                                $vi['subtotal'],
+                                $vi['stock_oversell_reason'] !== '' ? $vi['stock_oversell_reason'] : null,
+                                $vi['stock_oversell_note'] !== '' ? $vi['stock_oversell_note'] : null,
+                            ]
+                        );
+                    } catch (\Throwable $e3) {
+                        $this->query(
+                            "INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal)
+                             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            [$saleId, $vi['product_id'], $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['unit_cost'] ?? 0, $vi['subtotal']]
+                        );
+                    }
+                    }
                 }
                 $saleItemId = (int)$this->db->lastInsertId();
                 if (!empty($vi['sync_catalog_price'])) {
@@ -1081,6 +1298,16 @@ class TenantVentasController extends TenantController
                     (float)($vi['unit_cost'] ?? 0),
                     $oversell
                 );
+                if ($isConsignment) {
+                    (new \SoftNova\Services\ConsignmentService($this->db, $this->sales->stock()))->registerSaleDebt(
+                        $saleId,
+                        $saleItemId,
+                        (int)$vi['product_id'],
+                        (int)$vi['quantity'],
+                        (float)($vi['unit_cost'] ?? 0),
+                        (int)($vi['consignor_id'] ?? 0) ?: null
+                    );
+                }
             }
             
             $cashAmount = 0.0;
@@ -1118,6 +1345,12 @@ class TenantVentasController extends TenantController
             } catch (\Throwable $e) {
                 $accountingOk = false;
                 error_log('Contabilidad venta ' . $saleId . ': ' . $e->getMessage());
+                $this->accounting->enqueuePending(
+                    'post_sale',
+                    'sale',
+                    $saleId,
+                    $e->getMessage()
+                );
             }
 
             try {
@@ -1127,6 +1360,7 @@ class TenantVentasController extends TenantController
             }
 
             // Solo el efectivo del mixto (o del pago único) entra a la caja física.
+            $cashWarn = '';
             if ($cashAmount > 0.009) {
                 $label = ($paymentType === 'credit' && $paymentStatus !== 'paid')
                     ? 'Abono inicial: ' . $invoiceNumber
@@ -1134,7 +1368,10 @@ class TenantVentasController extends TenantController
                 if ($paymentMethod === 'mixed') {
                     $label .= ' (efectivo mixto)';
                 }
-                $this->cash->registerIncome($cashAmount, $label, 'sale', $saleId);
+                if (!$this->cash->registerIncome($cashAmount, $label, 'sale', $saleId)) {
+                    error_log('Caja: venta ' . $saleId . ' sin movimiento de ingreso');
+                    $cashWarn = ' La venta quedó registrada, pero el efectivo no entró a caja: revise la sesión abierta.';
+                }
             }
 
             // Aporte empresa al domicilio → gasto operacional Transporte.
@@ -1144,8 +1381,7 @@ class TenantVentasController extends TenantController
                         $saleId,
                         $invoiceNumber,
                         $deliveryCompanyFee,
-                        (int)($_SESSION['tenant_user_id'] ?? 0),
-                        true
+                        (int)($_SESSION['tenant_user_id'] ?? 0)
                     );
                 } catch (\Throwable $e) {
                     error_log('Gasto transporte domicilio venta ' . $saleId . ': ' . $e->getMessage());
@@ -1191,6 +1427,9 @@ class TenantVentasController extends TenantController
             if (!$accountingOk) {
                 $msg .= ' · Asiento contable pendiente: use «Sincronizar» en Contabilidad';
             }
+            if ($cashWarn !== '') {
+                $msg .= $cashWarn;
+            }
 
             try {
                 (new \SoftNova\Services\TenantAuditService($this->db))->log(
@@ -1208,6 +1447,7 @@ class TenantVentasController extends TenantController
                 'sale_id' => $saleId,
                 'invoice_number' => $invoiceNumber,
                 'client_sale_uuid' => $clientUuid !== '' ? $clientUuid : null,
+                'ticket_print_url' => rtrim((string)\SoftNova\Core\base_url('/app/ventas'), '/') . '?action=pdf&format=print&id=' . $saleId,
             ]);
         } catch (\Exception $e) {
             if ($this->db->inTransaction()) {
@@ -1311,6 +1551,12 @@ class TenantVentasController extends TenantController
                 $this->accounting->postSalePayment($paymentId);
             } catch (\Throwable $e) {
                 error_log('Contabilidad abono ' . $paymentId . ': ' . $e->getMessage());
+                $this->accounting->enqueuePending(
+                    'post_sale_payment',
+                    'sale_payment',
+                    $paymentId,
+                    $e->getMessage()
+                );
             }
 
             try {
@@ -1321,9 +1567,17 @@ class TenantVentasController extends TenantController
 
             // Solo el efectivo entra a la caja física (evita descuadre con contabilidad).
             if (\SoftNova\Services\PaymentMethodCatalog::affectsCash($method)) {
-                $this->cash->registerIncome($amount, 'Abono: ' . $sale['invoice_number'], 'sale_payment', $saleId);
+                $this->cash->registerIncome($amount, 'Abono: ' . $sale['invoice_number'], 'sale_payment', $paymentId);
             }
             $this->receivables->applyPayment($saleId, $totalPaid, (float)$sale['total']);
+
+            (new \SoftNova\Services\TenantAuditService($this->db))->log(
+                'payment',
+                'ventas',
+                'Abono ' . $this->formatMoney($amount) . ' en venta ' . $sale['invoice_number'],
+                'sale_payment',
+                $paymentId
+            );
             
             $this->respond(true, 'Abono registrado. Pendiente: ' . $this->formatMoney(max(0, $remaining)), '/app/ventas');
         } catch (\Exception $e) {
@@ -1477,16 +1731,24 @@ class TenantVentasController extends TenantController
         $newMethod = $plan['method'];
         $newCash = (float)$plan['cash_total'];
 
-        // Reversar asientos de los pagos viejos antes de reemplazar filas.
-        foreach ($oldPaymentIds as $oldPayId) {
-            if ($oldPayId <= 0) {
-                continue;
-            }
-            try {
+        // Reversar asientos de los pagos viejos ANTES de reemplazar filas.
+        // Si falla, no se toca la venta (evita doble asiento).
+        try {
+            foreach ($oldPaymentIds as $oldPayId) {
+                if ($oldPayId <= 0) {
+                    continue;
+                }
                 $this->accounting->reverseSource('sale_payment', $oldPayId, 'Cambio medio de pago: ' . $label);
-            } catch (\Throwable $e) {
-                error_log('reverse sale_payment ' . $oldPayId . ': ' . $e->getMessage());
             }
+        } catch (\Throwable $e) {
+            $this->respond(
+                false,
+                'No se puede cambiar el medio de pago: la reversión contable falló. '
+                . $e->getMessage()
+                . ' Abra el periodo o use Sincronizar en Contabilidad.',
+                $redirect
+            );
+            return;
         }
 
         $newPaymentIds = [];
@@ -1522,6 +1784,7 @@ class TenantVentasController extends TenantController
             return;
         }
 
+        $postErrors = [];
         foreach ($newPaymentIds as $newPayId) {
             if ($newPayId <= 0) {
                 continue;
@@ -1529,8 +1792,25 @@ class TenantVentasController extends TenantController
             try {
                 $this->accounting->postSalePayment($newPayId);
             } catch (\Throwable $e) {
+                $postErrors[] = $e->getMessage();
+                $this->accounting->enqueuePending(
+                    'post_sale_payment',
+                    'sale_payment',
+                    $newPayId,
+                    $e->getMessage()
+                );
                 error_log('postSalePayment after edit ' . $newPayId . ': ' . $e->getMessage());
             }
+        }
+        if ($postErrors !== []) {
+            $this->respond(
+                false,
+                'Medio de pago actualizado, pero el asiento contable quedó pendiente: '
+                . $postErrors[0]
+                . ' Use «Sincronizar» en Contabilidad.',
+                $redirect
+            );
+            return;
         }
         try {
             $comm = new \SoftNova\Services\CommissionService($this->db);
@@ -1633,7 +1913,14 @@ class TenantVentasController extends TenantController
                 $this->accounting->reverseSaleCascade($id, 'Venta cancelada: ' . $reasonLabel);
             } catch (\Throwable $accountingError) {
                 error_log('Accounting sale reversal: ' . $accountingError->getMessage());
-                $msg .= ' La reversión contable quedó pendiente de revisión.';
+                $this->accounting->enqueuePending(
+                    'reverse_sale_cascade',
+                    'sale',
+                    $id,
+                    $accountingError->getMessage(),
+                    ['reason' => 'Venta cancelada: ' . $reasonLabel]
+                );
+                $msg .= ' IMPORTANTE: la reversión contable quedó en cola — use «Sincronizar» en Contabilidad.';
             }
             try {
                 (new \SoftNova\Services\CommissionService($this->db))->cancelForSale($id);
@@ -1682,7 +1969,7 @@ class TenantVentasController extends TenantController
         try {
             $id = (int)$this->request->get('id');
             $format = (string)$this->request->get('format', 'a4');
-            if ($format !== 'ticket') {
+            if (!in_array($format, ['ticket', 'print'], true)) {
                 $format = 'a4';
             }
             $sale = $this->query(
@@ -1703,7 +1990,13 @@ class TenantVentasController extends TenantController
             }
 
             $items = $this->query(
-                "SELECT * FROM sale_items WHERE sale_id = ? ORDER BY id ASC",
+                "SELECT si.*,
+                        COALESCE(p.code, '') AS product_code,
+                        COALESCE(p.barcode, '') AS barcode
+                 FROM sale_items si
+                 LEFT JOIN products p ON p.id = si.product_id
+                 WHERE si.sale_id = ?
+                 ORDER BY si.id ASC",
                 [$id]
             )->fetchAll();
             $payments = $this->query(
@@ -1712,6 +2005,11 @@ class TenantVentasController extends TenantController
             )->fetchAll();
 
             $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
+            if ($format === 'print') {
+                header('Content-Type: text/html; charset=utf-8');
+                echo $pdf->generateTicket58($sale, $items ?: [], $payments ?: [], true);
+                exit;
+            }
             $content = $pdf->generateInvoice($sale, $items ?: [], $payments ?: [], $format);
             $prefix = $format === 'ticket' ? 'Ticket_' : 'Doc_';
             $pdf->download($content, $prefix . ($sale['invoice_number'] ?? $id) . '.pdf');
@@ -1768,7 +2066,7 @@ class TenantVentasController extends TenantController
     {
         try {
             $filters = $this->salesListFilters();
-            $sales = $this->fetchFilteredSales($filters, 5000);
+            $sales = $this->attachSaleItems($this->fetchFilteredSales($filters, 5000));
             $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
             $content = $pdf->generateSalesListReport($sales, $filters, $this->db);
             $pdf->download($content, 'reporte_ventas_' . date('Ymd_His') . '.pdf');
@@ -1784,8 +2082,8 @@ class TenantVentasController extends TenantController
     private function exportSales(): void
     {
         $filters = $this->salesListFilters();
-        $rows = $this->fetchFilteredSales($filters, 10000);
-        
+        $rows = $this->attachSaleItems($this->fetchFilteredSales($filters, 10000));
+
         $csvRows = [];
         foreach ($rows as $r) {
             $payLabel = PaymentMethodCatalog::label((string)$r['payment_method'], $this->db);
@@ -1793,9 +2091,15 @@ class TenantVentasController extends TenantController
                 ? 'Cancelado'
                 : ($r['payment_status'] === 'paid' ? 'Pagado' : ($r['payment_status'] === 'partial' ? 'Parcial' : 'Pendiente'));
             $csvRows[] = [
+                'venta',
                 $r['invoice_number'],
                 $r['customer_name'],
                 $r['sale_date'],
+                '',
+                '',
+                '',
+                '',
+                '',
                 $r['subtotal'],
                 $r['tax'],
                 $r['total'],
@@ -1804,12 +2108,148 @@ class TenantVentasController extends TenantController
                 $statusLabel,
                 $r['cancel_reason'] ?? '',
             ];
+            foreach (($r['items'] ?? []) as $it) {
+                $sku = (string)($it['product_code'] ?? '');
+                if ($sku !== '' && preg_match('/^\d{11,}$/', $sku)) {
+                    $sku = "\t" . $sku;
+                }
+                $ean = (string)($it['barcode'] ?? $it['product_barcode'] ?? '');
+                if ($ean !== '' && preg_match('/^\d{11,}$/', $ean)) {
+                    $ean = "\t" . $ean;
+                }
+                $csvRows[] = [
+                    'item',
+                    $r['invoice_number'],
+                    $r['customer_name'],
+                    $r['sale_date'],
+                    $sku,
+                    $ean,
+                    $it['product_name'] ?? '',
+                    $it['quantity'] ?? '',
+                    $it['unit_price'] ?? '',
+                    $it['subtotal'] ?? '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                ];
+            }
         }
-        
+
         $this->exportCsv(
             'ventas_' . date('Ymd_His') . '.csv',
-            ['Factura', 'Cliente', 'Fecha', 'Subtotal', 'Impuesto', 'Total', 'Metodo', 'Pago', 'Estado', 'Motivo cancelacion'],
+            [
+                'Tipo', 'Factura', 'Cliente', 'Fecha', 'SKU', 'EAN', 'Producto', 'Cantidad', 'P. unitario',
+                'Subtotal', 'Impuesto', 'Total', 'Metodo', 'Pago', 'Estado', 'Motivo cancelacion',
+            ],
             $csvRows
         );
+    }
+
+    /**
+     * Agrupa líneas del mismo producto_id sumando cantidades (comodín queda separado).
+     *
+     * @param list<array<string,mixed>> $items
+     * @return list<array<string,mixed>>
+     */
+    private function aggregateCartItemsByProduct(array $items): array
+    {
+        $grouped = [];
+        $openLines = [];
+        foreach ($items as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+            $productId = (int)($item['product_id'] ?? 0);
+            $quantity = (int)($item['quantity'] ?? 0);
+            if ($productId <= 0 || $quantity <= 0) {
+                continue;
+            }
+            $isOpen = !empty($item['is_open_item'])
+                || (string)($item['is_open_item'] ?? '') === '1'
+                || strtoupper((string)($item['code'] ?? '')) === 'COMODIN';
+            if (!$isOpen) {
+                try {
+                    $probe = $this->query(
+                        "SELECT id, code, COALESCE(product_type,'product') AS product_type FROM products WHERE id = ?",
+                        [$productId]
+                    )->fetch();
+                    if ($probe && \SoftNova\Services\OpenItemProduct::isOpenItem($probe)) {
+                        $isOpen = true;
+                    }
+                } catch (\Throwable $e) {
+                    // ignore
+                }
+            }
+            if ($isOpen) {
+                $row = $item;
+                $row['quantity'] = $quantity;
+                $openLines[] = $row;
+                continue;
+            }
+            if (!isset($grouped[$productId])) {
+                $grouped[$productId] = $item;
+                $grouped[$productId]['quantity'] = $quantity;
+            } else {
+                $grouped[$productId]['quantity'] = (int)$grouped[$productId]['quantity'] + $quantity;
+                $r = (string)($item['stock_oversell_reason'] ?? $item['oversell_reason'] ?? '');
+                if ($r !== '') {
+                    $grouped[$productId]['stock_oversell_reason'] = $r;
+                    $grouped[$productId]['stock_oversell_note'] = (string)(
+                        $item['stock_oversell_note'] ?? $item['oversell_note'] ?? ''
+                    );
+                }
+            }
+        }
+        return array_merge(array_values($grouped), $openLines);
+    }
+
+    /**
+     * Adjunta ítems de producto a cada venta (una sola consulta).
+     *
+     * @param list<array<string,mixed>> $sales
+     * @return list<array<string,mixed>>
+     */
+    private function attachSaleItems(array $sales): array
+    {
+        if ($sales === []) {
+            return $sales;
+        }
+        $ids = [];
+        foreach ($sales as $s) {
+            $id = (int)($s['id'] ?? 0);
+            if ($id > 0) {
+                $ids[] = $id;
+            }
+        }
+        $ids = array_values(array_unique($ids));
+        if ($ids === []) {
+            return $sales;
+        }
+
+        $ph = implode(',', array_fill(0, count($ids), '?'));
+        $itemRows = $this->query(
+            "SELECT si.sale_id, si.product_name, si.quantity, si.unit_price, si.subtotal,
+                    COALESCE(p.code, '') AS product_code,
+                    COALESCE(p.barcode, '') AS barcode
+             FROM sale_items si
+             LEFT JOIN products p ON p.id = si.product_id
+             WHERE si.sale_id IN ({$ph})
+             ORDER BY si.sale_id ASC, si.id ASC",
+            $ids
+        )->fetchAll();
+
+        $bySale = [];
+        foreach ($itemRows as $it) {
+            $bySale[(int)$it['sale_id']][] = $it;
+        }
+        foreach ($sales as &$s) {
+            $s['items'] = $bySale[(int)($s['id'] ?? 0)] ?? [];
+        }
+        unset($s);
+
+        return $sales;
     }
 }

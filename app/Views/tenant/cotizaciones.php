@@ -9,15 +9,28 @@ $filters = $filters ?? ['q'=>'','from'=>'','to'=>'','status'=>'','sort'=>'date',
 $cotizBase = $viewInstance->route('app/cotizaciones');
 $needBarcode = true;
 $pageScripts = ['cotizaciones.js'];
+$canCreateQuote = \SoftNova\Core\TenantMiddleware::canDo('create', 'cotizaciones');
+$canEditQuote = \SoftNova\Core\TenantMiddleware::canDo('edit', 'cotizaciones');
+$canDeleteQuote = \SoftNova\Core\TenantMiddleware::canDo('delete', 'cotizaciones');
+$canExportQuote = \SoftNova\Core\TenantMiddleware::canDo('export', 'cotizaciones');
+$canConvertSale = $canCreateQuote && \SoftNova\Core\TenantMiddleware::canDo('create', 'ventas');
+$defaultTaxRate = (float)($defaultTaxRate ?? 0);
+$taxEnabled = !empty($taxEnabled);
 function fmtQ(float $a, array $c): string { return $c['symbol'].' '.number_format($a, $c['decimals'], $c['decimal']??',', $c['thousands']??'.'); }
 ?>
 <meta name="currency-symbol" content="<?php echo $currency['symbol']; ?>">
 <meta name="currency-decimals" content="<?php echo $currency['decimals']; ?>">
+<meta name="quote-tax-enabled" content="<?php echo $taxEnabled ? '1' : '0'; ?>">
+<meta name="quote-tax-rate" content="<?php echo htmlspecialchars((string)$defaultTaxRate); ?>">
 <?php echo flashMessage(); ?>
 
 <div style="display:flex;gap:15px;margin-bottom:20px;flex-wrap:wrap;">
+    <?php if ($canCreateQuote): ?>
     <button onclick="openQuoteModal()" class="btn btn-primary neumorphic-btn" title="Nueva cotizacion">Nueva Cotizacion</button>
+    <?php endif; ?>
+    <?php if ($canExportQuote): ?>
     <a href="<?php echo $cotizBase; ?>?action=export" class="btn btn-secondary" title="Exportar CSV">Exportar CSV</a>
+    <?php endif; ?>
 </div>
 
 <div class="card neumorphic" style="margin-bottom:18px;">
@@ -79,13 +92,29 @@ function fmtQ(float $a, array $c): string { return $c['symbol'].' '.number_forma
                         <td class="table-actions">
                             <button onclick="viewQuoteDetail(<?php echo $q['id']; ?>)" class="btn btn-sm btn-info" title="Ver detalle"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg></button>
                             <a href="<?php echo $cotizBase; ?>?action=pdf&id=<?php echo $q['id']; ?>" class="btn btn-sm btn-secondary" target="_blank" title="Descargar PDF"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg></a>
-                            <?php if (in_array($q['status'], ['pending', 'accepted'])): ?>
+                            <?php if ($canEditQuote && ($q['status'] ?? '') === 'pending'): ?>
+                                <form method="POST" action="<?php echo $cotizBase; ?>?action=set_status" style="display:inline;" data-ajax="true">
+                                    <?php echo \SoftNova\Core\csrf_field(); ?>
+                                    <input type="hidden" name="id" value="<?php echo (int)$q['id']; ?>">
+                                    <input type="hidden" name="status" value="accepted">
+                                    <button type="submit" class="btn btn-sm btn-secondary" title="Marcar aceptada">✓</button>
+                                </form>
+                                <form method="POST" action="<?php echo $cotizBase; ?>?action=set_status" style="display:inline;" data-ajax="true">
+                                    <?php echo \SoftNova\Core\csrf_field(); ?>
+                                    <input type="hidden" name="id" value="<?php echo (int)$q['id']; ?>">
+                                    <input type="hidden" name="status" value="rejected">
+                                    <button type="submit" class="btn btn-sm btn-secondary" title="Marcar rechazada">✕</button>
+                                </form>
+                            <?php endif; ?>
+                            <?php if ($canConvertSale && in_array($q['status'], ['pending', 'accepted'], true)): ?>
                                 <button onclick="openConvertModal(<?php echo $q['id']; ?>,<?php echo $q['total']; ?>)" class="btn btn-sm btn-success" title="Convertir a venta"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></button>
                             <?php endif; ?>
+                            <?php if ($canDeleteQuote && ($q['status'] ?? '') !== 'converted'): ?>
                             <form method="POST" action="<?php echo $cotizBase; ?>?action=delete" style="display:inline;" data-ajax="true">
                                 <?php echo \SoftNova\Core\csrf_field(); ?><input type="hidden" name="id" value="<?php echo $q['id']; ?>">
                                 <button type="submit" data-confirm="Eliminar esta cotizacion?" class="btn btn-sm btn-danger" title="Eliminar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
                             </form>
+                            <?php endif; ?>
                         </td>
                     </tr>
                 <?php endforeach; ?>
@@ -133,11 +162,16 @@ function fmtQ(float $a, array $c): string { return $c['symbol'].' '.number_forma
                 <div class="form-group"><label>Productos <span class="field-tip" data-tip="Agregue los ítems a cotizar con cantidad y precio.">?</span></label>
                 <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
                     <input type="text" id="quoteBarcodeScan" class="form-control" placeholder="Escanear…" autocomplete="off" data-barcode-input="true" style="flex:1;min-width:120px;" title="Pistola de códigos de barras">
-                    <select id="productSelect" class="form-control" style="flex:2;min-width:160px;"><option value="">Seleccionar...</option><?php foreach($products as $p): ?><option value="<?php echo $p['id']; ?>" data-price="<?php echo $p['sale_price']; ?>" data-name="<?php echo htmlspecialchars($p['name']); ?>" data-code="<?php echo htmlspecialchars($p['code'] ?? ''); ?>"><?php echo htmlspecialchars((($p['code'] ?? '') !== '' ? ($p['code'] . ' — ') : '') . $p['name']); ?> (<?php echo fmtQ($p['sale_price'],$currency); ?>)</option><?php endforeach; ?></select>
+                    <select id="productSelect" class="form-control" style="flex:2;min-width:160px;"><option value="">Seleccionar...</option><?php foreach($products as $p): ?><option value="<?php echo $p['id']; ?>" data-price="<?php echo $p['sale_price']; ?>" data-name="<?php echo htmlspecialchars($p['name']); ?>" data-code="<?php echo htmlspecialchars($p['code'] ?? ''); ?>" data-tax="<?php echo htmlspecialchars((string)($p['tax_rate'] ?? '')); ?>"><?php echo htmlspecialchars((($p['code'] ?? '') !== '' ? ($p['code'] . ' — ') : '') . $p['name']); ?> (<?php echo fmtQ($p['sale_price'],$currency); ?>)</option><?php endforeach; ?></select>
                     <input type="number" id="productQty" value="1" min="1" class="form-control" style="width:80px;">
                     <button type="button" class="btn btn-primary" onclick="addQuoteProduct()">+</button>
                 </div>
-                <table id="itemsTable" style="width:100%;margin-top:10px;display:none;"><thead><tr><th>Producto</th><th>Cant</th><th>Precio</th><th>Subtotal</th><th></th></tr></thead><tbody></tbody><tfoot><tr><td colspan="3" style="text-align:right;font-weight:600;">Total:</td><td id="quoteTotal" style="font-weight:700;color:#10B981;">0</td><td></td></tr></tfoot></table>
+                <table id="itemsTable" style="width:100%;margin-top:10px;display:none;"><thead><tr><th>Producto</th><th>Cant</th><th>Precio</th><th>Subtotal</th><th></th></tr></thead><tbody></tbody>
+                <tfoot>
+                    <tr><td colspan="3" style="text-align:right;">Subtotal:</td><td id="quoteSubtotal" style="font-weight:600;">0</td><td></td></tr>
+                    <tr><td colspan="3" style="text-align:right;">IVA:</td><td id="quoteTax" style="font-weight:600;">0</td><td></td></tr>
+                    <tr><td colspan="3" style="text-align:right;font-weight:600;">Total:</td><td id="quoteTotal" style="font-weight:700;color:#10B981;">0</td><td></td></tr>
+                </tfoot></table>
             </div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="closeQuoteModal()">Cancelar</button><button type="submit" class="btn btn-primary" id="submitQuoteBtn">Crear Cotización</button></div>
         </form>

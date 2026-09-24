@@ -29,6 +29,32 @@ class ProductCsvImporter
 
     private StockService $stock;
 
+    /** @var array<string, array<string, mixed>> claves en minúsculas */
+    private array $productByCode = [];
+
+    /** @var array<string, array<string, mixed>> claves en minúsculas */
+    private array $productByBarcode = [];
+
+    /**
+     * Índice por nombre normalizado.
+     * false = nombre ambiguo (varios productos) → no se usa para emparejar.
+     *
+     * @var array<string, array<string, mixed>|false>
+     */
+    private array $productByName = [];
+
+    /** @var list<int> */
+    private array $pendingAccountingMovementIds = [];
+
+    /** @var array<int, true> */
+    private array $lotTouchedIds = [];
+
+    private ?AccountingService $accounting = null;
+
+    private ?SkuSequenceService $skuSeq = null;
+
+    private const MAX_ERROR_MESSAGES = 80;
+
     private function query(string $sql, array $params = []): \PDOStatement
     {
         $stmt = $this->db->prepare($sql);
@@ -37,16 +63,220 @@ class ProductCsvImporter
     }
 
     /** Un fallo contable no debe abortar la importación de la fila. */
-    private function postStockAccounting(int $movementId): void
+    private function queueStockAccounting(int $movementId): void
     {
-        if ($movementId <= 0) {
+        if ($movementId > 0) {
+            $this->pendingAccountingMovementIds[] = $movementId;
+        }
+    }
+
+    private function accountingService(): AccountingService
+    {
+        return $this->accounting ??= new AccountingService($this->db);
+    }
+
+    private function flushPendingAccounting(): void
+    {
+        if ($this->pendingAccountingMovementIds === []) {
             return;
         }
-        try {
-            (new AccountingService($this->db))->postStockMovement($movementId);
-        } catch (\Throwable $e) {
-            error_log('Contabilidad importación CSV, movimiento ' . $movementId . ': ' . $e->getMessage());
+        $svc = $this->accountingService();
+        foreach ($this->pendingAccountingMovementIds as $movementId) {
+            try {
+                $svc->postStockMovement($movementId);
+            } catch (\Throwable $e) {
+                error_log('Contabilidad importación CSV, movimiento ' . $movementId . ': ' . $e->getMessage());
+            }
         }
+        $this->pendingAccountingMovementIds = [];
+    }
+
+    private function pushImportError(array &$errors, string $message): void
+    {
+        if (count($errors) >= self::MAX_ERROR_MESSAGES) {
+            return;
+        }
+        $errors[] = $message;
+    }
+
+    private function normalizeMatchKey(string $value): string
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return '';
+        }
+        if (function_exists('mb_strtolower')) {
+            return mb_strtolower($value, 'UTF-8');
+        }
+        return strtolower($value);
+    }
+
+    /** Carga índice en memoria para evitar miles de SELECT por SKU/EAN/nombre. */
+    private function loadProductIndex(): void
+    {
+        $this->productByCode = [];
+        $this->productByBarcode = [];
+        $this->productByName = [];
+        $rows = $this->query(
+            "SELECT id, code, barcode, name, stock, COALESCE(track_lots, 0) AS track_lots, purchase_price
+             FROM products"
+        )->fetchAll();
+        foreach ($rows as $row) {
+            $this->indexProductRow($row);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    private function indexProductRow(array $row): void
+    {
+        $id = (int)($row['id'] ?? 0);
+        if ($id <= 0) {
+            return;
+        }
+        $code = trim((string)($row['code'] ?? ''));
+        $barcode = trim((string)($row['barcode'] ?? ''));
+        $name = trim((string)($row['name'] ?? ''));
+        $meta = [
+            'id' => $id,
+            'code' => $code,
+            'barcode' => $barcode,
+            'name' => $name,
+            'stock' => (int)($row['stock'] ?? 0),
+            'track_lots' => (int)($row['track_lots'] ?? 0),
+            'purchase_price' => (float)($row['purchase_price'] ?? 0),
+        ];
+        $codeKey = $this->normalizeMatchKey($code);
+        if ($codeKey !== '') {
+            $this->productByCode[$codeKey] = $meta;
+        }
+        $eanKey = $this->normalizeMatchKey($barcode);
+        if ($eanKey !== '') {
+            $this->productByBarcode[$eanKey] = $meta;
+        }
+        $nameKey = $this->normalizeMatchKey($name);
+        if ($nameKey !== '') {
+            if (!isset($this->productByName[$nameKey])) {
+                $this->productByName[$nameKey] = $meta;
+            } elseif (
+                $this->productByName[$nameKey] !== false
+                && (int)($this->productByName[$nameKey]['id'] ?? 0) !== $id
+            ) {
+                $this->productByName[$nameKey] = false;
+            } elseif ($this->productByName[$nameKey] !== false) {
+                $this->productByName[$nameKey] = $meta;
+            }
+        }
+    }
+
+    /**
+     * Empareja por SKU, luego EAN, luego nombre único (para re-imports sin código).
+     *
+     * @return array<string, mixed>|null
+     */
+    private function findExistingProduct(string $sku, ?string $ean, string $name = ''): ?array
+    {
+        $skuKey = $this->normalizeMatchKey($sku);
+        if ($skuKey !== '' && isset($this->productByCode[$skuKey])) {
+            return $this->productByCode[$skuKey];
+        }
+        $eanKey = $this->normalizeMatchKey((string)$ean);
+        if ($eanKey !== '' && isset($this->productByBarcode[$eanKey])) {
+            return $this->productByBarcode[$eanKey];
+        }
+        $nameKey = $this->normalizeMatchKey($name);
+        if ($nameKey !== '' && isset($this->productByName[$nameKey]) && $this->productByName[$nameKey] !== false) {
+            return $this->productByName[$nameKey];
+        }
+        return null;
+    }
+
+    private function skuSequence(): SkuSequenceService
+    {
+        return $this->skuSeq ??= new SkuSequenceService($this->db);
+    }
+
+    /**
+     * Si el CSV trae SKU nuevo y no choca con otro producto, actualiza el código.
+     * Útil al pasar de catálogo simple (SKU auto) a catálogo completo.
+     */
+    private function maybeUpgradeProductCode(int $productId, string $newSku, string $currentCode): string
+    {
+        $newSku = trim($newSku);
+        if ($newSku === '') {
+            return $currentCode;
+        }
+        if ($this->normalizeMatchKey($newSku) === $this->normalizeMatchKey($currentCode)) {
+            return $currentCode !== '' ? $currentCode : $newSku;
+        }
+        $newKey = $this->normalizeMatchKey($newSku);
+        if (isset($this->productByCode[$newKey]) && (int)($this->productByCode[$newKey]['id'] ?? 0) !== $productId) {
+            return $currentCode;
+        }
+        $this->query("UPDATE products SET code = ? WHERE id = ?", [$newSku, $productId]);
+        $oldKey = $this->normalizeMatchKey($currentCode);
+        if ($oldKey !== '' && isset($this->productByCode[$oldKey]) && (int)($this->productByCode[$oldKey]['id'] ?? 0) === $productId) {
+            unset($this->productByCode[$oldKey]);
+        }
+        return $newSku;
+    }
+
+    /**
+     * UPDATE parcial: solo columnas presentes en $fields (campos vacíos del CSV no pisan).
+     *
+     * @param array<string, mixed> $fields
+     */
+    private function updateProductFields(int $productId, array $fields): void
+    {
+        if ($productId <= 0 || $fields === []) {
+            return;
+        }
+        $allowed = [
+            'name', 'product_type', 'category_id', 'purchase_price', 'sale_price', 'tax_rate',
+            'wholesale_price', 'min_stock', 'unit', 'status', 'location', 'barcode', 'track_lots',
+        ];
+        $sets = [];
+        $params = [];
+        foreach ($allowed as $col) {
+            if (!array_key_exists($col, $fields)) {
+                continue;
+            }
+            $sets[] = '`' . $col . '` = ?';
+            $params[] = $fields[$col];
+        }
+        if ($sets === []) {
+            return;
+        }
+        $params[] = $productId;
+        $this->query('UPDATE products SET ' . implode(', ', $sets) . ' WHERE id = ?', $params);
+    }
+
+    /** Estima filas de datos (sin encabezado) leyendo saltos de línea. */
+    public static function estimateDataRows(string $path): int
+    {
+        $raw = @file_get_contents($path);
+        if ($raw === false || $raw === '') {
+            return 0;
+        }
+        if (strncmp($raw, "\xEF\xBB\xBF", 3) === 0) {
+            $raw = substr($raw, 3);
+        }
+        $lines = preg_split("/\r\n|\n|\r/", $raw) ?: [];
+        $count = 0;
+        $headerSeen = false;
+        foreach ($lines as $line) {
+            $line = trim((string)$line);
+            if ($line === '' || preg_match('/^sep=/i', $line)) {
+                continue;
+            }
+            if (!$headerSeen) {
+                $headerSeen = true;
+                continue;
+            }
+            $count++;
+        }
+        return $count;
     }
 
     /**
@@ -369,6 +599,7 @@ class ProductCsvImporter
             'categoria' => ['categoria', 'category', 'cat', 'rubro', 'grupo'],
             'costo' => ['costo', 'cost', 'purchase_price', 'precio_compra', 'coste'],
             'precio' => ['precio', 'price', 'sale_price', 'precio_venta', 'pvp'],
+            'iva' => ['iva', 'tax', 'tax_rate', 'impuesto', 'pct_iva', 'porcentaje_iva', 'tarifa_iva'],
             'precio_mayor' => [
                 'precio_mayor', 'preciomayor', 'precio_al_mayor', 'precioalmayor',
                 'wholesale', 'wholesale_price', 'pmayoreo', 'mayoreo', 'precio_mayoreo',
@@ -687,7 +918,7 @@ class ProductCsvImporter
      */
     private function readCsvHeader(string $raw, string $sep): array
     {
-        $handle = fopen('php://memory', 'r+');
+        $handle = fopen('php://temp/maxmemory:8388608', 'r+');
         if ($handle === false) {
             return [null, []];
         }
@@ -755,12 +986,20 @@ class ProductCsvImporter
     /**
      * @return array{
      *   created:int,updated:int,skipped:int,remesas:int,movements:int,
-     *   errors:list<string>
+     *   total_rows:int,errors:list<string>,costs_corrected:int,
+     *   duplicate_rows:int,unique_products:int,skip_reasons:array<string,int>,
+     *   explanation:string
      * }
      */
     public function importFromFile(string $path, int $userId = 0): array
     {
         SupplyChainSchema::ensure($this->db);
+        @set_time_limit(0);
+
+        $this->pendingAccountingMovementIds = [];
+        $this->lotTouchedIds = [];
+        $this->accounting = null;
+
         $raw = file_get_contents($path);
         if ($raw === false || $raw === '') {
             throw new \RuntimeException('No se pudo leer el CSV');
@@ -770,18 +1009,30 @@ class ProductCsvImporter
             throw new \RuntimeException('El CSV está vacío');
         }
 
+        $estimatedRows = self::estimateDataRows($path);
         [$handle, $header, $map, $delimiter] = $this->openCsvWithBestDelimiter($raw);
         unset($header);
+
+        $this->loadProductIndex();
 
         $created = 0;
         $updated = 0;
         $skipped = 0;
         $remesas = 0;
         $movements = 0;
+        $entradaSinLote = 0;
+        $totalRows = 0;
+        $costsCorrected = 0;
+        $duplicateRows = 0;
         $errors = [];
+        $skipReasons = [];
         $categoryCache = [];
         $touchedIds = [];
         $rowNum = 1;
+
+        $bumpSkip = static function (array &$bag, string $reason): void {
+            $bag[$reason] = (int)($bag[$reason] ?? 0) + 1;
+        };
 
         $cell = static function (array $map, array $row, string $key): string {
             $i = $map[$key] ?? null;
@@ -796,49 +1047,70 @@ class ProductCsvImporter
             if ($row === [null] || (count($row) === 1 && trim((string)$row[0]) === '')) {
                 continue;
             }
+            $totalRows++;
             $name = $this->decodeCsvText($cell($map, $row, 'nombre'));
             if ($name === '') {
                 $skipped++;
-                $errors[] = "Fila {$rowNum}: nombre obligatorio o ilegible (revise que el CSV esté en UTF-8 o Windows-1252)";
+                $bumpSkip($skipReasons, 'Sin nombre (obligatorio o ilegible)');
+                $this->pushImportError($errors, "Fila {$rowNum}: nombre obligatorio o ilegible (revise que el CSV esté en UTF-8 o Windows-1252)");
                 continue;
             }
 
             [$sku, $skuError] = $this->normalizeProductCode($cell($map, $row, 'sku'));
             if ($skuError !== null) {
                 $skipped++;
-                $errors[] = "Fila {$rowNum}: {$skuError}";
+                $bumpSkip($skipReasons, 'SKU inválido (Excel en notación científica u otro formato)');
+                $this->pushImportError($errors, "Fila {$rowNum}: {$skuError}");
                 continue;
             }
             [$ean, $eanError] = $this->normalizeProductCode($cell($map, $row, 'ean'));
             if ($eanError !== null) {
                 $skipped++;
-                $errors[] = "Fila {$rowNum}: EAN — {$eanError}";
+                $bumpSkip($skipReasons, 'EAN inválido');
+                $this->pushImportError($errors, "Fila {$rowNum}: EAN — {$eanError}");
                 continue;
             }
             if (mb_strlen($ean, 'UTF-8') > 64) {
                 $skipped++;
-                $errors[] = "Fila {$rowNum}: EAN demasiado largo";
+                $bumpSkip($skipReasons, 'EAN demasiado largo');
+                $this->pushImportError($errors, "Fila {$rowNum}: EAN demasiado largo");
                 continue;
             }
-            $type = mb_strtolower($cell($map, $row, 'tipo'));
+            $costRaw = $cell($map, $row, 'costo');
+            $priceRaw = $cell($map, $row, 'precio');
+            $wholesaleRaw = $cell($map, $row, 'precio_mayor');
+            $taxRaw = $cell($map, $row, 'iva');
+            $minRaw = $cell($map, $row, 'min');
+            $unitRaw = $cell($map, $row, 'unidad');
+            $tipoRaw = $cell($map, $row, 'tipo');
+            $estadoRaw = $cell($map, $row, 'estado');
+
+            $type = mb_strtolower($tipoRaw);
             if ($type !== 'service') {
                 $type = 'product';
             }
-            $status = mb_strtolower($cell($map, $row, 'estado'));
+            $status = mb_strtolower($estadoRaw);
             if ($status !== 'inactive') {
                 $status = 'active';
             }
-            $cost = $this->parseMoneyCell($cell($map, $row, 'costo'));
-            $price = $this->parseMoneyCell($cell($map, $row, 'precio'));
-            $wholesale = $this->parseMoneyCell($cell($map, $row, 'precio_mayor'));
+            $cost = $this->parseMoneyCell($costRaw);
+            $price = $this->parseMoneyCell($priceRaw);
+            $wholesale = $this->parseMoneyCell($wholesaleRaw);
+            [$cost, $costWasFixed] = $this->sanitizeImportCost($cost, $price);
+            if ($costWasFixed) {
+                $costsCorrected++;
+            }
+            $taxRate = $taxRaw !== ''
+                ? \SoftNova\Services\TaxService::normalizeRate((float)str_replace(',', '.', $taxRaw))
+                : \SoftNova\Services\TaxService::defaultRate($this->db);
             $stockRaw = $cell($map, $row, 'stock');
             $stockSpecified = $stockRaw !== '';
             $stockQty = $type === 'service' ? 0 : $this->parseQtyCell($stockRaw);
             if ($stockQty < 0) {
                 $stockQty = 0;
             }
-            $minStock = (int)($cell($map, $row, 'min') !== '' ? $cell($map, $row, 'min') : '5');
-            $unit = $cell($map, $row, 'unidad') ?: 'UND';
+            $minStock = (int)($minRaw !== '' ? $minRaw : '5');
+            $unit = $unitRaw !== '' ? $unitRaw : 'UND';
             if (mb_strlen($unit) > 20) {
                 $unit = mb_substr($unit, 0, 20);
             }
@@ -877,24 +1149,18 @@ class ProductCsvImporter
             }
 
             try {
-                $existingProduct = null;
-                if ($sku !== '') {
-                    $existingProduct = $this->query(
-                        "SELECT id, stock, COALESCE(track_lots, 0) AS track_lots, purchase_price
-                         FROM products WHERE code = ? LIMIT 1",
-                        [$sku]
-                    )->fetch();
-                }
-                if (!$existingProduct && $eanVal) {
-                    $existingProduct = $this->query(
-                        "SELECT id, stock, COALESCE(track_lots, 0) AS track_lots, purchase_price
-                         FROM products WHERE barcode = ? LIMIT 1",
-                        [$eanVal]
-                    )->fetch();
-                }
+                $existingProduct = $this->findExistingProduct($sku, $eanVal, $name);
 
                 if ($existingProduct) {
                     $id = (int)$existingProduct['id'];
+                    if (isset($touchedIds[$id])) {
+                        $duplicateRows++;
+                    }
+                    $finalCode = $this->maybeUpgradeProductCode(
+                        $id,
+                        $sku,
+                        (string)($existingProduct['code'] ?? '')
+                    );
 
                     // Stock/remesa antes del UPDATE de estado (decrease exige producto activo).
                     if ($type === 'product' && $stockSpecified) {
@@ -902,7 +1168,7 @@ class ProductCsvImporter
                             $id,
                             $stockQty,
                             $stockMode,
-                            $cost,
+                            $costRaw !== '' ? $cost : (float)($existingProduct['purchase_price'] ?? 0),
                             $userId,
                             $lotCode,
                             $expiryDate,
@@ -911,31 +1177,84 @@ class ProductCsvImporter
                         );
                         $movements += $stats['movements'];
                         $remesas += $stats['remesas'];
+                        if ($stockMode === 'entrada' && !$hasLotData && $stockQty > 0) {
+                            $entradaSinLote++;
+                        }
                     }
 
-                    // Ficha: no tocar stock aquí; el kardex/lotes ya lo sincronizaron.
-                    $this->query(
-                        "UPDATE products SET name = ?, product_type = ?, category_id = ?,
-                                purchase_price = ?, sale_price = ?, wholesale_price = ?, min_stock = ?,
-                                unit = ?, status = ?, location = COALESCE(?, location),
-                                barcode = COALESCE(?, barcode) WHERE id = ?",
-                        [$name, $type, $categoryId, $cost, $price, $wholesale, $minStock, $unit, $status, $locationVal, $eanVal, $id]
-                    );
+                    // Solo pisa campos que vienen con valor en esta fila (re-import parcial seguro).
+                    $fields = ['name' => $name];
+                    if ($tipoRaw !== '') {
+                        $fields['product_type'] = $type;
+                    }
+                    if ($catName !== '') {
+                        $fields['category_id'] = $categoryId;
+                    }
+                    if ($costRaw !== '') {
+                        $fields['purchase_price'] = $cost;
+                    }
+                    if ($priceRaw !== '') {
+                        $fields['sale_price'] = $price;
+                    }
+                    if ($taxRaw !== '') {
+                        $fields['tax_rate'] = $taxRate;
+                    }
+                    if ($wholesaleRaw !== '') {
+                        $fields['wholesale_price'] = $wholesale;
+                    }
+                    if ($minRaw !== '') {
+                        $fields['min_stock'] = $minStock;
+                    }
+                    if ($unitRaw !== '') {
+                        $fields['unit'] = $unit;
+                    }
+                    if ($estadoRaw !== '') {
+                        $fields['status'] = $status;
+                    }
+                    if ($locationVal !== null) {
+                        $fields['location'] = $locationVal;
+                    }
+                    if ($eanVal !== null) {
+                        $fields['barcode'] = $eanVal;
+                    }
+                    if ($type === 'product' && $hasLotData) {
+                        $fields['track_lots'] = 1;
+                    }
+                    $this->updateProductFields($id, $fields);
 
                     $touchedIds[$id] = true;
+                    if ($hasLotData) {
+                        $this->lotTouchedIds[$id] = true;
+                    }
+                    $this->indexProductRow([
+                        'id' => $id,
+                        'code' => $finalCode !== '' ? $finalCode : (string)($existingProduct['code'] ?? ''),
+                        'barcode' => $eanVal ?? (string)($existingProduct['barcode'] ?? ''),
+                        'name' => $name,
+                        'stock' => $stockSpecified ? $stockQty : (int)$existingProduct['stock'],
+                        'track_lots' => ($type === 'product' && $hasLotData) ? 1 : (int)$existingProduct['track_lots'],
+                        'purchase_price' => $costRaw !== '' ? $cost : (float)($existingProduct['purchase_price'] ?? 0),
+                    ]);
                     $updated++;
                 } else {
                     if ($sku === '') {
-                        $sku = 'SKU-' . strtoupper(substr(bin2hex(random_bytes(3)), 0, 6));
+                        try {
+                            $sku = (string)($this->skuSequence()->allocateNext()['sku'] ?? '');
+                        } catch (\Throwable $e) {
+                            $sku = '';
+                        }
+                        if ($sku === '') {
+                            $sku = 'SKU-' . strtoupper(substr(bin2hex(random_bytes(3)), 0, 6));
+                        }
                     }
                     $this->db->beginTransaction();
                     try {
                         // Alta con stock 0; la entrada va por increase (trazabilidad + lote).
                         $this->query(
                             "INSERT INTO products
-                                (code, barcode, name, product_type, category_id, purchase_price, sale_price, wholesale_price,
+                                (code, barcode, name, product_type, category_id, purchase_price, sale_price, tax_rate, wholesale_price,
                                  stock, min_stock, unit, status, location, track_lots, expiry_alert_days, created_by)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 30, ?)",
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 30, ?)",
                             [
                                 $sku,
                                 $eanVal,
@@ -944,6 +1263,7 @@ class ProductCsvImporter
                                 $categoryId,
                                 $cost,
                                 $price,
+                                $taxRate,
                                 $wholesale,
                                 $minStock,
                                 $unit,
@@ -971,6 +1291,18 @@ class ProductCsvImporter
                         }
                         $this->db->commit();
                         $touchedIds[$newId] = true;
+                        if ($hasLotData) {
+                            $this->lotTouchedIds[$newId] = true;
+                        }
+                        $this->indexProductRow([
+                            'id' => $newId,
+                            'code' => $sku,
+                            'barcode' => $eanVal,
+                            'name' => $name,
+                            'stock' => $stockQty,
+                            'track_lots' => ($type === 'product' && $hasLotData) ? 1 : 0,
+                            'purchase_price' => $cost,
+                        ]);
                         $created++;
                     } catch (\Throwable $e) {
                         if ($this->db->inTransaction()) {
@@ -981,17 +1313,21 @@ class ProductCsvImporter
                 }
             } catch (\Throwable $e) {
                 $skipped++;
-                $errors[] = "Fila {$rowNum}: " . $e->getMessage();
+                $bumpSkip($skipReasons, 'Error al guardar fila');
+                $this->pushImportError($errors, "Fila {$rowNum}: " . $e->getMessage());
             }
         }
         fclose($handle);
 
-        // Cuadre final: productos con lotes y saldo sin remesa (p.ej. sync absoluto previo).
-        foreach (array_keys($touchedIds) as $pid) {
+        $this->flushPendingAccounting();
+
+        // Cuadre final: solo productos con lotes/remesas en este CSV.
+        $lotsSvc = null;
+        foreach (array_keys($this->lotTouchedIds) as $pid) {
             try {
-                $lots = $this->stock->lots();
-                if ($lots->tracksLots((int)$pid)) {
-                    $seeded = $lots->seedOpeningLot((int)$pid);
+                $lotsSvc ??= $this->stock->lots();
+                if ($lotsSvc->tracksLots((int)$pid)) {
+                    $seeded = $lotsSvc->seedOpeningLot((int)$pid);
                     if ($seeded > 0) {
                         $remesas++;
                     }
@@ -1001,7 +1337,89 @@ class ProductCsvImporter
             }
         }
 
-        return compact('created', 'updated', 'skipped', 'remesas', 'movements', 'errors');
+        $uniqueProducts = count($touchedIds);
+        $explanation = $this->buildImportExplanation(
+            $estimatedRows,
+            $totalRows,
+            $created,
+            $updated,
+            $skipped,
+            $uniqueProducts,
+            $duplicateRows,
+            $costsCorrected,
+            $skipReasons,
+            $entradaSinLote
+        );
+
+        return [
+            'created' => $created,
+            'updated' => $updated,
+            'skipped' => $skipped,
+            'remesas' => $remesas,
+            'movements' => $movements,
+            'total_rows' => $totalRows,
+            'errors' => $errors,
+            'costs_corrected' => $costsCorrected,
+            'duplicate_rows' => $duplicateRows,
+            'unique_products' => $uniqueProducts,
+            'file_rows_estimated' => $estimatedRows,
+            'skip_reasons' => $skipReasons,
+            'explanation' => $explanation,
+        ];
+    }
+
+    /**
+     * @param array<string,int> $skipReasons
+     */
+    private function buildImportExplanation(
+        int $estimatedRows,
+        int $totalRows,
+        int $created,
+        int $updated,
+        int $skipped,
+        int $uniqueProducts,
+        int $duplicateRows,
+        int $costsCorrected,
+        array $skipReasons,
+        int $entradaSinLote = 0
+    ): string {
+        $parts = [];
+        $parts[] = "El archivo aportó {$totalRows} fila(s) de datos"
+            . ($estimatedRows > 0 && abs($estimatedRows - $totalRows) > 5
+                ? " (aprox. {$estimatedRows} líneas en el CSV, incl. vacías o encabezados)"
+                : '')
+            . '.';
+        $parts[] = "Resultado: {$created} producto(s) nuevos, {$updated} actualizado(s), "
+            . "{$uniqueProducts} producto(s) distintos tocados.";
+        $parts[] = 'Los productos que no vienen en el CSV no se borran.';
+        if ($entradaSinLote > 0) {
+            $parts[] = "Atención: {$entradaSinLote} fila(s) usaron Modo_stock=entrada sin Lote/Vence "
+                . '(sumaron al stock actual). Para sincronizar existencias use Modo_stock=absoluto. '
+                . 'Revise Trazabilidad (origen Importación CSV) si el stock quedó duplicado.';
+        }
+        if ($duplicateRows > 0) {
+            $parts[] = "{$duplicateRows} fila(s) repetían un producto ya procesado en el mismo archivo (mismo SKU/EAN/nombre): se re-actualizó, no se duplicó.";
+        }
+        if ($skipped > 0) {
+            $parts[] = "{$skipped} fila(s) omitida(s).";
+            if ($skipReasons !== []) {
+                $bits = [];
+                foreach ($skipReasons as $reason => $count) {
+                    $bits[] = "{$reason}: {$count}";
+                }
+                $parts[] = 'Motivos: ' . implode('; ', $bits) . '.';
+            }
+        }
+        if ($created + $updated > 0 && $uniqueProducts < $totalRows - $skipped) {
+            $diff = max(0, ($totalRows - $skipped) - $uniqueProducts);
+            if ($diff > 0) {
+                $parts[] = "Por eso puede ver menos ítems en inventario que filas del Excel (p. ej. {$totalRows} filas → {$uniqueProducts} productos): filas repetidas o actualizaciones sobre el mismo código.";
+            }
+        }
+        if ($costsCorrected > 0) {
+            $parts[] = "Se corrigió automáticamente el costo en {$costsCorrected} fila(s) (formato Excel tipo 15500.000 que inflaba el valor).";
+        }
+        return implode(' ', $parts);
     }
 
     /**
@@ -1056,7 +1474,7 @@ class ProductCsvImporter
                 $lotMeta
             );
             if ($movementId > 0) {
-                $this->postStockAccounting($movementId);
+                $this->queueStockAccounting($movementId);
                 $out['movements'] = 1;
                 if ($hasLotData || $this->stock->lots()->tracksLots($productId)) {
                     $out['remesas'] = 1;
@@ -1101,7 +1519,7 @@ class ProductCsvImporter
                 $lotMeta
             );
             if ($movementId > 0) {
-                $this->postStockAccounting($movementId);
+                $this->queueStockAccounting($movementId);
                 $out['movements'] = 1;
                 if ($hasLotData) {
                     $out['remesas'] = 1;
@@ -1117,7 +1535,7 @@ class ProductCsvImporter
                 $unitCost
             );
             if ($movementId > 0) {
-                $this->postStockAccounting($movementId);
+                $this->queueStockAccounting($movementId);
                 $out['movements'] = 1;
                 // Tras bajar stock, recortar lotes no vendibles (vencidos/bloqueados) que sobren.
                 try {
@@ -1131,19 +1549,191 @@ class ProductCsvImporter
         return $out;
     }
 
-    /** Parsea cantidades con miles (1.234 / 1,234) sin truncar a 1. */
+    /** Parsea cantidades con miles/decimales sin tratar "2.000" como 2000 uds. */
     private function parseQtyCell(string $raw): int
     {
         $raw = trim($raw);
         if ($raw === '') {
             return 0;
         }
-        // Entero puro
         if (preg_match('/^-?\d+$/', $raw)) {
             return max(0, (int)$raw);
         }
+        if (function_exists('SoftNova\\Core\\parse_quantity')) {
+            return max(0, (int)round(\SoftNova\Core\parse_quantity($raw)));
+        }
         $n = $this->parseMoneyCell($raw);
         return max(0, (int)round($n));
+    }
+
+    /**
+     * Corrige costos inflados típicos de Excel (15500.000 → 15500000).
+     * Devuelve [costo, true si se corrigió].
+     *
+     * @return array{0:float,1:bool}
+     */
+    private function sanitizeImportCost(float $cost, float $salePrice): array
+    {
+        $cost = round(max(0, $cost), 2);
+        $salePrice = round(max(0, $salePrice), 2);
+        if ($cost <= 0) {
+            return [$cost, false];
+        }
+        $fixed = self::suggestDeflatedCost($cost, $salePrice);
+        if ($fixed !== null && abs($fixed - $cost) > 0.009) {
+            return [$fixed, true];
+        }
+        return [$cost, false];
+    }
+
+    /**
+     * Si el costo parece ×10/×100/×1000 respecto al precio de venta, propone corrección.
+     */
+    public static function suggestDeflatedCost(float $cost, float $salePrice): ?float
+    {
+        $cost = round(max(0, $cost), 2);
+        $salePrice = round(max(0, $salePrice), 2);
+        if ($cost <= 0) {
+            return null;
+        }
+
+        // Sin PVP: bajar por miles mientras el costo sea absurdo.
+        if ($salePrice <= 0.009) {
+            if ($cost < 500000) {
+                return null;
+            }
+            $candidate = $cost;
+            for ($i = 0; $i < 4; $i++) {
+                if ($candidate < 500000) {
+                    break;
+                }
+                $candidate = round($candidate / 1000, 2);
+            }
+            return ($candidate > 0 && abs($candidate - $cost) > 0.009) ? $candidate : null;
+        }
+
+        // Ya razonable vs PVP.
+        if ($cost <= $salePrice * 5) {
+            return null;
+        }
+
+        $best = null;
+        $bestScore = null;
+        // Probar divisores comunes de inflación Excel / separadores.
+        foreach ([1000.0, 100.0, 10.0, 10000.0, 100000.0, 1000000.0] as $div) {
+            $candidate = round($cost / $div, 2);
+            if ($candidate <= 0) {
+                continue;
+            }
+            // Costo entre ~2% y 300% del PVP.
+            if ($candidate < $salePrice * 0.02 || $candidate > $salePrice * 3) {
+                continue;
+            }
+            $score = abs($candidate - ($salePrice * 0.55));
+            if ($best === null || $score < $bestScore) {
+                $best = $candidate;
+                $bestScore = $score;
+            }
+        }
+
+        // Si no encaja con PVP pero el costo es enorme, ÷1000 en cascada.
+        if ($best === null && $cost >= 1000000) {
+            $candidate = $cost;
+            for ($i = 0; $i < 4; $i++) {
+                $candidate = round($candidate / 1000, 2);
+                if ($candidate <= 0) {
+                    break;
+                }
+                if ($candidate <= $salePrice * 3 && $candidate >= $salePrice * 0.02) {
+                    return $candidate;
+                }
+                if ($candidate < 500000 && $candidate <= $salePrice * 5) {
+                    return $candidate;
+                }
+            }
+        }
+
+        return $best;
+    }
+
+    /**
+     * Repara purchase_price ya guardados con inflación típica de import CSV/Excel.
+     *
+     * @return array{scanned:int,fixed:int,samples:list<string>,top_before:list<array<string,mixed>>}
+     */
+    public function repairInflatedPurchaseCosts(int $limit = 50000): array
+    {
+        $limit = max(1, min(100000, $limit));
+        $rows = $this->query(
+            "SELECT id, name, code, stock, purchase_price, sale_price,
+                    (GREATEST(COALESCE(stock,0),0) * COALESCE(purchase_price,0)) AS line_cost
+             FROM products
+             WHERE product_type = 'product'
+               AND COALESCE(purchase_price, 0) > 0
+             ORDER BY line_cost DESC, purchase_price DESC
+             LIMIT {$limit}"
+        )->fetchAll();
+
+        $fixed = 0;
+        $samples = [];
+        $topBefore = [];
+        foreach (array_slice($rows, 0, 10) as $row) {
+            $topBefore[] = [
+                'code' => (string)($row['code'] ?? ''),
+                'name' => (string)($row['name'] ?? ''),
+                'cost' => round((float)$row['purchase_price'], 2),
+                'sale' => round((float)$row['sale_price'], 2),
+                'stock' => (int)($row['stock'] ?? 0),
+            ];
+        }
+
+        foreach ($rows as $row) {
+            $id = (int)$row['id'];
+            $cost = round((float)$row['purchase_price'], 2);
+            $sale = round((float)$row['sale_price'], 2);
+            $newCost = self::suggestDeflatedCost($cost, $sale);
+            // Respaldo agresivo: bajar de 10 en 10 hasta quedar razonable vs PVP.
+            if ($newCost === null && $cost > max($sale * 5, 100000.0)) {
+                $candidate = $cost;
+                for ($i = 0; $i < 8; $i++) {
+                    $candidate = round($candidate / 10, 2);
+                    if ($candidate <= 0) {
+                        break;
+                    }
+                    if ($sale > 0.009) {
+                        if ($candidate <= $sale * 3 && $candidate >= $sale * 0.02) {
+                            $newCost = $candidate;
+                            break;
+                        }
+                    } elseif ($candidate < 100000) {
+                        $newCost = $candidate;
+                        break;
+                    }
+                }
+            }
+            if ($newCost === null || abs($newCost - $cost) < 0.009) {
+                continue;
+            }
+            $this->query(
+                "UPDATE products SET purchase_price = ? WHERE id = ?",
+                [$newCost, $id]
+            );
+            $fixed++;
+            if (count($samples) < 12) {
+                $label = trim((string)($row['code'] ?? '')) !== ''
+                    ? (string)$row['code']
+                    : ('#' . $id);
+                $samples[] = $label . ': ' . number_format($cost, 2, ',', '.')
+                    . ' → ' . number_format($newCost, 2, ',', '.');
+            }
+        }
+
+        return [
+            'scanned' => count($rows),
+            'fixed' => $fixed,
+            'samples' => $samples,
+            'top_before' => $topBefore,
+        ];
     }
 
     /** entrada|absoluto */

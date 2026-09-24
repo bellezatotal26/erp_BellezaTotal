@@ -28,9 +28,36 @@ class TenantNotificationsController extends TenantController
                 return;
             }
         }
+
+        // Keep-alive ligero para Caja abierta todo el día (sin recargar).
+        if ($action === 'ping') {
+            $this->pingSession();
+            return;
+        }
         
         $this->maybeTriggerAutoBackup();
         $this->listNotifications();
+    }
+
+    /** Renueva sesión + CSRF sin carga de notificaciones. */
+    private function pingSession(): void
+    {
+        $authed = !empty($_SESSION['tenant_authenticated']);
+        if (!$authed) {
+            $this->json([
+                'success' => false,
+                'authenticated' => false,
+                'message' => 'Sesión no autenticada',
+                'csrf_token' => \SoftNova\Core\csrf_token(),
+            ], 401);
+            return;
+        }
+        $this->json([
+            'success' => true,
+            'authenticated' => true,
+            'csrf_token' => \SoftNova\Core\csrf_token(),
+            'server_time' => date('c'),
+        ]);
     }
     
     private function listNotifications(): void
@@ -75,6 +102,7 @@ class TenantNotificationsController extends TenantController
             'success' => true,
             'count' => count($visible),
             'badge' => $badge,
+            'csrf_token' => \SoftNova\Core\csrf_token(),
             'popups' => array_slice($popups, 0, 1),
             'items' => array_map(function ($item) {
                 $item['time_label'] = $this->relativeTime($item['time'] ?? null);

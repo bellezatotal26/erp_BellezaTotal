@@ -6,17 +6,23 @@
 return [
     'payment_methods' => [
         'cash' => 'Efectivo',
+        'transfer' => 'Transferencia',
         'debit_card' => 'Tarjeta débito',
         'credit_card' => 'Tarjeta crédito',
-        'dataphone' => 'Datáfono',
         'payment_link' => 'Link de pago',
-        'transfer' => 'Transferencia',
-        'card' => 'Tarjeta (genérico)', // legado
+        'nequi' => 'Nequi',
+        'daviplata' => 'Daviplata',
+        'breb' => 'BreB',
         'other' => 'Otro',
+        // Legado (historial; ya no se ofrecen en el selector)
+        'card' => 'Tarjeta',
+        'dataphone' => 'Datáfono',
     ],
     // Métodos electrónicos → cuenta banco en contabilidad (no afectan caja física)
     'electronic_payment_methods' => [
-        'card', 'debit_card', 'credit_card', 'dataphone', 'payment_link', 'transfer',
+        'debit_card', 'credit_card', 'payment_link', 'transfer',
+        'nequi', 'daviplata', 'breb',
+        'card', 'dataphone', // legado
     ],
     /**
      * Categorías de gasto (código => etiqueta).

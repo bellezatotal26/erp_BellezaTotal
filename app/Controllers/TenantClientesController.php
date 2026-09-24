@@ -42,17 +42,55 @@ class TenantClientesController extends TenantController
             return;
         }
         
-        $total = (int)$this->query("SELECT COUNT(*) as c FROM customers WHERE status = 'active'")->fetch()['c'];
-        $pagination = $this->paginate($total);
+        $q = trim((string)$this->request->get('q', ''));
+        $documentType = trim((string)$this->request->get('document_type', ''));
+        $source = trim((string)$this->request->get('source', ''));
+        $allowedDocs = ['CC', 'CE', 'NIT', 'PPT', 'OTROS'];
+        if ($documentType !== '' && !in_array($documentType, $allowedDocs, true)) {
+            $documentType = '';
+        }
+
+        $where = ["status = 'active'"];
+        $params = [];
+        if ($q !== '') {
+            $like = '%' . $q . '%';
+            $where[] = '(name LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR company_name LIKE ?
+                OR document_number LIKE ? OR email LIKE ? OR phone LIKE ?)';
+            array_push($params, $like, $like, $like, $like, $like, $like, $like);
+        }
+        if ($documentType !== '') {
+            $where[] = 'document_type = ?';
+            $params[] = $documentType;
+        }
+        if ($source !== '') {
+            $where[] = 'source = ?';
+            $params[] = $source;
+        }
+        $whereSql = 'WHERE ' . implode(' AND ', $where);
+
+        $per = $this->resolvePerPage();
+        $total = (int)$this->query("SELECT COUNT(*) as c FROM customers {$whereSql}", $params)->fetch()['c'];
+        $pagination = $this->paginate($total, $per['perPage']);
         
         $customers = $this->query(
-            "SELECT * FROM customers WHERE status = 'active' ORDER BY name ASC
-             LIMIT {$pagination['perPage']} OFFSET {$pagination['offset']}"
+            "SELECT * FROM customers {$whereSql} ORDER BY name ASC
+             LIMIT {$pagination['perPage']} OFFSET {$pagination['offset']}",
+            $params
         )->fetchAll();
         
         $this->view('tenant.clientes', $this->tenantViewData([
             'customers' => $customers,
             'pagination' => $pagination,
+            'perPageOptions' => $per['options'],
+            'qFilter' => $q,
+            'documentTypeFilter' => $documentType,
+            'sourceFilter' => $source,
+            'listQuery' => array_filter([
+                'q' => $q !== '' ? $q : null,
+                'document_type' => $documentType !== '' ? $documentType : null,
+                'source' => $source !== '' ? $source : null,
+                'per_page' => $per['perPage'] !== 20 ? (string)$per['perPage'] : null,
+            ], static fn($v) => $v !== null && $v !== ''),
         ]));
     }
     
@@ -204,22 +242,59 @@ class TenantClientesController extends TenantController
     
     private function exportCustomers(): void
     {
+        $q = trim((string)$this->request->get('q', ''));
+        $documentType = trim((string)$this->request->get('document_type', ''));
+        $source = trim((string)$this->request->get('source', ''));
+        $allowedDocs = ['CC', 'CE', 'NIT', 'PPT', 'OTROS'];
+        if ($documentType !== '' && !in_array($documentType, $allowedDocs, true)) {
+            $documentType = '';
+        }
+
+        $where = ["status = 'active'"];
+        $params = [];
+        if ($q !== '') {
+            $like = '%' . $q . '%';
+            $where[] = '(name LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR company_name LIKE ?
+                OR document_number LIKE ? OR email LIKE ? OR phone LIKE ?)';
+            array_push($params, $like, $like, $like, $like, $like, $like, $like);
+        }
+        if ($documentType !== '') {
+            $where[] = 'document_type = ?';
+            $params[] = $documentType;
+        }
+        if ($source !== '') {
+            $where[] = 'source = ?';
+            $params[] = $source;
+        }
+        $whereSql = 'WHERE ' . implode(' AND ', $where);
+
         $rows = $this->query(
-            "SELECT name, document_type, document_number, email, phone, city, status, created_at
-             FROM customers ORDER BY name"
+            "SELECT name, first_name, last_name, company_name, document_type, document_number,
+                    email, phone, source, address, created_at
+             FROM customers {$whereSql} ORDER BY name",
+            $params
         )->fetchAll();
         
         $csvRows = [];
         foreach ($rows as $r) {
             $csvRows[] = [
-                $r['name'], $r['document_type'], $r['document_number'], $r['email'],
-                $r['phone'], $r['city'], $r['status'], $r['created_at'],
+                $r['name'] ?: trim(($r['first_name'] ?? '') . ' ' . ($r['last_name'] ?? '')),
+                $r['first_name'] ?? '',
+                $r['last_name'] ?? '',
+                $r['company_name'] ?? '',
+                $r['document_type'],
+                $r['document_number'],
+                $r['email'],
+                $r['phone'],
+                $r['source'] ?? '',
+                $r['address'] ?? '',
+                $r['created_at'],
             ];
         }
         
         $this->exportCsv(
             'clientes_' . date('Ymd_His') . '.csv',
-            ['Nombre', 'Tipo Doc', 'Documento', 'Email', 'Telefono', 'Ciudad', 'Estado', 'Creado'],
+            ['Nombre', 'Nombres', 'Apellidos', 'Empresa', 'Tipo Doc', 'Documento', 'Email', 'Telefono', 'Origen', 'Direccion', 'Creado'],
             $csvRows
         );
     }

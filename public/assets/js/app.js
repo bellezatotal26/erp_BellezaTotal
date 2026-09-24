@@ -1,5 +1,197 @@
 // Seri ERP - JavaScript Principal
 
+/**
+ * CSRF + sesión viva (Caja/almacén abierto todo el día, sin F5).
+ */
+window.SeriCsrf = {
+    _lastOkAt: 0,
+    _inflight: null,
+    _timer: null,
+    maxAgeSec: 240,
+    intervalMs: 300000,
+
+    get: function () {
+        var meta = document.querySelector('meta[name="csrf-token"]');
+        return (meta && meta.content)
+            || window.poCsrfToken
+            || window.invCsrf
+            || window.csrfToken
+            || '';
+    },
+
+    apply: function (token) {
+        if (!token) return;
+        token = String(token);
+        var meta = document.querySelector('meta[name="csrf-token"]');
+        if (meta) meta.setAttribute('content', token);
+        document.querySelectorAll('input[name="csrf_token"], input[name="_token"]').forEach(function (el) {
+            el.value = token;
+        });
+        window.poCsrfToken = token;
+        window.invCsrf = token;
+        window.csrfToken = token;
+        if (typeof window.aiCsrf !== 'undefined') window.aiCsrf = token;
+        var panel = document.getElementById('posPanel');
+        if (panel) panel.setAttribute('data-csrf', token);
+        this._lastOkAt = Date.now();
+    },
+
+    refreshFromPayload: function (data) {
+        if (data && data.csrf_token) this.apply(data.csrf_token);
+    },
+
+    ensureOnForm: function (form) {
+        if (!form) return;
+        var t = this.get();
+        if (!t) return;
+        var input = form.querySelector('input[name="csrf_token"]');
+        if (!input) {
+            input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = 'csrf_token';
+            form.appendChild(input);
+        }
+        input.value = t;
+    },
+
+    pingUrl: function () {
+        var meta = document.querySelector('meta[name="session-ping-url"]');
+        if (meta && meta.content) return meta.content;
+        try {
+            return new URL('/app/notifications?action=ping', location.href).href;
+        } catch (e) {
+            return '/app/notifications?action=ping';
+        }
+    },
+
+    refresh: function () {
+        var self = this;
+        if (self._inflight) return self._inflight;
+        self._inflight = fetch(self.pingUrl(), {
+            method: 'GET',
+            credentials: 'same-origin',
+            cache: 'no-store',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                'Accept': 'application/json'
+            }
+        }).then(function (r) {
+            return r.text().then(function (text) {
+                var d = null;
+                try { d = text ? JSON.parse(text) : null; } catch (e) { d = null; }
+                return { ok: r.ok, status: r.status, data: d };
+            });
+        }).then(function (res) {
+            self._inflight = null;
+            if (res.data && res.data.csrf_token) {
+                self.apply(res.data.csrf_token);
+            }
+            if (res.status === 401 || (res.data && res.data.authenticated === false)) {
+                if (typeof showAlert === 'function') {
+                    showAlert('La sesión expiró. Inicie sesión de nuevo para seguir vendiendo.', 'error');
+                }
+                throw new Error('session_expired');
+            }
+            if (!res.ok && !(res.data && res.data.csrf_token)) {
+                throw new Error('ping_failed');
+            }
+            return self.get();
+        }).catch(function (err) {
+            self._inflight = null;
+            throw err;
+        });
+        return self._inflight;
+    },
+
+    ensureFresh: function (force) {
+        var age = Date.now() - (this._lastOkAt || 0);
+        if (!force && this.get() && age < (this.maxAgeSec * 1000)) {
+            return Promise.resolve(this.get());
+        }
+        return this.refresh().catch(function () {
+            return window.SeriCsrf.get();
+        });
+    },
+
+    startKeepAlive: function () {
+        var self = this;
+        if (self._timer) return;
+        self._lastOkAt = Date.now();
+        var tick = function () {
+            if (document.hidden) return;
+            if (navigator.onLine === false) return;
+            self.refresh().catch(function () {});
+        };
+        self._timer = setInterval(tick, self.intervalMs);
+        setTimeout(tick, 15000);
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) self.ensureFresh(true).catch(function () {});
+        });
+        window.addEventListener('online', function () {
+            self.ensureFresh(true).catch(function () {});
+        });
+    }
+};
+
+/** Fechas en zona de NEGOCIO (SERI_TIMEZONE / America/Bogota). */
+window.SeriDate = {
+    timezone: function () {
+        return (window.SERI_TIMEZONE && String(window.SERI_TIMEZONE)) || 'America/Bogota';
+    },
+    _parts: function (input) {
+        var d = input instanceof Date ? input : (input ? new Date(input) : new Date());
+        if (isNaN(d.getTime())) d = new Date();
+        var tz = this.timezone();
+        try {
+            var fmt = new Intl.DateTimeFormat('en-CA', {
+                timeZone: tz,
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false,
+                hourCycle: 'h23'
+            });
+            var map = {};
+            fmt.formatToParts(d).forEach(function (p) {
+                if (p.type !== 'literal') map[p.type] = p.value;
+            });
+            var hour = String(map.hour || '00');
+            if (hour === '24') hour = '00';
+            return {
+                y: map.year,
+                m: map.month,
+                day: map.day,
+                hh: hour.padStart(2, '0'),
+                mm: String(map.minute || '00').padStart(2, '0'),
+                ss: String(map.second || '00').padStart(2, '0')
+            };
+        } catch (e) {
+            return {
+                y: String(d.getFullYear()),
+                m: String(d.getMonth() + 1).padStart(2, '0'),
+                day: String(d.getDate()).padStart(2, '0'),
+                hh: String(d.getHours()).padStart(2, '0'),
+                mm: String(d.getMinutes()).padStart(2, '0'),
+                ss: String(d.getSeconds()).padStart(2, '0')
+            };
+        }
+    },
+    localYmd: function (input) {
+        var p = this._parts(input);
+        return p.y + '-' + p.m + '-' + p.day;
+    },
+    localHis: function (input) {
+        var p = this._parts(input);
+        return p.hh + ':' + p.mm + ':' + p.ss;
+    },
+    localYmdHis: function (input) {
+        return this.localYmd(input) + ' ' + this.localHis(input);
+    }
+};
+
 document.addEventListener('DOMContentLoaded', function() {
     // Manejo de navegación activa
     const currentPath = window.location.pathname;
@@ -234,11 +426,17 @@ function handleAjaxSubmit(form) {
     const submitBtn = form.querySelector('button[type="submit"]');
     const overlay = showLoadingOverlay();
     form.dataset.submitting = '1';
+
+    if (window.SeriCsrf && typeof SeriCsrf.ensureOnForm === 'function') {
+        SeriCsrf.ensureOnForm(form);
+    }
     
     if (submitBtn) {
         submitBtn.disabled = true;
         submitBtn.classList.add('btn-loading');
     }
+
+    var csrfNow = (window.SeriCsrf && SeriCsrf.get) ? SeriCsrf.get() : '';
     
     fetch(form.action, {
         method: form.method || 'POST',
@@ -249,7 +447,9 @@ function handleAjaxSubmit(form) {
             return new FormData(form);
         })(),
         headers: {
-            'X-Requested-With': 'XMLHttpRequest'
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json',
+            'X-CSRF-TOKEN': csrfNow || ''
         }
     })
     .then(response => {
@@ -276,6 +476,9 @@ function handleAjaxSubmit(form) {
     .then(data => {
         hideLoadingOverlay(overlay);
         form.dataset.submitting = '0';
+        if (data && data.csrf_token && window.SeriCsrf) {
+            SeriCsrf.apply(data.csrf_token);
+        }
         
         if (data.success) {
             showAlert(data.message, 'success');
@@ -317,6 +520,16 @@ function handleAjaxSubmit(form) {
         } else {
             if (window.SeriMoney && typeof SeriMoney.restoreForm === 'function') {
                 SeriMoney.restoreForm(form);
+            }
+            if (data && data.code === 'csrf' && form.dataset.csrfRetried !== '1' && data.csrf_token) {
+                form.dataset.csrfRetried = '1';
+                if (window.SeriCsrf) SeriCsrf.apply(data.csrf_token);
+                if (submitBtn) {
+                    submitBtn.disabled = false;
+                    submitBtn.classList.remove('btn-loading');
+                }
+                handleAjaxSubmit(form);
+                return;
             }
             showAlert(data.message || 'No se pudo completar la accion', 'error');
             if (data.suggest_add_lot && data.existing_product && typeof window.openAddLotForProduct === 'function') {
@@ -800,16 +1013,19 @@ document.addEventListener('DOMContentLoaded', function() {
 /**
  * Desplegables con opción "Otro": pide valor, lo guarda permanente y lo selecciona.
  * Uso: <select data-custom-other="payment_method">…<option value="__other__">Otro</option>
- * Grupos: payment_method | customer_source | sale_cancel_reason | discount_percent | product_location | expense_category
+ * Grupos: payment_method | customer_source | sale_cancel_reason | discount_percent | product_location | expense_category | loan_received_reason
  */
 window.SoftNovaCustomSelect = {
-    otherValues: { __other__: true, other: true, Otro: true },
+    otherValues: { __other__: true, other: true, Otro: true, otro: true },
 
     isOther: function(v) {
         return !!this.otherValues[String(v || '')];
     },
 
     csrf: function() {
+        if (window.SeriCsrf && typeof SeriCsrf.get === 'function') {
+            return SeriCsrf.get();
+        }
         return (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
     },
 
@@ -824,6 +1040,7 @@ window.SoftNovaCustomSelect = {
         if (group === 'sale_cancel_reason') return 'Escriba el motivo de eliminación:';
         if (group === 'product_location') return 'Nombre de la nueva ubicación (bodega, local, etc.):';
         if (group === 'expense_category') return 'Nombre del nuevo tipo de gasto (se guardará de forma permanente):';
+        if (group === 'loan_received_reason') return 'Escriba el nuevo motivo (se agregará a la lista de «Nos prestan»):';
         return 'Escriba la nueva opción:';
     },
 

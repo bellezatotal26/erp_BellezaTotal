@@ -69,12 +69,14 @@ class TenantDashboardController extends TenantController
         $payablesTotal = 0.0;
         $payablesError = null;
         $lowStockProducts = [];
+        $todaySoldProducts = [];
         
         // Cargar datos de todos los widgets accesibles para poder mostrarlos sin recargar.
         $needsRecent = $this->widgetInBoard($boardWidgets, 'recent_sales');
         $needsRx = $this->widgetInBoard($boardWidgets, 'receivables');
         $needsPay = $this->widgetInBoard($boardWidgets, 'payables');
         $needsLowList = $this->widgetInBoard($boardWidgets, 'low_stock_list');
+        $needsTodaySold = $this->widgetInBoard($boardWidgets, 'today_sold_products');
         
         if ($needsRecent) {
             $recentSales = $db->query("
@@ -82,7 +84,7 @@ class TenantDashboardController extends TenantController
                 FROM sales s
                 LEFT JOIN customers c ON s.customer_id = c.id
                 WHERE s.status != 'cancelled'
-                ORDER BY s.created_at DESC
+                ORDER BY s.sale_date DESC, s.id DESC
                 LIMIT 5
             ")->fetchAll();
         }
@@ -130,6 +132,45 @@ class TenantDashboardController extends TenantController
                 LIMIT 8
             ")->fetchAll();
         }
+
+        if ($needsTodaySold) {
+            try {
+                $itemSub = "COALESCE(si.subtotal, ROUND(si.quantity * si.unit_price, 2))";
+                $todaySoldProducts = $db->query("
+                    SELECT p.name,
+                           SUM(si.quantity) AS total_qty,
+                           SUM({$itemSub}) AS total_sales
+                    FROM sale_items si
+                    JOIN products p ON si.product_id = p.id
+                    JOIN sales s ON si.sale_id = s.id
+                    WHERE s.status = 'completed'
+                      AND DATE(s.sale_date) = CURDATE()
+                    GROUP BY p.id, p.name
+                    ORDER BY total_qty DESC, total_sales DESC
+                    LIMIT 10
+                ")->fetchAll();
+            } catch (\Throwable $e) {
+                // Fallback si subtotal no existe en installs viejos.
+                try {
+                    $todaySoldProducts = $db->query("
+                        SELECT p.name,
+                               SUM(si.quantity) AS total_qty,
+                               SUM(ROUND(si.quantity * si.unit_price, 2)) AS total_sales
+                        FROM sale_items si
+                        JOIN products p ON si.product_id = p.id
+                        JOIN sales s ON si.sale_id = s.id
+                        WHERE s.status = 'completed'
+                          AND DATE(s.sale_date) = CURDATE()
+                        GROUP BY p.id, p.name
+                        ORDER BY total_qty DESC, total_sales DESC
+                        LIMIT 10
+                    ")->fetchAll();
+                } catch (\Throwable $e2) {
+                    $todaySoldProducts = [];
+                    error_log('Dashboard today sold: ' . $e2->getMessage());
+                }
+            }
+        }
         
         $this->view('tenant.dashboard', $this->tenantViewData([
             'stats' => $stats,
@@ -141,6 +182,7 @@ class TenantDashboardController extends TenantController
             'payablesTotal' => $payablesTotal,
             'payablesError' => $payablesError,
             'lowStockProducts' => $lowStockProducts,
+            'todaySoldProducts' => $todaySoldProducts,
             'dashboardLayout' => $layout,
             'visibleWidgets' => $visibleWidgets,
             'boardWidgets' => $boardWidgets,
@@ -240,13 +282,18 @@ class TenantDashboardController extends TenantController
         }
         $group = trim((string)$this->request->post('group', ''));
         $label = trim((string)$this->request->post('label', ''));
+        $kind = trim((string)$this->request->post('kind', ''));
         if (!$this->canSaveCustomOptionGroup($group)) {
             $this->json(['success' => false, 'message' => 'No tienes permiso para agregar esta opción']);
             return;
         }
         try {
             $svc = new \SoftNova\Services\CustomOptionService($db);
-            $opt = $svc->add($group, $label);
+            $extra = [];
+            if ($group === \SoftNova\Services\CustomOptionService::GROUP_EXPENSE_CATEGORY && $kind !== '') {
+                $extra['kind'] = $kind;
+            }
+            $opt = $svc->add($group, $label, $extra);
             $this->json([
                 'success' => true,
                 'message' => $opt['created'] ? 'Opción guardada' : 'Opción ya existía',
@@ -254,6 +301,7 @@ class TenantDashboardController extends TenantController
                     'value' => $opt['value'],
                     'label' => $opt['label'],
                     'created' => $opt['created'],
+                    'kind' => $opt['kind'] ?? $kind,
                 ],
             ]);
         } catch (\Throwable $e) {
@@ -268,8 +316,7 @@ class TenantDashboardController extends TenantController
         }
         return match ($group) {
             \SoftNova\Services\CustomOptionService::GROUP_EXPENSE_CATEGORY =>
-                TenantMiddleware::canDo('create', 'gastos')
-                || TenantMiddleware::canDo('create', 'caja'),
+                TenantMiddleware::getRole() === 'admin',
             \SoftNova\Services\CustomOptionService::GROUP_PAYMENT_METHOD =>
                 TenantMiddleware::canDo('create', 'ventas')
                 || TenantMiddleware::canDo('create', 'caja')
@@ -287,6 +334,11 @@ class TenantDashboardController extends TenantController
             \SoftNova\Services\CustomOptionService::GROUP_PRODUCT_LOCATION =>
                 TenantMiddleware::canDo('create', 'inventario')
                 || TenantMiddleware::canDo('edit', 'inventario'),
+            \SoftNova\Services\CustomOptionService::GROUP_LOAN_REASON =>
+                TenantMiddleware::canDo('create', 'prestamos')
+                || TenantMiddleware::canDo('create', 'caja'),
+            \SoftNova\Services\CustomOptionService::GROUP_LOAN_RECEIVED_REASON =>
+                TenantMiddleware::canDo('create', 'prestamos'),
             default => false,
         };
     }
@@ -299,30 +351,62 @@ class TenantDashboardController extends TenantController
             return;
         }
 
+        $eanDigits = preg_replace('/\D+/', '', $code) ?? '';
+        $eanAlt = '';
+        if (strlen($eanDigits) === 12) {
+            $eanAlt = '0' . $eanDigits;
+        } elseif (strlen($eanDigits) === 13 && str_starts_with($eanDigits, '0')) {
+            $eanAlt = substr($eanDigits, 1);
+        }
+        $barcodeExpr = "REPLACE(REPLACE(TRIM(COALESCE(barcode,'')), ' ', ''), '-', '')";
+
         try {
             $stmt = $db->prepare(
-                "SELECT id, name, code, barcode, sale_price, purchase_price, stock, min_stock, product_type, status
+                "SELECT id, name, code, barcode, sale_price, wholesale_price, purchase_price, stock, min_stock,
+                        product_type, status, COALESCE(ownership,'owned') AS ownership, consignor_id,
+                        COALESCE(tax_rate, 0) AS tax_rate
                  FROM products
-                 WHERE status = 'active' AND (code = ? OR barcode = ?)
-                 ORDER BY CASE WHEN code = ? THEN 0 ELSE 1 END
+                 WHERE status = 'active'
+                   AND COALESCE(ownership,'owned') <> 'consignment'
+                   AND (
+                        code = ? OR barcode = ? OR TRIM(COALESCE(barcode,'')) = ?
+                        OR ({$barcodeExpr} <> '' AND {$barcodeExpr} IN (?, ?))
+                   )
+                 ORDER BY CASE WHEN code = ? THEN 0 WHEN barcode = ? THEN 1 ELSE 2 END
                  LIMIT 1"
             );
-            $stmt->execute([$code, $code, $code]);
+            $stmt->execute([
+                $code, $code, $code,
+                $eanDigits !== '' ? $eanDigits : $code,
+                $eanAlt !== '' ? $eanAlt : ($eanDigits !== '' ? $eanDigits : $code),
+                $code, $code,
+            ]);
             $row = $stmt->fetch(\PDO::FETCH_ASSOC);
         } catch (\Throwable $e) {
-            // Instalaciones sin columna barcode: fallback a SKU.
+            // Instalaciones sin ownership/barcode: fallback a SKU.
             try {
                 $stmt = $db->prepare(
                     "SELECT id, name, code, sale_price, purchase_price, stock, min_stock, product_type, status
                      FROM products
-                     WHERE status = 'active' AND code = ?
+                     WHERE status = 'active' AND (code = ? OR barcode = ?)
                      LIMIT 1"
                 );
-                $stmt->execute([$code]);
+                $stmt->execute([$code, $code]);
                 $row = $stmt->fetch(\PDO::FETCH_ASSOC);
             } catch (\Throwable $e2) {
-                $this->json(['success' => false, 'message' => 'Error al buscar código', 'product' => null]);
-                return;
+                try {
+                    $stmt = $db->prepare(
+                        "SELECT id, name, code, sale_price, purchase_price, stock, min_stock, product_type, status
+                         FROM products
+                         WHERE status = 'active' AND code = ?
+                         LIMIT 1"
+                    );
+                    $stmt->execute([$code]);
+                    $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+                } catch (\Throwable $e3) {
+                    $this->json(['success' => false, 'message' => 'Error al buscar código', 'product' => null]);
+                    return;
+                }
             }
         }
 
@@ -331,6 +415,7 @@ class TenantDashboardController extends TenantController
             return;
         }
 
+        $ownership = (string)($row['ownership'] ?? 'owned');
         $this->json([
             'success' => true,
             'product' => [
@@ -339,10 +424,15 @@ class TenantDashboardController extends TenantController
                 'code' => (string)($row['code'] ?? ''),
                 'barcode' => (string)($row['barcode'] ?? ''),
                 'sale_price' => (float)$row['sale_price'],
+                'wholesale_price' => (float)($row['wholesale_price'] ?? 0),
                 'purchase_price' => (float)($row['purchase_price'] ?? 0),
                 'stock' => (int)$row['stock'],
                 'min_stock' => (int)($row['min_stock'] ?? 0),
                 'product_type' => (string)($row['product_type'] ?? 'product'),
+                'ownership' => $ownership,
+                'is_consignment' => $ownership === 'consignment' ? 1 : 0,
+                'consignor_id' => (int)($row['consignor_id'] ?? 0),
+                'tax_rate' => (float)($row['tax_rate'] ?? 0),
             ],
         ]);
     }

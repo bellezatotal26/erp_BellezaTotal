@@ -49,12 +49,26 @@ class PdfService
         $docTitle = strtoupper($this->documentLabel((string)($sale['document_type'] ?? 'invoice')));
         $saleTax = (float)($sale['tax'] ?? $sale['tax_amount'] ?? 0);
         $saleSubtotal = (float)($sale['subtotal'] ?? 0);
+        $saleDiscount = round((float)($sale['discount'] ?? 0), 2);
         $saleTotal = (float)($sale['total'] ?? 0);
 
         $itemsHtml = '';
         foreach ($items as $item) {
             $lineTotal = $this->itemLineTotal($item);
-            $itemsHtml .= '<tr><td>' . htmlspecialchars((string)($item['product_name'] ?? '')) . '</td>'
+            $sku = trim((string)($item['product_code'] ?? $item['code'] ?? ''));
+            $ean = trim((string)($item['barcode'] ?? ''));
+            $nameCell = htmlspecialchars((string)($item['product_name'] ?? ''));
+            $metaBits = [];
+            if ($sku !== '') {
+                $metaBits[] = 'SKU: ' . htmlspecialchars($sku);
+            }
+            if ($ean !== '') {
+                $metaBits[] = 'EAN: ' . htmlspecialchars($ean);
+            }
+            if ($metaBits !== []) {
+                $nameCell .= '<div style="font-size:10px;color:#666;margin-top:2px;">' . implode(' · ', $metaBits) . '</div>';
+            }
+            $itemsHtml .= '<tr><td>' . $nameCell . '</td>'
                 . '<td style="text-align:center;">' . (int)($item['quantity'] ?? 0) . '</td>';
             if (!empty($cfg['show_unit_price'])) {
                 $itemsHtml .= '<td style="text-align:right;">' . $fmt($item['unit_price'] ?? 0) . '</td>';
@@ -105,11 +119,15 @@ class PdfService
         $totalsHtml = '';
         if (!empty($cfg['show_subtotal_tax'])) {
             $totalsHtml .= '<tr><td width="70%" style="text-align:right;"><strong>Subtotal:</strong></td>'
-                . '<td width="30%" style="text-align:right;">' . $fmt($saleSubtotal) . '</td></tr>'
-                . '<tr><td style="text-align:right;"><strong>' . $taxName . ':</strong></td>'
+                . '<td width="30%" style="text-align:right;">' . $fmt($saleSubtotal) . '</td></tr>';
+            if ($saleDiscount > 0.009) {
+                $totalsHtml .= '<tr><td style="text-align:right;"><strong>Descuento:</strong></td>'
+                    . '<td style="text-align:right;">-' . $fmt($saleDiscount) . '</td></tr>';
+            }
+            $totalsHtml .= '<tr><td style="text-align:right;"><strong>' . $taxName . ':</strong></td>'
                 . '<td style="text-align:right;">' . $fmt($saleTax) . '</td></tr>';
         }
-        $deliveryClient = max(0.0, (float)($sale['delivery_fee'] ?? 0));
+        $deliveryClient = $this->saleDeliveryFee($sale);
         if ($deliveryClient > 0.009) {
             $totalsHtml .= '<tr><td style="text-align:right;"><strong>Domicilio (cliente):</strong></td>'
                 . '<td style="text-align:right;">' . $fmt($deliveryClient) . '</td></tr>';
@@ -118,7 +136,7 @@ class PdfService
                 <td style="text-align:right;border-top:2px solid ' . $color . ';padding-top:8px;"><strong>TOTAL:</strong></td>
                 <td style="text-align:right;border-top:2px solid ' . $color . ';padding-top:8px;color:' . $color . ';">' . $fmt($saleTotal) . '</td>
             </tr>';
-        $cashInfo = $this->saleCashInfo($sale, $saleTotal);
+        $cashInfo = $this->saleCashInfo($sale, $saleTotal, $payments);
         if ($cashInfo['received'] > 0.009) {
             $totalsHtml .= '<tr><td style="text-align:right;"><strong>Billete / recibido:</strong></td>'
                 . '<td style="text-align:right;">' . $fmt($cashInfo['received']) . '</td></tr>';
@@ -186,7 +204,7 @@ class PdfService
     }
 
     /** Ticket térmico 58mm estilo POS (logo, cliente, tabla DESC/CANT/VALOR, pagos sin duplicar). */
-    public function generateTicket58(array $sale, array $items, array $payments = []): string
+    public function generateTicket58(array $sale, array $items, array $payments = [], bool $browserPrint = false): string
     {
         $cfg = SalesDocumentConfig::fromSettings($this->company)['ticket'];
         $currency = $this->currency['symbol'] ?? '$';
@@ -203,9 +221,10 @@ class PdfService
         $cashier = $esc($sale['user_name'] ?? $sale['cashier_name'] ?? '');
         $saleTax = (float)($sale['tax'] ?? $sale['tax_amount'] ?? 0);
         $saleSubtotal = (float)($sale['subtotal'] ?? 0);
+        $saleDiscount = round((float)($sale['discount'] ?? 0), 2);
         $saleTotal = (float)($sale['total'] ?? 0);
         if ($saleSubtotal <= 0 && $saleTotal > 0) {
-            $saleSubtotal = max(0, $saleTotal - $saleTax);
+            $saleSubtotal = max(0, $saleTotal + $saleDiscount - $saleTax);
         }
 
         $items = $this->uniqueSaleItems($items);
@@ -261,15 +280,20 @@ class PdfService
         if (!empty($cfg['show_customer'])) {
             $custName = trim((string)($sale['customer_name'] ?? '')) ?: 'CONSUMIDOR FINAL';
             $custDoc = trim((string)($sale['customer_document'] ?? $sale['document_number'] ?? ''));
-            $customerBlock = '<div class="box">'
+            $customerBlock = '<div class="hl">'
                 . '<div>CLIENTE: ' . $esc(mb_strtoupper($custName)) . '</div>'
                 . ($custDoc !== '' ? '<div>NIT/CC: ' . $esc($custDoc) . '</div>' : '')
                 . '</div>';
         }
 
         $rows = '';
+        $hasTaxMarkedItems = false;
         foreach ($items as $item) {
             $name = $esc($item['product_name'] ?? '');
+            if ($this->saleItemHasTax($item)) {
+                $name .= ' *';
+                $hasTaxMarkedItems = true;
+            }
             $qty = (int)($item['quantity'] ?? 0);
             $lineTotal = $this->itemLineTotal($item);
             $rows .= '<tr>'
@@ -277,10 +301,29 @@ class PdfService
                 . '<td class="cant">' . $qty . '</td>'
                 . '<td class="valor">' . $fmt($lineTotal) . '</td>'
                 . '</tr>';
+            $sku = trim((string)($item['product_code'] ?? $item['code'] ?? ''));
+            $ean = trim((string)($item['barcode'] ?? ''));
+            $codeBits = [];
+            if ($sku !== '') {
+                $codeBits[] = 'SKU ' . $sku;
+            }
+            if ($ean !== '') {
+                $codeBits[] = 'EAN ' . $ean;
+            }
+            if ($codeBits !== []) {
+                $rows .= '<tr><td colspan="3" class="unit">' . $esc(implode(' · ', $codeBits)) . '</td></tr>';
+            }
             if (!empty($cfg['show_unit_price']) && $qty > 0) {
                 $unit = (float)($item['unit_price'] ?? 0);
                 if ($unit > 0) {
-                    $rows .= '<tr><td colspan="3" class="unit">' . $qty . ' x ' . $fmt($unit) . '</td></tr>';
+                    $unitLine = $qty . ' x ' . $fmt($unit);
+                    if ($this->saleItemHasTax($item)) {
+                        $rate = round((float)($item['tax_rate'] ?? 0), 2);
+                        if ($rate > 0.009) {
+                            $unitLine .= ' (' . rtrim(rtrim(number_format($rate, 2, '.', ''), '0'), '.') . '% ' . $taxName . ')';
+                        }
+                    }
+                    $rows .= '<tr><td colspan="3" class="unit">' . $esc($unitLine) . '</td></tr>';
                 }
             }
         }
@@ -288,16 +331,19 @@ class PdfService
         $totalsInner = '';
         if (!empty($cfg['show_subtotal_tax'])) {
             $totalsInner .= '<div>SUBTOTAL: ' . $fmt($saleSubtotal) . '</div>';
+            if ($saleDiscount > 0.009) {
+                $totalsInner .= '<div>DESCUENTO: -' . $fmt($saleDiscount) . '</div>';
+            }
             if ($saleTax > 0.009) {
                 $totalsInner .= '<div>' . $taxName . ': ' . $fmt($saleTax) . '</div>';
             }
         }
-        $deliveryClient = max(0.0, (float)($sale['delivery_fee'] ?? 0));
+        $deliveryClient = $this->saleDeliveryFee($sale);
         if ($deliveryClient > 0.009) {
             $totalsInner .= '<div>DOMICILIO: ' . $fmt($deliveryClient) . '</div>';
         }
-        $totalsInner .= '<div class="grand">TOTAL: ' . $fmt($saleTotal) . '</div>';
-        $totalsBox = '<div class="box totals">' . $totalsInner . '</div>';
+        $totalsBox = ($totalsInner !== '' ? '<div class="totals-pre">' . $totalsInner . '</div>' : '')
+            . '<div class="hl grand">TOTAL: ' . $fmt($saleTotal) . '</div>';
 
         $payBlock = '';
         if (!empty($cfg['show_payment_method'])) {
@@ -327,18 +373,23 @@ class PdfService
         if ($footerText === '') {
             $footerText = 'Gracias por su compra';
         }
+        $taxLegend = '';
+        if ($hasTaxMarkedItems) {
+            $taxLegend = '<div class="tax-legend">* Producto gravado con ' . $taxName
+                . '. El impuesto discriminado en el total corresponde a estos ítems.</div>';
+        }
         $footer = '<div class="muted foot">' . nl2br($esc($footerText)) . '</div>';
 
         $html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
             @page { margin: 2mm; }
-            body { font-family: DejaVu Sans, Helvetica, sans-serif; font-size: 10px; color:#111; margin:0; padding:0; }
-            .co { font-size: 14px; font-weight: bold; text-align:center; margin: 0 0 2px; }
+            body { font-family: DejaVu Sans, Helvetica, sans-serif; font-size: 10px; color:#111; margin:0; padding:0; background:#fff; }
+            .co { font-size: 12px; font-weight: bold; text-align:center; margin: 0 0 2px; }
             .muted { color:#444; text-align:center; font-size:9px; margin: 1px 0; line-height:1.25; }
             .dash { border-top: 1px dashed #999; margin: 4px 0; }
-            .inv { font-size: 15px; font-weight: bold; text-align:center; margin: 4px 0 2px; }
-            .box { background:#f0f0f0; padding:5px 6px; margin: 4px 0; font-size:9px; }
-            .box.totals { font-size:10px; }
-            .grand { font-size:13px; font-weight:bold; margin-top:2px; }
+            .inv { font-size: 12px; font-weight: bold; text-align:center; margin: 4px 0 2px; }
+            .hl { background:transparent; border-top:1px solid #111; border-bottom:1px solid #111; padding:4px 0; margin: 5px 0; font-size:9px; }
+            .totals-pre { margin: 4px 0 0; font-size:10px; }
+            .grand { font-size:12px; font-weight:bold; }
             table.items { width:100%; border-collapse:collapse; margin-top:3px; }
             table.items th { font-size:8px; text-align:left; border-bottom:1px solid #bbb; padding:2px 0; color:#555; }
             table.items th.cant, table.items td.cant { text-align:center; width:14%; }
@@ -348,6 +399,7 @@ class PdfService
             table.items td.unit { font-size:8px; color:#666; padding-top:0; }
             .pay { margin-top:4px; font-size:9px; }
             .notes { margin-top:4px; font-size:8px; color:#555; }
+            .tax-legend { margin-top:5px; font-size:7px; color:#555; text-align:left; line-height:1.35; }
             .foot { margin-top:6px; }
         </style></head><body>
             ' . $header . '
@@ -360,11 +412,31 @@ class PdfService
             ' . $totalsBox . '
             <div class="pay">' . $payBlock . '</div>
             ' . $notes . '
+            ' . $taxLegend . '
             ' . $footer . '
         </body></html>';
 
         // Ancho 58mm; alto = contenido real (2 pasadas Dompdf).
+        if ($browserPrint) {
+            return $this->wrapTicketForBrowserPrint($html);
+        }
         return $this->generateTicketPdf($html, count($items));
+    }
+
+    private function wrapTicketForBrowserPrint(string $html): string
+    {
+        $extraCss = '@media print { @page { size: 58mm auto; margin: 2mm; } .no-print { display:none !important; } body { width:54mm; } }'
+            . 'html,body { width:58mm; margin:0 auto; background:#fff; }'
+            . '.no-print { text-align:center; margin:10px 4px 14px; font-family:sans-serif; font-size:12px; color:#333; }'
+            . '.no-print button { padding:8px 16px; font-size:14px; cursor:pointer; }';
+        $html = preg_replace('/<style>/', '<style>' . $extraCss, $html, 1) ?? $html;
+        $toolbar = '<div class="no-print">'
+            . '<button type="button" onclick="window.print()">Imprimir tirilla</button>'
+            . '<p>En el diálogo elija la impresora térmica 58 mm. Para no elegirla cada vez, configúrela como predeterminada en Windows.</p>'
+            . '</div>';
+        $html = preg_replace('/<body>/', '<body>' . $toolbar, $html, 1) ?? $html;
+        $script = '<script>window.addEventListener("load",function(){setTimeout(function(){window.print();},300);});</script>';
+        return str_replace('</body>', $script . '</body>', $html);
     }
 
     /**
@@ -470,7 +542,7 @@ class PdfService
 
         $received = null;
         $change = null;
-        $cashInfo = $this->saleCashInfo($sale, (float)($sale['total'] ?? 0));
+        $cashInfo = $this->saleCashInfo($sale, (float)($sale['total'] ?? 0), $payments);
         if ($cashInfo['received'] > 0.009) {
             $received = $cashInfo['received'];
             $change = $cashInfo['change'];
@@ -484,9 +556,10 @@ class PdfService
 
     /**
      * @param array<string,mixed> $sale
+     * @param list<array<string,mixed>> $payments
      * @return array{received:float,change:float}
      */
-    private function saleCashInfo(array $sale, float $saleTotal = 0.0): array
+    private function saleCashInfo(array $sale, float $saleTotal = 0.0, array $payments = []): array
     {
         $received = max(0.0, (float)($sale['cash_received'] ?? 0));
         $change = max(0.0, (float)($sale['cash_change'] ?? 0));
@@ -507,10 +580,46 @@ class PdfService
                 $change = max(0.0, (float)str_replace(',', '.', $raw));
             }
         }
-        if ($received > 0.009 && $change <= 0.009 && $saleTotal > 0) {
-            $change = max(0.0, round($received - $saleTotal, 2));
+        $due = $saleTotal;
+        $cashPaid = 0.0;
+        foreach ($payments as $p) {
+            if (PaymentMethodCatalog::affectsCash((string)($p['payment_method'] ?? ''))) {
+                $cashPaid += (float)($p['amount'] ?? 0);
+            }
+        }
+        if ($cashPaid > 0.009) {
+            $due = $cashPaid;
+        }
+        if (function_exists('\\SoftNova\\Core\\cash_change_amount')) {
+            $change = \SoftNova\Core\cash_change_amount($received, $due, $change);
+        } elseif ($received > 0.009 && ($change <= 0.009 || $change > $received + 0.05 || $change >= 1000000000.0)) {
+            $change = max(0.0, round($received - $due, 2));
         }
         return ['received' => $received, 'change' => $change];
+    }
+
+    /** Domicilio cobrado al cliente (columna o nota de la venta). */
+    private function saleDeliveryFee(array $sale): float
+    {
+        $fee = max(0.0, (float)($sale['delivery_fee'] ?? 0));
+        if ($fee > 0.009) {
+            return round($fee, 2);
+        }
+        $notes = (string)($sale['notes'] ?? '');
+        if ($notes === '') {
+            return 0.0;
+        }
+        if (preg_match('/cliente\s+([\d.,]+)/i', $notes, $m) && stripos($notes, 'Domicilio') !== false) {
+            $raw = $m[1];
+        } elseif (preg_match('/Domicilio:\s*([\d.,]+)/i', $notes, $m)) {
+            $raw = $m[1];
+        } else {
+            return 0.0;
+        }
+        if (function_exists('\\SoftNova\\Core\\parse_money')) {
+            return max(0.0, round(\SoftNova\Core\parse_money($raw), 2));
+        }
+        return max(0.0, round((float)str_replace(',', '.', $raw), 2));
     }
 
     private function ticketCleanNotes(string $notes): string
@@ -527,7 +636,7 @@ class PdfService
             if ($part === '') {
                 continue;
             }
-            if (preg_match('/^(recibido|cambio|pago\s*mixto|medio|efectivo|transferencia|dat[aá]fono|tarjeta)/i', $part)) {
+            if (preg_match('/^(recibido|cambio|vueltas|pago\s*mixto|medio|efectivo|transferencia|dat[aá]fono|tarjeta|domicilio)/i', $part)) {
                 continue;
             }
             if (preg_match('/^\d+[\d.,]*\s*$/', $part)) {
@@ -640,6 +749,16 @@ class PdfService
         return (float)($item['quantity'] ?? 0) * (float)($item['unit_price'] ?? 0);
     }
 
+    /** Ítem con IVA gravado (tasa o monto de impuesto en la línea). */
+    private function saleItemHasTax(array $item): bool
+    {
+        $rate = (float)($item['tax_rate'] ?? 0);
+        if ($rate > 0.009) {
+            return true;
+        }
+        return (float)($item['tax_amount'] ?? 0) > 0.009;
+    }
+
     private function documentLabel(string $type): string
     {
         if (class_exists(SalesDocumentService::class)) {
@@ -682,13 +801,24 @@ class PdfService
             </tr>';
         }
         
-        $validDays = !empty($quote['valid_days']) ? (int)$quote['valid_days'] : 15;
-        $validUntil = date('d/m/Y', strtotime('+' . $validDays . ' days', strtotime($quote['created_at'])));
+        $validDays = 15;
+        $validUntilLabel = '';
+        if (!empty($quote['valid_until']) && preg_match('/^\d{4}-\d{2}-\d{2}/', (string)$quote['valid_until'])) {
+            $validUntilTs = strtotime(substr((string)$quote['valid_until'], 0, 10));
+            $createdTs = strtotime((string)($quote['created_at'] ?? $quote['quote_date'] ?? 'now'));
+            if ($validUntilTs && $createdTs) {
+                $validDays = max(1, (int)ceil(($validUntilTs - $createdTs) / 86400));
+            }
+            $validUntilLabel = date('d/m/Y', $validUntilTs ?: time());
+        } else {
+            $validDays = !empty($quote['valid_days']) ? max(1, (int)$quote['valid_days']) : 15;
+            $validUntilLabel = date('d/m/Y', strtotime('+' . $validDays . ' days', strtotime($quote['created_at'] ?? 'now')));
+        }
         
         $html = $this->wrapHtml('COTIZACIÓN', $companyName, '
             <div style="margin-bottom:20px;padding:15px;background:#FFF3E0;border-left:4px solid #FF9800;border-radius:4px;">
-                <strong>📝 Documento informativo — No es una factura</strong><br>
-                <span style="font-size:12px;color:#666;">Válida hasta: ' . $validUntil . ' (' . $validDays . ' días)</span>
+                <strong>Documento informativo — No es una factura</strong><br>
+                <span style="font-size:12px;color:#666;">Válida hasta: ' . $validUntilLabel . '</span>
             </div>
             
             <div style="margin-bottom:20px;">
@@ -696,19 +826,19 @@ class PdfService
                     <tr>
                         <td width="50%">
                             <strong>Cotización #:</strong> ' . htmlspecialchars($quote['quote_number'] ?? 'N/A') . '<br>
-                            <strong>Fecha:</strong> ' . date('d/m/Y', strtotime($quote['created_at'])) . '<br>
+                            <strong>Fecha:</strong> ' . date('d/m/Y', strtotime($quote['created_at'] ?? $quote['quote_date'] ?? 'now')) . '<br>
                             <strong>Cliente:</strong> ' . htmlspecialchars($quote['customer_name'] ?? 'Cliente general') . '
                         </td>
                         <td width="50%" style="text-align:right;">
                             <strong>Estado:</strong> ' . ucfirst($quote['status'] ?? 'pending') . '<br>
-                            <strong>Válida hasta:</strong> ' . $validUntil . '
+                            <strong>Válida hasta:</strong> ' . $validUntilLabel . '
                         </td>
                     </tr>
                 </table>
             </div>
             
             <table width="100%" cellpadding="8" cellspacing="0" style="border-collapse:collapse;">
-                <tr style="background:#7C3AED;color:#fff;">
+                <tr style="background:#0F766E;color:#fff;">
                     <th style="text-align:left;padding:10px;">Producto</th>
                     <th style="text-align:center;padding:10px;">Cant.</th>
                     <th style="text-align:right;padding:10px;">Precio Unit.</th>
@@ -727,8 +857,8 @@ class PdfService
                     <td style="text-align:right;">' . $fmt($quote['tax'] ?? 0) . '</td>
                 </tr>
                 <tr style="font-size:16px;font-weight:bold;">
-                    <td style="text-align:right;border-top:2px solid #7C3AED;padding-top:8px;"><strong>TOTAL:</strong></td>
-                    <td style="text-align:right;border-top:2px solid #7C3AED;padding-top:8px;color:#7C3AED;">' . $fmt($quote['total'] ?? 0) . '</td>
+                    <td style="text-align:right;border-top:2px solid #0F766E;padding-top:8px;"><strong>TOTAL:</strong></td>
+                    <td style="text-align:right;border-top:2px solid #0F766E;padding-top:8px;color:#0F766E;">' . $fmt($quote['total'] ?? 0) . '</td>
                 </tr>
             </table>
             
@@ -1029,7 +1159,13 @@ class PdfService
     /**
      * Generar PDF de cierre de caja
      */
-    public function generateCashClosing(array $session, array $movements, array $totals, array $sales = []): string
+    public function generateCashClosing(
+        array $session,
+        array $movements,
+        array $totals,
+        array $sales = [],
+        array $adminExpenses = []
+    ): string
     {
         $currency = $this->currency['symbol'] ?? '$';
         $decimals = $this->currency['decimals'] ?? 0;
@@ -1041,12 +1177,26 @@ class PdfService
         $companyName = htmlspecialchars($this->company['company_name'] ?? 'Mi Empresa');
 
         // El arqueo cuadra contra efectivo, no contra el total facturado.
+        $opening = (float)($session['opening_amount'] ?? 0);
         $expectedCash = $totals['expected_cash'] ?? $session['expected_amount'] ?? null;
+        if ($expectedCash === null) {
+            $expectedCash = $opening + (float)($totals['cash_incomes'] ?? $totals['incomes'] ?? 0)
+                - (float)($totals['expenses'] ?? 0);
+        }
+        $expectedCash = (float)$expectedCash;
+        $cashSales = (float)($totals['cash_sales'] ?? 0);
+        if ($cashSales <= 0.009 && !empty($totals['payment_breakdown']['cash']['total'])) {
+            $cashSales = (float)$totals['payment_breakdown']['cash']['total'];
+        }
+        $otherCashIn = (float)($totals['other_cash_incomes'] ?? 0);
+        if ($otherCashIn <= 0.009 && isset($totals['cash_incomes'])) {
+            $otherCashIn = max(0.0, (float)$totals['cash_incomes'] - $cashSales);
+        }
+        $expenses = (float)($totals['expenses'] ?? 0);
+        $cashDayNet = (float)($totals['cash_day_net'] ?? ($expectedCash - $opening));
         $diff = $totals['difference'] ?? $session['difference_amount'] ?? null;
         if ($diff === null) {
-            $diff = $expectedCash !== null
-                ? ((float)($session['closing_amount'] ?? 0) - (float)$expectedCash)
-                : (($session['closing_amount'] ?? 0) - ($session['opening_amount'] ?? 0) - ($totals['incomes'] ?? 0) + ($totals['expenses'] ?? 0));
+            $diff = (float)($session['closing_amount'] ?? 0) - $expectedCash;
         }
         $diff = round((float)$diff, 2);
         
@@ -1056,6 +1206,7 @@ class PdfService
             $prefix = $mov['type'] === 'income' ? '+' : '-';
             $movementsHtml .= '<tr>
                 <td>' . date('H:i', strtotime($mov['created_at'])) . '</td>
+                <td>' . htmlspecialchars((string)($mov['user_name'] ?? 'Sin usuario')) . '</td>
                 <td>' . ($mov['type'] === 'income' ? 'Ingreso' : 'Egreso') . '</td>
                 <td>' . htmlspecialchars((string)($mov['description'] ?? '')) . '</td>
                 <td style="text-align:right;color:' . $color . ';">' . $prefix . $fmt($mov['amount']) . '</td>
@@ -1064,12 +1215,24 @@ class PdfService
 
         $salesHtml = '';
         $salesTotal = 0.0;
+        $salesDiscountTotal = (float)($totals['sales_discount_total'] ?? 0);
+        $salesSubtotalBeforeDiscount = (float)($totals['sales_subtotal_before_discount'] ?? 0);
         $paymentBreakdown = [];
+        $computedDiscount = 0.0;
+        $computedSubtotal = 0.0;
         foreach ($sales as $sale) {
             if (($sale['status'] ?? '') === 'cancelled') {
                 continue;
             }
-            $salesTotal += (float)($sale['total'] ?? 0);
+            $saleTotal = (float)($sale['total'] ?? 0);
+            $salesTotal += $saleTotal;
+            $disc = round((float)($sale['discount'] ?? 0), 2);
+            $sub = round((float)($sale['subtotal'] ?? 0), 2);
+            if ($sub <= 0.009) {
+                $sub = round($saleTotal + max(0.0, $disc), 2);
+            }
+            $computedDiscount += max(0.0, $disc);
+            $computedSubtotal += max(0.0, $sub);
             $methodCode = PaymentMethodCatalog::normalize((string)($sale['payment_method'] ?? 'cash'));
             if (!isset($paymentBreakdown[$methodCode])) {
                 $paymentBreakdown[$methodCode] = [
@@ -1078,7 +1241,7 @@ class PdfService
                     'count' => 0,
                 ];
             }
-            $paymentBreakdown[$methodCode]['total'] += (float)($sale['total'] ?? 0);
+            $paymentBreakdown[$methodCode]['total'] += $saleTotal;
             $paymentBreakdown[$methodCode]['count']++;
 
             $salesHtml .= '<tr>
@@ -1086,8 +1249,29 @@ class PdfService
                 <td>' . htmlspecialchars((string)($sale['invoice_number'] ?? ('#' . ($sale['id'] ?? '')))) . '</td>
                 <td>' . htmlspecialchars((string)($sale['customer_name'] ?? 'Publico general')) . '</td>
                 <td>' . htmlspecialchars(PaymentMethodCatalog::label((string)($sale['payment_method'] ?? 'cash'))) . '</td>
-                <td style="text-align:right;">' . $fmt($sale['total'] ?? 0) . '</td>
+                <td style="text-align:right;">' . $fmt($saleTotal) . '</td>
             </tr>';
+        }
+        if ($salesDiscountTotal <= 0.009 && $computedDiscount > 0.009) {
+            $salesDiscountTotal = $computedDiscount;
+        }
+        if ($salesSubtotalBeforeDiscount <= 0.009 && $computedSubtotal > 0.009) {
+            $salesSubtotalBeforeDiscount = $computedSubtotal;
+        }
+        if ($salesSubtotalBeforeDiscount <= 0.009 && $salesTotal > 0.009) {
+            $salesSubtotalBeforeDiscount = round($salesTotal + $salesDiscountTotal, 2);
+        }
+        // Preferir totales de sesión (misma fuente que el modal / WhatsApp).
+        if (isset($totals['sales_total'])) {
+            $salesTotal = (float)$totals['sales_total'];
+        }
+        if (isset($totals['sales_discount_total'])) {
+            $salesDiscountTotal = (float)$totals['sales_discount_total'];
+        }
+        if (isset($totals['sales_subtotal_before_discount'])
+            && (float)$totals['sales_subtotal_before_discount'] > 0.009
+        ) {
+            $salesSubtotalBeforeDiscount = (float)$totals['sales_subtotal_before_discount'];
         }
 
         // Preferir desglose precalculado si viene en totals
@@ -1147,32 +1331,52 @@ class PdfService
                     <th style="text-align:left;padding:10px;border-bottom:2px solid #ddd;">Concepto</th>
                     <th style="text-align:right;padding:10px;border-bottom:2px solid #ddd;">Monto</th>
                 </tr>
-                <tr>
-                    <td>Monto de Apertura</td>
-                    <td style="text-align:right;">' . $fmt($session['opening_amount'] ?? 0) . '</td>
+                <tr style="background:#FFFBEB;">
+                    <td><strong>Base de apertura (fondo en cajón)</strong><br>
+                        <span style="font-size:10px;color:#666;">No es venta del día: efectivo con el que se abrió</span></td>
+                    <td style="text-align:right;vertical-align:middle;">' . $fmt($opening) . '</td>
                 </tr>
                 <tr>
-                    <td>Total Ingresos (movimientos)</td>
-                    <td style="text-align:right;color:#10B981;">+' . $fmt($totals['incomes'] ?? 0) . '</td>
+                    <td>Efectivo de ventas del día<br>
+                        <span style="font-size:10px;color:#666;">Cobros en efectivo (sin la base)</span></td>
+                    <td style="text-align:right;color:#10B981;vertical-align:middle;">+' . $fmt($cashSales) . '</td>
+                </tr>
+                ' . ($otherCashIn > 0.009 ? '
+                <tr>
+                    <td>Otros ingresos en efectivo<br>
+                        <span style="font-size:10px;color:#666;">Ajustes / ingresos manuales al cajón</span></td>
+                    <td style="text-align:right;color:#10B981;vertical-align:middle;">+' . $fmt($otherCashIn) . '</td>
+                </tr>' : '') . '
+                <tr>
+                    <td>Egresos del cajón</td>
+                    <td style="text-align:right;color:#DC2626;">-' . $fmt($expenses) . '</td>
                 </tr>
                 <tr>
-                    <td>Total Egresos (movimientos)</td>
-                    <td style="text-align:right;color:#DC2626;">-' . $fmt($totals['expenses'] ?? 0) . '</td>
+                    <td>Neto del día en cajón<br>
+                        <span style="font-size:10px;color:#666;">Ventas efectivo ± movimientos − egresos (sin la base)</span></td>
+                    <td style="text-align:right;">' . ($cashDayNet >= 0 ? '+' : '') . $fmt($cashDayNet) . '</td>
                 </tr>
                 <tr>
-                    <td>Total Ventas del periodo</td>
+                    <td>Sub-total sin descuentos<br>
+                        <span style="font-size:10px;color:#666;">Suma de ventas antes del descuento (todos los medios)</span></td>
+                    <td style="text-align:right;">' . $fmt($salesSubtotalBeforeDiscount) . '</td>
+                </tr>
+                <tr>
+                    <td>Descuento total aplicado<br>
+                        <span style="font-size:10px;color:#666;">Descuentos de documento en ventas del día (todos los medios)</span></td>
+                    <td style="text-align:right;color:#B45309;">-' . $fmt($salesDiscountTotal) . '</td>
+                </tr>
+                <tr>
+                    <td>Total ventas facturadas (todos los medios)</td>
                     <td style="text-align:right;">' . $fmt($salesTotal) . '</td>
                 </tr>
-                <tr>
-                    <td>Balance del periodo (todos los medios)</td>
-                    <td style="text-align:right;">' . $fmt(($session['opening_amount'] ?? 0) + ($totals['incomes'] ?? 0) - ($totals['expenses'] ?? 0)) . '</td>
+                <tr style="font-weight:bold;font-size:14px;background:#ECFDF5;">
+                    <td style="border-top:2px solid #333;padding-top:8px;">Efectivo esperado en cajón<br>
+                        <span style="font-weight:normal;font-size:10px;color:#555;">Base + neto del día</span></td>
+                    <td style="text-align:right;border-top:2px solid #333;padding-top:8px;">' . $fmt($expectedCash) . '</td>
                 </tr>
                 <tr style="font-weight:bold;font-size:14px;">
-                    <td style="border-top:2px solid #333;padding-top:8px;">Efectivo Esperado en Caja</td>
-                    <td style="text-align:right;border-top:2px solid #333;padding-top:8px;">' . $fmt($expectedCash ?? (($session['opening_amount'] ?? 0) + ($totals['incomes'] ?? 0) - ($totals['expenses'] ?? 0))) . '</td>
-                </tr>
-                <tr style="font-weight:bold;font-size:14px;">
-                    <td>Efectivo Contado</td>
+                    <td>Efectivo contado</td>
                     <td style="text-align:right;">' . $fmt($session['closing_amount'] ?? 0) . '</td>
                 </tr>
                 <tr style="font-weight:bold;font-size:14px;">
@@ -1203,15 +1407,75 @@ class PdfService
             <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:11px;">
                 <tr style="background:#f5f5f5;">
                     <th style="text-align:left;border-bottom:1px solid #ddd;">Hora</th>
+                    <th style="text-align:left;border-bottom:1px solid #ddd;">Usuario</th>
                     <th style="text-align:left;border-bottom:1px solid #ddd;">Tipo</th>
                     <th style="text-align:left;border-bottom:1px solid #ddd;">Descripcion</th>
                     <th style="text-align:right;border-bottom:1px solid #ddd;">Monto</th>
                 </tr>
                 ' . $movementsHtml . '
             </table>' : '<p style="margin-top:16px;color:#666;">Sin movimientos manuales de caja en esta sesion.</p>') . '
+
+            ' . $this->cashClosingAdminExpensesHtml($adminExpenses, $fmt) . '
         ');
         
         return $this->generate($html);
+    }
+
+    /**
+     * Bloque HTML de egresos administrativos (informativo, no afecta cajón).
+     *
+     * @param list<array<string,mixed>> $adminExpenses
+     */
+    private function cashClosingAdminExpensesHtml(array $adminExpenses, callable $fmt): string
+    {
+        if ($adminExpenses === []) {
+            return '';
+        }
+
+        $rows = '';
+        $total = 0.0;
+        foreach ($adminExpenses as $row) {
+            $amount = (float)($row['amount'] ?? 0);
+            $total += $amount;
+            $payLabel = PaymentMethodCatalog::label((string)($row['payment_method'] ?? 'other'));
+            $desc = htmlspecialchars((string)($row['description'] ?? ''));
+            $cat = htmlspecialchars((string)($row['category_name'] ?? 'Administrativo'));
+            $note = trim((string)($row['notes'] ?? ''));
+            if ($note !== '') {
+                $desc .= ' — ' . htmlspecialchars($note);
+            }
+            $rows .= '<tr>
+                <td>' . date('d/m/Y', strtotime((string)($row['expense_date'] ?? 'now'))) . '</td>
+                <td>' . htmlspecialchars((string)($row['user_name'] ?? 'Sin usuario')) . '</td>
+                <td>' . $cat . '</td>
+                <td>' . $desc . '</td>
+                <td>' . htmlspecialchars($payLabel) . '</td>
+                <td style="text-align:right;">' . $fmt($amount) . '</td>
+            </tr>';
+        }
+
+        return '
+            <h3 style="margin-top:24px;background:#EFF6FF;border:1px solid #93C5FD;padding:8px 10px;border-radius:4px;">
+                Egresos administrativos (informativo)
+            </h3>
+            <p style="margin:0 0 10px;font-size:11px;color:#555;">
+                Arriendo, IVA, retenciones y similares registrados en Gastos. <strong>No descuentan el cajón físico</strong> ni alteran el arqueo de efectivo.
+            </p>
+            <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:11px;">
+                <tr style="background:#f5f5f5;">
+                    <th style="text-align:left;border-bottom:1px solid #ddd;">Fecha</th>
+                    <th style="text-align:left;border-bottom:1px solid #ddd;">Usuario</th>
+                    <th style="text-align:left;border-bottom:1px solid #ddd;">Categoría</th>
+                    <th style="text-align:left;border-bottom:1px solid #ddd;">Descripción</th>
+                    <th style="text-align:left;border-bottom:1px solid #ddd;">Pago</th>
+                    <th style="text-align:right;border-bottom:1px solid #ddd;">Monto</th>
+                </tr>
+                ' . $rows . '
+                <tr style="font-weight:bold;">
+                    <td colspan="5" style="border-top:1px solid #333;padding-top:6px;">Total administrativos del día</td>
+                    <td style="text-align:right;border-top:1px solid #333;padding-top:6px;">' . $fmt($total) . '</td>
+                </tr>
+            </table>';
     }
     
     /**
@@ -1235,11 +1499,20 @@ class PdfService
             ['Cesantías', $item['cesantias'] ?? 0],
             ['Intereses cesantías', $item['cesantias_interest'] ?? 0],
             ['Incapacidad (' . (int)($item['incapacity_days'] ?? 0) . ' días)', $item['incapacity_pay'] ?? 0],
-            ['(+) Total devengado', $item['gross_pay'] ?? 0],
-            ['(-) Salud empleado', -1 * (float)($item['health_employee'] ?? 0)],
-            ['(-) Pensión empleado', -1 * (float)($item['pension_employee'] ?? 0)],
-            ['(=) Neto a pagar', $item['net_pay'] ?? 0],
         ];
+        if ((float)($item['overtime_day_amount'] ?? 0) > 0 || (float)($item['overtime_day_hours'] ?? 0) > 0) {
+            $rows[] = ['HE diurnas (' . number_format((float)($item['overtime_day_hours'] ?? 0), 2, ',', '.') . ' h)', $item['overtime_day_amount'] ?? 0];
+        }
+        if ((float)($item['overtime_night_amount'] ?? 0) > 0 || (float)($item['overtime_night_hours'] ?? 0) > 0) {
+            $rows[] = ['HE nocturnas (' . number_format((float)($item['overtime_night_hours'] ?? 0), 2, ',', '.') . ' h)', $item['overtime_night_amount'] ?? 0];
+        }
+        if ((float)($item['dominical_amount'] ?? 0) > 0 || (float)($item['dominical_hours'] ?? 0) > 0) {
+            $rows[] = ['Dominical/festivo (' . number_format((float)($item['dominical_hours'] ?? 0), 2, ',', '.') . ' h)', $item['dominical_amount'] ?? 0];
+        }
+        $rows[] = ['(+) Total devengado', $item['gross_pay'] ?? 0];
+        $rows[] = ['(-) Salud empleado', -1 * (float)($item['health_employee'] ?? 0)];
+        $rows[] = ['(-) Pensión empleado', -1 * (float)($item['pension_employee'] ?? 0)];
+        $rows[] = ['(=) Neto a pagar', $item['net_pay'] ?? 0];
         $rowsHtml = '';
         foreach ($rows as [$label, $amt]) {
             $bold = str_starts_with($label, '(') || str_starts_with($label, '(=)') || str_starts_with($label, '(+)');
@@ -1309,6 +1582,7 @@ class PdfService
                 <tr><td>Primas</td><td style="text-align:right;">' . $fmt($run['prima_total'] ?? 0) . '</td></tr>
                 <tr><td>Cesantías</td><td style="text-align:right;">' . $fmt($run['cesantias_total'] ?? 0) . '</td></tr>
                 <tr><td>Incapacidades</td><td style="text-align:right;">' . $fmt($run['incapacity_total'] ?? 0) . '</td></tr>
+                <tr><td>HE / dominicales</td><td style="text-align:right;">' . $fmt($run['overtime_total'] ?? 0) . '</td></tr>
                 <tr><td>Deducciones empleados</td><td style="text-align:right;">' . $fmt($run['deductions_total'] ?? 0) . '</td></tr>
                 <tr><td>Aportes empleador</td><td style="text-align:right;">' . $fmt($run['employer_total'] ?? 0) . '</td></tr>
                 <tr><td>Parafiscales</td><td style="text-align:right;">' . $fmt($run['parafiscal_total'] ?? 0) . '</td></tr>
@@ -1320,7 +1594,8 @@ class PdfService
 
     /**
      * Reporte PDF del listado de ventas (respeta filtros).
-     * @param list<array<string,mixed>> $sales
+     * Incluye desglose de productos por cada venta.
+     * @param list<array<string,mixed>> $sales cada venta puede traer clave `items`
      * @param array<string,mixed> $filters
      */
     public function generateSalesListReport(array $sales, array $filters = [], ?\PDO $db = null): string
@@ -1360,6 +1635,7 @@ class PdfService
         $rowsHtml = '';
         $sumTotal = 0.0;
         $sumPaid = 0.0;
+        $itemLines = 0;
         foreach ($sales as $s) {
             $total = (float)($s['total'] ?? 0);
             $paid = (($s['payment_status'] ?? '') === 'paid')
@@ -1371,7 +1647,7 @@ class PdfService
                 ? 'Cancelado'
                 : (($s['payment_status'] ?? '') === 'paid' ? 'Pagado'
                     : (($s['payment_status'] ?? '') === 'partial' ? 'Parcial' : 'Pendiente'));
-            $rowsHtml .= '<tr>
+            $rowsHtml .= '<tr style="background:#eef6f1;font-weight:600;">
                 <td>' . htmlspecialchars((string)($s['invoice_number'] ?? '')) . '</td>
                 <td>' . htmlspecialchars((string)($s['customer_name'] ?? 'General')) . '</td>
                 <td>' . (!empty($s['sale_date']) ? date('d/m/Y H:i', strtotime((string)$s['sale_date'])) : '') . '</td>
@@ -1380,6 +1656,45 @@ class PdfService
                 <td>' . htmlspecialchars(PaymentMethodCatalog::label((string)($s['payment_method'] ?? 'cash'), $db)) . '</td>
                 <td>' . htmlspecialchars($status) . '</td>
             </tr>';
+
+            $items = is_array($s['items'] ?? null) ? $s['items'] : [];
+            if ($items === []) {
+                $rowsHtml .= '<tr>
+                    <td colspan="7" style="padding-left:18px;color:#888;font-size:9px;">Sin ítems registrados</td>
+                </tr>';
+                continue;
+            }
+            $rowsHtml .= '<tr style="background:#f7f7f7;color:#555;font-size:9px;">
+                <td style="padding-left:18px;" colspan="2">Producto / SKU / EAN</td>
+                <td style="text-align:right;">Cant.</td>
+                <td style="text-align:right;">P. unit.</td>
+                <td style="text-align:right;">Subtotal</td>
+                <td colspan="2"></td>
+            </tr>';
+            foreach ($items as $it) {
+                $itemLines++;
+                $sku = trim((string)($it['product_code'] ?? ''));
+                $ean = trim((string)($it['barcode'] ?? ''));
+                $pname = trim((string)($it['product_name'] ?? ''));
+                $label = $pname !== '' ? $pname : 'Producto';
+                $codes = [];
+                if ($sku !== '') {
+                    $codes[] = 'SKU ' . $sku;
+                }
+                if ($ean !== '') {
+                    $codes[] = 'EAN ' . $ean;
+                }
+                if ($codes !== []) {
+                    $label .= ' · ' . implode(' · ', $codes);
+                }
+                $rowsHtml .= '<tr style="font-size:9px;">
+                    <td colspan="2" style="padding-left:18px;">' . htmlspecialchars($label) . '</td>
+                    <td style="text-align:right;">' . (float)($it['quantity'] ?? 0) . '</td>
+                    <td style="text-align:right;">' . $fmt($it['unit_price'] ?? 0) . '</td>
+                    <td style="text-align:right;">' . $fmt($it['subtotal'] ?? 0) . '</td>
+                    <td colspan="2"></td>
+                </tr>';
+            }
         }
         if ($rowsHtml === '') {
             $rowsHtml = '<tr><td colspan="7" style="text-align:center;color:#666;padding:16px;">Sin ventas con estos filtros</td></tr>';
@@ -1387,7 +1702,8 @@ class PdfService
 
         $html = $this->wrapHtml('Reporte de ventas', $companyName, '
             <p style="margin:0 0 12px;color:#555;font-size:11px;">' . $filterLine . '</p>
-            <p style="margin:0 0 14px;"><strong>Registros:</strong> ' . count($sales)
+            <p style="margin:0 0 14px;"><strong>Ventas:</strong> ' . count($sales)
+            . ' &nbsp;|&nbsp; <strong>Líneas de producto:</strong> ' . $itemLines
             . ' &nbsp;|&nbsp; <strong>Total:</strong> ' . $fmt($sumTotal)
             . ' &nbsp;|&nbsp; <strong>Pagado:</strong> ' . $fmt($sumPaid) . '</p>
             <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:10px;">
@@ -1446,6 +1762,7 @@ class PdfService
             $detailHtml .= '<tr>
                 <td>' . htmlspecialchars((string)($r['category_name'] ?? '')) . '</td>
                 <td>' . htmlspecialchars((string)($r['code'] ?? '')) . '</td>
+                <td>' . htmlspecialchars((string)($r['barcode'] ?? '')) . '</td>
                 <td>' . htmlspecialchars((string)($r['name'] ?? '')) . '</td>
                 <td>' . htmlspecialchars((string)($r['location'] ?? '—')) . '</td>
                 <td style="text-align:right;">' . (int)($r['stock'] ?? 0) . '</td>
@@ -1454,7 +1771,7 @@ class PdfService
             </tr>';
         }
         if ($detailHtml === '') {
-            $detailHtml = '<tr><td colspan="7" style="text-align:center;color:#666;">Sin detalle</td></tr>';
+            $detailHtml = '<tr><td colspan="8" style="text-align:center;color:#666;">Sin detalle</td></tr>';
         }
 
         $html = $this->wrapHtml('Inventario por categoría', $companyName, '
@@ -1475,6 +1792,7 @@ class PdfService
                 <tr style="background:#f5f5f5;">
                     <th style="text-align:left;">Categoría</th>
                     <th style="text-align:left;">SKU</th>
+                    <th style="text-align:left;">EAN</th>
                     <th style="text-align:left;">Producto</th>
                     <th style="text-align:left;">Ubicación</th>
                     <th style="text-align:right;">Stock</th>
@@ -1509,13 +1827,20 @@ class PdfService
             'opening' => 'Inventario inicial',
             'return' => 'Devolución',
             'inventory_exit' => 'Salida / pérdida',
-            'loan' => 'Préstamo',
-            'loan_return' => 'Devolución préstamo',
+            'loan' => 'Préstamo (salida)',
+            'loan_return' => 'Devolución préstamo (entrada)',
+            'loan_received' => 'Préstamo recibido (entrada)',
+            'loan_received_return' => 'Devolución préstamo recibido (salida)',
+            'loan_received_settle' => 'Cierre préstamo recibido (sin stock)',
+            'status_change' => 'Cambio de estado',
+            'price_change' => 'Cambio de precio',
             'csv_import' => 'Importación CSV',
             'csv_export' => 'Exportación CSV',
             'woocommerce' => 'WooCommerce',
             'mercadolibre' => 'Mercado Libre',
             'purchase_cancel' => 'Cancel. compra',
+            'sale_credit_note' => 'Nota crédito venta',
+            'purchase_credit_note' => 'Nota crédito compra',
         ];
         $typeLabels = ['in' => 'Entrada', 'out' => 'Salida', 'adjustment' => 'Ajuste'];
 
@@ -1538,10 +1863,14 @@ class PdfService
             if ($type === 'in') $inQty += $qty;
             if ($type === 'out') $outQty += $qty;
             $ref = (string)($m['reference_type'] ?? '');
-            $date = !empty($m['movement_date']) ? $m['movement_date'] : ($m['created_at'] ?? '');
+            $dateLabel = StockService::formatMovementDisplayAt($m);
             $rowsHtml .= '<tr>
-                <td>' . ($date !== '' ? date('d/m/Y H:i', strtotime((string)$date)) : '') . '</td>
-                <td>' . htmlspecialchars((string)($m['product_code'] ?? '')) . '</td>
+                <td>' . htmlspecialchars($dateLabel !== '—' ? $dateLabel : '') . '</td>
+                <td>' . htmlspecialchars((string)($m['product_code'] ?? ''))
+                . (!empty($m['product_barcode'])
+                    ? '<br><span style="color:#666;font-size:7px;">EAN: ' . htmlspecialchars((string)$m['product_barcode']) . '</span>'
+                    : '')
+                . '</td>
                 <td>' . htmlspecialchars((string)($m['product_name'] ?? '')) . '</td>
                 <td>' . htmlspecialchars((string)($m['category_name'] ?? '—')) . '</td>
                 <td>' . htmlspecialchars((string)($m['product_location'] ?? '—')) . '</td>

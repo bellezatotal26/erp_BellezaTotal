@@ -145,6 +145,8 @@ class StockService
             'source' => "ALTER TABLE product_stock_debts ADD COLUMN source VARCHAR(20) NOT NULL DEFAULT 'sale' AFTER status",
             'movement_id' => "ALTER TABLE product_stock_debts ADD COLUMN movement_id INT UNSIGNED NULL AFTER source",
             'borrower' => "ALTER TABLE product_stock_debts ADD COLUMN borrower VARCHAR(120) NULL AFTER movement_id",
+            // Producto físico recibido al devolver (si difiere del prestado = sustitución).
+            'return_product_id' => "ALTER TABLE product_stock_debts ADD COLUMN return_product_id INT UNSIGNED NULL AFTER borrower",
         ] as $col => $sql) {
             try {
                 $exists = $this->db->query("SHOW COLUMNS FROM product_stock_debts LIKE " . $this->db->quote($col))->fetch();
@@ -238,7 +240,88 @@ class StockService
             ]
         );
 
-        return (int)$this->db->lastInsertId();
+        $movementId = (int)$this->db->lastInsertId();
+        $this->auditInventoryMovement(
+            $movementId,
+            $productId,
+            $type,
+            $quantity,
+            $referenceType,
+            $referenceId,
+            $notes,
+            $stockAfter
+        );
+        return $movementId;
+    }
+
+    /**
+     * Registra en auditoría solo movimientos de inventario (no ventas ni líneas de OC,
+     * que ya tienen un evento resumen en ventas/compras).
+     */
+    private function auditInventoryMovement(
+        int $movementId,
+        int $productId,
+        string $type,
+        int $quantity,
+        string $referenceType,
+        ?int $referenceId,
+        string $notes,
+        ?int $stockAfter
+    ): void {
+        $skip = [
+            'sale', 'return', 'sale_credit_note',
+            'purchase_order', 'purchase', 'purchase_credit_note',
+        ];
+        if (in_array($referenceType, $skip, true)) {
+            return;
+        }
+        $interesting = [
+            'adjustment', 'opening', 'inventory_exit',
+            'loan', 'loan_return', 'loan_received', 'loan_received_return', 'loan_received_settle',
+            'consignment_in', 'consignment_return',
+        ];
+        if ($referenceType !== '' && !in_array($referenceType, $interesting, true)) {
+            return;
+        }
+        if ($referenceType === '' && $notes === '') {
+            return;
+        }
+
+        $productName = '';
+        try {
+            $productName = (string)$this->query(
+                "SELECT name FROM products WHERE id = ? LIMIT 1",
+                [$productId]
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        $dir = $type === 'in' ? 'Entrada' : ($type === 'out' ? 'Salida' : 'Movimiento');
+        $refLabel = $referenceType !== '' ? $referenceType : 'manual';
+        $module = str_starts_with($referenceType, 'loan') ? 'prestamos' : 'inventario';
+        $action = $referenceType === 'adjustment' || $referenceType === 'opening' ? 'adjust' : 'movement';
+
+        TenantAuditService::safeLog(
+            $this->db,
+            $action,
+            $module,
+            $dir . ' stock: ' . ($productName !== '' ? $productName : ('#' . $productId))
+                . ' · qty=' . $quantity
+                . ($stockAfter !== null ? (' · stock=' . $stockAfter) : '')
+                . ' · ' . $refLabel
+                . ($notes !== '' ? (' — ' . mb_substr($notes, 0, 100)) : ''),
+            'stock_movement',
+            $movementId,
+            [
+                'product_id' => $productId,
+                'type' => $type,
+                'quantity' => $quantity,
+                'reference_type' => $referenceType,
+                'reference_id' => $referenceId,
+                'stock_after' => $stockAfter,
+            ]
+        );
     }
 
     public function updateMovementDate(int $movementId, string $movementDate): bool
@@ -360,7 +443,10 @@ class StockService
         if (!$product) {
             throw new \RuntimeException('Producto no encontrado');
         }
-        if (($product['status'] ?? '') !== 'active') {
+
+        // NC de compra: puede operar aunque el producto esté inactivo (ya no se vende).
+        $forceDocOut = in_array($referenceType, ['purchase_credit_note'], true);
+        if (($product['status'] ?? '') !== 'active' && !$forceDocOut) {
             throw new \RuntimeException('Producto inactivo: ' . ($product['name'] ?? ('#' . $productId)));
         }
 
@@ -389,38 +475,55 @@ class StockService
         $allowOversell = false;
         $oversellReason = '';
         $oversellNote = '';
+        $skipDebt = !empty($oversell['skip_debt']);
 
         if ($shortfall > 0) {
-            try {
-                $parsed = StockOversell::parse(
-                    $oversell['reason'] ?? null,
-                    $oversell['note'] ?? null
-                );
-            } catch (\InvalidArgumentException $e) {
-                throw new \RuntimeException($e->getMessage());
+            // Nota crédito compra: la mercancía debe salir del inventario aunque
+            // ya se haya vendido (queda negativo / trazabilidad). No es sobreventa.
+            if ($forceDocOut) {
+                $allowOversell = true;
+                $skipDebt = true;
+                $extra = ' · Sin stock en bodega al acreditar (disp. ' . $available . ')';
+                $notes = $notes !== '' ? ($notes . $extra) : ('Salida NC compra' . $extra);
+            } else {
+                try {
+                    $parsed = StockOversell::parse(
+                        $oversell['reason'] ?? null,
+                        $oversell['note'] ?? null
+                    );
+                } catch (\InvalidArgumentException $e) {
+                    throw new \RuntimeException($e->getMessage());
+                }
+                if ($parsed === null) {
+                    throw new \RuntimeException(
+                        'Stock insuficiente para: ' . ($product['name'] ?? ('#' . $productId))
+                        . ' (disponible: ' . $available . ', solicitado: ' . $quantity . '). '
+                        . 'Indique el motivo para vender sin stock.'
+                    );
+                }
+                $allowOversell = true;
+                $oversellReason = $parsed['reason'];
+                $oversellNote = $parsed['note'];
+                $reasonLabel = StockOversell::label($oversellReason);
+                $extra = ' · Sin stock (' . $reasonLabel . ')'
+                    . ($oversellNote !== '' ? (': ' . $oversellNote) : '');
+                $notes = $notes !== '' ? ($notes . $extra) : ('Salida sin stock' . $extra);
             }
-            if ($parsed === null) {
-                throw new \RuntimeException(
-                    'Stock insuficiente para: ' . ($product['name'] ?? ('#' . $productId))
-                    . ' (disponible: ' . $available . ', solicitado: ' . $quantity . '). '
-                    . 'Indique el motivo para vender sin stock.'
-                );
-            }
-            $allowOversell = true;
-            $oversellReason = $parsed['reason'];
-            $oversellNote = $parsed['note'];
-            $reasonLabel = StockOversell::label($oversellReason);
-            $extra = ' · Sin stock (' . $reasonLabel . ')'
-                . ($oversellNote !== '' ? (': ' . $oversellNote) : '');
-            $notes = $notes !== '' ? ($notes . $extra) : ('Salida sin stock' . $extra);
         }
 
-        if ($allowOversell) {
-            $stmt = $this->query(
-                "UPDATE products SET stock = stock - ?, last_sale_date = NOW()
-                 WHERE id = ? AND status = 'active'",
-                [$quantity, $productId]
-            );
+        if ($allowOversell || $forceDocOut) {
+            if ($forceDocOut) {
+                $stmt = $this->query(
+                    "UPDATE products SET stock = stock - ? WHERE id = ?",
+                    [$quantity, $productId]
+                );
+            } else {
+                $stmt = $this->query(
+                    "UPDATE products SET stock = stock - ?, last_sale_date = NOW()
+                     WHERE id = ? AND status = 'active'",
+                    [$quantity, $productId]
+                );
+            }
         } else {
             $stmt = $this->query(
                 "UPDATE products SET stock = stock - ?, last_sale_date = NOW()
@@ -451,7 +554,7 @@ class StockService
             $paymentMode
         );
 
-        if ($allowOversell && $shortfall > 0 && empty($oversell['skip_debt'])) {
+        if ($allowOversell && $shortfall > 0 && !$skipDebt) {
             $this->openStockDebt(
                 $productId,
                 $shortfall,
@@ -544,8 +647,13 @@ class StockService
         $oldStock = (int)$product['stock'];
         $oldCost = round((float)($product['purchase_price'] ?? 0), 2);
 
-        // Promedio ponderado (WAC): (stock×costo_actual + qty×costo_entrada) / nuevo_stock
-        if ($updatePurchasePrice && $cost > 0) {
+        // Bonificación / ingreso a $0: no diluir el costo promedio; conservar el precio de costo.
+        if ($updatePurchasePrice && $cost <= 0.009 && $oldCost > 0.009) {
+            $cost = $oldCost;
+        }
+
+        // Promedio ponderado (WAC). Las bonificaciones ya vienen valorizadas (o se igualan al costo actual).
+        if ($updatePurchasePrice) {
             $newWac = $this->weightedAverageCost($oldStock, $oldCost, $quantity, $cost);
             $this->query(
                 "UPDATE products SET stock = stock + ?, purchase_price = ? WHERE id = ?",
@@ -583,8 +691,10 @@ class StockService
             $referenceId
         );
 
-        // Devoluciones de venta cancelada / devolución de préstamo: no cubren sobreventas.
-        if ($coverSaleDebts && $referenceType !== 'return' && $referenceType !== 'loan_return') {
+        // Devoluciones / préstamos recibidos: no cubren sobreventas de venta.
+        if ($coverSaleDebts && $referenceType !== 'return' && $referenceType !== 'loan_return'
+            && $referenceType !== 'loan_received'
+            && $referenceType !== 'sale_credit_note') {
             $debtCoverOut = $this->coverOpenDebts($productId, $quantity);
             if (($debtCoverOut['covered'] ?? 0) > 0) {
                 $coverNote = $this->formatDebtCoverNote($debtCoverOut);
@@ -624,7 +734,7 @@ class StockService
             return;
         }
         $source = strtolower(trim($source));
-        if (!in_array($source, ['sale', 'loan'], true)) {
+        if (!in_array($source, ['sale', 'loan', ProductLoan::SOURCE_RECEIVED], true)) {
             $source = 'sale';
         }
         try {
@@ -646,9 +756,8 @@ class StockService
                 ]
             );
         } catch (\Throwable $e) {
-            // Préstamos NO pueden caer al fallback sin `source`: quedarían como venta y se
-            // cubrirían al comprar / desaparecerían del módulo Préstamos.
-            if ($source === ProductLoan::SOURCE) {
+            // Préstamos (salida o recibidos) NO pueden caer al fallback sin `source`.
+            if ($source === ProductLoan::SOURCE || $source === ProductLoan::SOURCE_RECEIVED) {
                 throw new \RuntimeException(
                     'No se pudo registrar la deuda del préstamo. Actualice el esquema de inventario e intente de nuevo.',
                     0,
@@ -730,12 +839,15 @@ class StockService
             $newRemaining = $owed - $take;
             $status = $newRemaining <= 0 ? 'closed' : 'partial';
             try {
-                $this->query(
+                $upd = $this->query(
                     "UPDATE product_stock_debts
                      SET qty_remaining = ?, status = ?, updated_at = NOW()
-                     WHERE id = ?",
-                    [$newRemaining, $status, (int)$debt['id']]
+                     WHERE id = ? AND qty_remaining = ? AND status IN ('open','partial')",
+                    [$newRemaining, $status, (int)$debt['id'], $owed]
                 );
+                if ($upd->rowCount() < 1) {
+                    continue;
+                }
             } catch (\Throwable $e) {
                 continue;
             }
@@ -746,7 +858,7 @@ class StockService
                 'sale_id' => $debt['sale_id'] ? (int)$debt['sale_id'] : null,
                 'invoice_number' => (string)($debt['invoice_number'] ?? ''),
                 'reason' => (string)$debt['reason'],
-                'reason_label' => ProductLoan::label((string)$debt['reason']),
+                'reason_label' => ProductLoan::label((string)$debt['reason'], $this->db),
                 'note' => (string)($debt['note'] ?? ''),
                 'covered' => $take,
                 'remaining' => $newRemaining,
@@ -825,9 +937,16 @@ class StockService
         if ($quantity <= 0) {
             throw new \InvalidArgumentException('La cantidad del préstamo debe ser mayor a 0');
         }
-        $parsed = ProductLoan::parse($reason, $note, $borrower);
+        ProductLoan::syncCatalog($this->db);
+        $parsed = ProductLoan::parse($reason, $note, $borrower, $this->db);
+        try {
+            new ConsignmentService($this->db);
+        } catch (\Throwable $e) {
+            // ignore
+        }
         $product = $this->query(
-            "SELECT id, name, stock, product_type, status FROM products WHERE id = ?",
+            "SELECT id, name, stock, product_type, status, COALESCE(ownership,'owned') AS ownership
+             FROM products WHERE id = ?",
             [$productId]
         )->fetch();
         if (!$product) {
@@ -839,10 +958,19 @@ class StockService
         if (($product['status'] ?? '') !== 'active') {
             throw new \RuntimeException('Producto inactivo');
         }
+        $own = (string)($product['ownership'] ?? 'owned');
+        if ($own === ConsignmentService::OWNERSHIP_CONSIGNMENT) {
+            throw new \RuntimeException('Ese producto es de consignación. Use el módulo Consignación.');
+        }
+        if ($own === ConsignmentService::OWNERSHIP_BORROWED) {
+            throw new \RuntimeException(
+                'Ese producto está marcado como Prestado (nos lo prestaron). Para devolverlo use «Préstamos recibidos».'
+            );
+        }
 
         $available = (int)$product['stock'];
         $shortfall = max(0, $quantity - max(0, $available));
-        $label = ProductLoan::label($parsed['reason']);
+        $label = ProductLoan::label($parsed['reason'], $this->db);
         $who = $parsed['borrower'] !== '' ? $parsed['borrower'] : '—';
         $notes = 'Préstamo: ' . $label
             . ' · A: ' . $who
@@ -892,6 +1020,12 @@ class StockService
             if ($debtId <= 0) {
                 throw new \RuntimeException('No se pudo obtener el ID de la deuda del préstamo');
             }
+            if ($movementId > 0) {
+                $this->query(
+                    "UPDATE stock_movements SET reference_id = ? WHERE id = ? AND reference_id IS NULL",
+                    [$debtId, $movementId]
+                );
+            }
 
             $stockAfter = (int)$this->query(
                 "SELECT stock FROM products WHERE id = ?",
@@ -917,19 +1051,30 @@ class StockService
 
     /**
      * Devuelve unidades de un préstamo abierto (reposición manual).
-     * Si $returnProductId es otro producto, el stock entra a ese ítem y se cierra
-     * el préstamo del original (sustitución).
+     * - Mismo producto: $returnLines vacío / null y sin $returnProductId.
+     * - Sustitución simple: $returnProductId distinto al prestado.
+     * - Sustitución múltiple: $returnLines = [{product_id, quantity}, ...] cuya suma = $quantity.
      *
-     * @return array{returned:int,stock_after:int,remaining:int,movement_id:int,return_product_id:int,substituted:bool}
+     * @param list<array{product_id?:int,quantity?:int}>|null $returnLines
+     * @return array{
+     *   returned:int,stock_before:int,stock_after:int,remaining:int,movement_id:int,
+     *   return_product_id:int,original_product_id:int,substituted:bool,
+     *   lines:list<array{product_id:int,quantity:int,stock_after:int,label:string}>
+     * }
      */
-    public function returnLoan(int $debtId, int $quantity, ?int $returnProductId = null): array
-    {
+    public function returnLoan(
+        int $debtId,
+        int $quantity,
+        ?int $returnProductId = null,
+        ?array $returnLines = null
+    ): array {
         if ($debtId <= 0 || $quantity <= 0) {
             throw new \InvalidArgumentException('Cantidad de devolución inválida');
         }
 
         // Calentar lotes/esquema ANTES de la TX (DDL hace COMMIT implícito en MySQL).
         $this->lots();
+        $this->ensureSchema();
 
         $ownTx = !$this->db->inTransaction();
         if ($ownTx) {
@@ -958,53 +1103,195 @@ class StockService
             }
 
             $originalProductId = (int)$debt['product_id'];
-            $stockProductId = $originalProductId;
-            $substituted = false;
-            $alt = null;
-
-            if ($returnProductId !== null && $returnProductId > 0 && $returnProductId !== $originalProductId) {
-                $alt = $this->query(
-                    "SELECT id, name, code, product_type, status FROM products WHERE id = ? LIMIT 1",
-                    [$returnProductId]
-                )->fetch();
-                if (!$alt || ($alt['status'] ?? '') !== 'active') {
-                    throw new \RuntimeException('El producto de devolución no existe o está inactivo');
-                }
-                if (($alt['product_type'] ?? 'product') === 'service') {
-                    throw new \RuntimeException('No puede devolver un servicio como reposición de préstamo');
-                }
-                $stockProductId = (int)$alt['id'];
-                $substituted = true;
-            }
-
             $owed = (int)$debt['qty_remaining'];
             $take = min($quantity, $owed);
-            $newRemaining = $owed - $take;
-            $status = $newRemaining <= 0 ? 'closed' : 'partial';
+            if ($take <= 0) {
+                throw new \RuntimeException('Este préstamo ya está cerrado');
+            }
+
+            // Normalizar líneas de ingreso de stock (mismo o sustitutos).
+            $qtyByProduct = [];
+            if (is_array($returnLines) && $returnLines !== []) {
+                foreach ($returnLines as $line) {
+                    if (!is_array($line)) {
+                        continue;
+                    }
+                    $pid = (int)($line['product_id'] ?? 0);
+                    $q = (int)($line['quantity'] ?? 0);
+                    if ($pid <= 0 || $q <= 0) {
+                        continue;
+                    }
+                    $qtyByProduct[$pid] = ($qtyByProduct[$pid] ?? 0) + $q;
+                }
+            } elseif ($returnProductId !== null && $returnProductId > 0) {
+                $qtyByProduct[(int)$returnProductId] = $take;
+            } else {
+                $qtyByProduct[$originalProductId] = $take;
+            }
+
+            if ($qtyByProduct === []) {
+                throw new \InvalidArgumentException('Indique al menos un producto a devolver');
+            }
+
+            $linesSum = array_sum($qtyByProduct);
+            if ($linesSum !== $take) {
+                throw new \InvalidArgumentException(
+                    'La suma de cantidades (' . $linesSum . ') debe ser exactamente '
+                    . $take . ' (unidades a cerrar del préstamo).'
+                );
+            }
+
+            $substituted = false;
+            foreach (array_keys($qtyByProduct) as $pid) {
+                if ((int)$pid !== $originalProductId) {
+                    $substituted = true;
+                    break;
+                }
+            }
 
             $orig = $this->query(
                 "SELECT name, code FROM products WHERE id = ?",
                 [$originalProductId]
             )->fetch() ?: [];
-            $label = ProductLoan::label((string)$debt['reason']);
-            $notes = 'Devolución préstamo: ' . $label
+            $origLabel = trim(
+                (string)(($orig['code'] ?? '') !== '' ? (($orig['code'] ?? '') . ' · ') : '')
+                . ($orig['name'] ?? ('#' . $originalProductId))
+            );
+            $label = ProductLoan::label((string)$debt['reason'], $this->db);
+            $baseNotes = 'Devolución préstamo: ' . $label
                 . (!empty($debt['borrower']) ? (' · ' . $debt['borrower']) : '')
                 . (!empty($debt['note']) ? (' — ' . $debt['note']) : '');
-            if ($substituted && is_array($alt)) {
-                $origLabel = trim((string)(($orig['code'] ?? '') !== '' ? ($orig['code'] . ' · ') : '') . ($orig['name'] ?? ('#' . $originalProductId)));
-                $altLabel = trim((string)(($alt['code'] ?? '') !== '' ? ($alt['code'] . ' · ') : '') . ($alt['name'] ?? ('#' . $stockProductId)));
-                $notes .= ' · Sustitución: prestó ' . $origLabel . ' / devolvió ' . $altLabel;
+
+            $lineResults = [];
+            $movementId = 0;
+            $firstAltId = 0;
+            $altLabels = [];
+
+            foreach ($qtyByProduct as $pid => $lineQty) {
+                $pid = (int)$pid;
+                $lineQty = (int)$lineQty;
+                $prod = $this->query(
+                    "SELECT id, name, code, product_type, status, COALESCE(ownership,'owned') AS ownership
+                     FROM products WHERE id = ? LIMIT 1",
+                    [$pid]
+                )->fetch();
+                if (!$prod || ($prod['status'] ?? '') !== 'active') {
+                    throw new \RuntimeException('El producto de devolución no existe o está inactivo (#' . $pid . ')');
+                }
+                if (($prod['product_type'] ?? 'product') === 'service') {
+                    throw new \RuntimeException('No puede devolver un servicio como reposición de préstamo');
+                }
+                $own = (string)($prod['ownership'] ?? 'owned');
+                if ($own === ConsignmentService::OWNERSHIP_CONSIGNMENT) {
+                    throw new \RuntimeException(
+                        'No use un producto de consignación como devolución de préstamo.'
+                    );
+                }
+
+                try {
+                    $stockBefore = (int)$this->query(
+                        "SELECT stock FROM products WHERE id = ? LIMIT 1 FOR UPDATE",
+                        [$pid]
+                    )->fetchColumn();
+                } catch (\Throwable $e) {
+                    $stockBefore = (int)$this->query(
+                        "SELECT stock FROM products WHERE id = ? LIMIT 1",
+                        [$pid]
+                    )->fetchColumn();
+                }
+
+                $prodLabel = trim(
+                    (string)(($prod['code'] ?? '') !== '' ? (($prod['code'] ?? '') . ' · ') : '')
+                    . ($prod['name'] ?? ('#' . $pid))
+                );
+                $notes = $baseNotes
+                    . ' · stock ' . $stockBefore . '→' . ($stockBefore + $lineQty)
+                    . ' · +' . $lineQty . ' uds';
+                if ($pid !== $originalProductId) {
+                    $notes .= ' · Sustitución: prestó ' . $origLabel . ' / devolvió ' . $prodLabel;
+                    $altLabels[] = $prodLabel . '×' . $lineQty;
+                    if ($firstAltId <= 0) {
+                        $firstAltId = $pid;
+                    }
+                } else {
+                    $altLabels[] = $prodLabel . '×' . $lineQty . ' (mismo)';
+                }
+
+                $movId = $this->increase(
+                    $pid,
+                    $lineQty,
+                    'loan_return',
+                    $debtId,
+                    $notes,
+                    'in'
+                );
+                if ($movementId <= 0) {
+                    $movementId = $movId;
+                }
+
+                $stockAfterLine = (int)$this->query(
+                    "SELECT stock FROM products WHERE id = ?",
+                    [$pid]
+                )->fetchColumn();
+                if ($stockAfterLine !== ($stockBefore + $lineQty)) {
+                    throw new \RuntimeException(
+                        'La devolución no actualizó el inventario de ' . $prodLabel
+                        . ' (esperaba ' . ($stockBefore + $lineQty) . ', quedó ' . $stockAfterLine . ').'
+                    );
+                }
+
+                $lineResults[] = [
+                    'product_id' => $pid,
+                    'quantity' => $lineQty,
+                    'stock_after' => $stockAfterLine,
+                    'label' => $prodLabel,
+                ];
             }
 
-            $movementId = $this->increase(
-                $stockProductId,
-                $take,
-                'loan_return',
-                $debtId,
-                $notes,
-                'in'
-            );
+            if ($substituted && $firstAltId > 0) {
+                try {
+                    $this->query(
+                        "UPDATE product_stock_debts
+                         SET return_product_id = ?, updated_at = NOW()
+                         WHERE id = ?",
+                        [$firstAltId, $debtId]
+                    );
+                } catch (\Throwable $e) {
+                    // Columna aún no migrada
+                }
 
+                $swapNote = ' · Cambio: devolvió ' . implode(', ', $altLabels)
+                    . ' (entrada en esos SKU, no repone el stock prestado)';
+                $loanMovId = (int)($debt['movement_id'] ?? 0);
+                try {
+                    if ($loanMovId > 0) {
+                        $this->query(
+                            "UPDATE stock_movements
+                             SET notes = CONCAT(IFNULL(notes,''), ?)
+                             WHERE id = ?
+                               AND product_id = ?
+                               AND reference_type = 'loan'
+                               AND IFNULL(notes,'') NOT LIKE ?",
+                            [$swapNote, $loanMovId, $originalProductId, '%' . mb_substr($swapNote, 0, 40) . '%']
+                        );
+                    } else {
+                        $this->query(
+                            "UPDATE stock_movements
+                             SET notes = CONCAT(IFNULL(notes,''), ?)
+                             WHERE reference_type = 'loan'
+                               AND reference_id = ?
+                               AND product_id = ?
+                               AND IFNULL(notes,'') NOT LIKE ?",
+                            [$swapNote, $debtId, $originalProductId, '%' . mb_substr($swapNote, 0, 40) . '%']
+                        );
+                    }
+                } catch (\Throwable $e) {
+                    // No bloquear
+                }
+            }
+
+            $newRemaining = $owed - $take;
+            $status = $newRemaining <= 0 ? 'closed' : 'partial';
             $upd = $this->query(
                 "UPDATE product_stock_debts
                  SET qty_remaining = ?, status = ?, updated_at = NOW()
@@ -1015,10 +1302,21 @@ class StockService
                 throw new \RuntimeException('El préstamo cambió mientras se registraba la devolución. Intente de nuevo.');
             }
 
-            $stockAfter = (int)$this->query(
+            $primaryPid = $substituted && $firstAltId > 0
+                ? $firstAltId
+                : $originalProductId;
+            $stockBeforePrimary = 0;
+            $stockAfterPrimary = (int)$this->query(
                 "SELECT stock FROM products WHERE id = ?",
-                [$stockProductId]
+                [$primaryPid]
             )->fetchColumn();
+            foreach ($lineResults as $lr) {
+                if ((int)$lr['product_id'] === $primaryPid) {
+                    $stockAfterPrimary = (int)$lr['stock_after'];
+                    $stockBeforePrimary = $stockAfterPrimary - (int)$lr['quantity'];
+                    break;
+                }
+            }
 
             if ($ownTx && $this->db->inTransaction()) {
                 $this->db->commit();
@@ -1026,18 +1324,43 @@ class StockService
 
             return [
                 'returned' => $take,
-                'stock_after' => $stockAfter,
+                'stock_before' => $stockBeforePrimary,
+                'stock_after' => $stockAfterPrimary,
                 'remaining' => $newRemaining,
                 'movement_id' => $movementId,
-                'return_product_id' => $stockProductId,
+                'return_product_id' => $primaryPid,
                 'original_product_id' => $originalProductId,
                 'substituted' => $substituted,
+                'lines' => $lineResults,
             ];
         } catch (\Throwable $e) {
             if ($ownTx && $this->db->inTransaction()) {
                 $this->db->rollBack();
             }
             throw $e;
+        }
+    }
+
+    /**
+     * Unidades pendientes de préstamos recibidos (nos prestaron) por producto.
+     */
+    public function openReceivedLoanQty(int $productId): int
+    {
+        if ($productId <= 0) {
+            return 0;
+        }
+        try {
+            return (int)$this->query(
+                "SELECT COALESCE(SUM(qty_remaining), 0)
+                 FROM product_stock_debts
+                 WHERE product_id = ?
+                   AND status IN ('open','partial')
+                   AND qty_remaining > 0
+                   AND COALESCE(source, '') = ?",
+                [$productId, ProductLoan::SOURCE_RECEIVED]
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            return 0;
         }
     }
 
@@ -1050,16 +1373,20 @@ class StockService
     {
         return [
             'garantia' => 'Garantía',
-            'roto' => 'Producto roto',
-            'devolucion' => 'Devolución',
+            'roto' => 'Producto roto / dañado',
+            'merma' => 'Merma / deterioro',
+            'perdida' => 'Pérdida / extravío',
+            'robo' => 'Robo / hurto',
             'vencimiento' => 'Vencimiento',
+            'devolucion' => 'Devolución (sin nota de crédito)',
+            'otro' => 'Otro (detalle en observación)',
         ];
     }
 
     /**
      * Salida de inventario por pérdida operativa (gasto a inventory_loss_account).
      *
-     * @return array{movement_id:int,stock_after:int,reason:string}
+     * @return array{movement_id:int,stock_after:int,reason:string,unit_cost:float,total_cost:float}
      */
     public function registerInventoryExit(
         int $productId,
@@ -1073,14 +1400,37 @@ class StockService
         if (!isset($reasons[$reasonKey])) {
             throw new \InvalidArgumentException('Motivo de salida inválido');
         }
+        $note = trim($note);
+        if (mb_strlen($note) < 5) {
+            throw new \InvalidArgumentException(
+                'Indique una observación/justificación (mín. 5 caracteres) de por qué sale el inventario.'
+            );
+        }
         if ($productId <= 0 || $quantity <= 0) {
             throw new \InvalidArgumentException('Producto o cantidad inválidos');
         }
 
+        $product = $this->query(
+            "SELECT id, name, purchase_price, sale_price, stock, status, product_type
+             FROM products WHERE id = ?",
+            [$productId]
+        )->fetch();
+        if (!$product) {
+            throw new \InvalidArgumentException('Producto no encontrado');
+        }
+        if (($product['product_type'] ?? 'product') === 'service') {
+            throw new \InvalidArgumentException('No aplica salida de inventario a un servicio');
+        }
+
+        $unitCost = round((float)($product['purchase_price'] ?? 0), 2);
+        if ($unitCost <= 0) {
+            // Sin costo de compra: valorar a precio de venta para no omitir el asiento de pérdida.
+            $unitCost = round((float)($product['sale_price'] ?? 0), 2);
+        }
+
         $label = $reasons[$reasonKey];
-        $note = trim($note);
         $notes = 'Salida inventario: ' . $label
-            . ($note !== '' ? (' — ' . $note) : '');
+            . ' · Justificación: ' . $note;
 
         // Calentar esquema de lotes fuera de TX
         $this->lots();
@@ -1100,7 +1450,7 @@ class StockService
                 'inventory_exit',
                 null,
                 $notes,
-                null,
+                $unitCost,
                 null,
                 'loss'
             );
@@ -1126,6 +1476,8 @@ class StockService
                 'movement_id' => $movementId,
                 'stock_after' => $stockAfter,
                 'reason' => $reasonKey,
+                'unit_cost' => $unitCost,
+                'total_cost' => round($unitCost * $quantity, 2),
             ];
         } catch (\Throwable $e) {
             if ($ownTx && $this->db->inTransaction()) {
@@ -1133,6 +1485,423 @@ class StockService
             }
             throw $e;
         }
+    }
+
+    /**
+     * Entrada de mercancía que nos prestan (no consignación).
+     * Producto queda ownership=borrowed; deuda source=loan_received hasta devolver.
+     *
+     * @return array{movement_id:int,debt_id:int,product_id:int,stock_after:int,created_product:bool}
+     */
+    public function registerLoanReceived(
+        int $quantity,
+        string $reason,
+        string $note,
+        string $lender,
+        ?int $productId = null,
+        ?string $newName = null,
+        ?string $newCode = null,
+        ?string $newBarcode = null,
+        ?float $unitCost = null
+    ): array {
+        if ($quantity <= 0) {
+            throw new \InvalidArgumentException('La cantidad debe ser mayor a 0');
+        }
+        $parsed = ProductLoan::parseReceived($reason, $note, $lender, $this->db);
+        $unitCost = round(max(0, (float)($unitCost ?? 0)), 2);
+        $created = false;
+
+        try {
+            new ConsignmentService($this->db);
+        } catch (\Throwable $e) {
+            // ignore
+        }
+        $this->lots();
+
+        $ownTx = !$this->db->inTransaction();
+        if ($ownTx) {
+            $this->db->beginTransaction();
+        }
+        try {
+            if ($productId !== null && $productId > 0) {
+                $product = $this->query(
+                    "SELECT id, name, code, ownership, product_type, status FROM products WHERE id = ? LIMIT 1",
+                    [$productId]
+                )->fetch();
+                if (!$product) {
+                    throw new \RuntimeException('Producto no encontrado');
+                }
+                if (($product['product_type'] ?? 'product') === 'service') {
+                    throw new \RuntimeException('No aplica a servicios');
+                }
+                $own = (string)($product['ownership'] ?? 'owned');
+                if ($own === ConsignmentService::OWNERSHIP_CONSIGNMENT) {
+                    throw new \RuntimeException('Ese producto es de consignación. Use el módulo Consignación.');
+                }
+                if ($own !== ConsignmentService::OWNERSHIP_BORROWED) {
+                    $this->query(
+                        "UPDATE products SET ownership = ? WHERE id = ?",
+                        [ConsignmentService::OWNERSHIP_BORROWED, $productId]
+                    );
+                }
+                if (($product['status'] ?? '') !== 'active') {
+                    $this->query(
+                        "UPDATE products SET status = 'active', deleted_at = NULL WHERE id = ?",
+                        [$productId]
+                    );
+                }
+            } else {
+                $name = trim((string)$newName);
+                if ($name === '') {
+                    throw new \InvalidArgumentException('Indique el nombre del producto prestado');
+                }
+                $code = trim((string)($newCode ?? ''));
+                if ($code === '') {
+                    try {
+                        $code = (string)((new SkuSequenceService($this->db))->allocateNext()['sku'] ?? '');
+                    } catch (\Throwable $e) {
+                        $code = 'PREST-' . strtoupper(substr(bin2hex(random_bytes(3)), 0, 6));
+                    }
+                }
+                $barcode = trim((string)($newBarcode ?? ''));
+                $this->query(
+                    "INSERT INTO products
+                        (code, barcode, name, product_type, ownership, purchase_price, sale_price,
+                         stock, min_stock, unit, status, track_lots, created_by)
+                     VALUES (?, ?, ?, 'product', ?, ?, 0, 0, 0, 'UND', 'active', 0, ?)",
+                    [
+                        $code,
+                        $barcode !== '' ? $barcode : null,
+                        $name,
+                        ConsignmentService::OWNERSHIP_BORROWED,
+                        $unitCost,
+                        $_SESSION['tenant_user_id'] ?? null,
+                    ]
+                );
+                $productId = (int)$this->db->lastInsertId();
+                $created = true;
+            }
+
+            $reasonLabel = ProductLoan::receivedLabel($parsed['reason'], $this->db);
+            $notes = 'Préstamo recibido: ' . $reasonLabel
+                . ' · De: ' . $parsed['lender']
+                . ($parsed['note'] !== '' ? (' — ' . $parsed['note']) : '')
+                . ' · Pendiente devolver';
+
+            $debtCover = null;
+            $movementId = $this->increase(
+                $productId,
+                $quantity,
+                'loan_received',
+                null,
+                $notes,
+                'in',
+                $unitCost > 0 ? $unitCost : null,
+                null,
+                null,
+                false,
+                null,
+                null,
+                $debtCover,
+                false
+            );
+
+            $this->openStockDebt(
+                $productId,
+                $quantity,
+                $parsed['reason'],
+                $parsed['note'] !== '' ? $parsed['note'] : ('Prestamista: ' . $parsed['lender']),
+                null,
+                null,
+                ProductLoan::SOURCE_RECEIVED,
+                $movementId > 0 ? $movementId : null,
+                $parsed['lender']
+            );
+            $debtId = (int)$this->db->lastInsertId();
+            if ($debtId <= 0) {
+                throw new \RuntimeException('No se pudo registrar el préstamo recibido');
+            }
+            if ($movementId > 0) {
+                $this->query(
+                    "UPDATE stock_movements SET reference_id = ? WHERE id = ? AND reference_id IS NULL",
+                    [$debtId, $movementId]
+                );
+            }
+
+            $stockAfter = (int)$this->query("SELECT stock FROM products WHERE id = ?", [$productId])->fetchColumn();
+
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->commit();
+            }
+
+            return [
+                'movement_id' => $movementId,
+                'debt_id' => $debtId,
+                'product_id' => $productId,
+                'stock_after' => $stockAfter,
+                'created_product' => $created,
+            ];
+        } catch (\Throwable $e) {
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * Devolvemos mercancía que nos habían prestado (sale del inventario borrowed).
+     * Si ya se vendió/usó y no hay stock físico, con $allowSettleWithoutStock se cierra la deuda
+     * sin exigir unidades en inventario (trazabilidad de liquidación).
+     *
+     * @return array{returned:int,stock_after:int,remaining:int,movement_id:int,settled_without_stock:int,physical_out:int}
+     */
+    public function returnLoanReceived(
+        int $debtId,
+        int $quantity,
+        bool $allowSettleWithoutStock = false
+    ): array {
+        if ($debtId <= 0 || $quantity <= 0) {
+            throw new \InvalidArgumentException('Cantidad de devolución inválida');
+        }
+        $this->lots();
+        $ownTx = !$this->db->inTransaction();
+        if ($ownTx) {
+            $this->db->beginTransaction();
+        }
+        try {
+            try {
+                $debt = $this->query(
+                    "SELECT * FROM product_stock_debts WHERE id = ? LIMIT 1 FOR UPDATE",
+                    [$debtId]
+                )->fetch();
+            } catch (\Throwable $e) {
+                $debt = $this->query(
+                    "SELECT * FROM product_stock_debts WHERE id = ? LIMIT 1",
+                    [$debtId]
+                )->fetch();
+            }
+            if (!$debt) {
+                throw new \RuntimeException('Préstamo recibido no encontrado');
+            }
+            if (strtolower((string)($debt['source'] ?? '')) !== ProductLoan::SOURCE_RECEIVED) {
+                throw new \RuntimeException('El registro no es un préstamo recibido');
+            }
+            if (!in_array((string)$debt['status'], ['open', 'partial'], true) || (int)$debt['qty_remaining'] <= 0) {
+                throw new \RuntimeException('Este préstamo recibido ya está cerrado');
+            }
+
+            $productId = (int)$debt['product_id'];
+            $owed = (int)$debt['qty_remaining'];
+            $take = min($quantity, $owed);
+            $newRemaining = $owed - $take;
+            $status = $newRemaining <= 0 ? 'closed' : 'partial';
+
+            // Candado de fila de producto: evita leer stock obsoleto frente a compras concurrentes.
+            try {
+                $stockNow = (int)$this->query(
+                    "SELECT stock FROM products WHERE id = ? LIMIT 1 FOR UPDATE",
+                    [$productId]
+                )->fetchColumn();
+            } catch (\Throwable $e) {
+                $stockNow = (int)$this->query(
+                    "SELECT stock FROM products WHERE id = ? LIMIT 1",
+                    [$productId]
+                )->fetchColumn();
+            }
+            $stockBefore = $stockNow;
+            $physicalOut = min(max(0, $stockNow), $take);
+            $settleQty = $take - $physicalOut;
+
+            if ($settleQty > 0 && !$allowSettleWithoutStock) {
+                throw new \RuntimeException(
+                    'Stock insuficiente para devolver (' . $stockNow . ' disponible, necesita ' . $take . '). '
+                    . 'Si ya vendió o usó lo prestado, marque «Cerrar sin devolución física» en el formulario. '
+                    . 'Si aún tiene el producto, no debería estar en 0: revise el inventario.'
+                );
+            }
+
+            $lender = trim((string)($debt['borrower'] ?? ''));
+            $label = ProductLoan::receivedLabel((string)$debt['reason'], $this->db);
+            $baseNotes = 'Devolución de préstamo recibido: ' . $label
+                . ($lender !== '' ? (' · A: ' . $lender) : '')
+                . (!empty($debt['note']) ? (' — ' . $debt['note']) : '');
+
+            $movementId = 0;
+            if ($physicalOut > 0) {
+                $physNotes = $baseNotes
+                    . ' · Salida física: ' . $physicalOut . ' uds'
+                    . ' · stock ' . $stockBefore . '→' . ($stockBefore - $physicalOut);
+                // Sin payment_mode loss: no capitaliza ni registra pérdida (off-balance).
+                $movementId = $this->decrease(
+                    $productId,
+                    $physicalOut,
+                    'loan_received_return',
+                    $debtId,
+                    $physNotes,
+                    null,
+                    null,
+                    null
+                );
+            }
+            if ($settleQty > 0) {
+                $settleNotes = $baseNotes
+                    . ' · Liquidación sin stock físico: ' . $settleQty
+                    . ' uds (ya vendidas/usadas); se cierra la deuda con el prestamista';
+                $stockForSettle = (int)$this->query(
+                    "SELECT stock FROM products WHERE id = ? LIMIT 1",
+                    [$productId]
+                )->fetchColumn();
+                $settleId = $this->addMovement(
+                    $productId,
+                    'adjustment',
+                    $settleQty,
+                    'loan_received_settle',
+                    $debtId,
+                    $settleNotes,
+                    null,
+                    0.0,
+                    $stockForSettle
+                );
+                if ($movementId <= 0) {
+                    $movementId = $settleId;
+                }
+            }
+
+            $upd = $this->query(
+                "UPDATE product_stock_debts
+                 SET qty_remaining = ?, status = ?, updated_at = NOW()
+                 WHERE id = ? AND qty_remaining = ? AND status IN ('open','partial')",
+                [$newRemaining, $status, $debtId, $owed]
+            );
+            if ($upd->rowCount() !== 1) {
+                throw new \RuntimeException('Conflicto al actualizar el préstamo recibido; reintente');
+            }
+
+            // Si ya no queda deuda recibida abierta, quitar marca Prestado.
+            if ($newRemaining <= 0) {
+                try {
+                    $stillOpen = (int)$this->query(
+                        "SELECT COALESCE(SUM(qty_remaining),0) FROM product_stock_debts
+                         WHERE product_id = ? AND status IN ('open','partial') AND qty_remaining > 0
+                           AND COALESCE(source,'') = ?",
+                        [$productId, ProductLoan::SOURCE_RECEIVED]
+                    )->fetchColumn();
+                    if ($stillOpen <= 0) {
+                        $this->query(
+                            "UPDATE products SET ownership = 'owned'
+                             WHERE id = ? AND COALESCE(ownership,'owned') = 'borrowed'",
+                            [$productId]
+                        );
+                    }
+                } catch (\Throwable $e) {
+                    // no bloquear
+                }
+            }
+
+            $stockAfter = (int)$this->query("SELECT stock FROM products WHERE id = ?", [$productId])->fetchColumn();
+
+            // Defensa: si se pidió salida física, el stock DEBE haber bajado.
+            if ($physicalOut > 0 && $stockAfter !== ($stockBefore - $physicalOut)) {
+                throw new \RuntimeException(
+                    'La devolución no actualizó el inventario correctamente '
+                    . '(esperaba ' . ($stockBefore - $physicalOut) . ', quedó ' . $stockAfter . '). Reintente.'
+                );
+            }
+
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->commit();
+            }
+
+            return [
+                'returned' => $take,
+                'stock_before' => $stockBefore,
+                'stock_after' => $stockAfter,
+                'remaining' => $newRemaining,
+                'movement_id' => $movementId,
+                'settled_without_stock' => $settleQty,
+                'physical_out' => $physicalOut,
+            ];
+        } catch (\Throwable $e) {
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * @return list<array<string,mixed>>
+     */
+    public function listOpenReceivedLoans(int $limit = 200): array
+    {
+        try {
+            $rows = $this->query(
+                "SELECT d.*, p.name AS product_name, p.code AS product_code, p.barcode AS product_barcode,
+                        p.stock AS product_stock, p.ownership
+                 FROM product_stock_debts d
+                 JOIN products p ON p.id = d.product_id
+                 WHERE COALESCE(d.source, '') = 'loan_received'
+                   AND d.status IN ('open','partial') AND d.qty_remaining > 0
+                 ORDER BY d.id DESC
+                 LIMIT " . max(1, min(500, $limit))
+            )->fetchAll();
+            $out = [];
+            foreach ($rows as $row) {
+                $enriched = $this->enrichDebtRow($row);
+                $reason = (string)($row['reason'] ?? '');
+                $enriched['reason_label'] = ProductLoan::receivedLabel($reason, $this->db);
+                $out[] = $enriched;
+            }
+            return $out;
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /**
+     * Cambio de estado active/inactive con justificación (trazabilidad sin mover cantidad).
+     */
+    public function recordProductStatusChange(
+        int $productId,
+        string $fromStatus,
+        string $toStatus,
+        string $reason
+    ): int {
+        $reason = trim($reason);
+        if ($productId <= 0) {
+            return 0;
+        }
+        if (mb_strlen($reason) < 5) {
+            throw new \InvalidArgumentException(
+                'Indique una razón (mín. 5 caracteres) para el cambio de estado del producto.'
+            );
+        }
+        $fromStatus = strtolower(trim($fromStatus));
+        $toStatus = strtolower(trim($toStatus));
+        if ($fromStatus === $toStatus) {
+            return 0;
+        }
+        $stock = (int)$this->query("SELECT stock FROM products WHERE id = ?", [$productId])->fetchColumn();
+        $labelFrom = $fromStatus === 'inactive' ? 'Inactivo' : 'Activo';
+        $labelTo = $toStatus === 'inactive' ? 'Inactivo' : 'Activo';
+        $notes = 'Cambio de estado: ' . $labelFrom . ' → ' . $labelTo
+            . ' · Justificación: ' . $reason;
+
+        return $this->addMovement(
+            $productId,
+            'adjustment',
+            0,
+            'status_change',
+            null,
+            $notes,
+            null,
+            0.0,
+            $stock,
+            null,
+            null,
+            date('Y-m-d')
+        );
     }
 
     /**
@@ -1163,6 +1932,7 @@ class StockService
      *   count:int,
      *   negative_count:int,
      *   loan_count:int,
+     *   loan_received_count:int,
      *   sale_debt_count:int,
      *   products:list<array<string,mixed>>,
      *   debts:list<array<string,mixed>>,
@@ -1176,6 +1946,7 @@ class StockService
             'count' => 0,
             'negative_count' => 0,
             'loan_count' => 0,
+            'loan_received_count' => 0,
             'sale_debt_count' => 0,
             'products' => [],
             'debts' => [],
@@ -1229,17 +2000,22 @@ class StockService
             }
         }
         $loanCount = 0;
+        $loanReceivedCount = 0;
         $saleDebtCount = 0;
         $lines = [];
         foreach ($debts as $d) {
             $src = (string)($d['source'] ?? 'sale');
             if ($src === ProductLoan::SOURCE) {
                 $loanCount++;
+            } elseif ($src === ProductLoan::SOURCE_RECEIVED) {
+                $loanReceivedCount++;
             } else {
                 $saleDebtCount++;
             }
             $stock = (int)($d['product_stock'] ?? 0);
-            $line = trim((string)($d['product_code'] ?? '')) !== ''
+            $tag = (string)($d['source_label'] ?? 'Pendiente');
+            $line = '[' . $tag . '] ';
+            $line .= trim((string)($d['product_code'] ?? '')) !== ''
                 ? ((string)$d['product_code'] . ' · ')
                 : '';
             $line .= (string)($d['product_name'] ?? 'Producto');
@@ -1249,7 +2025,9 @@ class StockService
             if (!empty($d['invoice_number'])) {
                 $line .= ' (' . $d['invoice_number'] . ')';
             }
-            if (!empty($d['borrower'])) {
+            if ($src === ProductLoan::SOURCE_RECEIVED && !empty($d['borrower'])) {
+                $line .= ' · Nos prestó: ' . $d['borrower'];
+            } elseif (!empty($d['borrower'])) {
                 $line .= ' · A: ' . $d['borrower'];
             }
             if (!empty($d['note'])) {
@@ -1272,7 +2050,8 @@ class StockService
             }
             if (!$hasDebt) {
                 $code = trim((string)($p['code'] ?? ''));
-                $lines[] = ($code !== '' ? $code . ' · ' : '')
+                $lines[] = '[Stock negativo] '
+                    . ($code !== '' ? $code . ' · ' : '')
                     . (string)$p['name']
                     . ' · stock ' . (int)$p['stock']
                     . ' · sin motivo registrado';
@@ -1287,6 +2066,7 @@ class StockService
             'count' => count($products),
             'negative_count' => $negativeCount,
             'loan_count' => $loanCount,
+            'loan_received_count' => $loanReceivedCount,
             'sale_debt_count' => $saleDebtCount,
             'products' => $products,
             'debts' => $debts,
@@ -1338,8 +2118,20 @@ class StockService
     private function enrichDebtRow(array $row): array
     {
         $row['source'] = strtolower((string)($row['source'] ?? 'sale')) ?: 'sale';
-        $row['reason_label'] = ProductLoan::label((string)($row['reason'] ?? ''));
-        $row['source_label'] = $row['source'] === ProductLoan::SOURCE ? 'Préstamo' : 'Venta sin stock';
+        $reason = (string)($row['reason'] ?? '');
+        if ($row['source'] === ProductLoan::SOURCE_RECEIVED) {
+            $row['reason_label'] = ProductLoan::receivedLabel($reason, $this->db);
+            $row['source_label'] = 'Nos prestaron';
+        } elseif ($row['source'] === ProductLoan::SOURCE) {
+            $row['reason_label'] = ProductLoan::label($reason, $this->db);
+            $row['source_label'] = 'Préstamo (salida)';
+        } else {
+            $row['reason_label'] = ProductLoan::label($reason, $this->db);
+            if ($row['reason_label'] === $reason || $row['reason_label'] === '') {
+                $row['reason_label'] = $reason !== '' ? $reason : 'Venta sin stock';
+            }
+            $row['source_label'] = 'Venta sin stock';
+        }
         return $row;
     }
 
@@ -1379,7 +2171,7 @@ class StockService
         }
         $parts = [];
         foreach (($cover['details'] ?? []) as $d) {
-            $label = (string)($d['reason_label'] ?? ProductLoan::label((string)($d['reason'] ?? '')));
+            $label = (string)($d['reason_label'] ?? ProductLoan::label((string)($d['reason'] ?? ''), $this->db));
             $inv = (string)($d['invoice_number'] ?? '');
             $bit = $d['covered'] . ' uds · ' . $label;
             if ($inv !== '') {
@@ -1399,13 +2191,26 @@ class StockService
     }
 
     /**
-     * Mensaje amigable para UI tras una entrada de stock.
+     * Mensaje amigable para UI tras una entrada/ajuste de stock.
      *
      * @param array{covered:int,remaining:int,details:list<array<string,mixed>>}|null $cover
      */
-    public function formatDebtCoverAlert(int $qtyIn, ?array $cover): string
-    {
-        $base = "Stock aumentado en {$qtyIn} unidades";
+    public function formatDebtCoverAlert(
+        int $qtyIn,
+        ?array $cover,
+        ?int $stockBefore = null,
+        ?int $stockAfter = null
+    ): string {
+        if ($stockBefore !== null && $stockAfter !== null) {
+            $base = "Stock: {$stockBefore} → {$stockAfter}";
+            if ($qtyIn > 0 && $stockAfter !== $stockBefore) {
+                $delta = $stockAfter - $stockBefore;
+                $sign = $delta > 0 ? '+' : '';
+                $base .= " ({$sign}{$delta} uds)";
+            }
+        } else {
+            $base = "Stock aumentado en {$qtyIn} unidades";
+        }
         if (!$cover || (int)($cover['covered'] ?? 0) <= 0) {
             return $base;
         }
@@ -1642,6 +2447,36 @@ class StockService
     }
 
     /**
+     * Fecha/hora visible en trazabilidad.
+     * movement_date es DATE (sin hora); si se usa solo, siempre sale 00:00.
+     * Se combina la fecha operativa con la hora real de created_at.
+     */
+    public static function formatMovementDisplayAt(array $m): string
+    {
+        $created = trim((string)($m['created_at'] ?? ''));
+        $mov = trim((string)($m['movement_date'] ?? ''));
+        if ($mov === '' || $mov === '0000-00-00' || str_starts_with($mov, '0000-00-00')) {
+            return $created !== '' ? date('d/m/Y H:i', strtotime($created)) : '—';
+        }
+
+        // Si movement_date ya trae hora (DATETIME legado), usarla.
+        if (preg_match('/\d{2}:\d{2}/', $mov)) {
+            return date('d/m/Y H:i', strtotime($mov));
+        }
+
+        $datePart = date('Y-m-d', strtotime($mov));
+        if ($created !== '') {
+            $createdDate = date('Y-m-d', strtotime($created));
+            if ($createdDate === $datePart) {
+                return date('d/m/Y H:i', strtotime($created));
+            }
+            return date('d/m/Y', strtotime($datePart)) . ' ' . date('H:i', strtotime($created));
+        }
+
+        return date('d/m/Y H:i', strtotime($datePart . ' 00:00:00'));
+    }
+
+    /**
      * Motivo legible y detallado para trazabilidad (columna Motivo).
      * Segmenta producto nuevo vs ajuste de producto existente.
      * Devuelve texto plano (PDF / export); para UI usar describeMovementMotiveLines().
@@ -1684,8 +2519,31 @@ class StockService
         }
 
         $lines = [];
-        if ($isNewProduct) {
+        // Préstamos primero: loan_received_settle usa type=adjustment y no debe caer en "Ajuste genérico".
+        if ($ref === 'loan') {
+            if (preg_match('/sustituci[oó]n|cambio:\s*devolvi/iu', $notes) === 1) {
+                $lines[] = 'Salida por préstamo (luego cambiado por otra referencia)';
+            } else {
+                $lines[] = 'Salida por préstamo de producto';
+            }
+        } elseif ($ref === 'loan_return') {
+            if (preg_match('/sustituci[oó]n|cambio de referencia/iu', $notes) === 1) {
+                $lines[] = 'Entrada por cambio de referencia (cierra préstamo de otro SKU)';
+            } else {
+                $lines[] = 'Entrada por devolución de préstamo';
+            }
+        } elseif ($ref === 'loan_received') {
+            $lines[] = 'Entrada por préstamo recibido (nos prestaron)';
+        } elseif ($ref === 'loan_received_return') {
+            $lines[] = 'Salida por devolución de préstamo recibido';
+        } elseif ($ref === 'loan_received_settle') {
+            $lines[] = 'Cierre de préstamo recibido sin stock (ya vendido/usado)';
+        } elseif ($isNewProduct) {
             $lines[] = 'Producto nuevo · Inventario inicial';
+        } elseif ($ref === 'status_change') {
+            $lines[] = 'Cambio de estado del producto';
+        } elseif ($ref === 'price_change') {
+            $lines[] = 'Cambio de precio (sin movimiento de cantidad)';
         } elseif (in_array($ref, ['adjustment', 'csv_import', 'csv_export'], true) || $type === 'adjustment') {
             $lines[] = 'Ajuste · Producto existente';
         } elseif ($ref === 'inventory_exit') {
@@ -1700,16 +2558,17 @@ class StockService
             $lines[] = 'Ajuste por nota de crédito de compra';
         } elseif ($ref === 'sale_credit_note') {
             $lines[] = 'Reingreso por nota de crédito de venta (devolución cliente)';
-        } elseif ($ref === 'loan') {
-            $lines[] = 'Salida por préstamo de producto';
-        } elseif ($ref === 'loan_return') {
-            $lines[] = 'Entrada por devolución de préstamo';
-        } elseif ($ref === 'price_change') {
-            $lines[] = 'Cambio de precio (sin movimiento de cantidad)';
         }
 
         $dir = $type === 'out' ? 'Salida' : ($type === 'in' ? 'Entrada' : 'Ajuste');
-        if ($qty !== 0 || $type === 'adjustment') {
+        // Settle: no cambia stock; mostrar qty liquidada sin fingir Δ de inventario.
+        if ($ref === 'loan_received_settle') {
+            $qtyLine = 'Liquidación: ' . abs($qty) . ' und. (sin cambio de stock)';
+            if ($stockAfter !== null) {
+                $qtyLine .= ' · Stock ' . $stockAfter;
+            }
+            $lines[] = $qtyLine;
+        } elseif ($qty !== 0 || $type === 'adjustment') {
             $signed = $type === 'out' ? -abs($qty) : ($type === 'in' ? abs($qty) : $qty);
             $qtyLine = $dir . ': ' . abs($qty) . ' und.';
             if ($signed !== 0) {
@@ -1734,10 +2593,10 @@ class StockService
 
         $costBits = [];
         if ($unitCost !== null && $unitCost > 0) {
-            $costBits[] = 'Costo u.: ' . number_format($unitCost, 2, '.', '');
+            $costBits[] = 'Costo u.: ' . number_format($unitCost, 2, ',', '.');
         }
         if ($totalCost !== null && $totalCost > 0 && $qty !== 0) {
-            $costBits[] = 'Total: ' . number_format($totalCost, 2, '.', '');
+            $costBits[] = 'Total: ' . number_format($totalCost, 2, ',', '.');
         }
         if ($payment !== '') {
             $payMap = ['equity' => 'capital/aporte', 'loss' => 'pérdida', 'cash' => 'caja', 'credit' => 'crédito'];
@@ -1762,6 +2621,17 @@ class StockService
         $notes = trim($notes);
         if ($notes === '') {
             return '';
+        }
+
+        // Justificación explícita (ajustes / salidas manuales).
+        // No recortar notes de préstamos: ahí "Justificación: pendiente devolver" borraba prestamista/motivo.
+        if (preg_match('/Justificaci[oó]n:\s*(.+?)(?=\s*·\s*|$)/iu', $notes, $jm)
+            && !preg_match('/^(Pr[eé]stamo|Devoluci[oó]n\s+pr[eé]stamo)/iu', $notes)
+        ) {
+            $j = trim((string)($jm[1] ?? ''));
+            if ($j !== '' && !preg_match('/^pendiente\s+devolver$/iu', $j)) {
+                return 'Justificación: ' . $j;
+            }
         }
 
         // Preferir el último "Detalle:" (el de usuario).
@@ -1838,7 +2708,8 @@ class StockService
         int $newStock,
         string $notes = 'Ajuste manual de stock',
         ?float $unitCost = null,
-        ?string $movementDate = null
+        ?string $movementDate = null,
+        ?array &$debtCoverOut = null
     ): int {
         $product = $this->query(
             "SELECT id, stock, purchase_price, product_type FROM products WHERE id = ?",
@@ -1851,6 +2722,7 @@ class StockService
         $old = (int)$product['stock'];
         $diff = $newStock - $old;
         if ($diff === 0) {
+            $debtCoverOut = ['covered' => 0, 'remaining' => 0, 'details' => []];
             return 0;
         }
 
@@ -1862,7 +2734,7 @@ class StockService
 
         $movementId = $this->addMovement(
             $productId,
-            'adjustment',
+            $diff > 0 ? 'in' : 'out',
             abs($diff),
             'adjustment',
             null,
@@ -1882,7 +2754,20 @@ class StockService
         );
 
         if ($diff > 0) {
-            $this->coverOpenDebts($productId, $diff);
+            $debtCoverOut = $this->coverOpenDebts($productId, $diff);
+            if (($debtCoverOut['covered'] ?? 0) > 0) {
+                $coverNote = $this->formatDebtCoverNote($debtCoverOut);
+                if ($coverNote !== '') {
+                    try {
+                        $this->query(
+                            "UPDATE stock_movements SET notes = CONCAT(IFNULL(notes,''), ?) WHERE id = ?",
+                            [' · ' . $coverNote, $movementId]
+                        );
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+                }
+            }
             try {
                 if ($this->lots()->tracksLots($productId)) {
                     $this->lots()->registerEntry($productId, $diff, $cost, [
@@ -1894,7 +2779,8 @@ class StockService
             } catch (\Throwable $e) {
                 error_log('Lote en adjustTo +: ' . $e->getMessage());
             }
-        } elseif ($diff < 0) {
+        } else {
+            $debtCoverOut = ['covered' => 0, 'remaining' => 0, 'details' => []];
             $this->consumeLots($productId, abs($diff), $movementId);
         }
 
@@ -1924,7 +2810,8 @@ class StockService
         }
 
         $oldStock = (int)$product['stock'];
-        $newStock = max(0, $oldStock + $delta);
+        // Permitir stock negativo (oversell/préstamos): no forzar a 0.
+        $newStock = $oldStock + $delta;
         $this->query("UPDATE products SET stock = ? WHERE id = ?", [$newStock, $productId]);
 
         $cost = (float)$result['unit_cost'] > 0
@@ -1996,7 +2883,8 @@ class StockService
         }
 
         $oldStock = (int)$product['stock'];
-        $newStock = max(0, $oldStock - $qty);
+        // Permitir stock negativo: no truncar con max(0) (corrompe kardex tras oversell).
+        $newStock = $oldStock - $qty;
         $this->query("UPDATE products SET stock = ? WHERE id = ?", [$newStock, $productId]);
 
         $cost = (float)$info['unit_cost'] > 0
@@ -2159,7 +3047,7 @@ class StockService
              JOIN products p ON p.id = sm.product_id AND COALESCE(p.product_type, 'product') = 'product'
              WHERE sm.accounting_entry_id IS NULL
                AND COALESCE(sm.total_cost, 0) > 0
-               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return')
+               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return', 'loan_received', 'loan_received_return', 'loan_received_settle', 'status_change', 'consignment_in', 'consignment_return')
                AND (
                     sm.type = 'in'
                     OR sm.type = 'out'
@@ -2179,7 +3067,7 @@ class StockService
              JOIN products p ON p.id = sm.product_id AND COALESCE(p.product_type, 'product') = 'product'
              WHERE sm.accounting_entry_id IS NULL
                AND COALESCE(sm.total_cost, 0) > 0
-               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return')
+               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return', 'loan_received', 'loan_received_return', 'loan_received_settle', 'status_change', 'consignment_in', 'consignment_return')
                AND (
                     sm.type = 'in'
                     OR sm.type = 'out'
@@ -2194,6 +3082,191 @@ class StockService
      *
      * @return array{rows:array,total:int}
      */
+    /**
+     * Clave de agrupación: un movimiento operativo (OC, venta, etc.) o una línea suelta.
+     */
+    public static function movementGroupKey(array $m): string
+    {
+        $rt = trim((string)($m['reference_type'] ?? ''));
+        $rid = (int)($m['reference_id'] ?? 0);
+        if ($rt !== '' && $rid > 0) {
+            return $rt . '#' . $rid;
+        }
+        return 'm#' . (int)($m['id'] ?? 0);
+    }
+
+    /**
+     * Detecta alta de producto (opening/notes) o producto creado junto al movimiento (p. ej. desde factura).
+     */
+    public static function isNewProductMovement(array $m): bool
+    {
+        $ref = (string)($m['reference_type'] ?? '');
+        $notes = trim((string)($m['notes'] ?? ''));
+        $type = (string)($m['type'] ?? '');
+
+        if (in_array($ref, [
+                'adjustment', 'csv_export', 'sale', 'inventory_exit', 'loan',
+                'loan_return', 'loan_received', 'loan_received_return', 'loan_received_settle',
+                'purchase_credit_note',
+            ], true)
+            || $type === 'out'
+        ) {
+            return false;
+        }
+        if (preg_match('/ajuste\s+de\s+stock|producto\s+existente/iu', $notes) === 1) {
+            return false;
+        }
+
+        $byNotes = in_array($ref, ['opening'], true)
+            || preg_match('/producto\s+nuevo|inventario\s+inicial|stock\s+inicial/iu', $notes) === 1;
+        if ($ref === 'csv_import') {
+            $byNotes = preg_match('/producto\s+nuevo|stock\s+inicial|inventario\s+inicial/iu', $notes) === 1
+                && preg_match('/producto\s+existente|ajuste/iu', $notes) !== 1;
+        }
+        if ($byNotes) {
+            return true;
+        }
+
+        // Alta desde compra/factura: producto creado minutos antes del ingreso.
+        $pc = trim((string)($m['product_created_at'] ?? ''));
+        $mc = trim((string)($m['created_at'] ?? ''));
+        if ($pc !== '' && $mc !== '' && $type === 'in') {
+            $pt = strtotime($pc);
+            $mt = strtotime($mc);
+            if ($pt && $mt && $pt <= $mt && ($mt - $pt) <= 600) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Agrupa filas de stock_movements por operación (reference_type + reference_id).
+     *
+     * @param list<array<string,mixed>> $rows
+     * @return list<array<string,mixed>>
+     */
+    public static function buildMovementGroups(array $rows): array
+    {
+        $buckets = [];
+        foreach ($rows as $m) {
+            $key = self::movementGroupKey($m);
+            if (!isset($buckets[$key])) {
+                $buckets[$key] = [];
+            }
+            $buckets[$key][] = $m;
+        }
+
+        $groups = [];
+        foreach ($buckets as $key => $lines) {
+            usort($lines, static function ($a, $b) {
+                $na = (string)($a['product_name'] ?? '');
+                $nb = (string)($b['product_name'] ?? '');
+                $cmp = strcasecmp($na, $nb);
+                return $cmp !== 0 ? $cmp : ((int)($a['id'] ?? 0) <=> (int)($b['id'] ?? 0));
+            });
+
+            $head = $lines[0];
+            // Cabecera: el movimiento más reciente del grupo.
+            foreach ($lines as $line) {
+                $ca = (string)($line['created_at'] ?? '');
+                $cb = (string)($head['created_at'] ?? '');
+                if ($ca !== '' && ($cb === '' || strcmp($ca, $cb) > 0)) {
+                    $head = $line;
+                }
+            }
+
+            $qtyTotal = 0;
+            $costTotal = 0.0;
+            $newCount = 0;
+            $types = [];
+            foreach ($lines as $line) {
+                $qtyTotal += abs((int)($line['quantity'] ?? 0));
+                $costTotal += (float)($line['total_cost'] ?? 0);
+                if (self::isNewProductMovement($line)) {
+                    $newCount++;
+                }
+                $t = (string)($line['type'] ?? '');
+                if ($t !== '') {
+                    $types[$t] = ($types[$t] ?? 0) + 1;
+                }
+            }
+            arsort($types);
+            $dominantType = array_key_first($types) ?: (string)($head['type'] ?? '');
+
+            $groups[] = [
+                'key' => $key,
+                'reference_type' => (string)($head['reference_type'] ?? ''),
+                'reference_id' => (int)($head['reference_id'] ?? 0),
+                'reference_code' => (string)($head['purchase_order_number'] ?? $head['sale_document_number'] ?? ''),
+                'purchase_order_status' => (string)($head['purchase_order_status'] ?? ''),
+                'type' => $dominantType,
+                'display_at' => self::formatMovementDisplayAt($head),
+                'source_channel' => (string)($head['source_channel'] ?? 'manual'),
+                'user_name' => (string)($head['user_name'] ?? '—'),
+                'notes' => (string)($head['notes'] ?? ''),
+                'lines_count' => count($lines),
+                'new_products_count' => $newCount,
+                'qty_total' => $qtyTotal,
+                'cost_total' => round($costTotal, 2),
+                'lines' => $lines,
+            ];
+        }
+
+        usort($groups, static function ($a, $b) {
+            $la = $a['lines'][0] ?? [];
+            $lb = $b['lines'][0] ?? [];
+            // Usar el head más reciente ya calculado vía display / created
+            $ca = '';
+            $cb = '';
+            foreach ($a['lines'] as $line) {
+                $t = (string)($line['created_at'] ?? '');
+                if ($t !== '' && strcmp($t, $ca) > 0) {
+                    $ca = $t;
+                }
+            }
+            foreach ($b['lines'] as $line) {
+                $t = (string)($line['created_at'] ?? '');
+                if ($t !== '' && strcmp($t, $cb) > 0) {
+                    $cb = $t;
+                }
+            }
+            if ($ca !== $cb) {
+                return strcmp($cb, $ca);
+            }
+            return strcmp((string)$b['key'], (string)$a['key']);
+        });
+
+        return $groups;
+    }
+
+    /**
+     * Lista paginada por movimiento (grupo), no por producto/línea.
+     *
+     * @return array{groups: list<array>, total: int, line_total: int, truncated: bool}
+     */
+    public function listMovementGroups(array $filters = [], int $limit = 20, int $offset = 0): array
+    {
+        // Cargar un ventana amplia de líneas, agrupar y paginar grupos.
+        // Evita partir una misma OC entre páginas.
+        $scan = $this->listMovements($filters, 2500, 0);
+        $allGroups = self::buildMovementGroups($scan['rows']);
+        $totalGroups = count($allGroups);
+        $limit = max(1, min(100, $limit));
+        $offset = max(0, $offset);
+        if ($offset >= $totalGroups && $totalGroups > 0) {
+            $offset = 0;
+        }
+
+        return [
+            'groups' => array_slice($allGroups, $offset, $limit),
+            'total' => $totalGroups,
+            'line_total' => (int)$scan['total'],
+            'truncated' => (int)$scan['total'] > count($scan['rows']),
+        ];
+    }
+
     public function listMovements(array $filters = [], int $limit = 50, int $offset = 0): array
     {
         $this->ensureSchema();
@@ -2233,9 +3306,19 @@ class StockService
         }
 
         if (!empty($filters['q'])) {
-            $where[] = '(p.name LIKE ? OR p.code LIKE ? OR COALESCE(p.barcode,\'\') LIKE ? OR sm.notes LIKE ? OR sm.reference_type LIKE ?)';
-            $like = '%' . $filters['q'] . '%';
-            array_push($params, $like, $like, $like, $like, $like);
+            $search = \SoftNova\Core\multi_term_like_clause((string)$filters['q'], [
+                'p.name',
+                'p.code',
+                "COALESCE(p.barcode,'')",
+                'sm.notes',
+                'sm.reference_type',
+                "COALESCE(po.order_number,'')",
+                "COALESCE(s.invoice_number,'')",
+            ]);
+            $where[] = $search['sql'];
+            foreach ($search['params'] as $p) {
+                $params[] = $p;
+            }
         }
 
         $from = trim((string)($filters['from'] ?? ''));
@@ -2259,9 +3342,15 @@ class StockService
         }
         $whereSql = implode(' AND ', $where);
 
-        $total = (int)$this->query(
-            "SELECT COUNT(*) FROM stock_movements sm
+        $fromJoins = "FROM stock_movements sm
              LEFT JOIN products p ON p.id = sm.product_id
+             LEFT JOIN purchase_orders po ON po.id = sm.reference_id
+                  AND sm.reference_type IN ('purchase_order', 'purchase', 'purchase_cancel')
+             LEFT JOIN sales s ON s.id = sm.reference_id
+                  AND sm.reference_type IN ('sale', 'return')";
+
+        $total = (int)$this->query(
+            "SELECT COUNT(*) {$fromJoins}
              WHERE {$whereSql}",
             $params
         )->fetchColumn();
@@ -2272,14 +3361,19 @@ class StockService
             $offset = 0;
         }
         $rows = $this->query(
-            "SELECT sm.*, p.name product_name, p.code product_code, p.source_channel, p.location product_location,
-                    c.name category_name, u.name user_name
-             FROM stock_movements sm
-             LEFT JOIN products p ON p.id = sm.product_id
+            "SELECT sm.*, p.name product_name, p.code product_code, p.barcode product_barcode,
+                    p.source_channel, p.location product_location,
+                    p.created_at AS product_created_at,
+                    c.name category_name, u.name user_name,
+                    po.order_number AS purchase_order_number,
+                    po.status AS purchase_order_status,
+                    s.invoice_number AS sale_document_number
+             {$fromJoins}
              LEFT JOIN categories c ON c.id = p.category_id
              LEFT JOIN users u ON u.id = sm.user_id
              WHERE {$whereSql}
-             ORDER BY COALESCE(NULLIF(sm.movement_date, '0000-00-00'), sm.created_at) DESC, sm.id DESC
+             ORDER BY COALESCE(NULLIF(sm.movement_date, '0000-00-00'), DATE(sm.created_at)) DESC,
+                      sm.created_at DESC, sm.id DESC
              LIMIT {$limit} OFFSET {$offset}",
             $params
         )->fetchAll();

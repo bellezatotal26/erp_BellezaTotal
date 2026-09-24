@@ -16,12 +16,20 @@ $avatarUrl = !empty($settings['user_avatar'])
 $isAdmin = $isAdmin ?? (\SoftNova\Core\TenantMiddleware::getRole() === 'admin');
 $teamUsers = $teamUsers ?? [];
 $jobsPending = $jobsPending ?? 0;
+$auditLogs = $auditLogs ?? [];
+$auditPagination = $auditPagination ?? ['page' => 1, 'perPage' => 25, 'total' => 0, 'totalPages' => 1];
+$auditFilterOptions = $auditFilterOptions ?? ['modules' => [], 'actions' => [], 'users' => []];
+$auditFilters = $auditFilters ?? ['module' => '', 'action' => '', 'user_id' => 0, 'q' => '', 'from' => '', 'to' => '', 'severity' => ''];
+$auditModuleOptions = $auditModuleOptions ?? [];
+$auditActionOptions = $auditActionOptions ?? [];
+$auditAnomalies = $auditAnomalies ?? [];
+$expenseCategories = $expenseCategories ?? [];
 $managedModules = $managedModules ?? \SoftNova\Core\TenantMiddleware::MANAGED_MODULES;
 $permActions = $permActions ?? \SoftNova\Core\TenantMiddleware::ACTIONS;
 $teamRoleLabels = $teamRoleLabels ?? \SoftNova\Core\TenantMiddleware::teamRoleLabels();
 $moduleLabels = [
     'dashboard' => 'Dashboard', 'caja' => 'Caja', 'ventas' => 'Ventas', 'inventario' => 'Inventario',
-    'prestamos' => 'Préstamos', 'clientes' => 'Clientes', 'proveedores' => 'Proveedores', 'compras' => 'Compras',
+    'prestamos' => 'Préstamos', 'consignacion' => 'Consignación', 'clientes' => 'Clientes', 'proveedores' => 'Proveedores', 'compras' => 'Compras',
     'cotizaciones' => 'Cotizaciones', 'gastos' => 'Gastos', 'contabilidad' => 'Contabilidad',
     'nomina' => 'Nómina', 'reportes' => 'Reportes',
 ];
@@ -48,12 +56,30 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
 .config-tab-btn.active{background:var(--color-primary);color:#fff;border-color:var(--color-primary);}
 .config-tab-panel{display:none;}
 .config-tab-panel.active{display:block;}
+.audit-action-badge{font-size:11px;padding:2px 8px;border-radius:999px;font-weight:600;display:inline-block;}
+.audit-action-create{background:rgba(16,185,129,.15);color:#059669;}
+.audit-action-update{background:rgba(59,130,246,.15);color:#2563EB;}
+.audit-action-delete{background:rgba(220,38,38,.12);color:#DC2626;}
+.audit-action-payment,.audit-action-open,.audit-action-close,.audit-action-movement,.audit-action-receive,.audit-action-adjust,.audit-action-note{background:rgba(245,158,11,.15);color:#D97706;}
+.audit-action-cancel,.audit-action-anomaly{background:rgba(220,38,38,.12);color:#DC2626;}
+.audit-action-default{background:rgba(100,116,139,.15);color:#475569;}
+.audit-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px;align-items:end;}
+.audit-anomaly-box{border:1px solid rgba(220,38,38,.25);background:rgba(220,38,38,.05);border-radius:10px;padding:12px 14px;margin-bottom:14px;}
+.audit-anomaly-box.ok{border-color:rgba(16,185,129,.3);background:rgba(16,185,129,.06);}
+.audit-anomaly-item{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid rgba(0,0,0,.06);font-size:13px;}
+.audit-anomaly-item:first-child{border-top:none;padding-top:0;}
+.audit-sev{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:2px 6px;border-radius:4px;flex-shrink:0;}
+.audit-sev-danger{background:#FEE2E2;color:#B91C1C;}
+.audit-sev-warning{background:#FEF3C7;color:#B45309;}
+.audit-sev-info{background:#E0E7FF;color:#3730A3;}
 </style>
 
 <nav class="config-tabs" role="tablist" aria-label="Secciones de configuracion">
     <button type="button" class="config-tab-btn active" data-config-tab="general">General</button>
     <?php if ($isAdmin): ?>
     <button type="button" class="config-tab-btn" data-config-tab="usuarios">Usuarios</button>
+    <button type="button" class="config-tab-btn" data-config-tab="auditoria">Auditoría</button>
+    <button type="button" class="config-tab-btn" data-config-tab="gastos-admin">Administración de gastos</button>
     <?php endif; ?>
     <button type="button" class="config-tab-btn" data-config-tab="empresa">Empresa</button>
     <button type="button" class="config-tab-btn" data-config-tab="documentos">Documentos</button>
@@ -61,7 +87,7 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
 </nav>
 
 <div class="config-tab-panel active" id="configTab-general">
-<div class="settings-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 20px;">
+<div class="settings-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; max-width: 960px;">
     
     <!-- Perfil de Usuario -->
     <div class="card neumorphic">
@@ -114,6 +140,17 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
             </form>
         </div>
     </div>
+
+    <?php if ($isAdmin): ?>
+    <div class="card neumorphic">
+        <div class="card-header"><h3>Accesos rápidos</h3></div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:10px;">
+            <button type="button" class="btn btn-secondary" onclick="activateConfigTab('usuarios')">Usuarios del sistema</button>
+            <button type="button" class="btn btn-secondary" onclick="activateConfigTab('auditoria')">Registro de auditoría</button>
+            <button type="button" class="btn btn-secondary" onclick="activateConfigTab('sistema')">Copias de seguridad</button>
+        </div>
+    </div>
+    <?php endif; ?>
 </div>
 </div><!-- /tab general -->
 
@@ -280,7 +317,275 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
     }
     </script>
 </div><!-- /tab usuarios -->
+
+<div class="config-tab-panel" id="configTab-auditoria">
+    <div class="card neumorphic">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+            <h3 style="margin:0;">Registro de auditoría</h3>
+            <span style="font-size:12px;color:var(--color-text-secondary);">
+                <?php echo (int)($auditPagination['total'] ?? 0); ?> evento(s) registrados
+            </span>
+        </div>
+        <div class="card-body">
+            <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 14px;">
+                Historial cruzado de ventas, caja, inventario, facturas de compra, usuarios y configuración.
+                El detalle muestra la cadena relacionada (p. ej. venta ↔ salida de stock, factura ↔ entrada).
+                Solo visible para administradores.
+            </p>
+
+            <?php if ($isAdmin): ?>
+                <?php if (empty($auditAnomalies)): ?>
+                    <div class="audit-anomaly-box ok">
+                        <strong style="font-size:13px;">Sin anomalías detectadas</strong>
+                        <p style="margin:4px 0 0;font-size:12px;color:var(--color-text-secondary);">
+                            En el rango filtrado (o últimos 30 días) no hay descuadres evidentes entre ventas, facturas e inventario.
+                        </p>
+                    </div>
+                <?php else: ?>
+                    <div class="audit-anomaly-box">
+                        <strong style="font-size:13px;"><?php echo count($auditAnomalies); ?> alerta(s) de consistencia</strong>
+                        <p style="margin:4px 0 8px;font-size:12px;color:var(--color-text-secondary);">
+                            Cruce automático: ventas sin stock, facturas sin entrada, stock negativo o salidas huérfanas.
+                        </p>
+                        <?php foreach ($auditAnomalies as $an): ?>
+                            <div class="audit-anomaly-item">
+                                <span class="audit-sev audit-sev-<?php echo htmlspecialchars((string)($an['severity'] ?? 'warning')); ?>">
+                                    <?php echo htmlspecialchars((string)($an['severity'] ?? 'aviso')); ?>
+                                </span>
+                                <div style="flex:1;min-width:0;">
+                                    <div style="font-weight:600;"><?php echo htmlspecialchars((string)($an['title'] ?? '')); ?></div>
+                                    <div style="color:var(--color-text-secondary);"><?php echo htmlspecialchars((string)($an['detail'] ?? '')); ?></div>
+                                    <?php if (!empty($an['url'])): ?>
+                                        <a href="<?php echo htmlspecialchars((string)$an['url']); ?>" style="font-size:12px;">Ver entidad</a>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endif; ?>
+            <?php endif; ?>
+
+            <form method="GET" action="<?php echo $configBase; ?>" class="audit-filters" id="auditFilterForm">
+                <input type="hidden" name="audit_page" value="1">
+                <div class="form-group" style="margin:0;">
+                    <label style="font-size:12px;">Módulo</label>
+                    <select name="audit_module" class="form-control">
+                        <option value="">Todos</option>
+                        <?php foreach ($auditModuleOptions as $opt): ?>
+                            <option value="<?php echo htmlspecialchars((string)$opt['value']); ?>" <?php echo ($auditFilters['module'] ?? '') === $opt['value'] ? 'selected' : ''; ?>>
+                                <?php echo htmlspecialchars((string)$opt['label']); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label style="font-size:12px;">Acción</label>
+                    <select name="audit_action" class="form-control">
+                        <option value="">Todas</option>
+                        <?php foreach ($auditActionOptions as $opt): ?>
+                            <option value="<?php echo htmlspecialchars((string)$opt['value']); ?>" <?php echo ($auditFilters['action'] ?? '') === $opt['value'] ? 'selected' : ''; ?>>
+                                <?php echo htmlspecialchars((string)$opt['label']); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label style="font-size:12px;">Usuario</label>
+                    <select name="audit_user" class="form-control">
+                        <option value="0">Todos</option>
+                        <?php foreach ($auditFilterOptions['users'] as $au): ?>
+                            <option value="<?php echo (int)$au['user_id']; ?>" <?php echo (int)($auditFilters['user_id'] ?? 0) === (int)$au['user_id'] ? 'selected' : ''; ?>>
+                                <?php echo htmlspecialchars((string)($au['user_name'] ?? 'Usuario')); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label style="font-size:12px;">Desde</label>
+                    <input type="date" name="audit_from" class="form-control" value="<?php echo htmlspecialchars((string)($auditFilters['from'] ?? '')); ?>">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label style="font-size:12px;">Hasta</label>
+                    <input type="date" name="audit_to" class="form-control" value="<?php echo htmlspecialchars((string)($auditFilters['to'] ?? '')); ?>">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label style="font-size:12px;">Buscar</label>
+                    <input type="text" name="audit_q" class="form-control" placeholder="Descripción, usuario, IP..." value="<?php echo htmlspecialchars((string)($auditFilters['q'] ?? '')); ?>">
+                </div>
+                <div style="display:flex;gap:8px;">
+                    <button type="submit" class="btn btn-primary">Filtrar</button>
+                    <a class="btn btn-secondary" href="<?php echo $configBase; ?>#auditoria">Limpiar</a>
+                </div>
+            </form>
+
+            <?php if (empty($auditLogs)): ?>
+                <p style="text-align:center;color:var(--color-text-secondary);padding:24px 0;">No hay registros de auditoría con los filtros actuales.</p>
+            <?php else: ?>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Fecha / hora</th>
+                                <th>Usuario</th>
+                                <th>Módulo</th>
+                                <th>Acción</th>
+                                <th>Descripción</th>
+                                <th>Entidad</th>
+                                <th>IP</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                        <?php foreach ($auditLogs as $log): ?>
+                            <?php
+                            $act = (string)($log['action'] ?? '');
+                            $badgeClass = match ($act) {
+                                'create' => 'audit-action-create',
+                                'update', 'edit', 'note' => 'audit-action-update',
+                                'delete', 'cancel', 'anomaly' => 'audit-action-delete',
+                                'payment', 'open', 'close', 'movement', 'receive', 'adjust', 'import', 'pay' => 'audit-action-payment',
+                                default => 'audit-action-default',
+                            };
+                            $entityType = (string)($log['entity_type'] ?? '');
+                            $entityId = (int)($log['entity_id'] ?? 0);
+                            $entityUrl = (string)($log['entity_url'] ?? '');
+                            $desc = (string)($log['description'] ?? '');
+                            if ($entityType !== '' && $entityId > 0 && str_ends_with($desc, '[' . $entityType . ' #' . $entityId . ']')) {
+                                $desc = trim(substr($desc, 0, -strlen('[' . $entityType . ' #' . $entityId . ']')));
+                            }
+                            ?>
+                            <tr>
+                                <td style="white-space:nowrap;font-size:13px;"><?php echo date('d/m/Y H:i', strtotime((string)$log['created_at'])); ?></td>
+                                <td><?php echo htmlspecialchars((string)($log['user_name'] ?? 'Sistema')); ?></td>
+                                <td><?php echo htmlspecialchars((string)($log['module_label'] ?? ($log['module'] ?? ''))); ?></td>
+                                <td><span class="audit-action-badge <?php echo $badgeClass; ?>"><?php echo htmlspecialchars((string)($log['action_label'] ?? $act)); ?></span>
+                                    <?php if (!empty($log['severity'])): ?>
+                                        <span class="audit-sev audit-sev-<?php echo htmlspecialchars((string)$log['severity']); ?>" style="margin-left:4px;"><?php echo htmlspecialchars((string)$log['severity']); ?></span>
+                                    <?php endif; ?>
+                                </td>
+                                <td style="max-width:320px;"><?php echo htmlspecialchars($desc); ?></td>
+                                <td>
+                                    <?php if ($entityType !== '' && $entityId > 0): ?>
+                                        <?php if ($entityUrl): ?>
+                                            <a href="<?php echo htmlspecialchars($entityUrl); ?>"><?php echo htmlspecialchars($entityType . ' #' . $entityId); ?></a>
+                                        <?php else: ?>
+                                            <?php echo htmlspecialchars($entityType . ' #' . $entityId); ?>
+                                        <?php endif; ?>
+                                    <?php else: ?>
+                                        —
+                                    <?php endif; ?>
+                                </td>
+                                <td style="font-size:12px;color:var(--color-text-secondary);"><?php echo htmlspecialchars((string)($log['ip_address'] ?? '—')); ?></td>
+                                <td>
+                                    <button type="button" class="btn btn-sm btn-info" onclick="showAuditDetail(<?php echo (int)$log['id']; ?>)">Detalle</button>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+
+                <?php if (($auditPagination['totalPages'] ?? 1) > 1): ?>
+                    <?php
+                    $auditQuery = static function (int $page) use ($auditFilters, $configBase): string {
+                        $params = ['audit_page' => $page];
+                        if (($auditFilters['module'] ?? '') !== '') {
+                            $params['audit_module'] = $auditFilters['module'];
+                        }
+                        if (($auditFilters['action'] ?? '') !== '') {
+                            $params['audit_action'] = $auditFilters['action'];
+                        }
+                        if ((int)($auditFilters['user_id'] ?? 0) > 0) {
+                            $params['audit_user'] = (int)$auditFilters['user_id'];
+                        }
+                        if (($auditFilters['q'] ?? '') !== '') {
+                            $params['audit_q'] = $auditFilters['q'];
+                        }
+                        if (($auditFilters['from'] ?? '') !== '') {
+                            $params['audit_from'] = $auditFilters['from'];
+                        }
+                        if (($auditFilters['to'] ?? '') !== '') {
+                            $params['audit_to'] = $auditFilters['to'];
+                        }
+                        return $configBase . '?' . http_build_query($params) . '#auditoria';
+                    };
+                    ?>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px;flex-wrap:wrap;gap:8px;">
+                        <span style="font-size:12px;color:var(--color-text-secondary);">
+                            Página <?php echo (int)$auditPagination['page']; ?> de <?php echo (int)$auditPagination['totalPages']; ?>
+                            · <?php echo (int)$auditPagination['total']; ?> registros
+                        </span>
+                        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                            <?php if ((int)$auditPagination['page'] > 1): ?>
+                                <a class="btn btn-sm btn-secondary" href="<?php echo htmlspecialchars($auditQuery((int)$auditPagination['page'] - 1)); ?>">Anterior</a>
+                            <?php endif; ?>
+                            <?php if ((int)$auditPagination['page'] < (int)$auditPagination['totalPages']): ?>
+                                <a class="btn btn-sm btn-secondary" href="<?php echo htmlspecialchars($auditQuery((int)$auditPagination['page'] + 1)); ?>">Siguiente</a>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            <?php endif; ?>
+        </div>
+    </div>
+</div><!-- /tab auditoria -->
+
     <?php endif; ?>
+
+<?php if ($isAdmin): ?>
+<div class="config-tab-panel" id="configTab-gastos-admin">
+    <?php $viewInstance->partial('expense_admin_config', [
+        'expenseCategories' => $expenseCategories,
+        'expenseSubgroups' => $expenseSubgroups ?? [],
+        'configBase' => $configBase,
+    ]); ?>
+</div>
+
+<div id="expCatEditModal" class="modal-overlay" style="display:none;z-index:1200;">
+    <div class="modal-content neumorphic" style="max-width:420px;">
+        <div class="modal-header">
+            <h3>Editar categoría</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('expCatEditModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $configBase; ?>?action=expenseCategorySave" data-ajax="true">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="id" id="expCatEditId" value="0">
+            <input type="hidden" name="kind" id="expCatEditKind" value="operational">
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Nombre</label>
+                    <input type="text" name="name" id="expCatEditName" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label>Cuenta PUC</label>
+                    <input type="text" name="account_code" id="expCatEditAccount" class="form-control">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('expCatEditModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-primary">Guardar</button>
+            </div>
+        </form>
+    </div>
+</div>
+<script>
+function expCatOpenAddModal() {
+    var m = document.getElementById('expCatAddModal');
+    if (m) m.style.display = 'flex';
+}
+function expSubgroupOpenModal() {
+    var m = document.getElementById('expSubgroupModal');
+    if (m) m.style.display = 'flex';
+}
+function expCatEdit(id, name, kind, account) {
+    document.getElementById('expCatEditId').value = id;
+    document.getElementById('expCatEditName').value = name;
+    document.getElementById('expCatEditKind').value = kind;
+    document.getElementById('expCatEditAccount').value = account || '';
+    document.getElementById('expCatEditModal').style.display = 'flex';
+}
+</script>
+<?php endif; ?>
 
 <div class="config-tab-panel" id="configTab-empresa">
 <div class="settings-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 20px;">
@@ -305,10 +610,48 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
                            value="<?php echo htmlspecialchars($settings['tax_name'] ?? 'IVA'); ?>">
                 </div>
                 <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;">
+                        <input type="hidden" name="tax_enabled" value="0">
+                        <input type="checkbox" name="tax_enabled" value="1"
+                            <?php echo (($settings['tax_enabled'] ?? '1') !== '0') ? 'checked' : ''; ?>>
+                        Calcular IVA en ventas (caja, POS y cotizaciones)
+                    </label>
+                    <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
+                        Desactivado: el total de venta no incluye IVA aunque los productos tengan tasa en inventario.
+                        Las <strong>compras</strong> siguen registrando IVA por línea de factura.
+                    </small>
+                </div>
+                <div class="form-group">
                     <label>Tasa de Impuesto (%)</label>
+                    <?php
+                    $taxRateVal = $settings['tax_rate'] ?? '19';
+                    if ($taxRateVal === null || $taxRateVal === '') {
+                        $taxRateVal = '0';
+                    }
+                    ?>
                     <input type="number" name="tax_rate" class="form-control" 
-                           value="<?php echo htmlspecialchars($settings['tax_rate'] ?? '19'); ?>" 
+                           value="<?php echo htmlspecialchars((string)$taxRateVal); ?>" 
                            step="0.1" min="0" max="100" placeholder="19">
+                    <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
+                        Tasa <strong>por defecto</strong> para comodín y productos sin % definido (solo si aplica IVA por producto).
+                        En <strong>compras</strong> el IVA sigue yendo por línea de la factura.
+                    </small>
+                </div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;">
+                        <input type="hidden" name="product_tax_enabled" value="0">
+                        <input type="checkbox" name="product_tax_enabled" value="1"
+                            <?php echo (($settings['product_tax_enabled'] ?? '0') !== '0') ? 'checked' : ''; ?>
+                            <?php echo (($settings['tax_enabled'] ?? '1') === '0') ? ' disabled' : ''; ?>>
+                        Aplicar IVA por producto (según tasa en Inventario)
+                    </label>
+                    <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
+                        <strong>Activado:</strong> cada producto usa su % IVA de inventario
+                        (<strong>0</strong> = exento, <strong>19</strong> = gravado, etc.).
+                        Los que están en <strong>0</strong> no heredan la tasa global.
+                        <strong>Desactivado:</strong> los productos de catálogo no llevan IVA en ventas
+                        (útil si vende mostly exento). El comodín sigue la tasa global de arriba.
+                    </small>
                 </div>
                 <button type="submit" class="btn btn-primary">Guardar Datos</button>
             </form>
@@ -335,6 +678,52 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
                     <small style="color: var(--color-text-secondary);">Esta moneda se usará en ventas, caja y reportes.</small>
                 </div>
                 <button type="submit" class="btn btn-primary">Guardar Moneda</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Fecha, hora y zona horaria de negocio -->
+    <div class="card neumorphic">
+        <div class="card-header">
+            <h3>Fecha, hora y zona horaria</h3>
+        </div>
+        <div class="card-body">
+            <?php
+            $timezones = $timezones ?? \SoftNova\Core\BusinessTimezone::options();
+            $currentTz = \SoftNova\Core\BusinessTimezone::normalize($settings['timezone'] ?? \SoftNova\Core\BusinessTimezone::DEFAULT);
+            $clock = $businessClock ?? \SoftNova\Core\BusinessTimezone::clientPayload();
+            ?>
+            <div style="margin-bottom:14px;padding:12px 14px;border-radius:10px;background:var(--color-bg-secondary,rgba(0,0,0,.04));">
+                <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:4px;">Reloj de negocio actual</div>
+                <div style="font-size:18px;font-weight:700;" id="cfgBusinessClock">
+                    <?php echo htmlspecialchars(date('d/m/Y H:i:s', strtotime((string)($clock['now'] ?? 'now')))); ?>
+                </div>
+                <div style="font-size:12px;color:var(--color-text-secondary);margin-top:4px;">
+                    Zona: <?php echo htmlspecialchars((string)($clock['label'] ?? $currentTz)); ?>
+                    · Usada en ventas, caja, facturas, reportes y <code>NOW()</code> de MySQL.
+                </div>
+            </div>
+            <form method="POST" action="<?php echo $viewInstance->route('app/configuracion'); ?>?action=save" data-ajax="true">
+                <?php echo \SoftNova\Core\csrf_field(); ?>
+                <div class="form-group">
+                    <label>Zona horaria de la empresa</label>
+                    <select name="timezone" class="form-control" required>
+                        <?php foreach ($timezones as $tzId => $tzLabel): ?>
+                            <option value="<?php echo htmlspecialchars($tzId); ?>" <?php echo $currentTz === $tzId ? 'selected' : ''; ?>>
+                                <?php echo htmlspecialchars($tzLabel); ?>
+                            </option>
+                        <?php endforeach; ?>
+                        <?php if (!isset($timezones[$currentTz])): ?>
+                            <option value="<?php echo htmlspecialchars($currentTz); ?>" selected>
+                                <?php echo htmlspecialchars($currentTz); ?> (actual)
+                            </option>
+                        <?php endif; ?>
+                    </select>
+                    <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
+                        Colombia debe usar <strong>America/Bogota</strong>. No depende del reloj del PC del cajero ni de UTC del navegador.
+                    </small>
+                </div>
+                <button type="submit" class="btn btn-primary">Guardar zona horaria</button>
             </form>
         </div>
     </div>
@@ -456,7 +845,7 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
         <div class="card-body">
             <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 12px;">Campos visibles en el ticket térmico / PDF angosto.</p>
             <?php foreach ($docToggleLabels as $key => $label): ?>
-                <?php if (in_array($key, ['show_payments_table', 'show_system_footer'], true)) continue; ?>
+                <?php if (in_array($key, ['show_payments_table', 'show_system_footer', 'auto_print_ticket'], true)) continue; ?>
                 <label style="display:flex;align-items:center;gap:8px;margin:0 0 8px;font-size:13px;cursor:pointer;">
                     <input type="checkbox" name="doc_ticket_<?php echo htmlspecialchars($key); ?>" value="1" form="docsConfigForm"
                         <?php echo !empty($docConfig['ticket'][$key]) ? 'checked' : ''; ?>
@@ -473,6 +862,17 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
                 <label>Mensaje de pie</label>
                 <textarea name="doc_ticket_footer_text" class="form-control" rows="2" form="docsConfigForm"><?php echo htmlspecialchars((string)($docConfig['ticket']['footer_text'] ?? 'Gracias por su compra')); ?></textarea>
             </div>
+            <label style="display:flex;align-items:flex-start;gap:8px;margin:12px 0 0;font-size:13px;cursor:pointer;">
+                <input type="checkbox" name="doc_ticket_auto_print_ticket" value="1" form="docsConfigForm"
+                    <?php echo !empty($docConfig['ticket']['auto_print_ticket']) ? 'checked' : ''; ?>
+                    style="width:16px;height:16px;margin-top:2px;">
+                <span>
+                    Imprimir tirilla al confirmar la venta
+                    <span style="display:block;font-size:12px;color:var(--color-text-secondary);font-weight:400;">
+                        Abre el diálogo de impresión. En Windows, ponga la térmica 58 mm como impresora predeterminada para no elegirla cada vez.
+                    </span>
+                </span>
+            </label>
         </div>
     </div>
 
@@ -514,10 +914,10 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
 </div><!-- /tab documentos -->
 
 <div class="config-tab-panel" id="configTab-sistema">
-<div class="settings-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 20px;">
+<div class="config-sistema-layout">
 
     <!-- Suscripción -->
-    <div class="card neumorphic">
+    <div class="card neumorphic config-sistema-sub">
         <div class="card-header"><h3>Suscripcion</h3></div>
         <div class="card-body">
             <?php if ($subscription): ?>
@@ -555,91 +955,105 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
     </div>
     
     <!-- Preferencias -->
-    <div class="card neumorphic">
+    <div class="card neumorphic config-sistema-prefs">
         <div class="card-header">
             <h3>⚙️ Preferencias</h3>
         </div>
         <div class="card-body">
             <form method="POST" action="<?php echo $viewInstance->route('app/configuracion'); ?>?action=save" data-ajax="true">
                 <?php echo \SoftNova\Core\csrf_field(); ?>
-                <div class="form-group">
-                    <label>Prefijo de Factura</label>
-                    <input type="text" name="invoice_prefix" class="form-control" 
-                           value="<?php echo htmlspecialchars($settings['invoice_prefix'] ?? 'FAC-'); ?>">
-                </div>
-                <div class="form-group">
-                    <label>Alerta de Stock Bajo</label>
-                    <input type="number" name="low_stock_alert" class="form-control" 
-                           value="<?php echo htmlspecialchars($settings['low_stock_alert'] ?? '5'); ?>" 
-                           min="1" placeholder="5">
-                    <small style="color: var(--color-text-secondary);">Se alertará cuando el stock esté por debajo de este valor.</small>
-                </div>
-                <div class="form-group">
-                    <label>Webhook venta fallida/cancelada (opcional)</label>
-                    <input type="url" name="webhook_sale_url" class="form-control"
-                           value="<?php echo htmlspecialchars($settings['webhook_sale_url'] ?? ''); ?>"
-                           placeholder="https://hooks.ejemplo.com/venta">
-                    <small style="color: var(--color-text-secondary);">POST JSON encolado al cancelar o fallar una venta.</small>
-                </div>
-                <hr style="border:none;border-top:1px solid var(--color-border,#e5e7eb);margin:16px 0;">
-                <h4 style="margin:0 0 10px;font-size:14px;">Secuencia automática de EAN</h4>
-                <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 12px;">
-                    En Inventario puede escribir el EAN a mano o usar el botón <strong>Generar EAN</strong>,
-                    que toma el siguiente número de esta secuencia.
-                </p>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+
+                <div class="config-prefs-grid">
                     <div class="form-group" style="margin:0;">
-                        <label>Prefijo</label>
-                        <input type="text" name="ean_prefix" class="form-control" inputmode="numeric"
-                               value="<?php echo htmlspecialchars($settings['ean_prefix'] ?? '200'); ?>"
-                               maxlength="12" placeholder="200">
+                        <label>Prefijo de Factura</label>
+                        <input type="text" name="invoice_prefix" class="form-control"
+                               value="<?php echo htmlspecialchars($settings['invoice_prefix'] ?? 'FAC-'); ?>">
                     </div>
                     <div class="form-group" style="margin:0;">
-                        <label>Siguiente número</label>
-                        <input type="number" name="ean_next" class="form-control" min="1"
-                               value="<?php echo htmlspecialchars($settings['ean_next'] ?? '1'); ?>">
+                        <label>Alerta de Stock Bajo</label>
+                        <input type="number" name="low_stock_alert" class="form-control"
+                               value="<?php echo htmlspecialchars($settings['low_stock_alert'] ?? '5'); ?>"
+                               min="1" placeholder="5">
+                        <small style="color: var(--color-text-secondary);">Se alertará cuando el stock esté por debajo de este valor.</small>
                     </div>
-                    <div class="form-group" style="margin:0;">
-                        <label>Longitud</label>
-                        <select name="ean_length" class="form-control">
-                            <?php $eanLen = (string)($settings['ean_length'] ?? '13'); ?>
-                            <option value="13" <?php echo $eanLen === '13' ? 'selected' : ''; ?>>EAN-13</option>
-                            <option value="8" <?php echo $eanLen === '8' ? 'selected' : ''; ?>>EAN-8</option>
-                        </select>
-                    </div>
-                    <div class="form-group" style="margin:0;display:flex;align-items:flex-end;">
-                        <label style="display:flex;gap:8px;align-items:center;font-weight:500;">
-                            <input type="checkbox" name="ean_check_digit" value="1"
-                                <?php echo ($settings['ean_check_digit'] ?? '1') !== '0' ? 'checked' : ''; ?>>
-                            Calcular dígito de control
-                        </label>
+                    <div class="form-group config-prefs-span" style="margin:0;">
+                        <label>Webhook venta fallida/cancelada (opcional)</label>
+                        <input type="url" name="webhook_sale_url" class="form-control"
+                               value="<?php echo htmlspecialchars($settings['webhook_sale_url'] ?? ''); ?>"
+                               placeholder="https://hooks.ejemplo.com/venta">
+                        <small style="color: var(--color-text-secondary);">
+                            URL externa (Zapier, Make, n8n, Slack, etc.). Si se cancela o falla una venta, el ERP encola un
+                            <strong>POST JSON</strong> con el evento (<code>sale.cancelled</code> / <code>sale.failed</code>),
+                            id de venta y mensaje. Déjelo vacío si no lo usa.
+                        </small>
                     </div>
                 </div>
-                <hr style="border:none;border-top:1px solid var(--color-border,#e5e7eb);margin:18px 0;">
-                <h4 style="margin:0 0 10px;font-size:14px;">Secuencia automática de SKU</h4>
-                <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 12px;">
-                    En Inventario puede escribir el SKU a mano (fórmula del tooltip) o usar
-                    <strong>Generar SKU</strong>, que toma el siguiente de esta secuencia (ej. SKU-000001).
-                </p>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-                    <div class="form-group" style="margin:0;">
-                        <label>Prefijo</label>
-                        <input type="text" name="sku_prefix" class="form-control"
-                               value="<?php echo htmlspecialchars($settings['sku_prefix'] ?? 'SKU-'); ?>"
-                               maxlength="40" placeholder="SKU-">
+
+                <div class="config-prefs-blocks">
+                    <div class="config-prefs-block">
+                        <h4 class="config-prefs-block-title">Secuencia automática de EAN</h4>
+                        <p class="config-prefs-block-help">
+                            En Inventario puede escribir el EAN a mano o usar <strong>Generar EAN</strong>,
+                            que toma el siguiente número de esta secuencia.
+                        </p>
+                        <div class="config-prefs-fields">
+                            <div class="form-group" style="margin:0;">
+                                <label>Prefijo</label>
+                                <input type="text" name="ean_prefix" class="form-control" inputmode="numeric"
+                                       value="<?php echo htmlspecialchars($settings['ean_prefix'] ?? '200'); ?>"
+                                       maxlength="12" placeholder="200">
+                            </div>
+                            <div class="form-group" style="margin:0;">
+                                <label>Siguiente número</label>
+                                <input type="number" name="ean_next" class="form-control" min="1"
+                                       value="<?php echo htmlspecialchars($settings['ean_next'] ?? '1'); ?>">
+                            </div>
+                            <div class="form-group" style="margin:0;">
+                                <label>Longitud</label>
+                                <select name="ean_length" class="form-control">
+                                    <?php $eanLen = (string)($settings['ean_length'] ?? '13'); ?>
+                                    <option value="13" <?php echo $eanLen === '13' ? 'selected' : ''; ?>>EAN-13</option>
+                                    <option value="8" <?php echo $eanLen === '8' ? 'selected' : ''; ?>>EAN-8</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="margin:0;display:flex;align-items:flex-end;">
+                                <label style="display:flex;gap:8px;align-items:center;font-weight:500;">
+                                    <input type="checkbox" name="ean_check_digit" value="1"
+                                        <?php echo ($settings['ean_check_digit'] ?? '1') !== '0' ? 'checked' : ''; ?>>
+                                    Calcular dígito de control
+                                </label>
+                            </div>
+                        </div>
                     </div>
-                    <div class="form-group" style="margin:0;">
-                        <label>Siguiente número</label>
-                        <input type="number" name="sku_next" class="form-control" min="1"
-                               value="<?php echo htmlspecialchars($settings['sku_next'] ?? '1'); ?>">
-                    </div>
-                    <div class="form-group" style="margin:0;">
-                        <label>Ceros (padding)</label>
-                        <input type="number" name="sku_pad" class="form-control" min="3" max="12"
-                               value="<?php echo htmlspecialchars($settings['sku_pad'] ?? '6'); ?>">
+
+                    <div class="config-prefs-block">
+                        <h4 class="config-prefs-block-title">Secuencia automática de SKU</h4>
+                        <p class="config-prefs-block-help">
+                            En Inventario puede escribir el SKU a mano o usar <strong>Generar SKU</strong>
+                            (ej. SKU-000001).
+                        </p>
+                        <div class="config-prefs-fields">
+                            <div class="form-group" style="margin:0;">
+                                <label>Prefijo</label>
+                                <input type="text" name="sku_prefix" class="form-control"
+                                       value="<?php echo htmlspecialchars($settings['sku_prefix'] ?? 'SKU-'); ?>"
+                                       maxlength="40" placeholder="SKU-">
+                            </div>
+                            <div class="form-group" style="margin:0;">
+                                <label>Siguiente número</label>
+                                <input type="number" name="sku_next" class="form-control" min="1"
+                                       value="<?php echo htmlspecialchars($settings['sku_next'] ?? '1'); ?>">
+                            </div>
+                            <div class="form-group" style="margin:0;">
+                                <label>Ceros (padding)</label>
+                                <input type="number" name="sku_pad" class="form-control" min="3" max="12"
+                                       value="<?php echo htmlspecialchars($settings['sku_pad'] ?? '6'); ?>">
+                            </div>
+                        </div>
                     </div>
                 </div>
-                <button type="submit" class="btn btn-primary" style="margin-top:14px;">Guardar Preferencias</button>
+
+                <button type="submit" class="btn btn-primary" style="margin-top:16px;">Guardar Preferencias</button>
             </form>
         </div>
     </div>
@@ -652,7 +1066,7 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
     $backupLast = $settings['backup_last_run'] ?? '';
     $isAdmin = \SoftNova\Core\TenantMiddleware::getRole() === 'admin';
     ?>
-    <div class="card neumorphic" style="grid-column: 1 / -1;">
+    <div class="card neumorphic config-sistema-backup">
         <div class="card-header">
             <h3>Copia de seguridad</h3>
         </div>
@@ -787,10 +1201,73 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
     </div>
 
     <?php if ($isAdmin): ?>
+    <?php
+        $sandboxStatus = $sandboxStatus ?? \SoftNova\Services\SandboxService::status();
+        $sandboxActive = !empty($sandboxStatus['active']);
+    ?>
+    <!-- Modo caja de arena -->
+    <div class="card neumorphic" style="grid-column: 1 / -1;border:1px solid <?php echo $sandboxActive ? '#D97706' : '#2563EB'; ?>;">
+        <div class="card-header" style="background:<?php echo $sandboxActive ? 'rgba(217,119,6,0.12)' : 'rgba(37,99,235,0.08)'; ?>;">
+            <h3 style="color:<?php echo $sandboxActive ? '#B45309' : '#1D4ED8'; ?>;">
+                <?php echo $sandboxActive ? 'Modo caja de arena — ACTIVO' : 'Modo caja de arena (pruebas)'; ?>
+            </h3>
+        </div>
+        <div class="card-body">
+            <p style="color:var(--color-text-secondary);font-size:13px;margin-bottom:12px;">
+                Clona la base de datos real a un espejo de pruebas. Mientras esté activo <strong>solo en su sesión</strong>,
+                ventas, compras, caja e inventario afectan el espejo; el resto del equipo sigue en producción.
+                Al volver a producción, los movimientos de prueba <strong>no se aplican</strong> a los datos reales.
+            </p>
+            <p style="font-size:12px;color:var(--color-text-secondary);margin-bottom:14px;">
+                Producción: <code><?php echo htmlspecialchars((string)($sandboxStatus['production_db'] ?? '')); ?></code>
+                · Espejo: <code><?php echo htmlspecialchars((string)($sandboxStatus['sandbox_db'] ?? '')); ?></code>
+                <?php if (!empty($sandboxStatus['cloned_at'])): ?>
+                    · Clonado: <?php echo htmlspecialchars((string)$sandboxStatus['cloned_at']); ?>
+                <?php endif; ?>
+            </p>
+            <?php if ($sandboxActive): ?>
+                <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                    <form method="POST" action="<?php echo $viewInstance->route('app/configuracion'); ?>?action=sandboxExit" style="display:inline;">
+                        <?php echo \SoftNova\Core\csrf_field(); ?>
+                        <input type="hidden" name="drop_sandbox" value="0">
+                        <button type="submit" class="btn btn-primary">Volver a producción</button>
+                    </form>
+                    <form method="POST" action="<?php echo $viewInstance->route('app/configuracion'); ?>?action=sandboxExit" id="sandboxDropForm" style="display:inline;" onsubmit="return openSandboxDropModal(event)">
+                        <?php echo \SoftNova\Core\csrf_field(); ?>
+                        <input type="hidden" name="drop_sandbox" value="1">
+                        <input type="hidden" name="confirm_password" id="sandboxDropPassword" value="">
+                        <button type="submit" class="btn btn-danger">Volver y eliminar espejo</button>
+                    </form>
+                    <form method="POST" action="<?php echo $viewInstance->route('app/configuracion'); ?>?action=sandboxEnter" id="sandboxRefreshForm" style="display:inline;" onsubmit="return openSandboxEnterModal(event, this)">
+                        <?php echo \SoftNova\Core\csrf_field(); ?>
+                        <input type="hidden" name="refresh" value="1">
+                        <input type="hidden" name="confirm_password" class="sandbox-enter-password" value="">
+                        <button type="submit" class="btn btn-secondary">Reclonar desde producción</button>
+                    </form>
+                </div>
+            <?php else: ?>
+                <form method="POST" action="<?php echo $viewInstance->route('app/configuracion'); ?>?action=sandboxEnter" id="sandboxEnterForm" onsubmit="return openSandboxEnterModal(event, this)">
+                    <?php echo \SoftNova\Core\csrf_field(); ?>
+                    <input type="hidden" name="refresh" value="1">
+                    <input type="hidden" name="confirm_password" class="sandbox-enter-password" value="">
+                    <button type="submit" class="btn btn-primary">Activar modo caja de arena</button>
+                </form>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin-top:10px;">
+                    En hosting compartido el usuario MySQL <strong>no puede crear bases</strong>. Hágalo una vez en cPanel:
+                    <br>1) <strong>Bases de datos MySQL</strong> → crear <code><?php echo htmlspecialchars((string)($sandboxStatus['sandbox_db'] ?? '')); ?></code>
+                    <br>2) Agregar el usuario <code>bellezat_master</code> (el mismo de la app) con <strong>todos los privilegios</strong>
+                    <br>3) Volver aquí y pulsar «Activar modo caja de arena»
+                </p>
+            <?php endif; ?>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <?php if ($isAdmin): ?>
     <!-- Zona de peligro: borrado general -->
     <div class="card neumorphic" style="grid-column: 1 / -1;border:1px solid #DC2626;">
         <div class="card-header" style="background:rgba(220,38,38,0.08);">
-            <h3 style="color:#B91C1C;">Zona de peligro — Borrado general</h3>
+            <h3 style="color:#B91C1C;">Zona de peligro — Borrado general<?php echo !empty($sandboxStatus['active']) ? ' (solo espejo)' : ''; ?></h3>
         </div>
         <div class="card-body">
             <p style="color:var(--color-text-secondary);font-size:13px;margin-bottom:12px;">
@@ -884,6 +1361,62 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
     </div>
 </div>
 
+<!-- Modal: activar / reclonar caja de arena -->
+<div id="sandboxEnterModal" class="modal-overlay restore-danger-overlay" style="display:none;">
+    <div class="restore-danger-modal" role="dialog" aria-modal="true" aria-labelledby="sandboxEnterTitle">
+        <h3 id="sandboxEnterTitle">ACTIVAR CAJA DE ARENA</h3>
+        <p class="restore-danger-warn">Se clonará la base de producción</p>
+        <p class="restore-danger-text">
+            Su sesión pasará a un espejo de pruebas. El resto del equipo sigue en producción.
+            La primera vez (o al reclonar) puede tardar varios minutos.
+        </p>
+        <div class="form-group" style="text-align:left;">
+            <label style="color:#fff;">Contraseña de administrador</label>
+            <input type="password" id="sandboxEnterPassword" class="form-control" autocomplete="current-password" placeholder="Contraseña de administrador">
+        </div>
+        <div class="restore-danger-actions">
+            <button type="button" class="btn btn-secondary" onclick="closeSandboxEnterModal()">Cancelar</button>
+            <button type="button" class="btn btn-primary" onclick="confirmSandboxEnter()">Activar</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal: salir y eliminar espejo -->
+<div id="sandboxDropModal" class="modal-overlay restore-danger-overlay" style="display:none;">
+    <div class="restore-danger-modal" role="dialog" aria-modal="true" aria-labelledby="sandboxDropTitle">
+        <h3 id="sandboxDropTitle">ELIMINAR ESPEJO DE PRUEBAS</h3>
+        <p class="restore-danger-warn">¿Volver a producción y borrar el espejo?</p>
+        <p class="restore-danger-text">
+            Se cierra el modo caja de arena y se elimina la base espejo. Producción no se modifica.
+        </p>
+        <div class="form-group" style="text-align:left;">
+            <label style="color:#fff;">Contraseña de administrador</label>
+            <input type="password" id="sandboxDropPasswordInput" class="form-control" autocomplete="current-password" placeholder="Contraseña de administrador">
+        </div>
+        <div class="restore-danger-actions">
+            <button type="button" class="btn btn-secondary" onclick="closeSandboxDropModal()">Cancelar</button>
+            <button type="button" class="btn btn-danger" onclick="confirmSandboxDrop()">Sí, eliminar espejo</button>
+        </div>
+    </div>
+</div>
+
+<?php if ($isAdmin): ?>
+<div id="auditDetailModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:640px;">
+        <div class="modal-header">
+            <h3 id="auditDetailTitle">Detalle de auditoría</h3>
+            <button type="button" class="modal-close" onclick="closeAuditDetailModal()">&times;</button>
+        </div>
+        <div class="modal-body" id="auditDetailBody">
+            <p class="dashboard-empty">Cargando...</p>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeAuditDetailModal()">Cerrar</button>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
+
 <script>
 var restoreFormPending = null;
 function openRestoreDangerModal(e) {
@@ -919,6 +1452,81 @@ function confirmRestoreDanger() {
         form.submit();
     }
 }
+function closeAuditDetailModal() {
+    var modal = document.getElementById('auditDetailModal');
+    if (modal) modal.style.display = 'none';
+}
+function escapeAuditHtml(value) {
+    var div = document.createElement('div');
+    div.textContent = value == null ? '' : String(value);
+    return div.innerHTML;
+}
+function showAuditDetail(id) {
+    var modal = document.getElementById('auditDetailModal');
+    var body = document.getElementById('auditDetailBody');
+    if (!modal || !body) return;
+    body.innerHTML = '<p class="dashboard-empty">Cargando...</p>';
+    modal.style.display = 'flex';
+    var url = <?php echo json_encode($configBase); ?> + '?action=auditDetail&id=' + encodeURIComponent(id);
+    fetch(url, {headers: {'X-Requested-With': 'XMLHttpRequest'}})
+        .then(function(r){ return r.json(); })
+        .then(function(data){
+            if (!data.success || !data.log) throw new Error(data.message || 'No se pudo cargar');
+            var log = data.log;
+            document.getElementById('auditDetailTitle').textContent = log.action_label + ' · ' + log.module_label;
+            var html = '<dl style="margin:0;display:grid;grid-template-columns:120px 1fr;gap:8px 12px;font-size:13px;">';
+            html += '<dt style="color:var(--color-text-secondary);">Fecha</dt><dd>' + escapeAuditHtml(log.created_at) + '</dd>';
+            html += '<dt style="color:var(--color-text-secondary);">Usuario</dt><dd>' + escapeAuditHtml(log.user_name) + '</dd>';
+            html += '<dt style="color:var(--color-text-secondary);">Módulo</dt><dd>' + escapeAuditHtml(log.module_label) + '</dd>';
+            html += '<dt style="color:var(--color-text-secondary);">Acción</dt><dd>' + escapeAuditHtml(log.action_label) + '</dd>';
+            html += '<dt style="color:var(--color-text-secondary);">Descripción</dt><dd>' + escapeAuditHtml(log.description) + '</dd>';
+            if (log.entity_type && log.entity_id) {
+                html += '<dt style="color:var(--color-text-secondary);">Entidad</dt><dd>';
+                if (log.entity_url) {
+                    html += '<a href="' + escapeAuditHtml(log.entity_url) + '">' + escapeAuditHtml(log.entity_type + ' #' + log.entity_id) + '</a>';
+                } else {
+                    html += escapeAuditHtml(log.entity_type + ' #' + log.entity_id);
+                }
+                html += '</dd>';
+            }
+            html += '<dt style="color:var(--color-text-secondary);">IP</dt><dd>' + escapeAuditHtml(log.ip_address || '—') + '</dd>';
+            if (log.user_agent) {
+                html += '<dt style="color:var(--color-text-secondary);">Navegador</dt><dd style="word-break:break-word;">' + escapeAuditHtml(log.user_agent) + '</dd>';
+            }
+            html += '</dl>';
+
+            var anomalies = data.anomalies || [];
+            if (anomalies.length) {
+                html += '<h4 style="margin:18px 0 8px;font-size:14px;">Alertas de esta entidad</h4>';
+                anomalies.forEach(function(an) {
+                    html += '<div class="audit-anomaly-item"><span class="audit-sev audit-sev-' + escapeAuditHtml(an.severity || 'warning') + '">'
+                        + escapeAuditHtml(an.severity || 'aviso') + '</span><div><strong>' + escapeAuditHtml(an.title || '')
+                        + '</strong><div style="color:var(--color-text-secondary);">' + escapeAuditHtml(an.detail || '') + '</div></div></div>';
+                });
+            }
+
+            var related = data.related || [];
+            if (related.length) {
+                html += '<h4 style="margin:18px 0 8px;font-size:14px;">Eventos relacionados</h4>';
+                html += '<div style="max-height:240px;overflow:auto;border:1px solid rgba(0,0,0,.06);border-radius:8px;padding:8px 10px;">';
+                related.forEach(function(ev) {
+                    html += '<div style="padding:6px 0;border-bottom:1px solid rgba(0,0,0,.04);font-size:12px;">';
+                    html += '<div style="color:var(--color-text-secondary);">' + escapeAuditHtml(ev.at || '') + ' · ' + escapeAuditHtml(ev.source || '') + '</div>';
+                    html += '<strong>' + escapeAuditHtml(ev.label || '') + '</strong>';
+                    html += '<div>' + escapeAuditHtml(ev.detail || '') + '</div>';
+                    html += '</div>';
+                });
+                html += '</div>';
+            } else {
+                html += '<p style="margin:16px 0 0;font-size:12px;color:var(--color-text-secondary);">Sin eventos relacionados en inventario/compras/auditoría.</p>';
+            }
+
+            body.innerHTML = html;
+        })
+        .catch(function(err){
+            body.innerHTML = '<p class="dashboard-empty" style="color:#DC2626;">' + escapeAuditHtml(err.message || 'Error') + '</p>';
+        });
+}
 function openWipeDangerModal(e) {
     e.preventDefault();
     document.getElementById('wipeDangerPhrase').value = '';
@@ -948,6 +1556,72 @@ function confirmWipeDanger() {
     document.getElementById('wipeConfirmPhrase').value = phrase;
     document.getElementById('wipeConfirmPassword').value = pwd;
     document.getElementById('wipeDangerModal').style.display = 'none';
+    if (!form) return;
+    form.onsubmit = null;
+    form.removeAttribute('onsubmit');
+    if (typeof handleAjaxSubmit === 'function') {
+        handleAjaxSubmit(form);
+    } else {
+        form.submit();
+    }
+}
+
+var sandboxEnterFormPending = null;
+function openSandboxEnterModal(e, form) {
+    e.preventDefault();
+    sandboxEnterFormPending = form || e.target;
+    document.getElementById('sandboxEnterPassword').value = '';
+    document.getElementById('sandboxEnterModal').style.display = 'flex';
+    if (typeof initPasswordToggles === 'function') initPasswordToggles(document.getElementById('sandboxEnterModal'));
+    setTimeout(function(){ document.getElementById('sandboxEnterPassword').focus(); }, 50);
+    return false;
+}
+function closeSandboxEnterModal() {
+    document.getElementById('sandboxEnterModal').style.display = 'none';
+    sandboxEnterFormPending = null;
+}
+function confirmSandboxEnter() {
+    var pwd = (document.getElementById('sandboxEnterPassword').value || '').trim();
+    if (!pwd) {
+        if (typeof showAlert === 'function') showAlert('Debe escribir la contraseña del administrador', 'error');
+        else alert('Debe escribir la contraseña del administrador');
+        return;
+    }
+    var form = sandboxEnterFormPending || document.getElementById('sandboxEnterForm');
+    if (!form) return;
+    var hidden = form.querySelector('.sandbox-enter-password');
+    if (hidden) hidden.value = pwd;
+    document.getElementById('sandboxEnterModal').style.display = 'none';
+    form.onsubmit = null;
+    form.removeAttribute('onsubmit');
+    if (typeof showAlert === 'function') showAlert('Clonando base de datos… puede tardar unos minutos', 'info');
+    if (typeof handleAjaxSubmit === 'function') {
+        handleAjaxSubmit(form);
+    } else {
+        form.submit();
+    }
+}
+function openSandboxDropModal(e) {
+    e.preventDefault();
+    document.getElementById('sandboxDropPasswordInput').value = '';
+    document.getElementById('sandboxDropModal').style.display = 'flex';
+    if (typeof initPasswordToggles === 'function') initPasswordToggles(document.getElementById('sandboxDropModal'));
+    setTimeout(function(){ document.getElementById('sandboxDropPasswordInput').focus(); }, 50);
+    return false;
+}
+function closeSandboxDropModal() {
+    document.getElementById('sandboxDropModal').style.display = 'none';
+}
+function confirmSandboxDrop() {
+    var pwd = (document.getElementById('sandboxDropPasswordInput').value || '').trim();
+    if (!pwd) {
+        if (typeof showAlert === 'function') showAlert('Debe escribir la contraseña del administrador', 'error');
+        else alert('Debe escribir la contraseña del administrador');
+        return;
+    }
+    var form = document.getElementById('sandboxDropForm');
+    document.getElementById('sandboxDropPassword').value = pwd;
+    document.getElementById('sandboxDropModal').style.display = 'none';
     if (!form) return;
     form.onsubmit = null;
     form.removeAttribute('onsubmit');
@@ -1090,7 +1764,7 @@ function previewAndUploadCompanyLogo(input) {
 })();
 
 (function(){
-    function activateConfigTab(name) {
+    window.activateConfigTab = function(name) {
         document.querySelectorAll('.config-tab-btn').forEach(function(btn) {
             btn.classList.toggle('active', btn.getAttribute('data-config-tab') === name);
         });
@@ -1104,23 +1778,48 @@ function previewAndUploadCompanyLogo(input) {
                 location.hash = name;
             }
         } catch (e) {}
-    }
+    };
     document.querySelectorAll('.config-tab-btn').forEach(function(btn) {
         btn.addEventListener('click', function() {
-            activateConfigTab(btn.getAttribute('data-config-tab'));
+            window.activateConfigTab(btn.getAttribute('data-config-tab'));
         });
     });
     var hash = (location.hash || '').replace(/^#/, '');
     if (hash === 'teamUsers' || hash === 'usuarios') {
-        activateConfigTab('usuarios');
+        window.activateConfigTab('usuarios');
+    } else if (hash === 'auditoria') {
+        window.activateConfigTab('auditoria');
+    } else if (hash === 'gastos-admin' || hash === 'gastos_admin') {
+        window.activateConfigTab('gastos-admin');
     } else if (hash === 'backup-list' || hash === 'sistema') {
-        activateConfigTab('sistema');
+        window.activateConfigTab('sistema');
     } else if (hash === 'empresa') {
-        activateConfigTab('empresa');
+        window.activateConfigTab('empresa');
     } else if (hash === 'documentos') {
-        activateConfigTab('documentos');
+        window.activateConfigTab('documentos');
     } else if (hash === 'general') {
-        activateConfigTab('general');
+        window.activateConfigTab('general');
+    } else {
+        var params = new URLSearchParams(window.location.search);
+        if (params.has('audit_page') || params.has('audit_module') || params.has('audit_action')
+            || params.has('audit_user') || params.has('audit_q') || params.has('audit_from') || params.has('audit_to')) {
+            window.activateConfigTab('auditoria');
+        }
     }
+})();
+(function () {
+    var taxOn = document.querySelector('input[name="tax_enabled"][type="checkbox"]');
+    var prodOn = document.querySelector('input[name="product_tax_enabled"][type="checkbox"]');
+    if (!taxOn || !prodOn) return;
+    function syncProductTaxToggle() {
+        if (!taxOn.checked) {
+            prodOn.checked = false;
+            prodOn.disabled = true;
+        } else {
+            prodOn.disabled = false;
+        }
+    }
+    taxOn.addEventListener('change', syncProductTaxToggle);
+    syncProductTaxToggle();
 })();
 </script>

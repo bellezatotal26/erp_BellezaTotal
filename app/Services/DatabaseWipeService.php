@@ -123,6 +123,7 @@ class DatabaseWipeService
     private function resetSequenceSettings(): void
     {
         $resets = [
+            'ean_next' => '1',
             'barcode_next' => '1',
             'sku_next' => '1',
             'invoice_next' => '1',
@@ -140,7 +141,39 @@ class DatabaseWipeService
                     "UPDATE settings SET setting_value = ? WHERE setting_key = ?",
                     [$value, $key]
                 );
+            } else {
+                $this->query(
+                    "INSERT INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                    [$key, $value]
+                );
             }
+        }
+
+        // Reinicia AUTO_INCREMENT en tablas vaciadas (IDs desde 1).
+        try {
+            $rows = $this->db->query(
+                "SELECT TABLE_NAME
+                 FROM information_schema.TABLES
+                 WHERE TABLE_SCHEMA = DATABASE()
+                   AND TABLE_TYPE = 'BASE TABLE'
+                   AND AUTO_INCREMENT IS NOT NULL"
+            )->fetchAll(\PDO::FETCH_COLUMN);
+            foreach ($rows as $table) {
+                $table = (string)$table;
+                if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+                    continue;
+                }
+                if (strtolower($table) === 'users') {
+                    continue; // conserva secuencia del admin
+                }
+                try {
+                    $this->db->exec('ALTER TABLE `' . $table . '` AUTO_INCREMENT = 1');
+                } catch (\Throwable $e) {
+                    // ignora tablas no alterables
+                }
+            }
+        } catch (\Throwable $e) {
+            error_log('DatabaseWipeService AUTO_INCREMENT: ' . $e->getMessage());
         }
     }
 

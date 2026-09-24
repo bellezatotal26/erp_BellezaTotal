@@ -5,13 +5,16 @@ namespace SoftNova\Core;
 /**
  * Helpers de catálogo (pagos, gastos, canales).
  */
-function payment_methods(bool $includeLegacyCard = true): array
+function payment_methods(bool $includeLegacy = false): array
 {
     $methods = config('payment_methods', []);
-    if (!$includeLegacyCard) {
-        unset($methods['card']);
+    if (!is_array($methods)) {
+        return [];
     }
-    return is_array($methods) ? $methods : [];
+    if (!$includeLegacy) {
+        unset($methods['card'], $methods['dataphone']);
+    }
+    return $methods;
 }
 
 function payment_method_label(string $code): string

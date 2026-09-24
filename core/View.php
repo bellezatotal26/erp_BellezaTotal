@@ -68,8 +68,10 @@ class View
             } else {
                 echo $content;
             }
-        } catch (\Exception $e) {
-            ob_end_clean();
+        } catch (\Throwable $e) {
+            if (ob_get_level() > 0) {
+                ob_end_clean();
+            }
             throw $e;
         }
     }

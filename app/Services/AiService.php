@@ -3,8 +3,8 @@
 namespace SoftNova\Services;
 
 /**
- * Servicio de IA via OpenRouter (compatible OpenAI)
- * Modelo: NVIDIA Nemotron 3 Ultra (free)
+ * Servicio de IA via OpenRouter (compatible OpenAI).
+ * Modelos separados: chat, facturas (texto) y visión (escaneos).
  */
 class AiService
 {
@@ -158,6 +158,39 @@ class AiService
         $key = trim((string)($this->config['api_key'] ?? ''));
         return $enabled && $key !== '';
     }
+
+    /** @return array{chat:string,invoice:string,vision:string} */
+    public function modelsForDisplay(): array
+    {
+        return [
+            'chat' => $this->resolveModel('chat'),
+            'invoice' => $this->resolveModel('invoice'),
+            'vision' => $this->resolveModel('vision'),
+        ];
+    }
+
+    private function resolveModel(string $role): string
+    {
+        $default = trim((string)($this->config['default_model'] ?? ''));
+        if ($default === '') {
+            $default = 'google/gemini-2.5-flash';
+        }
+
+        $chains = [
+            'chat' => ['chat_model', 'model', 'default_model'],
+            'invoice' => ['invoice_model', 'chat_model', 'model', 'default_model'],
+            'vision' => ['vision_model', 'invoice_model', 'chat_model', 'model', 'default_model'],
+        ];
+
+        foreach ($chains[$role] ?? ['default_model'] as $key) {
+            $value = trim((string)($this->config[$key] ?? ''));
+            if ($value !== '') {
+                return $value;
+            }
+        }
+
+        return $default;
+    }
     
     /**
      * Genera respuesta del asistente Seri
@@ -299,7 +332,7 @@ class AiService
         $baseUrl = rtrim((string)($this->config['base_url'] ?? 'https://openrouter.ai/api/v1'), '/');
         $url = $baseUrl . '/chat/completions';
         $apiKey = (string)$this->config['api_key'];
-        $model = (string)($this->config['model'] ?? 'nvidia/nemotron-3-ultra-550b-a55b:free');
+        $model = $this->resolveModel('chat');
         
         $system = $this->systemPrompt($context);
 
@@ -448,7 +481,9 @@ Reglas: usa punto decimal; no inventes datos ausentes (deja vacío o 0);
 separa SIEMPRE barcode/EAN de supplier_sku/ID.
 Si el texto trae "ID: 048391 / EAN: 7702113048391", supplier_sku=048391 y barcode=7702113048391.
 No uses como cantidad los números del nombre (ej. 5.0, 6.35, 60 gr); la cantidad es CANT./unidades facturadas.
-Si hay BONIF y CANT=0, quantity = BONIF.
+Si hay BONIF y CANT=0, quantity = BONIF y unit_cost=0, line_total=0 (bonificación/regalo).
+Si hay CANT>0 y BONIF>0, genera DOS items: uno con quantity=CANT y precios de la factura, y otro con quantity=BONIF, unit_cost=0, line_total=0 (mismo barcode/sku/nombre).
+Las bonificaciones (costo 0) SÍ deben listarse: entran al inventario con el mismo SKU/EAN.
 si el texto no es una factura devuelve {"items": []}.
 PROMPT;
 
@@ -457,13 +492,13 @@ PROMPT;
             $response = $this->httpPostJson(
                 $baseUrl . '/chat/completions',
                 [
-                    'model' => (string)($this->config['model'] ?? 'nvidia/nemotron-3-ultra-550b-a55b:free'),
+                    'model' => $this->resolveModel('invoice'),
                     'messages' => [
                         ['role' => 'system', 'content' => $instruccion],
                         ['role' => 'user', 'content' => $rawText],
                     ],
                     'temperature' => 0,
-                    'max_tokens' => 3000,
+                    'max_tokens' => (int)($this->config['invoice_max_tokens'] ?? 4000),
                 ],
                 [
                     'Content-Type: application/json',
@@ -471,7 +506,7 @@ PROMPT;
                     'HTTP-Referer: ' . ($this->config['site_url'] ?? 'http://localhost'),
                     'X-Title: ' . ($this->config['site_name'] ?? 'Seri ERP'),
                 ],
-                (int)($this->config['timeout'] ?? 60)
+                (int)($this->config['invoice_timeout'] ?? $this->config['timeout'] ?? 90)
             );
         } catch (\Throwable $e) {
             error_log('AiService extractInvoiceData: ' . $this->safeError($e->getMessage()));
@@ -566,22 +601,17 @@ PROMPT
             return null;
         }
 
-        $model = (string)($this->config['vision_model'] ?? '');
-        if ($model === '') {
-            $model = (string)($this->config['model'] ?? 'google/gemini-2.0-flash-exp:free');
-        }
-
         try {
             $baseUrl = rtrim((string)($this->config['base_url'] ?? 'https://openrouter.ai/api/v1'), '/');
             $response = $this->httpPostJson(
                 $baseUrl . '/chat/completions',
                 [
-                    'model' => $model,
+                    'model' => $this->resolveModel('vision'),
                     'messages' => [
                         ['role' => 'user', 'content' => $parts],
                     ],
                     'temperature' => 0,
-                    'max_tokens' => 4000,
+                    'max_tokens' => (int)($this->config['invoice_max_tokens'] ?? 4000),
                 ],
                 [
                     'Content-Type: application/json',

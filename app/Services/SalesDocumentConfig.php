@@ -55,6 +55,7 @@ class SalesDocumentConfig
                 'footer_text' => 'Gracias por su compra',
                 'header_extra' => '',
                 'header_color' => '#000000',
+                'auto_print_ticket' => false,
             ],
         ];
     }

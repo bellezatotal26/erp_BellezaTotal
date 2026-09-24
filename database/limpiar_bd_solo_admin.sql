@@ -1,106 +1,92 @@
--- ============================================================
--- Seri ERP — Limpiar BD (solo queda el usuario admin)
--- Ejecutar en phpMyAdmin sobre la base de datos del sistema.
--- ============================================================
--- ADVERTENCIA: borra TODOS los datos (ventas, inventario, compras, etc.).
--- Conserva:
---   - Catálogo contable (accounting_accounts / accounting_settings)
---   - Preferencias (settings)
---   - Un único usuario con rol admin
--- ============================================================
+-- =============================================================================
+-- Alias / copia amigable del wipe operativo (phpMyAdmin, SIN DELIMITER)
+-- Preferido: database/wipe_operational_bellezat.sql
+-- =============================================================================
+-- Este archivo incluye además: forzar email admin@bellezatotal.co
+-- y contraseña temporal Admin123! (cámbiela al entrar).
+-- Si solo quiere vaciar datos SIN tocar login, use wipe_operational_bellezat.sql
+-- =============================================================================
 
 SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;
 
--- Procedimiento auxiliar: TRUNCATE solo si la tabla existe
-DROP PROCEDURE IF EXISTS `seri_truncate_if_exists`;
-DELIMITER $$
-CREATE PROCEDURE `seri_truncate_if_exists`(IN p_table VARCHAR(64))
-BEGIN
-  IF EXISTS (
-    SELECT 1
-    FROM information_schema.TABLES
-    WHERE TABLE_SCHEMA = DATABASE()
-      AND TABLE_NAME = p_table
-  ) THEN
-    SET @sql = CONCAT('TRUNCATE TABLE `', p_table, '`');
-    PREPARE stmt FROM @sql;
-    EXECUTE stmt;
-    DEALLOCATE PREPARE stmt;
-  END IF;
-END$$
-DELIMITER ;
+TRUNCATE TABLE `sale_items`;
+TRUNCATE TABLE `sale_payments`;
+TRUNCATE TABLE `sales`;
+TRUNCATE TABLE `sale_credit_note_items`;
+TRUNCATE TABLE `sale_credit_notes`;
+TRUNCATE TABLE `receivables`;
+TRUNCATE TABLE `cash_movements`;
+TRUNCATE TABLE `cash_sessions`;
+TRUNCATE TABLE `quote_items`;
+TRUNCATE TABLE `quotes`;
+TRUNCATE TABLE `sales_commissions`;
+TRUNCATE TABLE `user_commission_rates`;
 
--- ---- Ventas / caja / CxC ----
-CALL seri_truncate_if_exists('sale_items');
-CALL seri_truncate_if_exists('sale_payments');
-CALL seri_truncate_if_exists('sales');
-CALL seri_truncate_if_exists('sale_credit_note_items');
-CALL seri_truncate_if_exists('sale_credit_notes');
-CALL seri_truncate_if_exists('receivables');
-CALL seri_truncate_if_exists('cash_movements');
-CALL seri_truncate_if_exists('cash_sessions');
-CALL seri_truncate_if_exists('quote_items');
-CALL seri_truncate_if_exists('quotes');
-CALL seri_truncate_if_exists('sales_commissions');
-CALL seri_truncate_if_exists('user_commission_rates');
+TRUNCATE TABLE `stock_movement_lots`;
+TRUNCATE TABLE `stock_movements`;
+TRUNCATE TABLE `product_lots`;
+TRUNCATE TABLE `product_suppliers`;
+TRUNCATE TABLE `product_stock_debts`;
+TRUNCATE TABLE `product_offer_log`;
+TRUNCATE TABLE `products`;
+TRUNCATE TABLE `categories`;
+TRUNCATE TABLE `notification_dismissals`;
 
--- ---- Inventario ----
-CALL seri_truncate_if_exists('stock_movement_lots');
-CALL seri_truncate_if_exists('stock_movements');
-CALL seri_truncate_if_exists('product_lots');
-CALL seri_truncate_if_exists('product_suppliers');
-CALL seri_truncate_if_exists('product_stock_debts');
-CALL seri_truncate_if_exists('product_offer_log');
-CALL seri_truncate_if_exists('products');
-CALL seri_truncate_if_exists('categories');
-CALL seri_truncate_if_exists('notification_dismissals');
+TRUNCATE TABLE `customers`;
+TRUNCATE TABLE `suppliers`;
+TRUNCATE TABLE `expenses`;
+TRUNCATE TABLE `expense_categories`;
+TRUNCATE TABLE `expense_subgroups`;
 
--- ---- Clientes / proveedores / gastos ----
-CALL seri_truncate_if_exists('customers');
-CALL seri_truncate_if_exists('suppliers');
-CALL seri_truncate_if_exists('expenses');
-CALL seri_truncate_if_exists('expense_categories');
+TRUNCATE TABLE `purchase_credit_note_items`;
+TRUNCATE TABLE `purchase_credit_notes`;
+TRUNCATE TABLE `supplier_payments`;
+TRUNCATE TABLE `purchase_order_items`;
+TRUNCATE TABLE `purchase_orders`;
+TRUNCATE TABLE `purchase_invoice_import_items`;
+TRUNCATE TABLE `purchase_invoice_imports`;
+TRUNCATE TABLE `replenishment_draft_items`;
+TRUNCATE TABLE `purchase_items`;
+TRUNCATE TABLE `purchases`;
 
--- ---- Compras ----
-CALL seri_truncate_if_exists('purchase_credit_note_items');
-CALL seri_truncate_if_exists('purchase_credit_notes');
-CALL seri_truncate_if_exists('supplier_payments');
-CALL seri_truncate_if_exists('purchase_order_items');
-CALL seri_truncate_if_exists('purchase_orders');
-CALL seri_truncate_if_exists('purchase_invoice_import_items');
-CALL seri_truncate_if_exists('purchase_invoice_imports');
-CALL seri_truncate_if_exists('replenishment_draft_items');
-CALL seri_truncate_if_exists('purchase_items');
-CALL seri_truncate_if_exists('purchases');
+TRUNCATE TABLE `consignment_settlement_items`;
+TRUNCATE TABLE `consignment_settlements`;
+TRUNCATE TABLE `consignment_sale_debts`;
+TRUNCATE TABLE `consignment_receipt_items`;
+TRUNCATE TABLE `consignment_receipts`;
+TRUNCATE TABLE `consignors`;
 
--- ---- Nómina ----
-CALL seri_truncate_if_exists('payroll_items');
-CALL seri_truncate_if_exists('payroll_runs');
-CALL seri_truncate_if_exists('employees');
+TRUNCATE TABLE `payroll_items`;
+TRUNCATE TABLE `payroll_runs`;
+TRUNCATE TABLE `employees`;
 
--- ---- Contabilidad (movimientos; se conserva el PUC) ----
-CALL seri_truncate_if_exists('accounting_lines');
-CALL seri_truncate_if_exists('accounting_entries');
-CALL seri_truncate_if_exists('accounting_periods');
+TRUNCATE TABLE `accounting_lines`;
+TRUNCATE TABLE `accounting_entries`;
+TRUNCATE TABLE `accounting_periods`;
 
--- ---- IA / jobs / auditoría / extras ----
-CALL seri_truncate_if_exists('ai_messages');
-CALL seri_truncate_if_exists('ai_conversations');
-CALL seri_truncate_if_exists('jobs');
-CALL seri_truncate_if_exists('audit_logs');
-CALL seri_truncate_if_exists('tenant_notifications');
-CALL seri_truncate_if_exists('custom_select_options');
+TRUNCATE TABLE `ai_messages`;
+TRUNCATE TABLE `ai_conversations`;
+TRUNCATE TABLE `jobs`;
+TRUNCATE TABLE `audit_logs`;
+TRUNCATE TABLE `tenant_notifications`;
+TRUNCATE TABLE `custom_select_options`;
+TRUNCATE TABLE `integration_settings`;
+TRUNCATE TABLE `ecommerce_settings`;
 
-DROP PROCEDURE IF EXISTS `seri_truncate_if_exists`;
+TRUNCATE TABLE `ticket_messages`;
+TRUNCATE TABLE `tickets`;
+TRUNCATE TABLE `license_payments`;
+TRUNCATE TABLE `license_sales`;
+TRUNCATE TABLE `tenant_users`;
+TRUNCATE TABLE `tenants`;
+TRUNCATE TABLE `subscription_plans`;
+TRUNCATE TABLE `announcements`;
+TRUNCATE TABLE `system_settings`;
+TRUNCATE TABLE `super_admin_users`;
 
 SET FOREIGN_KEY_CHECKS = 1;
 
--- ============================================================
--- Dejar solo un usuario admin
--- ============================================================
-
--- Actualiza el admin principal Y fuerza contraseña temporal: Admin123!
 UPDATE `users`
 SET
   `email` = 'admin@bellezatotal.co',
@@ -115,7 +101,6 @@ WHERE `id` = (
   ) AS t
 );
 
--- Si no existía admin, crea uno (contraseña temporal: Admin123!)
 INSERT INTO `users` (`name`, `email`, `password`, `role`, `status`)
 SELECT
   'Administrador',
@@ -127,9 +112,14 @@ WHERE NOT EXISTS (
   SELECT 1 FROM `users` WHERE `email` = 'admin@bellezatotal.co'
 );
 
--- Elimina el resto de usuarios
 DELETE FROM `users`
 WHERE `email` <> 'admin@bellezatotal.co';
 
--- Verificación final
+UPDATE `settings` SET `setting_value` = '1' WHERE `setting_key` = 'barcode_next';
+UPDATE `settings` SET `setting_value` = '1' WHERE `setting_key` = 'sku_next';
+UPDATE `settings` SET `setting_value` = '1' WHERE `setting_key` = 'invoice_next';
+UPDATE `settings` SET `setting_value` = '1' WHERE `setting_key` = 'quote_next';
+UPDATE `settings` SET `setting_value` = '1' WHERE `setting_key` = 'purchase_order_next';
+UPDATE `settings` SET `setting_value` = '1' WHERE `setting_key` = 'sale_next';
+
 SELECT `id`, `name`, `email`, `role`, `status` FROM `users`;
