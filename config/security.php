@@ -15,7 +15,7 @@ return [
     
     'session_security' => [
         'regenerate_id' => true,
-        'regenerate_interval' => 300,
+        'regenerate_interval' => 1800,
     ],
     
     'rate_limiting' => [

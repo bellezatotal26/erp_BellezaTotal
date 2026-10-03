@@ -77,6 +77,32 @@ assertTrue(!TenantMiddleware::canAccess('prestamos'), 'user custom: NO ver prest
 assertTrue(TenantMiddleware::canDo('create', 'prestamos'), 'user custom: create prestamos sin ver módulo');
 assertTrue(TenantMiddleware::canAccess('caja'), 'user custom: caja view');
 assertTrue(!TenantMiddleware::canAccess('configuracion'), 'user custom: NO configuracion');
+assertTrue(!TenantMiddleware::isManagement(), 'user custom: NO isManagement');
+
+// --- Gerencia ---
+$_SESSION = [];
+TenantMiddleware::hydrateSessionPermissions('gerencia', TenantMiddleware::fullPermissions());
+assertTrue(TenantMiddleware::getRole() === 'gerencia', 'gerencia: rol se conserva');
+assertTrue(TenantMiddleware::isManagement(), 'gerencia: isManagement');
+assertTrue(TenantMiddleware::canAccess('configuracion'), 'gerencia accede a configuracion');
+assertTrue(TenantMiddleware::canDo('edit', 'configuracion'), 'gerencia puede edit configuracion');
+assertTrue(!TenantMiddleware::canDo('delete', 'configuracion'), 'gerencia NO delete configuracion');
+assertTrue(TenantMiddleware::canAccess('ventas'), 'gerencia (todo marcado): ventas view');
+assertTrue(TenantMiddleware::canDo('delete', 'ventas'), 'gerencia (todo marcado): ventas delete');
+assertTrue(TenantMiddleware::roleDisplayLabel('gerencia') === 'Gerencia', 'label gerencia = Gerencia');
+
+$_SESSION = [];
+TenantMiddleware::hydrateSessionPermissions('gerencia', [
+    'ventas' => ['view' => true, 'create' => false, 'edit' => false, 'delete' => false, 'export' => false],
+]);
+assertTrue(TenantMiddleware::canAccess('ventas'), 'gerencia recortada: ventas view');
+assertTrue(!TenantMiddleware::canAccess('inventario'), 'gerencia recortada: NO inventario');
+assertTrue(!TenantMiddleware::canDo('create', 'ventas'), 'gerencia recortada: NO create ventas');
+assertTrue(TenantMiddleware::canAccess('configuracion'), 'gerencia recortada: sigue con configuracion');
+
+$_SESSION = [];
+TenantMiddleware::hydrateSessionPermissions('gerencia', []);
+assertTrue(TenantMiddleware::homePath() === '/app/configuracion', 'gerencia sin módulos: home = configuracion');
 
 echo "\nResultado: {$passed} pass, {$failed} fail\n";
 exit($failed > 0 ? 1 : 0);

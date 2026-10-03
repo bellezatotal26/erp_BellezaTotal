@@ -2477,6 +2477,100 @@ class StockService
     }
 
     /**
+     * Enriquece movimientos de compra con el IVA de la línea de la OC y el tipo de
+     * documento de la factura: el kardex guarda el costo base y el IVA vive en la OC.
+     * Agrega purchase_tax_known, purchase_tax_unit, purchase_tax_rate y purchase_vat_in_cost.
+     *
+     * @param list<array<string,mixed>> $movements
+     * @return list<array<string,mixed>>
+     */
+    public static function attachPurchaseTaxInfo(\PDO $db, array $movements): array
+    {
+        $orderIds = [];
+        foreach ($movements as $m) {
+            if (in_array((string)($m['reference_type'] ?? ''), ['purchase_order', 'purchase'], true)
+                && (int)($m['reference_id'] ?? 0) > 0
+            ) {
+                $orderIds[(int)$m['reference_id']] = true;
+            }
+        }
+        if ($orderIds === []) {
+            return $movements;
+        }
+
+        $items = [];
+        $kinds = [];
+        foreach (array_chunk(array_keys($orderIds), 500) as $chunk) {
+            $ph = implode(',', array_fill(0, count($chunk), '?'));
+            try {
+                $st = $db->prepare(
+                    "SELECT purchase_order_id, product_id, quantity, unit_cost, tax_rate, tax_amount
+                     FROM purchase_order_items
+                     WHERE purchase_order_id IN ($ph)
+                     ORDER BY id"
+                );
+                $st->execute($chunk);
+                foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $it) {
+                    $items[(int)$it['purchase_order_id'] . ':' . (int)$it['product_id']][] = $it;
+                }
+            } catch (\Throwable $e) {
+                return $movements;
+            }
+            try {
+                $st = $db->prepare(
+                    "SELECT purchase_order_id, document_kind
+                     FROM purchase_invoice_imports
+                     WHERE purchase_order_id IN ($ph)
+                     ORDER BY id"
+                );
+                $st->execute($chunk);
+                foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $imp) {
+                    $kinds[(int)$imp['purchase_order_id']] = (string)($imp['document_kind'] ?? '');
+                }
+            } catch (\Throwable $e) {
+                // Sin tabla de importación: solo OC manuales.
+            }
+        }
+
+        foreach ($movements as &$m) {
+            $orderId = (int)($m['reference_id'] ?? 0);
+            if ($orderId <= 0 || !in_array((string)($m['reference_type'] ?? ''), ['purchase_order', 'purchase'], true)) {
+                continue;
+            }
+            $candidates = $items[$orderId . ':' . (int)($m['product_id'] ?? 0)] ?? [];
+            if ($candidates === []) {
+                continue;
+            }
+            // Misma OC puede traer línea pagada y bonificada del mismo producto.
+            $movCost = round((float)($m['unit_cost'] ?? 0), 2);
+            $item = $candidates[0];
+            foreach ($candidates as $cand) {
+                if (abs(round((float)$cand['unit_cost'], 2) - $movCost) < 0.01) {
+                    $item = $cand;
+                    break;
+                }
+            }
+            $qty = (float)($item['quantity'] ?? 0);
+            $cost = (float)($item['unit_cost'] ?? 0);
+            $rate = (float)($item['tax_rate'] ?? 0);
+            $taxAmount = (float)($item['tax_amount'] ?? 0);
+            $taxUnit = 0.0;
+            if ($taxAmount > 0.009 && $qty > 0) {
+                $taxUnit = round($taxAmount / $qty, 2);
+            } elseif ($rate > 0.009 && $cost > 0) {
+                $taxUnit = round($cost * $rate / 100, 2);
+            }
+            $m['purchase_tax_known'] = true;
+            $m['purchase_tax_unit'] = $taxUnit;
+            $m['purchase_tax_rate'] = $rate;
+            $m['purchase_vat_in_cost'] = strtolower(trim($kinds[$orderId] ?? '')) === 'electronic';
+        }
+        unset($m);
+
+        return $movements;
+    }
+
+    /**
      * Motivo legible y detallado para trazabilidad (columna Motivo).
      * Segmenta producto nuevo vs ajuste de producto existente.
      * Devuelve texto plano (PDF / export); para UI usar describeMovementMotiveLines().
@@ -2591,19 +2685,52 @@ class StockService
             $lines[] = 'Stock resultante: ' . $stockAfter;
         }
 
+        $money = static fn(float $v): string => '$ ' . number_format($v, 2, ',', '.');
         $costBits = [];
-        if ($unitCost !== null && $unitCost > 0) {
-            $costBits[] = 'Costo u.: ' . number_format($unitCost, 2, ',', '.');
-        }
-        if ($totalCost !== null && $totalCost > 0 && $qty !== 0) {
-            $costBits[] = 'Total: ' . number_format($totalCost, 2, ',', '.');
-        }
-        if ($payment !== '') {
-            $payMap = ['equity' => 'capital/aporte', 'loss' => 'pérdida', 'cash' => 'caja', 'credit' => 'crédito'];
-            $costBits[] = 'Modo: ' . ($payMap[$payment] ?? $payment);
+        $taxLine = '';
+        $taxKnown = !empty($m['purchase_tax_known']) && $unitCost !== null && $unitCost > 0;
+        $taxUnit = round((float)($m['purchase_tax_unit'] ?? 0), 2);
+        if ($taxKnown && $taxUnit > 0.009) {
+            $withVat = round($unitCost + $taxUnit, 2);
+            $rate = (float)($m['purchase_tax_rate'] ?? 0);
+            $rateLabel = $rate > 0.009
+                ? ' ' . rtrim(rtrim(number_format($rate, 2, ',', ''), '0'), ',') . '%'
+                : '';
+            $costBits[] = 'Costo u. con IVA: ' . $money($withVat);
+            if ($qty !== 0) {
+                $costBits[] = 'Total con IVA: ' . $money(round($withVat * abs($qty), 2));
+            }
+            $taxLine = 'Base sin IVA: ' . $money($unitCost) . ' + IVA' . $rateLabel . ': ' . $money($taxUnit) . ' por und.';
+        } elseif ($taxKnown && !empty($m['purchase_vat_in_cost'])) {
+            $costBits[] = 'Costo u. con IVA: ' . $money($unitCost) . ' (IVA incluido, F. Electrónica)';
+            if ($totalCost !== null && $totalCost > 0 && $qty !== 0) {
+                $costBits[] = 'Total con IVA: ' . $money($totalCost);
+            }
+        } elseif (!empty($m['purchase_tax_known']) && $unitCost !== null && $unitCost <= 0.009 && $type === 'in') {
+            $costBits[] = 'Bonificado: costo $ 0 (se conserva el costo del inventario)';
+        } else {
+            if ($unitCost !== null && $unitCost > 0) {
+                $costBits[] = 'Costo u.' . ($taxKnown ? ' (sin IVA)' : '') . ': ' . $money($unitCost);
+            }
+            if ($totalCost !== null && $totalCost > 0 && $qty !== 0) {
+                $costBits[] = 'Total: ' . $money($totalCost);
+            }
         }
         if ($costBits !== []) {
             $lines[] = implode(' · ', $costBits);
+        }
+        if ($taxLine !== '') {
+            $lines[] = $taxLine;
+        }
+        if ($payment !== '') {
+            $payMap = [
+                'equity' => 'capital/aporte',
+                'loss' => 'pérdida',
+                'cash' => 'caja',
+                'credit' => 'crédito',
+                'payable' => 'por pagar al proveedor',
+            ];
+            $lines[] = 'Modo: ' . ($payMap[$payment] ?? $payment);
         }
 
         if ($userDetail !== '') {
@@ -3259,8 +3386,24 @@ class StockService
             $offset = 0;
         }
 
+        $pageGroups = array_slice($allGroups, $offset, $limit);
+        $flat = [];
+        foreach ($pageGroups as $gi => $group) {
+            foreach ($group['lines'] as $li => $line) {
+                $flat[$gi . ':' . $li] = $line;
+            }
+        }
+        $enriched = array_combine(
+            array_keys($flat),
+            self::attachPurchaseTaxInfo($this->db, array_values($flat))
+        ) ?: [];
+        foreach ($enriched as $key => $line) {
+            [$gi, $li] = array_map('intval', explode(':', (string)$key));
+            $pageGroups[$gi]['lines'][$li] = $line;
+        }
+
         return [
-            'groups' => array_slice($allGroups, $offset, $limit),
+            'groups' => $pageGroups,
             'total' => $totalGroups,
             'line_total' => (int)$scan['total'],
             'truncated' => (int)$scan['total'] > count($scan['rows']),

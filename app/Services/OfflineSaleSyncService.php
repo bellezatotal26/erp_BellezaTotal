@@ -199,7 +199,26 @@ class OfflineSaleSyncService
         // Reconstruye items[0][product_id] planos (FormData / colas antiguas).
         if ($items === []) {
             foreach ($raw as $key => $value) {
-                if (!is_string($key) || !preg_match('/^items\[(\d+)\]\[(\w+)\]$/', $key, $m)) {
+                if (!is_string($key)) {
+                    continue;
+                }
+                if (preg_match('/^items\[(\d+)\]\[components\]\[(\d+)\]\[(\w+)\]$/', $key, $m)) {
+                    $idx = (int)$m[1];
+                    $cIdx = (int)$m[2];
+                    $cField = $m[3];
+                    if (!isset($items[$idx]) || !is_array($items[$idx])) {
+                        $items[$idx] = [];
+                    }
+                    if (!isset($items[$idx]['components']) || !is_array($items[$idx]['components'])) {
+                        $items[$idx]['components'] = [];
+                    }
+                    if (!isset($items[$idx]['components'][$cIdx]) || !is_array($items[$idx]['components'][$cIdx])) {
+                        $items[$idx]['components'][$cIdx] = [];
+                    }
+                    $items[$idx]['components'][$cIdx][$cField] = $value;
+                    continue;
+                }
+                if (!preg_match('/^items\[(\d+)\]\[(\w+)\]$/', $key, $m)) {
                     continue;
                 }
                 $idx = (int)$m[1];
@@ -215,8 +234,41 @@ class OfflineSaleSyncService
             if (!is_array($item)) {
                 continue;
             }
-            $pid = (int)($item['product_id'] ?? 0);
+            $isCombo = !empty($item['is_combo'])
+                || (string)($item['is_combo'] ?? '') === '1'
+                || (string)($item['product_type'] ?? '') === 'combo'
+                || !empty($item['components_json']);
             $qty = (int)($item['quantity'] ?? 0);
+            if ($isCombo) {
+                if ($qty <= 0) {
+                    continue;
+                }
+                $components = $item['components'] ?? [];
+                if ((!is_array($components) || $components === []) && !empty($item['components_json'])) {
+                    $decoded = json_decode((string)$item['components_json'], true);
+                    if (is_array($decoded)) {
+                        $components = $decoded;
+                    }
+                }
+                if (!is_array($components) || count($components) < 2) {
+                    continue;
+                }
+                $normalizedItems[] = [
+                    'is_combo' => '1',
+                    'product_type' => 'combo',
+                    'combo_id' => (int)($item['combo_id'] ?? 0),
+                    'product_id' => 0,
+                    'quantity' => $qty,
+                    'unit_price' => isset($item['unit_price']) ? (float)$item['unit_price'] : 0.0,
+                    'product_name' => (string)($item['product_name'] ?? 'Combo'),
+                    'price_manual' => '1',
+                    'tax_rate' => $item['tax_rate'] ?? null,
+                    'components' => array_values($components),
+                    'components_json' => json_encode(array_values($components), JSON_UNESCAPED_UNICODE),
+                ];
+                continue;
+            }
+            $pid = (int)($item['product_id'] ?? 0);
             if ($pid <= 0 || $qty <= 0) {
                 continue;
             }
@@ -327,7 +379,151 @@ class OfflineSaleSyncService
         // (nombre/precio distintos); fusionarlas distorsiona totales.
         $grouped = [];
         $openItemLines = [];
+        $comboValidExtra = [];
+        $comboStockNeed = []; // product_id => qty extra por combos
         foreach ($items as $item) {
+            $isCombo = !empty($item['is_combo'])
+                || (string)($item['is_combo'] ?? '') === '1'
+                || (string)($item['product_type'] ?? '') === 'combo'
+                || !empty($item['components_json']);
+            if ($isCombo) {
+                $packs = (int)($item['quantity'] ?? 0);
+                if ($packs <= 0) {
+                    return [
+                        'status' => 'conflict',
+                        'message' => 'Cantidad de combo inválida',
+                        'code' => 'combo_invalid',
+                        'stock_conflicts' => [],
+                    ];
+                }
+                $comps = $item['components'] ?? [];
+                if ((!is_array($comps) || $comps === []) && !empty($item['components_json'])) {
+                    $decoded = json_decode((string)$item['components_json'], true);
+                    if (is_array($decoded)) {
+                        $comps = $decoded;
+                    }
+                }
+                if (!is_array($comps)) {
+                    $comps = [];
+                }
+                $comps = array_values(array_filter($comps, static fn($c) => is_array($c) && (int)($c['product_id'] ?? 0) > 0));
+                if (count($comps) < 2) {
+                    return [
+                        'status' => 'conflict',
+                        'message' => 'Combo sin productos. Actualice la app e intente de nuevo.',
+                        'code' => 'combo_invalid',
+                        'stock_conflicts' => [],
+                    ];
+                }
+                $comboName = trim((string)($item['product_name'] ?? 'Combo'));
+                if ($comboName === '') {
+                    $comboName = 'Combo';
+                }
+                if (!str_starts_with(mb_strtolower($comboName), 'combo')) {
+                    $comboName = 'Combo: ' . $comboName;
+                }
+                $comboPrice = round((float)($item['unit_price'] ?? 0), 2);
+                $comboId = (int)($item['combo_id'] ?? 0);
+                $costSum = 0.0;
+                $taxRateCombo = 0.0;
+                $hidden = [];
+                foreach ($comps as $comp) {
+                    $pid = (int)$comp['product_id'];
+                    $qty = (int)($comp['quantity'] ?? 0);
+                    if ($qty <= 0) {
+                        $per = (int)($comp['quantity_per_pack'] ?? 0);
+                        $qty = $per > 0 ? $per * $packs : 0;
+                    }
+                    if ($pid <= 0 || $qty <= 0) {
+                        continue;
+                    }
+                    $product = $this->query(
+                        "SELECT id, name, purchase_price, stock, COALESCE(product_type,'product') product_type,
+                                COALESCE(ownership,'owned') ownership, consignor_id, COALESCE(tax_rate,0) tax_rate, status
+                         FROM products WHERE id = ?",
+                        [$pid]
+                    )->fetch();
+                    if (!$product || ($product['status'] ?? '') !== 'active') {
+                        return [
+                            'status' => 'conflict',
+                            'message' => 'Producto del combo no disponible',
+                            'code' => 'combo_product_missing',
+                            'stock_conflicts' => [['product_id' => $pid, 'requested' => $qty, 'available' => 0]],
+                        ];
+                    }
+                    $unitCost = round((float)($product['purchase_price'] ?? 0), 2);
+                    $perPack = max(1, (int)round($qty / max(1, $packs)));
+                    $costSum += $unitCost * $perPack;
+                    $tr = TaxService::resolveProductRate($product, TaxService::defaultRate($this->db), $this->db);
+                    if ($tr > $taxRateCombo) {
+                        $taxRateCombo = $tr;
+                    }
+                    $comboStockNeed[$pid] = ($comboStockNeed[$pid] ?? 0) + $qty;
+                    $hidden[] = [
+                        'product_id' => $pid,
+                        'product_name' => (string)$product['name'],
+                        'quantity' => $qty,
+                        'unit_price' => 0.0,
+                        'catalog_price' => 0.0,
+                        'sync_catalog_price' => false,
+                        'unit_cost' => 0.0,
+                        'stock_unit_cost' => $unitCost,
+                        'subtotal' => 0.0,
+                        'tax_rate' => 0.0,
+                        'product_type' => (string)($product['product_type'] ?? 'product'),
+                        'is_consignment' => (($product['ownership'] ?? '') === 'consignment'),
+                        'consignor_id' => (($product['ownership'] ?? '') === 'consignment') ? (int)($product['consignor_id'] ?? 0) : 0,
+                        'stock_oversell_reason' => '',
+                        'stock_oversell_note' => '',
+                        'is_combo' => false,
+                        'document_hidden' => true,
+                        'combo_id' => $comboId > 0 ? $comboId : null,
+                        'skip_stock' => false,
+                    ];
+                }
+                if (count($hidden) < 2) {
+                    return [
+                        'status' => 'conflict',
+                        'message' => 'Combo inválido',
+                        'code' => 'combo_invalid',
+                        'stock_conflicts' => [],
+                    ];
+                }
+                $costSum = round($costSum, 2);
+                if ($costSum > 0.009 && !ProductPriceGuard::saleExceedsCost($comboPrice, $costSum)) {
+                    return [
+                        'status' => 'conflict',
+                        'message' => ProductPriceGuard::message($comboName, $comboPrice, $costSum),
+                        'code' => 'price_cost',
+                        'stock_conflicts' => [],
+                    ];
+                }
+                $postedTax = isset($item['tax_rate']) ? round((float)$item['tax_rate'], 2) : $taxRateCombo;
+                $comboValidExtra[] = [
+                    'product_id' => null,
+                    'product_name' => $comboName,
+                    'quantity' => $packs,
+                    'unit_price' => $comboPrice,
+                    'catalog_price' => $comboPrice,
+                    'sync_catalog_price' => false,
+                    'unit_cost' => $costSum,
+                    'subtotal' => round($comboPrice * $packs, 2),
+                    'tax_rate' => $postedTax,
+                    'product_type' => 'combo',
+                    'is_consignment' => false,
+                    'consignor_id' => 0,
+                    'stock_oversell_reason' => '',
+                    'stock_oversell_note' => '',
+                    'is_combo' => true,
+                    'document_hidden' => false,
+                    'combo_id' => $comboId > 0 ? $comboId : null,
+                    'skip_stock' => true,
+                ];
+                foreach ($hidden as $h) {
+                    $comboValidExtra[] = $h;
+                }
+                continue;
+            }
             $productId = (int)($item['product_id'] ?? 0);
             $quantity = (int)($item['quantity'] ?? 0);
             if ($productId <= 0 || $quantity <= 0) {
@@ -357,6 +553,26 @@ class OfflineSaleSyncService
             }
         }
 
+        // Sumar demanda de stock de combos a la validación (sin crear líneas de venta sueltas).
+        foreach ($comboStockNeed as $pid => $qty) {
+            $pid = (int)$pid;
+            $qty = (int)$qty;
+            if ($pid <= 0 || $qty <= 0) {
+                continue;
+            }
+            if (!isset($grouped[$pid])) {
+                $grouped[$pid] = [
+                    'product_id' => $pid,
+                    'quantity' => $qty,
+                    'unit_price' => null,
+                    '_combo_stock_only' => true,
+                ];
+            } else {
+                // Ya hay línea suelta: solo aumentar el chequeo de stock, no la cantidad a facturar.
+                $grouped[$pid]['_extra_combo_qty'] = (int)($grouped[$pid]['_extra_combo_qty'] ?? 0) + $qty;
+            }
+        }
+
         $valid = [];
         $conflicts = [];
         TaxService::ensureSchema($this->db);
@@ -365,6 +581,7 @@ class OfflineSaleSyncService
         foreach (array_merge(array_values($grouped), $openItemLines) as $item) {
             $productId = (int)$item['product_id'];
             $quantity = (int)$item['quantity'];
+            $comboStockOnly = !empty($item['_combo_stock_only']);
             $product = $this->query(
                 "SELECT id, name, code, sale_price, wholesale_price, stock, purchase_price, status,
                         COALESCE(product_type,'product') product_type,
@@ -390,14 +607,15 @@ class OfflineSaleSyncService
             $available = (int)$product['stock'];
             $oversellReason = '';
             $oversellNote = '';
-            if (!$isService && $available < $quantity) {
+            $qtyForStock = $quantity + (int)($item['_extra_combo_qty'] ?? 0);
+            if (!$isService && $available < $qtyForStock) {
                 $isConsignmentEarly = ($product['ownership'] ?? 'owned') === 'consignment';
                 if ($isConsignmentEarly) {
                     $conflicts[] = [
                         'product_id' => $productId,
                         'code' => (string)($product['code'] ?? ''),
                         'name' => (string)$product['name'],
-                        'requested' => $quantity,
+                        'requested' => $qtyForStock,
                         'available' => $available,
                         'reason' => 'stock',
                         'message' => 'No se permite sobreventa de consignación',
@@ -414,7 +632,7 @@ class OfflineSaleSyncService
                         'product_id' => $productId,
                         'code' => (string)($product['code'] ?? ''),
                         'name' => (string)$product['name'],
-                        'requested' => $quantity,
+                        'requested' => $qtyForStock,
                         'available' => $available,
                         'reason' => 'stock',
                         'message' => $e->getMessage(),
@@ -426,7 +644,7 @@ class OfflineSaleSyncService
                         'product_id' => $productId,
                         'code' => (string)($product['code'] ?? ''),
                         'name' => (string)$product['name'],
-                        'requested' => $quantity,
+                        'requested' => $qtyForStock,
                         'available' => $available,
                         'reason' => 'stock',
                     ];
@@ -434,6 +652,11 @@ class OfflineSaleSyncService
                 }
                 $oversellReason = $parsed['reason'];
                 $oversellNote = $parsed['note'];
+            }
+
+            // Solo se usó para validar stock del combo; no crear línea de venta suelta.
+            if ($comboStockOnly) {
+                continue;
             }
 
             $isOpenItem = OpenItemProduct::isOpenItem($product);
@@ -531,6 +754,10 @@ class OfflineSaleSyncService
                 'code' => 'stock',
                 'stock_conflicts' => $conflicts,
             ];
+        }
+
+        if ($comboValidExtra !== []) {
+            $valid = array_merge($valid, $comboValidExtra);
         }
 
         if (empty($valid)) {
@@ -701,6 +928,11 @@ class OfflineSaleSyncService
         } catch (\Throwable $e) {
             // ignore
         }
+        try {
+            (new ProductComboService($this->db))->ensureSchema();
+        } catch (\Throwable $e) {
+            // ignore
+        }
 
         $cashReceivedSync = isset($payload['cash_received']) ? max(0, round((float)$payload['cash_received'], 2)) : null;
         $cashChangeSync = null;
@@ -753,17 +985,27 @@ class OfflineSaleSyncService
 
             foreach ($validItems as $vi) {
                 $isConsignment = !empty($vi['is_consignment']);
+                $isComboLine = !empty($vi['is_combo']);
+                $docHidden = !empty($vi['document_hidden']);
+                $comboIdVal = !empty($vi['combo_id']) ? (int)$vi['combo_id'] : null;
+                $productIdVal = isset($vi['product_id']) && $vi['product_id'] !== null && $vi['product_id'] !== ''
+                    ? (int)$vi['product_id']
+                    : null;
+                if ($productIdVal !== null && $productIdVal <= 0) {
+                    $productIdVal = null;
+                }
                 try {
                     $this->query(
                         "INSERT INTO sale_items
                             (sale_id, product_id, product_name, quantity, unit_price, unit_cost,
                              is_consignment, consignor_id, subtotal, tax_rate, tax_amount,
                              discount_amount, taxable,
-                             stock_oversell_reason, stock_oversell_note)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             stock_oversell_reason, stock_oversell_note,
+                             is_combo, document_hidden, combo_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         [
                             $saleId,
-                            $vi['product_id'],
+                            $productIdVal,
                             $vi['product_name'],
                             $vi['quantity'],
                             $vi['unit_price'],
@@ -777,6 +1019,9 @@ class OfflineSaleSyncService
                             round((float)($vi['taxable'] ?? $vi['subtotal'] ?? 0), 2),
                             !empty($vi['stock_oversell_reason']) ? $vi['stock_oversell_reason'] : null,
                             !empty($vi['stock_oversell_note']) ? $vi['stock_oversell_note'] : null,
+                            $isComboLine ? 1 : 0,
+                            $docHidden ? 1 : 0,
+                            $comboIdVal,
                         ]
                     );
                 } catch (\Throwable $e) {
@@ -789,7 +1034,7 @@ class OfflineSaleSyncService
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             [
                                 $saleId,
-                                $vi['product_id'],
+                                $productIdVal,
                                 $vi['product_name'],
                                 $vi['quantity'],
                                 $vi['unit_price'],
@@ -812,7 +1057,7 @@ class OfflineSaleSyncService
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             [
                                 $saleId,
-                                $vi['product_id'],
+                                $productIdVal,
                                 $vi['product_name'],
                                 $vi['quantity'],
                                 $vi['unit_price'],
@@ -826,20 +1071,23 @@ class OfflineSaleSyncService
                         $this->query(
                             "INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal)
                              VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            [$saleId, $vi['product_id'], $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['unit_cost'] ?? 0, $vi['subtotal']]
+                            [$saleId, $productIdVal, $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['unit_cost'] ?? 0, $vi['subtotal']]
                         );
                     }
                     }
                 }
                 $saleItemId = (int)$this->db->lastInsertId();
-                if (!empty($vi['sync_catalog_price'])) {
+                if (!empty($vi['sync_catalog_price']) && $productIdVal) {
                     $this->sales->stock()->recordSalePriceChange(
-                        (int)$vi['product_id'],
+                        (int)$productIdVal,
                         (float)$vi['catalog_price'],
                         (float)$vi['unit_price'],
                         $saleId,
                         $invoiceNumber
                     );
+                }
+                if (!empty($vi['skip_stock']) || !$productIdVal) {
+                    continue;
                 }
                 $oversell = null;
                 if (!empty($vi['stock_oversell_reason'])) {
@@ -849,29 +1097,27 @@ class OfflineSaleSyncService
                         'sale_item_id' => $saleItemId,
                     ];
                 }
+                $stockCost = array_key_exists('stock_unit_cost', $vi)
+                    ? (float)$vi['stock_unit_cost']
+                    : (float)($vi['unit_cost'] ?? 0);
                 $this->sales->stock()->decrease(
-                    $vi['product_id'],
+                    $productIdVal,
                     $vi['quantity'],
                     'sale',
                     $saleId,
-                    'Venta: ' . $invoiceNumber,
-                    (float)($vi['unit_cost'] ?? 0),
+                    'Venta: ' . $invoiceNumber . ($docHidden ? ' (combo)' : ''),
+                    $stockCost,
                     $oversell
                 );
                 if ($isConsignment) {
-                    try {
-                        (new ConsignmentService($this->db, $this->sales->stock()))->registerSaleDebt(
-                            $saleId,
-                            $saleItemId,
-                            (int)$vi['product_id'],
-                            (int)$vi['quantity'],
-                            (float)($vi['unit_cost'] ?? 0),
-                            (int)($vi['consignor_id'] ?? 0) ?: null
-                        );
-                    } catch (\Throwable $e) {
-                        error_log('consignment sale debt: ' . $e->getMessage());
-                        throw $e;
-                    }
+                    (new ConsignmentService($this->db, $this->sales->stock()))->registerSaleDebt(
+                        $saleId,
+                        $saleItemId,
+                        (int)$productIdVal,
+                        (int)$vi['quantity'],
+                        $stockCost,
+                        (int)($vi['consignor_id'] ?? 0) ?: null
+                    );
                 }
             }
 

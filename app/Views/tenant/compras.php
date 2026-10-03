@@ -23,6 +23,8 @@ $fromFilter = $fromFilter ?? '';
 $toFilter = $toFilter ?? '';
 $supplierFilter = (int)($supplierFilter ?? 0);
 $paidMonth = $paidMonth ?? 0;
+$invoiceQuick = $invoiceQuick ?? [];
+$invoiceFiltered = $invoiceFiltered ?? ['count' => 0, 'balance' => 0];
 $comprasTab = $comprasTab ?? 'ordenes';
 $isFacturasTab = $comprasTab === 'facturas';
 $creditNotesPanel = !empty($creditNotesPanel);
@@ -259,7 +261,11 @@ $tabBtn = static function (bool $active): string {
 
 <?php if ($isFacturasTab): ?>
 <div class="stats-grid">
-    <div class="stat-card neumorphic"><h4>Por pagar</h4><div class="stat-value" style="color:<?php echo $payableTotal > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo fmtC((float)$payableTotal, $currency); ?></div></div>
+    <div class="stat-card neumorphic stat-card--stack">
+        <h4>Por pagar</h4>
+        <div class="stat-value" style="color:<?php echo $payableTotal > 0 ? '#DC2626' : '#10B981'; ?>;"><?php echo fmtC((float)$payableTotal, $currency); ?></div>
+        <small><a href="<?php echo $comprasBase; ?>?action=facturas&amp;payment=unpaid">Ver facturas por pagar →</a></small>
+    </div>
     <div class="stat-card neumorphic"><h4>Recibido este mes</h4><div class="stat-value" style="color:#10B981;"><?php echo fmtC((float)$monthReceived, $currency); ?></div></div>
     <div class="stat-card neumorphic"><h4>Abonos del mes</h4><div class="stat-value"><?php echo fmtC((float)$paidMonth, $currency); ?></div></div>
     <div class="stat-card neumorphic"><h4>Facturas</h4><div class="stat-value"><?php echo (int)($pagination['total'] ?? count($orders)); ?></div></div>
@@ -345,12 +351,12 @@ $tabBtn = static function (bool $active): string {
                 <label style="font-size:12px;">Pago</label>
                 <select name="payment" class="form-control" style="width:auto;">
                     <option value="">Todas (activas + anuladas)</option>
+                    <option value="unpaid" <?php echo $paymentFilter === 'unpaid' ? 'selected' : ''; ?>>Por pagar (con saldo)</option>
+                    <option value="partial" <?php echo $paymentFilter === 'partial' ? 'selected' : ''; ?>>Con abono parcial</option>
+                    <option value="paid" <?php echo $paymentFilter === 'paid' ? 'selected' : ''; ?>>Pagadas</option>
+                    <option value="paid_only" <?php echo $paymentFilter === 'paid_only' ? 'selected' : ''; ?>>Saldadas (saldo en cero, incluye NC)</option>
                     <option value="active" <?php echo $paymentFilter === 'active' ? 'selected' : ''; ?>>Solo activas</option>
                     <option value="voided" <?php echo $paymentFilter === 'voided' ? 'selected' : ''; ?>>Solo anuladas</option>
-                    <option value="unpaid" <?php echo $paymentFilter === 'unpaid' ? 'selected' : ''; ?>>Con saldo</option>
-                    <option value="partial" <?php echo $paymentFilter === 'partial' ? 'selected' : ''; ?>>Abono parcial</option>
-                    <option value="paid" <?php echo $paymentFilter === 'paid' ? 'selected' : ''; ?>>Pagadas</option>
-                    <option value="paid_only" <?php echo $paymentFilter === 'paid_only' ? 'selected' : ''; ?>>Saldo en cero</option>
                 </select>
             </div>
             <div class="form-group" style="margin:0;">
@@ -441,8 +447,67 @@ $tabBtn = static function (bool $active): string {
 </div>
 <?php endif; ?>
 
+<?php if ($isFacturasTab && !empty($invoiceQuick)): ?>
+    <?php
+    $quickBaseQs = array_filter([
+        'action' => 'facturas',
+        'q' => $qFilter !== '' ? $qFilter : null,
+        'supplier_id' => $supplierFilter > 0 ? $supplierFilter : null,
+        'from' => $fromFilter !== '' ? $fromFilter : null,
+        'to' => $toFilter !== '' ? $toFilter : null,
+        'per_page' => (int)($pagination['perPage'] ?? 20) !== 20 ? (int)$pagination['perPage'] : null,
+    ]);
+    $quickChips = [
+        'all' => ['label' => 'Todas', 'payment' => '', 'due' => '', 'color' => ''],
+        'unpaid' => ['label' => 'Por pagar', 'payment' => 'unpaid', 'due' => '', 'color' => '#DC2626'],
+        'overdue' => ['label' => 'Vencidas', 'payment' => '', 'due' => 'overdue', 'color' => '#B91C1C'],
+        'due_soon' => ['label' => 'Por vencer (7 días)', 'payment' => '', 'due' => 'due_soon', 'color' => '#B45309'],
+        'paid_only' => ['label' => 'Saldadas', 'payment' => 'paid_only', 'due' => '', 'color' => '#059669'],
+        'voided' => ['label' => 'Anuladas', 'payment' => 'voided', 'due' => '', 'color' => '#6B7280'],
+    ];
+    ?>
+    <div class="po-quick-filters" style="display:flex;gap:8px;flex-wrap:wrap;margin:0 0 14px;">
+        <?php foreach ($quickChips as $key => $chip): ?>
+            <?php
+            $info = $invoiceQuick[$key] ?? ['count' => 0, 'balance' => 0];
+            $isActive = $paymentFilter === $chip['payment'] && $dueFilter === $chip['due'];
+            $href = $comprasBase . '?' . http_build_query(array_merge($quickBaseQs, array_filter([
+                'payment' => $chip['payment'] !== '' ? $chip['payment'] : null,
+                'due' => $chip['due'] !== '' ? $chip['due'] : null,
+            ])));
+            $showBalance = in_array($key, ['unpaid', 'overdue', 'due_soon'], true) && $info['balance'] > 0.009;
+            ?>
+            <a href="<?php echo htmlspecialchars($href); ?>"
+               class="btn btn-sm <?php echo $isActive ? 'btn-primary' : 'btn-secondary'; ?>"
+               style="display:inline-flex;gap:6px;align-items:center;">
+                <?php if ($chip['color'] !== ''): ?>
+                    <span style="width:9px;height:9px;border-radius:50%;background:<?php echo $chip['color']; ?>;box-shadow:0 0 0 2px rgba(255,255,255,.85);"></span>
+                <?php endif; ?>
+                <span><?php echo htmlspecialchars($chip['label']); ?></span>
+                <span style="font-weight:700;">(<?php echo (int)$info['count']; ?>)</span>
+                <?php if ($showBalance): ?>
+                    <span style="font-size:11px;opacity:.85;">· <?php echo fmtC((float)$info['balance'], $currency); ?></span>
+                <?php endif; ?>
+            </a>
+        <?php endforeach; ?>
+    </div>
+<?php endif; ?>
+
 <div class="card neumorphic">
-    <div class="card-header"><h3><?php echo $isFacturasTab ? 'Facturas de proveedor' : 'Órdenes de compra'; ?></h3></div>
+    <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+        <h3><?php
+            echo $isFacturasTab ? 'Facturas de proveedor' : 'Órdenes de compra';
+            if ($isFacturasTab && $paymentFilter === 'unpaid') {
+                echo ' — por pagar';
+            }
+        ?></h3>
+        <?php if ($isFacturasTab && (float)($invoiceFiltered['balance'] ?? 0) > 0.009): ?>
+            <span style="font-size:13px;">
+                Saldo por pagar del listado:
+                <strong style="color:var(--dmc-DC2626, #DC2626);"><?php echo fmtC((float)$invoiceFiltered['balance'], $currency); ?></strong>
+            </span>
+        <?php endif; ?>
+    </div>
     <div class="card-body">
         <?php if (empty($orders)): ?>
             <?php
@@ -527,9 +592,9 @@ $tabBtn = static function (bool $active): string {
                             <td><?php echo !empty($o['invoice_date']) ? date('d/m/Y', strtotime((string)$o['invoice_date'])) : date('d/m/Y', strtotime($o['order_date'])); ?></td>
                             <td<?php
                                 if ($dueOverdue) {
-                                    echo ' style="color:#DC2626;font-weight:600;"';
+                                    echo ' style="color:var(--dmc-DC2626, #DC2626);font-weight:600;"';
                                 } elseif ($dueSoon) {
-                                    echo ' style="color:#B45309;font-weight:600;"';
+                                    echo ' style="color:var(--dmc-B45309, #B45309);font-weight:600;"';
                                 }
                             ?>>
                                 <?php if ($dueDate): ?>
@@ -956,13 +1021,13 @@ $tabBtn = static function (bool $active): string {
                     <td><strong><?php echo htmlspecialchars($p['order_number']); ?></strong></td>
                     <td><?php echo htmlspecialchars($p['supplier_name'] ?? '—'); ?></td>
                     <td><?php echo htmlspecialchars($p['invoice_number'] ?? '—'); ?></td>
-                    <td<?php echo $overdue ? ' style="color:#DC2626;font-weight:600;"' : ''; ?>>
+                    <td<?php echo $overdue ? ' style="color:var(--dmc-DC2626, #DC2626);font-weight:600;"' : ''; ?>>
                         <?php echo $p['due_date'] ? date('d/m/Y', strtotime($p['due_date'])) : '—'; ?>
                         <?php echo $overdue ? ' (' . (int)$p['days_overdue'] . ' d)' : ''; ?>
                     </td>
                     <td><?php echo fmtC((float)$p['total'], $currency); ?></td>
                     <td style="color:#10B981;"><?php echo fmtC((float)$p['paid_amount'], $currency); ?></td>
-                    <td style="font-weight:600;color:#DC2626;"><?php echo fmtC($saldo, $currency); ?></td>
+                    <td style="font-weight:600;color:var(--dmc-DC2626, #DC2626);"><?php echo fmtC($saldo, $currency); ?></td>
                     <td>
                         <?php if ($canEdit): ?>
                             <button type="button" class="btn btn-sm btn-primary"
@@ -1169,7 +1234,7 @@ $tabBtn = static function (bool $active): string {
                                 Necesario para PDF escaneados o fotos. Si el PDF ya trae texto, también mejora la lectura.
                             </small>
                             <?php if (!$aiInvoiceReady): ?>
-                                <small style="display:block;color:#B45309;">Configure OPENROUTER_API_KEY para habilitarlo.</small>
+                                <small style="display:block;color:var(--dmc-B45309, #B45309);">Configure OPENROUTER_API_KEY para habilitarlo.</small>
                             <?php endif; ?>
                         </span>
                     </label>
@@ -1590,25 +1655,54 @@ function openInvoiceUpload() {
 function closeInvoiceUpload() {
     document.getElementById('invoiceUploadModal').style.display = 'none';
 }
+function persistInvoiceReviewDraft() {
+    return new Promise(function(resolve, reject) {
+        var form = document.getElementById('invoiceReviewForm');
+        var importId = window._invoiceReviewImportId
+            || parseInt((document.getElementById('irImportId') || {}).value || '0', 10);
+        if (!form || !importId || !window.poInvoiceSaveDraftUrl) {
+            resolve(null);
+            return;
+        }
+        if (window.SeriMoney && typeof SeriMoney.normalizeForm === 'function') {
+            SeriMoney.normalizeForm(form);
+        }
+        var fd = new FormData(form);
+        fd.set('import_id', String(importId));
+        fetch(window.poInvoiceSaveDraftUrl, {
+            method: 'POST',
+            body: fd,
+            credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (!d || !d.success) {
+                throw new Error((d && d.message) || 'No se pudo guardar el borrador');
+            }
+            if (Array.isArray(d.items)) {
+                window._invoiceReviewItems = d.items;
+            }
+            resolve(d);
+        })
+        .catch(reject)
+        .finally(function() {
+            if (window.SeriMoney && typeof SeriMoney.restoreForm === 'function') {
+                SeriMoney.restoreForm(form);
+            }
+        });
+    });
+}
+
 function closeInvoiceReview(opts) {
     opts = opts || {};
     var skipSave = !!opts.skipSave;
     var modal = document.getElementById('invoiceReviewModal');
-    var form = document.getElementById('invoiceReviewForm');
-    var importId = window._invoiceReviewImportId
-        || parseInt((document.getElementById('irImportId') || {}).value || '0', 10);
 
-    if (skipSave || !form || !importId || !window.poInvoiceSaveDraftUrl) {
+    if (skipSave) {
         if (modal) modal.style.display = 'none';
         return;
     }
-
-    if (window.SeriMoney && typeof SeriMoney.normalizeForm === 'function') {
-        SeriMoney.normalizeForm(form);
-    }
-
-    var fd = new FormData(form);
-    fd.set('import_id', String(importId));
 
     var btn = document.querySelector('#invoiceReviewModal .invoice-shell-footer .btn-secondary');
     var prevLabel = btn ? btn.textContent : '';
@@ -1617,19 +1711,10 @@ function closeInvoiceReview(opts) {
         btn.textContent = 'Guardando…';
     }
 
-    fetch(window.poInvoiceSaveDraftUrl, {
-        method: 'POST',
-        body: fd,
-        credentials: 'same-origin',
-        headers: { 'X-Requested-With': 'XMLHttpRequest' }
-    })
-    .then(function(r) { return r.json(); })
+    persistInvoiceReviewDraft()
     .then(function(d) {
-        if (!d || !d.success) {
-            throw new Error((d && d.message) || 'No se pudo guardar el borrador');
-        }
         if (modal) modal.style.display = 'none';
-        if (typeof showAlert === 'function') {
+        if (d && typeof showAlert === 'function') {
             showAlert(d.message || 'Borrador guardado', 'success');
         }
     })
@@ -1642,9 +1727,6 @@ function closeInvoiceReview(opts) {
         if (btn) {
             btn.disabled = false;
             btn.textContent = prevLabel || 'Cerrar sin aplicar';
-        }
-        if (window.SeriMoney && typeof SeriMoney.restoreForm === 'function') {
-            SeriMoney.restoreForm(form);
         }
     });
 }
@@ -1997,7 +2079,7 @@ function renderInvoiceReview(imp, items) {
     var h = '';
     if (docKind) {
         h += '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 12px;">' +
-             '<span class="badge" style="background:#EEF2FF;color:#3730A3;padding:4px 10px;border-radius:999px;font-weight:600;">' +
+             '<span class="badge" style="background:var(--dmb-EEF2FF, #EEF2FF);color:var(--dmc-3730A3, #3730A3);padding:4px 10px;border-radius:999px;font-weight:600;">' +
              esc(docLabel) + '</span>';
         if (docKind === 'electronic') {
             h += '<small style="color:var(--color-text-secondary);">IVA (' + defaultTax + '%) incluido en el costo unitario / precio de compra.</small>';
@@ -2115,7 +2197,7 @@ function renderInvoiceReview(imp, items) {
         return i.row_action !== 'skip' && (!(parseFloat(i.quantity) > 0));
     }).length;
     if (sinMonto > 0) {
-        h += '<p style="font-size:13px;color:#DC2626;font-weight:600;margin:0 0 10px;">' +
+        h += '<p style="font-size:13px;color:var(--dmc-DC2626, #DC2626);font-weight:600;margin:0 0 10px;">' +
              sinMonto + ' línea(s) con cantidad en 0. Complete Cant. antes de confirmar (marcadas en rojo).</p>';
     }
     var bonifCount = items.filter(function(i) {
@@ -2126,7 +2208,7 @@ function renderInvoiceReview(imp, items) {
         return q > 0 && c <= 0 && t <= 0;
     }).length;
     if (bonifCount > 0) {
-        h += '<p style="font-size:13px;color:#047857;font-weight:600;margin:0 0 10px;">' +
+        h += '<p style="font-size:13px;color:var(--dmc-047857, #047857);font-weight:600;margin:0 0 10px;">' +
              bonifCount + ' línea(s) de bonificación/regalo: en la factura quedan a $0; en inventario conservan el costo (no diluyen el promedio).</p>';
     }
 
@@ -2197,7 +2279,7 @@ function renderInvoiceReview(imp, items) {
                 : '') +
              '</td>';
         h += '<td><input type="text" name="' + base + '[description]" class="form-control" style="min-width:190px;" value="' + esc(it.description || '') + '">' +
-             (isBonus ? '<div class="inv-bonus-hint" style="font-size:11px;color:#1D4ED8;font-weight:600;">Bonificación: factura $0 · inventario conserva costo</div>' : '') +
+             (isBonus ? '<div class="inv-bonus-hint" style="font-size:11px;color:var(--dmc-1D4ED8, #1D4ED8);font-weight:600;">Bonificación: factura $0 · inventario conserva costo</div>' : '') +
              '</td>';
         h += '<td><input type="text" name="' + base + '[supplier_sku]" class="form-control" style="width:160px;min-width:160px;font-family:ui-monospace,Consolas,monospace;font-size:12px;" value="' + esc(it.supplier_sku || '') + '" placeholder="SKU / ID" title="SKU / ID proveedor"></td>';
         h += '<td><input type="text" name="' + base + '[barcode]" class="form-control" style="width:180px;min-width:180px;font-family:ui-monospace,Consolas,monospace;font-size:12px;" value="' + esc(it.barcode || '') + '" placeholder="EAN" title="Código de barras / EAN"></td>';
@@ -2217,7 +2299,7 @@ function renderInvoiceReview(imp, items) {
         } else {
             h += '<td><input type="number" step="0.01" min="0" name="' + base + '[tax_rate]" class="form-control" style="min-width:70px;" value="' + lineTax + '" title="IVA del producto (editable)"></td>';
         }
-        h += '<td><input type="number" step="0.01" min="0" name="' + base + '[discount_pct]" class="form-control" style="min-width:70px;" value="' + (parseFloat(it.discount_pct) || 0) + '"></td>';
+        h += '<td><input type="number" step="1" min="0" max="100" inputmode="numeric" name="' + base + '[discount_pct]" class="form-control inv-disc" style="min-width:70px;" value="' + Math.max(0, Math.min(100, Math.round(parseFloat(it.discount_pct) || 0))) + '" title="Descuento en % (número entero)"></td>';
         h += '<td><input type="text" maxlength="60" name="' + base + '[lot_code]" class="form-control" style="min-width:90px;" value="' + esc(it.lot_code || '') + '"></td>';
         h += '<td><input type="date" name="' + base + '[expiry_date]" class="form-control" style="min-width:130px;" value="' + (it.expiry_date || '') + '"></td>';
         h += '<td><input type="text" inputmode="decimal" name="' + base + '[sale_price]" class="form-control money-input" data-money="1" style="min-width:95px;" value="' + (it.sale_price != null && it.sale_price !== '' ? (window.SeriMoney ? SeriMoney.format(it.sale_price) : parseFloat(it.sale_price)) : '') + '"></td>';
@@ -2375,10 +2457,10 @@ function renderOrderMatchPanel(match) {
          '</span></div>';
 
     if (ok) {
-        h += '<p style="margin:0;font-size:13px;color:#047857;font-weight:600;">Cruce OK: ' +
+        h += '<p style="margin:0;font-size:13px;color:var(--dmc-047857, #047857);font-weight:600;">Cruce OK: ' +
              (match.matched_count || 0) + ' producto(s) coinciden en cantidad y costo.</p>';
     } else {
-        h += '<p style="margin:0 0 8px;font-size:13px;color:#B45309;font-weight:600;">Revise diferencias antes de ingresar (' +
+        h += '<p style="margin:0 0 8px;font-size:13px;color:var(--dmc-B45309, #B45309);font-weight:600;">Revise diferencias antes de ingresar (' +
              (match.issue_count || 0) + ' hallazgo(s)).</p>';
         h += '<ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.45;">';
         if (match.qty_diff_count > 0) {
@@ -2438,7 +2520,7 @@ function renderOcDispositionPanel(linkedOrderId, match) {
          '<input type="radio" name="oc_disposition" value="close"' + (!preferPartial ? ' checked' : '') + ' style="margin-top:3px;">' +
          '<span><strong>Cerrar OC completa</strong> — esta factura cierra la OC (reemplaza ítems con lo facturado).</span></label>';
     if (preferPartial) {
-        h += '<small style="display:block;margin-top:8px;color:#B45309;">El cruce detectó productos/cantidades pendientes en la OC. Se recomienda recepción parcial.</small>';
+        h += '<small style="display:block;margin-top:8px;color:var(--dmc-B45309, #B45309);">El cruce detectó productos/cantidades pendientes en la OC. Se recomienda recepción parcial.</small>';
     }
     h += '</div>';
     return h;
@@ -2546,6 +2628,9 @@ function bindInvoiceLineTotals() {
         if (/\[quantity\]$/.test(t.name)) {
             t.value = String(invoiceParseIntQty(t.value));
         }
+        if (/\[discount_pct\]$/.test(t.name)) {
+            t.value = String(Math.max(0, Math.min(100, Math.round(invoiceParseQty(t.value)))));
+        }
         if (!/\[(quantity|unit_cost|tax_rate|discount_pct|sale_price|row_action)\]$/.test(t.name)
             && t.id !== 'reviewTaxOverrideAmount'
             && !/early_payment_discount_pct|commercial_discount/.test(t.name)) {
@@ -2581,7 +2666,7 @@ function refreshInvoiceRowVisual(tr, qty, cost, line, action) {
         originTd.style.whiteSpace = 'nowrap';
         originTd.style.fontSize = '12px';
         originTd.style.fontWeight = '600';
-        originTd.style.color = bad ? '#DC2626' : (isBonus ? '#1D4ED8' : (fromOc ? '#B45309' : '#047857'));
+        originTd.style.color = bad ? 'var(--dmc-DC2626, #DC2626)' : (isBonus ? 'var(--dmc-1D4ED8, #1D4ED8)' : (fromOc ? 'var(--dmc-B45309, #B45309)' : 'var(--dmc-047857, #047857)'));
         originTd.textContent = bad ? '—' : (isBonus ? 'Bonif.' : (fromOc ? 'OC' : 'Factura'));
     }
     var descCell = tr.querySelector('td input[name$="[description]"]');
@@ -2591,7 +2676,7 @@ function refreshInvoiceRowVisual(tr, qty, cost, line, action) {
             if (!hint) {
                 hint = document.createElement('div');
                 hint.className = 'inv-bonus-hint';
-                hint.style.cssText = 'font-size:11px;color:#1D4ED8;font-weight:600;';
+                hint.style.cssText = 'font-size:11px;color:var(--dmc-1D4ED8, #1D4ED8);font-weight:600;';
                 hint.textContent = 'Bonificación: factura $0 · inventario conserva costo';
                 descCell.parentNode.appendChild(hint);
             }
@@ -2630,7 +2715,7 @@ function recalcInvoiceReviewTotals() {
         var qty = invoiceParseIntQty(qtyEl.value);
         var cost = invoiceParseMoneyVal(costEl.value);
         var tax = customVat ? 0 : (taxEl ? invoiceParseQty(taxEl.value) : 0);
-        var disc = discEl ? Math.max(0, Math.min(100, invoiceParseQty(discEl.value))) : 0;
+        var disc = discEl ? Math.max(0, Math.min(100, Math.round(invoiceParseQty(discEl.value)))) : 0;
         var action = actionEl ? actionEl.value : 'add_stock';
         var lineGross = qty * cost;
         var lineDiscAmt = lineGross * (disc / 100);
@@ -2682,7 +2767,7 @@ function recalcInvoiceReviewTotals() {
     if (foot) {
         foot.innerHTML = '<span>Subtotal: ' + poMoney(displaySubtotal) + '</span>' +
             (productDiscTotal > 0.009
-                ? '<span style="color:#B45309;">Desc. productos: -' + poMoney(productDiscTotal) + '</span>'
+                ? '<span style="color:var(--dmc-B45309, #B45309);">Desc. productos: -' + poMoney(productDiscTotal) + '</span>'
                 : '') +
             '<span>IVA' + (vatInCost ? ' (en costo)' : (customVat ? ' (personalizado)' : '')) + ': ' + poMoney(taxTotal) + '</span>' +
             '<span>Bruto: ' + poMoney(grand) + '</span>' +
@@ -2695,13 +2780,13 @@ function recalcInvoiceReviewTotals() {
     if (liveNotes) {
         var bits = [];
         if (sinMonto > 0) {
-            bits.push('<span style="color:#DC2626;font-weight:600;">' + sinMonto + ' línea(s) con cantidad en 0</span>');
+            bits.push('<span style="color:var(--dmc-DC2626, #DC2626);font-weight:600;">' + sinMonto + ' línea(s) con cantidad en 0</span>');
         }
         if (bonifCount > 0) {
-            bits.push('<span style="color:#047857;font-weight:600;">' + bonifCount + ' bonificación/regalo ($0 en factura)</span>');
+            bits.push('<span style="color:var(--dmc-047857, #047857);font-weight:600;">' + bonifCount + ' bonificación/regalo ($0 en factura)</span>');
         }
         if (productDiscTotal > 0.009) {
-            bits.push('<span style="color:#B45309;font-weight:600;">Dcto. en líneas: -' + poMoney(productDiscTotal) + '</span>');
+            bits.push('<span style="color:var(--dmc-B45309, #B45309);font-weight:600;">Dcto. en líneas: -' + poMoney(productDiscTotal) + '</span>');
         }
         liveNotes.innerHTML = bits.length ? bits.join(' · ') : '<span style="color:var(--color-text-secondary);">Cambios aplicados al instante</span>';
     }
@@ -2714,16 +2799,20 @@ function linkInvoiceToOrder(orderId) {
         return showAlert('No está disponible la vinculación con OC', 'error');
     }
 
-    var fd = new FormData();
-    fd.append('csrf_token', (window.SeriCsrf && SeriCsrf.get) ? SeriCsrf.get() : (window.poCsrfToken || ''));
-    fd.append('import_id', String(importId));
-    fd.append('linked_order_id', String(orderId || '0'));
+    persistInvoiceReviewDraft()
+    .catch(function() { return null; })
+    .then(function() {
+        var fd = new FormData();
+        fd.append('csrf_token', (window.SeriCsrf && SeriCsrf.get) ? SeriCsrf.get() : (window.poCsrfToken || ''));
+        fd.append('import_id', String(importId));
+        fd.append('linked_order_id', String(orderId || '0'));
 
-    fetch(window.poInvoiceLinkOrderUrl, {
-        method: 'POST',
-        body: fd,
-        credentials: 'same-origin',
-        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        return fetch(window.poInvoiceLinkOrderUrl, {
+            method: 'POST',
+            body: fd,
+            credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        });
     })
     .then(function(r) { return r.json(); })
     .then(function(d) {
@@ -2735,7 +2824,6 @@ function linkInvoiceToOrder(orderId) {
     })
     .catch(function(err) {
         if (typeof showAlert === 'function') showAlert(err.message || 'Error al casar OC', 'error');
-        // Reabrir preview limpio para no dejar un select inconsistente
         openInvoiceReview(importId);
     });
 }
@@ -2827,30 +2915,38 @@ function addInvoiceManualProduct(productId, opts) {
     if (!(qty > 0)) qty = 1;
     if (qtyEl && opts.qty == null) qtyEl.value = String(qty);
 
-    var fd = new FormData();
-    fd.append('csrf_token', (window.SeriCsrf && SeriCsrf.get) ? SeriCsrf.get() : (window.poCsrfToken || ''));
-    fd.append('import_id', String(importId));
-    fd.append('product_id', String(productId));
-    fd.append('quantity', String(qty));
-    if (asBonus) {
-        fd.append('as_bonus', '1');
-        fd.append('unit_cost', '0');
-        fd.append('force_separate', '1');
-    } else if (opts.forceSeparate) {
-        fd.append('force_separate', '1');
-    }
-
-    fetch(window.poInvoiceAddLineUrl, {
-        method: 'POST',
-        body: fd,
-        credentials: 'same-origin',
-        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    // Guardar ediciones en pantalla antes de agregar (evita que el re-render restaure valores viejos).
+    persistInvoiceReviewDraft()
+    .catch(function(err) {
+        if (typeof showAlert === 'function') {
+            showAlert((err && err.message) || 'No se pudieron guardar las ediciones previas', 'error');
+        }
+        return Promise.reject(err);
+    })
+    .then(function() {
+        var fd = new FormData();
+        fd.append('csrf_token', (window.SeriCsrf && SeriCsrf.get) ? SeriCsrf.get() : (window.poCsrfToken || ''));
+        fd.append('import_id', String(importId));
+        fd.append('product_id', String(productId));
+        fd.append('quantity', String(qty));
+        if (asBonus) {
+            fd.append('as_bonus', '1');
+            fd.append('unit_cost', '0');
+            fd.append('force_separate', '1');
+        } else if (opts.forceSeparate) {
+            fd.append('force_separate', '1');
+        }
+        return fetch(window.poInvoiceAddLineUrl, {
+            method: 'POST',
+            body: fd,
+            credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        });
     })
     .then(function(r) { return r.json(); })
     .then(function(d) {
         if (!d || !d.success) throw new Error((d && d.message) || 'No se pudo agregar');
         window._invoiceReviewOpenOrders = window._invoiceReviewOpenOrders || [];
-        // Preservar OC casada seleccionada
         var linked = document.getElementById('reviewLinkedOrderId');
         var linkedVal = linked ? linked.value : '';
         renderInvoiceReview(d.import, d.items || []);
@@ -2861,7 +2957,9 @@ function addInvoiceManualProduct(productId, opts) {
         if (typeof showAlert === 'function') showAlert(d.message || 'Producto agregado', 'success');
     })
     .catch(function(err) {
-        if (typeof showAlert === 'function') showAlert(err.message || 'Error', 'error');
+        if (err && typeof showAlert === 'function' && String(err.message || '').indexOf('ediciones previas') < 0) {
+            showAlert(err.message || 'Error', 'error');
+        }
     });
 }
 
@@ -2871,16 +2969,19 @@ function removeInvoiceReviewLine(itemId) {
     if (!importId || !itemId) return;
     if (!window.confirm('¿Eliminar esta línea del borrador?')) return;
 
-    var fd = new FormData();
-    fd.append('csrf_token', (window.SeriCsrf && SeriCsrf.get) ? SeriCsrf.get() : (window.poCsrfToken || ''));
-    fd.append('import_id', String(importId));
-    fd.append('item_id', String(itemId));
-
-    fetch(window.poInvoiceRemoveLineUrl || (window.comprasBase + '?action=invoice_remove_line'), {
-        method: 'POST',
-        body: fd,
-        credentials: 'same-origin',
-        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    persistInvoiceReviewDraft()
+    .catch(function() { return null; })
+    .then(function() {
+        var fd = new FormData();
+        fd.append('csrf_token', (window.SeriCsrf && SeriCsrf.get) ? SeriCsrf.get() : (window.poCsrfToken || ''));
+        fd.append('import_id', String(importId));
+        fd.append('item_id', String(itemId));
+        return fetch(window.poInvoiceRemoveLineUrl || (window.comprasBase + '?action=invoice_remove_line'), {
+            method: 'POST',
+            body: fd,
+            credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        });
     })
     .then(function(r) { return r.json(); })
     .then(function(d) {
@@ -3750,10 +3851,10 @@ function viewPurchase(id) {
                 h += '</ol>';
             }
             if (o.balance != null && parseFloat(o.balance) > 0.009) {
-                h += '<p style="margin-top:10px;font-weight:600;color:#DC2626;">Saldo pendiente: '
+                h += '<p style="margin-top:10px;font-weight:600;color:var(--dmc-DC2626, #DC2626);">Saldo pendiente: '
                     + poMoney(o.balance) + '</p>';
             } else if (o.balance != null && parseFloat(o.balance) < -0.009) {
-                h += '<p style="margin-top:10px;font-weight:600;color:#2563EB;">Saldo a favor: '
+                h += '<p style="margin-top:10px;font-weight:600;color:var(--dmc-2563EB, #2563EB);">Saldo a favor: '
                     + poMoney(Math.abs(parseFloat(o.balance))) + '</p>';
             } else if (o.status === 'received') {
                 h += '<p style="margin-top:10px;font-weight:600;color:#10B981;">Orden sin saldo pendiente</p>';

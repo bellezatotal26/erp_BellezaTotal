@@ -73,7 +73,7 @@ body:has(.ai-page-root) .breadcrumbs { flex-shrink: 0; margin-bottom: 8px; }
 .ai-conv-item:hover { background: var(--bg-input); }
 .ai-conv-item.active { background: var(--bg-input); border-left: 3px solid var(--color-primary); }
 .ai-conv-item .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ai-conv-item .del { opacity: 0; border: none; background: none; color: #DC2626; cursor: pointer; font-size: 15px; }
+.ai-conv-item .del { opacity: 0; border: none; background: none; color: var(--dmc-DC2626, #DC2626); cursor: pointer; font-size: 15px; }
 .ai-conv-item:hover .del { opacity: 1; }
 .ai-conv-empty { padding: 20px; text-align: center; font-size: 12px; color: var(--color-text-secondary); }
 
@@ -134,7 +134,7 @@ body:has(.ai-page-root) .breadcrumbs { flex-shrink: 0; margin-bottom: 8px; }
     border: 1px solid var(--color-border); background: var(--bg-card);
     color: var(--color-text-primary); cursor: pointer; transition: all 0.2s; white-space: nowrap;
 }
-.ai-suggestions button:hover:not(:disabled) { border-color: var(--color-primary); color: var(--color-primary); }
+.ai-suggestions button:hover:not(:disabled) { border-color: var(--color-primary); color: var(--color-accent-text, var(--color-primary)); }
 .ai-suggestions button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 @media (max-width: 800px) {

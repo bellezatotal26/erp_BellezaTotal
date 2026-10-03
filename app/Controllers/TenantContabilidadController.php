@@ -114,27 +114,35 @@ class TenantContabilidadController extends TenantController
         }
         if ($needsPurchaseSummary) {
             try {
-                $legacy = $this->query(
-                    "SELECT COUNT(*) cnt, COALESCE(SUM(total),0) total
-                     FROM purchases WHERE status='completed' AND DATE(purchase_date) BETWEEN ? AND ?",
-                    [$from, $to]
-                )->fetch() ?: ['cnt'=>0,'total'=>0];
-                $purchaseSummary['cnt'] = (int)$purchaseSummary['cnt'] + (int)$legacy['cnt'];
-                $purchaseSummary['total'] = (float)$purchaseSummary['total'] + (float)$legacy['total'];
+                // Solo sumar legacy si no hay OC received en el rango (evita doble conteo en migraciones híbridas).
+                $poCnt = (int)($purchaseSummary['cnt'] ?? 0);
+                if ($poCnt === 0) {
+                    $legacy = $this->query(
+                        "SELECT COUNT(*) cnt, COALESCE(SUM(total),0) total
+                         FROM purchases WHERE status='completed' AND DATE(purchase_date) BETWEEN ? AND ?",
+                        [$from, $to]
+                    )->fetch() ?: ['cnt'=>0,'total'=>0];
+                    $purchaseSummary['cnt'] = (int)$legacy['cnt'];
+                    $purchaseSummary['total'] = (float)$legacy['total'];
+                }
             } catch (\Throwable $e) {
                 // tabla purchases puede no existir en installs nuevos
             }
         }
         $expenseByType = [];
         if (in_array($tab, ['dashboard', 'gastos'], true)) {
-            $expenseByType = $this->query(
-                "SELECT COALESCE(category,'general') category, COUNT(*) cnt, COALESCE(SUM(amount),0) total
-                 FROM expenses
-                 WHERE expense_date BETWEEN ? AND ?
-                   AND COALESCE(status, 'active') <> 'cancelled'
-                 GROUP BY COALESCE(category,'general') ORDER BY total DESC",
-                [$from, $to]
-            )->fetchAll();
+            try {
+                $expenseByType = $this->query(
+                    "SELECT COALESCE(category,'general') category, COUNT(*) cnt, COALESCE(SUM(amount),0) total
+                     FROM expenses
+                     WHERE expense_date BETWEEN ? AND ?
+                       AND COALESCE(status, 'active') <> 'cancelled'
+                     GROUP BY COALESCE(category,'general') ORDER BY total DESC",
+                    [$from, $to]
+                )->fetchAll();
+            } catch (\Throwable $e) {
+                $expenseByType = [];
+            }
         }
         $trace = ['rows' => [], 'total' => 0];
         if (in_array($tab, ['dashboard', 'trace'], true)) {
@@ -145,6 +153,7 @@ class TenantContabilidadController extends TenantController
         $accounts = $this->accounting->accounts();
         $needsStatements = in_array($tab, ['dashboard', 'statements'], true);
         $needsRecon = $tab === 'dashboard';
+        $needsAccountAudit = in_array($tab, ['dashboard', 'accounts'], true);
         $needsEntries = in_array($tab, ['dashboard', 'entries'], true);
         $needsLedger = $tab === 'ledger' && $accountId > 0;
         $needsPeriods = in_array($tab, ['dashboard', 'periods'], true);
@@ -189,13 +198,18 @@ class TenantContabilidadController extends TenantController
             'totals' => ['assets' => 0, 'liabilities' => 0, 'equity' => 0, 'revenue' => 0, 'expenses' => 0],
             'profit' => 0,
         ];
-        $ledger = $needsLedger
+        $ledgerReport = $needsLedger
             ? $this->accounting->ledger($accountId, $from, $to)
-            : [];
-        $accountAudit = $needsRecon ? $this->accounting->auditCriticalAccounts() : [];
+            : ['opening_balance' => 0.0, 'rows' => []];
+        $ledger = $ledgerReport['rows'] ?? [];
+        $ledgerOpening = (float)($ledgerReport['opening_balance'] ?? 0);
+        $accountAudit = $needsAccountAudit ? $this->accounting->auditCriticalAccounts() : [];
         $reconciliation = $needsRecon ? $this->accounting->subledgerReconciliation() : [];
-        $pendingSync = $needsRecon ? $this->accounting->pendingSyncCount() : 0;
         $pendingQueue = $needsRecon ? $this->accounting->pendingQueueCount() : 0;
+        // pendingSync = operaciones sin asiento (sin incluir cola, para no doble-contar en UI).
+        $pendingSync = $needsRecon
+            ? max(0, $this->accounting->pendingSyncCount() - $pendingQueue)
+            : 0;
 
         $commissionCfg = [];
         $commissionList = ['rows' => [], 'pending' => 0, 'paid' => 0, 'cancelled' => 0];
@@ -244,6 +258,7 @@ class TenantContabilidadController extends TenantController
             'trialIncludeZero' => $trialIncludeZero,
             'statements' => $statements,
             'ledger' => $ledger,
+            'ledgerOpening' => $ledgerOpening,
             'selectedAccountId' => $accountId,
             'periods' => $needsPeriods ? $this->accounting->periods() : [],
             'integrationStatuses' => $integrations->statuses(),
@@ -411,6 +426,16 @@ class TenantContabilidadController extends TenantController
                 'client_id' => $this->request->post('client_id', ''),
                 'client_secret' => $this->request->post('client_secret', ''),
                 'password' => $this->request->post('password', ''),
+                // Siigo (IDs de documento/vendedor/medio/grupo contable)
+                'document_id' => $this->request->post('document_id', ''),
+                'seller_id' => $this->request->post('seller_id', ''),
+                'payment_type_id' => $this->request->post('payment_type_id', ''),
+                'account_group_id' => $this->request->post('account_group_id', ''),
+                // Factus
+                'numbering_range_id' => $this->request->post('numbering_range_id', ''),
+                'tax_rate' => $this->request->post('tax_rate', '0'),
+                'municipality_id' => $this->request->post('municipality_id', ''),
+                // DIAN
                 'nit' => $this->request->post('nit', ''),
                 'dv' => $this->request->post('dv', ''),
                 'legal_name' => $this->request->post('legal_name', ''),
@@ -546,6 +571,7 @@ class TenantContabilidadController extends TenantController
             'stock' => 'movimientos de inventario',
             'supplier_payments' => 'abonos a proveedores',
             'cash' => 'movimientos de caja',
+            'cash_sessions' => 'cierres/arqueos de caja',
             'sale_credit_notes' => 'NC de ventas',
             'purchase_credit_notes' => 'NC de compras',
         ] as $clave => $etiqueta) {

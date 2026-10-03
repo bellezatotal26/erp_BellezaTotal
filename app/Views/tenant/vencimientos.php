@@ -46,14 +46,14 @@ function vencEstado(?int $daysLeft, string $status = 'active'): array
 <div class="stats-grid" style="margin-bottom:16px;">
     <div class="stat-card neumorphic">
         <h4>Lotes vencidos</h4>
-        <div class="stat-value" style="color:#DC2626;"><?php echo (int)($summary['expired_lots'] ?? 0); ?></div>
+        <div class="stat-value" style="color:var(--dmc-DC2626, #DC2626);"><?php echo (int)($summary['expired_lots'] ?? 0); ?></div>
         <p style="font-size:12px;color:var(--color-text-secondary);margin:4px 0 0;">
             <?php echo (int)($summary['expired_units'] ?? 0); ?> unidades
         </p>
     </div>
     <div class="stat-card neumorphic">
         <h4>Pérdida por vencidos</h4>
-        <div class="stat-value" style="color:#DC2626;"><?php echo vencFmt((float)($summary['expired_value'] ?? 0), $currency); ?></div>
+        <div class="stat-value" style="color:var(--dmc-DC2626, #DC2626);"><?php echo vencFmt((float)($summary['expired_value'] ?? 0), $currency); ?></div>
     </div>
     <div class="stat-card neumorphic">
         <h4>Lotes por vencer</h4>
@@ -187,7 +187,7 @@ function vencEstado(?int $daysLeft, string $status = 'active'): array
                         <td><?php echo (int)($row['sellable_stock'] ?? 0); ?></td>
                         <td><?php echo (int)($row['expired_stock'] ?? 0); ?></td>
                         <td><?php echo (int)($row['blocked_stock'] ?? 0); ?></td>
-                        <td style="font-weight:600;color:#DC2626;"><?php echo $diff; ?></td>
+                        <td style="font-weight:600;color:var(--dmc-DC2626, #DC2626);"><?php echo $diff; ?></td>
                         <?php if ($canEdit): ?>
                         <td style="white-space:nowrap;">
                             <?php if ($diff > 0): ?>

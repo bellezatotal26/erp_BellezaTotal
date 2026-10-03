@@ -67,6 +67,65 @@ class Session
     {
         session_regenerate_id(true);
     }
+
+    /**
+     * Rota el ID sin perder peticiones concurrentes: la sesión vieja queda marcada
+     * y apunta a la nueva durante un periodo de gracia (ver followRotation()).
+     */
+    public static function rotateId(): void
+    {
+        if (session_status() !== PHP_SESSION_ACTIVE || headers_sent()) {
+            return;
+        }
+        $newId = session_create_id();
+        if (!is_string($newId) || $newId === '') {
+            return;
+        }
+        $data = $_SESSION;
+        $_SESSION['_seri_obsolete_at'] = time();
+        $_SESSION['_seri_new_sid'] = $newId;
+        session_write_close();
+
+        self::startWithId($newId);
+        unset($data['_seri_obsolete_at'], $data['_seri_new_sid']);
+        $_SESSION = $data;
+        $_SESSION['_seri_last_regen'] = time();
+    }
+
+    /**
+     * Si la petición llegó con un ID ya rotado, continúa en la sesión nueva
+     * (dentro de la gracia) o descarta el ID viejo si expiró.
+     */
+    public static function followRotation(int $graceSeconds): void
+    {
+        for ($hop = 0; $hop < 3; $hop++) {
+            if (session_status() !== PHP_SESSION_ACTIVE) {
+                return;
+            }
+            $obsoleteAt = (int)($_SESSION['_seri_obsolete_at'] ?? 0);
+            if ($obsoleteAt <= 0) {
+                return;
+            }
+            $newId = (string)($_SESSION['_seri_new_sid'] ?? '');
+            if ($newId === '' || (time() - $obsoleteAt) > $graceSeconds || headers_sent()) {
+                $_SESSION = [];
+                if (!headers_sent()) {
+                    @session_regenerate_id(true);
+                }
+                return;
+            }
+            session_write_close();
+            self::startWithId($newId);
+        }
+    }
+
+    /** El ID nuevo aún puede no existir en disco; strict mode lo rechazaría. */
+    private static function startWithId(string $id): void
+    {
+        ini_set('session.use_strict_mode', '0');
+        session_id($id);
+        session_start();
+    }
     
     /**
      * Destruir sesión

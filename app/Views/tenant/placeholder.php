@@ -8,7 +8,7 @@ $userName = $userName ?? 'Usuario';
 
 <div class="card neumorphic" style="text-align: center; padding: 60px 40px;">
     <div style="font-size: 64px; margin-bottom: 15px;">🚧</div>
-    <h2 style="color: var(--color-primary); margin-bottom: 10px;">
+    <h2 style="color: var(--color-accent-text, var(--color-primary)); margin-bottom: 10px;">
         Módulo de <?php echo htmlspecialchars($moduleName ?? ''); ?>
     </h2>
     <p style="color: var(--color-text-secondary); font-size: 16px; max-width: 500px; margin: 0 auto 20px;">

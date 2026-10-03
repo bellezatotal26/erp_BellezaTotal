@@ -35,7 +35,7 @@ function repFmt(float $a, array $c): string
 <div class="stats-grid" style="margin-bottom:16px;">
     <div class="stat-card neumorphic">
         <h4>Agotados</h4>
-        <div class="stat-value" style="color:#DC2626;"><?php echo (int)($summary['out_of_stock'] ?? 0); ?></div>
+        <div class="stat-value" style="color:var(--dmc-DC2626, #DC2626);"><?php echo (int)($summary['out_of_stock'] ?? 0); ?></div>
     </div>
     <div class="stat-card neumorphic">
         <h4>Por agotarse</h4>
@@ -198,7 +198,7 @@ function repFmt(float $a, array $c): string
                             </td>
                             <td>
                                 <?php if ($sinProveedor): ?>
-                                    <span style="color:#B45309;font-weight:600;">Sin proveedor (OK)</span>
+                                    <span style="color:var(--dmc-B45309, #B45309);font-weight:600;">Sin proveedor (OK)</span>
                                 <?php else: ?>
                                     <?php echo htmlspecialchars((string)$item['supplier_name']); ?>
                                     <?php if (!empty($item['supplier_sku'])): ?>

@@ -21,7 +21,7 @@ $tickets = $tickets ?? [];
                 <thead><tr><th>Código</th><th>Asunto</th><th>Estado</th><th>Prioridad</th><th>Mensajes</th><th>Fecha</th></tr></thead>
                 <tbody><?php foreach($tickets as $t): ?>
                     <tr>
-                        <td><a href="<?php echo $viewInstance->route('app/soporte'); ?>?id=<?php echo $t['id'];?>" style="color:var(--color-primary);font-weight:600;"><?php echo htmlspecialchars($t['ticket_code']);?></a></td>
+                        <td><a href="<?php echo $viewInstance->route('app/soporte'); ?>?id=<?php echo $t['id'];?>" style="color:var(--color-accent-text, var(--color-primary));font-weight:600;"><?php echo htmlspecialchars($t['ticket_code']);?></a></td>
                         <td><?php echo htmlspecialchars($t['subject']);?></td>
                         <td><span class="badge <?php echo $t['status']==='open'?'badge-danger':($t['status']==='in_progress'?'badge-warning':'badge-success');?>"><?php echo $t['status']==='open'?'Abierto':($t['status']==='in_progress'?'En Progreso':$t['status']);?></span></td>
                         <td><span class="badge <?php echo $t['priority']==='urgent'?'badge-danger':($t['priority']==='high'?'badge-warning':'badge-info');?>"><?php echo ucfirst($t['priority']);?></span></td>

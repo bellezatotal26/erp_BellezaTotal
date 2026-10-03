@@ -257,9 +257,39 @@ class TenantOpsSchema
             ['payroll_items', 'overtime_night_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER overtime_night_hours'],
             ['payroll_items', 'dominical_hours', 'DECIMAL(8,2) NOT NULL DEFAULT 0.00 AFTER overtime_night_amount'],
             ['payroll_items', 'dominical_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER dominical_hours'],
+            ['payroll_items', 'night_surcharge_hours', 'DECIMAL(8,2) NOT NULL DEFAULT 0.00 AFTER dominical_amount'],
+            ['payroll_items', 'night_surcharge_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER night_surcharge_hours'],
+            ['payroll_items', 'overtime_dom_day_hours', 'DECIMAL(8,2) NOT NULL DEFAULT 0.00 AFTER night_surcharge_amount'],
+            ['payroll_items', 'overtime_dom_day_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER overtime_dom_day_hours'],
+            ['payroll_items', 'overtime_dom_night_hours', 'DECIMAL(8,2) NOT NULL DEFAULT 0.00 AFTER overtime_dom_day_amount'],
+            ['payroll_items', 'overtime_dom_night_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER overtime_dom_night_hours'],
         ] as [$table, $col, $def]) {
             self::addColumnIfMissing($db, $table, $col, $def);
         }
+
+        // Horarios semanales (días en JSON: 1=lunes … 7=domingo)
+        $db->exec(
+            "CREATE TABLE IF NOT EXISTS payroll_schedules (
+                id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(80) NOT NULL,
+                color VARCHAR(7) NOT NULL DEFAULT '#6366f1',
+                days_json TEXT NOT NULL,
+                notes VARCHAR(255) NULL,
+                status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                KEY idx_schedule_status (status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        );
+        self::addColumnIfMissing($db, 'employees', 'schedule_id', 'INT UNSIGNED NULL AFTER status');
+        // Comisión fija mensual (no salarial): suma al neto, no es base de aportes.
+        self::addColumnIfMissing($db, 'employees', 'fixed_commission', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER salary');
+        self::addColumnIfMissing($db, 'payroll_items', 'commission_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER transport_aid');
+        self::addColumnIfMissing($db, 'payroll_runs', 'commission_total', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER overtime_total');
+        // Provisión de vacaciones (no suma al neto; se contabiliza en 510539 / 261015).
+        self::addColumnIfMissing($db, 'payroll_items', 'vacation_provision', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER cesantias_interest');
+        self::addColumnIfMissing($db, 'payroll_runs', 'vacation_total', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER cesantias_total');
+        self::addColumnIfMissing($db, 'payroll_runs', 'include_vacaciones', 'TINYINT(1) NOT NULL DEFAULT 0 AFTER include_cesantias');
     }
 
     private static function addColumnIfMissing(\PDO $db, string $table, string $column, string $definition): void

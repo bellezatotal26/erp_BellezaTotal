@@ -419,8 +419,8 @@ class TenantInventarioController extends TenantController
         )->fetch()['c'];
 
         $inventoryValue = ['cost' => 0.0, 'sale' => 0.0, 'units' => 0];
-        // Totales de costo/venta: solo Administrador (KPI sensible).
-        if (\SoftNova\Core\TenantMiddleware::getRole() === 'admin') {
+        // Totales de costo/venta: solo Administrador y Gerencia (KPI sensible).
+        if (\SoftNova\Core\TenantMiddleware::isManagement()) {
             try {
                 $row = $this->query(
                     "SELECT
@@ -570,6 +570,7 @@ class TenantInventarioController extends TenantController
             }));
         }
 
+        $movements = \SoftNova\Services\StockService::attachPurchaseTaxInfo($this->db, $movements);
         foreach ($movements as &$m) {
             $m['display_at'] = \SoftNova\Services\StockService::formatMovementDisplayAt($m);
             $m['origin_label'] = $this->movementOriginLabel($m);
@@ -655,8 +656,10 @@ class TenantInventarioController extends TenantController
                 'purchase_invoice_number' => $inv !== '' ? $inv : null,
                 'purchase_order_status' => $status,
                 'unit_cost' => $po['unit_cost'] ?? null,
+                'product_id' => $id,
                 'synthetic' => true,
             ];
+            $synthetic = \SoftNova\Services\StockService::attachPurchaseTaxInfo($this->db, [$synthetic])[0];
             $synthetic['display_at'] = \SoftNova\Services\StockService::formatMovementDisplayAt($synthetic);
             $synthetic['origin_label'] = $this->movementOriginLabel($synthetic);
             $synthetic['motive'] = \SoftNova\Services\StockService::describeMovementMotive($synthetic);
@@ -2656,8 +2659,9 @@ class TenantInventarioController extends TenantController
                 'category_id' => (int)$this->request->get('category_id', 0) ?: null,
             ];
             $result = $this->stock->listMovements($filters, 5000, 0);
+            $rows = \SoftNova\Services\StockService::attachPurchaseTaxInfo($this->db, $result['rows'] ?? []);
             $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
-            $content = $pdf->generateTraceabilityReport($result['rows'] ?? [], $filters);
+            $content = $pdf->generateTraceabilityReport($rows, $filters);
             $pdf->download($content, 'trazabilidad_' . date('Ymd_His') . '.pdf');
         } catch (\Throwable $e) {
             error_log('traceabilityPdf: ' . $e->getMessage());

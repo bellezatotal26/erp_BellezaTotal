@@ -43,8 +43,8 @@ $gastosBase = $viewInstance->route('app/gastos');
 <?php echo flashMessage(); ?>
 
 <div class="stats-grid">
-    <div class="stat-card neumorphic"><h4>Gastos mes</h4><div class="stat-value" style="color:#DC2626;"><?php echo fmtG((float)$monthTotal, $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Operativos (mes)</h4><div class="stat-value" style="color:#0D7C4A;"><?php echo fmtG((float)$monthOperational, $currency); ?></div><small>Descuentan caja</small></div>
+    <div class="stat-card neumorphic"><h4>Gastos mes</h4><div class="stat-value" style="color:var(--dmc-DC2626, #DC2626);"><?php echo fmtG((float)$monthTotal, $currency); ?></div></div>
+    <div class="stat-card neumorphic"><h4>Operativos (mes)</h4><div class="stat-value" style="color:var(--dmc-0D7C4A, #0D7C4A);"><?php echo fmtG((float)$monthOperational, $currency); ?></div><small>Descuentan caja</small></div>
     <div class="stat-card neumorphic stat-card--stack"><h4>Contables (mes)</h4><div class="stat-value"><?php echo fmtG((float)$monthAccounting, $currency); ?></div><small>Adm. <?php echo fmtG((float)$monthAdministrative, $currency); ?> · Fin. <?php echo fmtG((float)$monthFinancial, $currency); ?> · Gest. <?php echo fmtG((float)$monthManagement, $currency); ?></small></div>
 </div>
 
@@ -116,7 +116,7 @@ $gastosBase = $viewInstance->route('app/gastos');
     <strong>Operativos:</strong> papelería, alimentos, transporte, mantenimiento — <strong>descuentan caja</strong> si paga en efectivo.
     <strong>Contables:</strong> administrativos, financieros y de gestión — <strong>no descuentan caja</strong>, se contabilizan y quedan trazados por sub-grupo.
     Use <em>+ Agregar otro…</em> solo si es administrador (crea tipos permanentes en Configuración).
-    <?php if (\SoftNova\Core\TenantMiddleware::getRole() === 'admin'): ?>
+    <?php if (\SoftNova\Core\TenantMiddleware::isManagement()): ?>
         Administre el catálogo en <a href="<?php echo $viewInstance->route('app/configuracion'); ?>#gastos-admin">Configuración → Administración de gastos</a>.
     <?php endif; ?>
 </p>
@@ -166,7 +166,7 @@ $gastosBase = $viewInstance->route('app/gastos');
                             <?php if ($kindText): ?><br><span class="badge <?php echo $kindBadge; ?>" style="font-size:10px;"><?php echo $kindText; ?></span><?php endif; ?>
                         </td>
                         <td><?php echo htmlspecialchars($exp['supplier_name'] ?? '-'); ?></td>
-                        <td style="font-weight:600;color:#DC2626;"><?php echo fmtG((float)$exp['amount'], $currency); ?></td>
+                        <td style="font-weight:600;color:var(--dmc-DC2626, #DC2626);"><?php echo fmtG((float)$exp['amount'], $currency); ?></td>
                         <td><?php echo htmlspecialchars($methodLabel); ?></td>
                         <td>
                             <?php if (!empty($exp['receipt_path'])): ?>
@@ -260,7 +260,7 @@ $gastosBase = $viewInstance->route('app/gastos');
                             'managementCats' => $managementCats,
                             'customSubgroupSections' => $customSubgroupSections,
                             'required' => true,
-                            'allowCustomExpenseCategory' => \SoftNova\Core\TenantMiddleware::getRole() === 'admin',
+                            'allowCustomExpenseCategory' => \SoftNova\Core\TenantMiddleware::isManagement(),
                         ]); ?>
                     </div>
                     <div class="form-group">

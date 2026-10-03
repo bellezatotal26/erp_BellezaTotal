@@ -79,7 +79,7 @@ $proveedoresBase = $viewInstance->route('app/proveedores');
                             <?php endif; ?>
                         </div>
                         <div style="flex:1;min-width:0;">
-                            <h4 style="margin:0 0 6px 0;font-size:16px;color:var(--color-primary);"><?php echo htmlspecialchars($s['name']); ?></h4>
+                            <h4 style="margin:0 0 6px 0;font-size:16px;color:var(--color-accent-text, var(--color-primary));"><?php echo htmlspecialchars($s['name']); ?></h4>
                             <?php if (!empty($s['contact_name'])): ?>
                                 <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:3px;">👤 <?php echo htmlspecialchars($s['contact_name']); ?></div>
                             <?php endif; ?>
@@ -148,7 +148,7 @@ $proveedoresBase = $viewInstance->route('app/proveedores');
                                             🏢
                                         <?php endif; ?>
                                     </div>
-                                    <strong style="color:var(--color-primary);"><?php echo htmlspecialchars((string)$s['name']); ?></strong>
+                                    <strong style="color:var(--color-accent-text, var(--color-primary));"><?php echo htmlspecialchars((string)$s['name']); ?></strong>
                                 </div>
                             </td>
                             <td style="white-space:nowrap;font-size:13px;">

@@ -29,7 +29,7 @@ $canCreatePrestamos = \SoftNova\Core\TenantMiddleware::canDo('create', 'prestamo
 $canViewConsignacion = \SoftNova\Core\TenantMiddleware::canAccess('consignacion');
 $canDeleteProduct = \SoftNova\Core\TenantMiddleware::canDo('delete', 'inventario');
 $canExportInv = \SoftNova\Core\TenantMiddleware::canDo('export', 'inventario');
-$isAdmin = \SoftNova\Core\TenantMiddleware::getRole() === 'admin';
+$isAdmin = \SoftNova\Core\TenantMiddleware::isManagement();
 $inventoryValue = $inventoryValue ?? ['cost' => 0.0, 'sale' => 0.0, 'units' => 0];
 $invCost = (float)($inventoryValue['cost'] ?? 0);
 $invSale = (float)($inventoryValue['sale'] ?? 0);
@@ -118,7 +118,7 @@ function invMarginHtml(float $cost, float $sale, array $currency): string
     </div>
     <div class="inv-kpi">
         <span class="inv-kpi-label">Servicios</span>
-        <span class="inv-kpi-value" style="color:#3B82F6;"><?php echo (int)$totalServices; ?></span>
+        <span class="inv-kpi-value" style="color:var(--dmc-3B82F6, #3B82F6);"><?php echo (int)$totalServices; ?></span>
     </div>
     <div class="inv-kpi">
         <span class="inv-kpi-label">Stock bajo</span>
@@ -146,14 +146,14 @@ function invMarginHtml(float $cost, float $sale, array $currency): string
     <?php if ($canViewPrestamos): ?>
     <a href="<?php echo $viewInstance->route('app/prestamos'); ?>" class="inv-kpi inv-kpi--link">
         <span class="inv-kpi-label">Préstamos</span>
-        <span class="inv-kpi-value" style="color:var(--color-primary);">Ir →</span>
+        <span class="inv-kpi-value" style="color:var(--color-accent-text, var(--color-primary));">Ir →</span>
         <span class="inv-kpi-hint">Salidas por préstamo y devoluciones</span>
     </a>
     <?php endif; ?>
     <?php if ($canViewConsignacion): ?>
     <a href="<?php echo $viewInstance->route('app/consignacion'); ?>" class="inv-kpi inv-kpi--link">
         <span class="inv-kpi-label">Consignación</span>
-        <span class="inv-kpi-value" style="color:var(--color-primary);">Ir →</span>
+        <span class="inv-kpi-value" style="color:var(--color-accent-text, var(--color-primary));">Ir →</span>
         <span class="inv-kpi-hint">Mercancía de terceros (no inventario propio)</span>
     </a>
     <?php endif; ?>
@@ -446,7 +446,7 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                     </div>
                     <div style="flex:1;min-width:0;">
                         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
-                            <h4 style="margin:0;font-size:15px;color:var(--color-primary);"><?php echo htmlspecialchars($p['name']); ?></h4>
+                            <h4 style="margin:0;font-size:15px;color:var(--color-accent-text, var(--color-primary));"><?php echo htmlspecialchars($p['name']); ?></h4>
                             <span style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;">
                                 <span class="badge <?php echo $isInactive ? 'badge-warning' : 'badge-success'; ?>">
                                     <?php echo $isInactive ? 'Inactivo' : 'Activo'; ?>
@@ -485,7 +485,7 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                                         <?php echo !empty($p['offer_percent']) ? ' (−' . rtrim(rtrim(number_format((float)$p['offer_percent'], 1, '.', ''), '0'), '.') . '%)' : ''; ?>
                                     </span>
                                 <?php else: ?>
-                                <strong style="color:#DC2626;"><?php echo fmtI((float)$p['sale_price'], $currency); ?></strong>
+                                <strong style="color:var(--dmc-DC2626, #DC2626);"><?php echo fmtI((float)$p['sale_price'], $currency); ?></strong>
                                 <span style="text-decoration:line-through;color:var(--color-text-secondary);font-size:12px;margin-left:4px;">
                                     <?php echo fmtI((float)($p['offer_original_price'] ?? 0), $currency); ?>
                                 </span>
@@ -729,7 +729,7 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                         </td>
                         <td class="inv-td-price">
                             <?php if (!empty($p['offer_active'])): ?>
-                                <strong style="color:#DC2626;"><?php echo fmtI((float)$p['sale_price'], $currency); ?></strong>
+                                <strong style="color:var(--dmc-DC2626, #DC2626);"><?php echo fmtI((float)$p['sale_price'], $currency); ?></strong>
                                 <br><small style="text-decoration:line-through;color:var(--color-text-secondary);"><?php echo fmtI((float)($p['offer_original_price'] ?? 0), $currency); ?></small>
                                 <br><span class="badge badge-danger">Oferta</span>
                             <?php else: ?>
@@ -941,7 +941,7 @@ if ($paginationTotal > 0):
                         «Lote N» / Compras solo si <em>sí</em> llegó mercancía nueva.
                     </p>
                     <p id="prodStockDeltaHint" style="display:none;margin:6px 0 0;font-size:12px;color:var(--color-text-secondary);"></p>
-                    <div id="prodNegConfirmWrap" style="display:none;margin-top:10px;padding:10px 12px;border-radius:8px;background:#FEF3C7;border:1px solid #F59E0B;color:#92400E;font-size:13px;">
+                    <div id="prodNegConfirmWrap" style="display:none;margin-top:10px;padding:10px 12px;border-radius:8px;background:var(--dmb-FEF3C7, #FEF3C7);border:1px solid #F59E0B;color:var(--dmc-92400E, #92400E);font-size:13px;">
                         <p style="margin:0 0 8px;" id="prodNegConfirmText"></p>
                         <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-weight:600;">
                             <input type="checkbox" name="confirm_negative_cover" id="prodNegConfirm" value="1" style="width:auto;margin-top:2px;">
@@ -1041,8 +1041,8 @@ if ($paginationTotal > 0):
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="id" id="stockProdId">
             <p id="stockProdName" style="margin-bottom:10px;font-weight:600;"></p>
-            <div id="stockDebtAlert" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:8px;background:#FEF3C7;border:1px solid #F59E0B;color:#92400E;font-size:13px;"></div>
-            <div id="stockNegConfirmWrap" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:8px;background:#FEE2E2;border:1px solid #EF4444;color:#991B1B;font-size:13px;">
+            <div id="stockDebtAlert" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:8px;background:var(--dmb-FEF3C7, #FEF3C7);border:1px solid #F59E0B;color:var(--dmc-92400E, #92400E);font-size:13px;"></div>
+            <div id="stockNegConfirmWrap" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:8px;background:var(--dmb-FEE2E2, #FEE2E2);border:1px solid #EF4444;color:var(--dmc-991B1B, #991B1B);font-size:13px;">
                 <p style="margin:0 0 8px;" id="stockNegConfirmText"></p>
                 <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-weight:600;">
                     <input type="checkbox" name="confirm_negative_cover" id="stockNegConfirm" value="1" style="width:auto;margin-top:2px;">
@@ -1073,7 +1073,7 @@ if ($paginationTotal > 0):
                     <input type="text" name="lot_code" id="stockLotCode" class="form-control" maxlength="60" placeholder="Automático si vacío">
                 </div>
             </div>
-            <p id="stockLotHint" style="display:none;font-size:12px;color:#92400E;background:#FEF3C7;border:1px solid #F59E0B;border-radius:8px;padding:8px 10px;margin:0 0 12px;">
+            <p id="stockLotHint" style="display:none;font-size:12px;color:var(--dmc-92400E, #92400E);background:var(--dmb-FEF3C7, #FEF3C7);border:1px solid #F59E0B;border-radius:8px;padding:8px 10px;margin:0 0 12px;">
                 Este producto controla lotes: indique la <strong>fecha de vencimiento</strong> de esta remesa. Si es distinta a lotes previos, se crea un lote nuevo.
             </p>
             <div class="form-group">
@@ -1385,7 +1385,7 @@ if ($paginationTotal > 0):
                         <li>Columnas: <code>SKU; EAN; Nombre; Tipo; Categoria; Costo; Precio; IVA; Precio_mayor; Stock; Min; Unidad; Estado; Ubicacion; Lote; Vence; Modo_stock</code> (SKU y EAN opcionales).</li>
                         <li><code>Precio_mayor</code>: precio al por mayor (opcional). <code>Unidad</code>: UND, Lts, Mt, etc.</li>
                         <li><strong>Misma SKU + distinto Lote/Vence</strong> = remesa del mismo producto (no cree otro ítem).</li>
-                        <li><strong style="color:#B45309;">Importante — Modo_stock:</strong>
+                        <li><strong style="color:var(--dmc-B45309, #B45309);">Importante — Modo_stock:</strong>
                             <ul style="margin:4px 0 0 14px;">
                                 <li><code>absoluto</code> = el valor de <code>Stock</code> es la <em>existencia total</em> (corrige / sincroniza). Úselo para actualizar inventario.</li>
                                 <li><code>entrada</code> = <em>suma</em> esa cantidad al stock actual (como una compra/remesa). Si pone el stock que ya tenía con <code>entrada</code>, lo duplica.</li>

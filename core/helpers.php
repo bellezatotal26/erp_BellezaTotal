@@ -130,6 +130,15 @@ function theme_color_style(?string $hex): string
     // Fondo sutil (tinte translúcido del primario).
     $tint = sprintf('rgba(%d, %d, %d, 0.06)', $r, $g, $b);
 
+    // Modo oscuro: un primario casi negro se confunde con las tarjetas (#1E293B); se aclara solo para superficies.
+    $darkSurface = '';
+    if ($luminance < 0.08) {
+        $lighten = static function (int $c): int {
+            return (int)round($c + (255 - $c) * 0.28);
+        };
+        $darkSurface = sprintf('--dm-primary-surface: #%02X%02X%02X;', $lighten($r), $lighten($g), $lighten($b));
+    }
+
     return "<style id=\"tenant-theme\">:root{"
         . "--color-primary: {$hex};"
         . "--bg-btn-primary: {$hex};"
@@ -144,6 +153,7 @@ function theme_color_style(?string $hex): string
         . "--bg-btn-primary: {$hex};"
         . "--bg-btn-primary-hover: {$hover};"
         . "--color-btn-primary-text: {$textOnPrimary};"
+        . $darkSurface
         . "}</style>";
 }
 

@@ -441,7 +441,7 @@ function viewDetail(id) {
                             + '</div>';
                     }
                 } else if (hasSub) {
-                    origin += '<div style="font-size:11px;color:#B45309;margin-top:2px;">con cambio de referencia</div>';
+                    origin += '<div style="font-size:11px;color:var(--dmc-B45309, #B45309);margin-top:2px;">con cambio de referencia</div>';
                 }
                 var detail = x.motive || x.notes || '-';
                 if (x.user_name) detail += (detail && detail !== '-' ? ' · ' : '') + x.user_name;

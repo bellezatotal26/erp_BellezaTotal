@@ -89,16 +89,17 @@ class TenantReportesController extends TenantController
     }
 
     /** Filtro de fechas (mismo criterio que contabilidad / reportes históricos). */
-    private function salesRangeSql(string $alias = 's'): string
+    private function salesRangeSql(string $alias = ''): string
     {
         $col = $alias !== '' ? "{$alias}.sale_date" : 'sale_date';
         return "DATE({$col}) BETWEEN ? AND ?";
     }
 
+    /** Ventas válidas: pagadas y a crédito ('pending'); solo se excluyen las anuladas. */
     private function completedSalesSql(string $alias = ''): string
     {
         $col = $alias !== '' ? "{$alias}.status" : 'status';
-        return "{$col} = 'completed'";
+        return "COALESCE({$col}, '') <> 'cancelled'";
     }
 
     /**
@@ -114,10 +115,14 @@ class TenantReportesController extends TenantController
 
     private function saleItemCostExpr(): string
     {
-        if ($this->columnExists('sale_items', 'unit_cost')) {
-            return 'COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)';
+        $cost = $this->columnExists('sale_items', 'unit_cost')
+            ? 'COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)'
+            : 'COALESCE(p.purchase_price, 0)';
+        // Componentes ocultos de un combo: el costo ya viene en la línea visible del combo.
+        if ($this->columnExists('sale_items', 'document_hidden')) {
+            return "(CASE WHEN COALESCE(si.document_hidden, 0) = 1 THEN 0 ELSE {$cost} END)";
         }
-        return 'COALESCE(p.purchase_price, 0)';
+        return $cost;
     }
 
     private function salesSubtotalSumExpr(string $alias = ''): string
@@ -258,6 +263,7 @@ class TenantReportesController extends TenantController
             'lowStockProducts' => [],
             'productTrend' => [],
             'paymentMethods' => [],
+            'salesSummary' => ['by_method' => [], 'collected' => 0.0, 'pending' => 0.0, 'total' => 0.0, 'count' => 0, 'discount' => 0.0],
             'marginByChannel' => [],
             'dataphoneRecon' => [
                 'sales_total' => 0, 'expected_total' => 0, 'recorded_total' => 0, 'gap' => 0,
@@ -327,7 +333,7 @@ class TenantReportesController extends TenantController
         $avgTicket = $totalSalesCount > 0 ? $totalSales / $totalSalesCount : 0;
 
         $customersCountSql = $this->tableExists('customers')
-            ? "(SELECT COUNT(*) FROM customers WHERE status = 'active')"
+            ? "(SELECT COUNT(*) FROM customers WHERE COALESCE(status, 'active') <> 'inactive')"
             : '(SELECT 0)';
 
         $counts = $this->tryBlock(
@@ -402,17 +408,44 @@ class TenantReportesController extends TenantController
 
         $periodExpenses = 0.0;
         if ($this->tableExists('expenses')) {
-            $periodExpenses = (float)$this->fetchScalar(
-                "SELECT COALESCE(SUM(amount), 0) t FROM expenses WHERE expense_date BETWEEN ? AND ?",
-                [$dateFrom, $dateTo],
-                't',
-                0.0
+            $expenseStatusSql = $this->columnExists('expenses', 'status')
+                ? " AND COALESCE(status, 'active') <> 'cancelled'"
+                : '';
+            $periodExpenses = (float)$this->tryBlock(
+                fn () => $this->fetchScalar(
+                    "SELECT COALESCE(SUM(amount), 0) t FROM expenses
+                     WHERE expense_date BETWEEN ? AND ?{$expenseStatusSql}",
+                    [$dateFrom, $dateTo],
+                    't',
+                    0.0
+                ),
+                0.0,
+                'periodExpenses'
             );
         }
 
-        $grossProfit = (float)$revenue - (float)$costOfSales;
+        $salesDiscounts = 0.0;
+        if ($this->columnExists('sales', 'discount')) {
+            $salesDiscounts = (float)$this->tryBlock(
+                fn () => $this->fetchScalar(
+                    "SELECT COALESCE(SUM(discount), 0) t
+                     FROM sales
+                     WHERE {$this->completedSalesSql('')}
+                       AND {$this->salesRangeSql()}",
+                    $rangeParams,
+                    't',
+                    0.0
+                ),
+                0.0,
+                'salesDiscounts'
+            );
+        }
+
+        $netRevenue = (float)$revenue - $salesDiscounts;
+        $grossProfit = $netRevenue - (float)$costOfSales;
         $netProfit = $grossProfit - (float)$periodExpenses;
-        $margin = (float)$revenue > 0 ? round(($netProfit / (float)$revenue) * 100, 1) : 0.0;
+        $margin = $netRevenue > 0 ? round(($netProfit / $netRevenue) * 100, 1) : 0.0;
+        $grossMargin = $netRevenue > 0 ? round(($grossProfit / $netRevenue) * 100, 1) : 0.0;
 
         $accounting = new \SoftNova\Services\AccountingService($this->db);
         $expenseBreakdown = ['fixed' => 0.0, 'financial' => 0.0, 'operating' => 0.0, 'total' => 0.0, 'by_category' => [], 'by_group' => []];
@@ -442,8 +475,11 @@ class TenantReportesController extends TenantController
             'revenue' => $revenue,
             'billed' => $totalSales,
             'subtotal' => (float)$revenue,
+            'discounts' => $salesDiscounts,
+            'net_revenue' => $netRevenue,
             'cost' => $costOfSales,
             'gross' => $grossProfit,
+            'gross_margin' => $grossMargin,
             'expenses' => $periodExpenses,
             'expenses_fixed' => (float)($expenseBreakdown['fixed'] ?? 0),
             'expenses_financial' => (float)($expenseBreakdown['financial'] ?? 0),
@@ -538,17 +574,23 @@ class TenantReportesController extends TenantController
         ];
 
         $productLimit = $reportsFull ? 10 : 5;
+        // Combos: la línea visible (sin product_id) representa la venta; sus componentes van ocultos.
+        $visibleItems = $this->columnExists('sale_items', 'document_hidden')
+            ? ' AND COALESCE(si.document_hidden, 0) = 0'
+            : '';
+        $itemKey = "COALESCE(CAST(si.product_id AS CHAR), CONCAT('n:', si.product_name))";
+        $itemName = "MAX(COALESCE(p.name, si.product_name, 'Producto'))";
         $topProducts = $this->tryBlock(
             fn () => $this->query(
-                "SELECT p.name,
+                "SELECT {$itemName} AS name,
                         SUM(si.quantity) AS total_qty,
                         SUM({$itemSubtotal}) AS total_sales,
                         SUM({$itemSubtotal}) - SUM(si.quantity * {$costExpr}) AS profit
                  FROM sale_items si
-                 JOIN products p ON si.product_id = p.id
+                 LEFT JOIN products p ON si.product_id = p.id
                  JOIN sales s ON si.sale_id = s.id
-                 WHERE {$completed} AND {$salesRange}
-                 GROUP BY p.id, p.name
+                 WHERE {$completed} AND {$salesRange}{$visibleItems}
+                 GROUP BY {$itemKey}
                  ORDER BY total_qty DESC
                  LIMIT {$productLimit}",
                 $rangeParams
@@ -559,15 +601,15 @@ class TenantReportesController extends TenantController
 
         $profitability = $this->tryBlock(
             fn () => $this->query(
-                "SELECT p.name,
+                "SELECT {$itemName} AS name,
                         SUM(si.quantity) AS qty,
                         SUM({$itemSubtotal}) AS revenue,
                         SUM({$itemSubtotal}) - SUM(si.quantity * {$costExpr}) AS profit
                  FROM sale_items si
-                 JOIN products p ON si.product_id = p.id
+                 LEFT JOIN products p ON si.product_id = p.id
                  JOIN sales s ON si.sale_id = s.id
-                 WHERE {$completed} AND {$salesRange}
-                 GROUP BY p.id, p.name
+                 WHERE {$completed} AND {$salesRange}{$visibleItems}
+                 GROUP BY {$itemKey}
                  ORDER BY profit DESC
                  LIMIT {$productLimit}",
                 $rangeParams
@@ -622,7 +664,21 @@ class TenantReportesController extends TenantController
         $topCustomers = [];
         $stockMovements = [];
         $productTrend = [];
+
+        $salesSummary = $this->tryBlock(
+            fn () => \SoftNova\Services\SalesPeriodSummary::build($this->db, $dateFrom, $dateTo),
+            ['by_method' => [], 'collected' => 0.0, 'pending' => 0.0, 'total' => 0.0, 'count' => 0, 'discount' => 0.0],
+            'salesSummary'
+        );
         $paymentMethods = [];
+        foreach ($salesSummary['by_method'] as $pm) {
+            $paymentMethods[] = [
+                'payment_method' => $pm['method'],
+                'label' => $pm['label'],
+                'count' => $pm['count'],
+                'total' => $pm['amount'],
+            ];
+        }
 
         if ($reportsFull) {
             $prevRange = [$prevFrom, $prevTo];
@@ -730,40 +786,6 @@ class TenantReportesController extends TenantController
                 'productTrend'
             );
 
-            if ($this->tableExists('sale_payments')) {
-                $paymentMethods = $this->tryBlock(
-                    fn () => $this->query(
-                        "SELECT pm.payment_method,
-                                COUNT(*) AS count,
-                                COALESCE(SUM(pm.amount), 0) AS total
-                         FROM sale_payments pm
-                         JOIN sales s ON s.id = pm.sale_id
-                         WHERE {$completed} AND {$salesRange}
-                         GROUP BY pm.payment_method
-                         ORDER BY total DESC",
-                        $rangeParams
-                    )->fetchAll(),
-                    [],
-                    'paymentMethods'
-                );
-            }
-
-            if ($paymentMethods === []) {
-                $paymentMethods = $this->tryBlock(
-                    fn () => $this->query(
-                        "SELECT payment_method, COUNT(*) AS count, COALESCE(SUM(total), 0) AS total
-                         FROM sales
-                         WHERE {$this->completedSalesSql('')}
-                           AND {$this->salesRangeSql()}
-                         GROUP BY payment_method
-                         ORDER BY count DESC",
-                        $rangeParams
-                    )->fetchAll(),
-                    [],
-                    'paymentMethodsFallback'
-                );
-            }
-
             $salesTrend = $prevTotalSales > 0
                 ? round((($totalSales - $prevTotalSales) / $prevTotalSales) * 100, 1)
                 : 0;
@@ -807,6 +829,7 @@ class TenantReportesController extends TenantController
             'lowStockProducts' => $lowStockProducts,
             'productTrend' => $productTrend,
             'paymentMethods' => $paymentMethods,
+            'salesSummary' => $salesSummary,
             'marginByChannel' => $marginByChannel,
             'dataphoneRecon' => $dataphoneRecon,
             'expenseBreakdown' => $expenseBreakdown,
@@ -850,7 +873,7 @@ class TenantReportesController extends TenantController
                 $r['subtotal'],
                 $r['tax'],
                 $r['total'],
-                $r['payment_method'],
+                \SoftNova\Services\PaymentMethodCatalog::label((string)$r['payment_method'], $this->db),
                 $r['payment_status'],
             ];
         }

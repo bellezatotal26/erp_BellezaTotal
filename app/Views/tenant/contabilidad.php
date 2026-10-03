@@ -133,9 +133,9 @@ foreach ($accounts as $account) {
             <div class="form-group" style="margin:0;"><label>Desde</label><input class="form-control" type="date" name="from" value="<?php echo htmlspecialchars($dateFrom); ?>"></div>
             <div class="form-group" style="margin:0;"><label>Hasta</label><input class="form-control" type="date" name="to" value="<?php echo htmlspecialchars($dateTo); ?>"></div>
             <?php if ($tab === 'trial'): ?>
-                <div class="form-group" style="margin:0;min-width:120px;">
-                    <label>Año</label>
-                    <select name="year" class="form-control">
+                <div class="form-group" style="margin:0;min-width:140px;">
+                    <label>Año del Balance</label>
+                    <select name="year" class="form-control" title="El Balance muestra los 12 meses de este año">
                         <?php
                         $yNow = (int)date('Y');
                         for ($y = $yNow; $y >= $yNow - 6; $y--):
@@ -164,7 +164,7 @@ foreach ($accounts as $account) {
     <?php if ($canCreate): ?>
         <div style="display:flex;justify-content:flex-end;align-items:center;gap:12px;margin-bottom:12px;">
             <?php if ((int)($pendingSync ?? 0) > 0): ?>
-                <span style="font-size:13px;color:#DC2626;font-weight:600;">
+                <span style="font-size:13px;color:var(--dmc-DC2626, #DC2626);font-weight:600;">
                     <?php echo (int)$pendingSync; ?> operación(es) sin comprobante contable
                     <?php if ((int)($pendingQueue ?? 0) > 0): ?>
                         <span style="font-weight:500;color:var(--color-text-secondary);">
@@ -272,14 +272,24 @@ foreach ($accounts as $account) {
     </div></div>
 
 <?php elseif ($tab === 'ledger'): ?>
+    <?php $ledgerOpening = (float)($ledgerOpening ?? 0); ?>
     <div class="card neumorphic"><div class="card-header"><h3>Libro mayor</h3></div><div class="card-body">
         <?php if (!$selectedAccountId): ?>
             <p class="dashboard-empty">Seleccione una cuenta para consultar sus movimientos.</p>
         <?php else: ?>
-            <?php $running = 0.0; ?>
+            <?php $running = $ledgerOpening; ?>
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">
+                Periodo <?php echo htmlspecialchars($dateFrom); ?> → <?php echo htmlspecialchars($dateTo); ?>.
+                El saldo arrastra el saldo anterior a la fecha «Desde».
+            </p>
             <div class="table-container"><table>
                 <thead><tr><th>Fecha</th><th>Comprobante</th><th>Concepto</th><th>Tercero</th><th>Debe</th><th>Haber</th><th>Saldo</th></tr></thead>
                 <tbody>
+                <tr style="background:var(--dmb-F8FAFC, #F8FAFC);font-weight:600;">
+                    <td colspan="4">Saldo inicial (antes de <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateFrom) ?: time())); ?>)</td>
+                    <td></td><td></td>
+                    <td><?php echo acctFmt($ledgerOpening, $currency); ?></td>
+                </tr>
                 <?php if (!$ledger): ?><tr><td colspan="7" class="dashboard-empty">Sin movimientos en el periodo</td></tr><?php endif; ?>
                 <?php foreach ($ledger as $line): $running += (float)$line['debit'] - (float)$line['credit']; ?><tr>
                     <td><?php echo date('d/m/Y', strtotime($line['entry_date'])); ?></td>
@@ -290,6 +300,13 @@ foreach ($accounts as $account) {
                     <td><?php echo acctFmt((float)$line['credit'], $currency); ?></td>
                     <td><?php echo acctFmt($running, $currency); ?></td>
                 </tr><?php endforeach; ?>
+                <?php if ($ledger): ?>
+                <tr style="background:var(--dmb-F1F5F9, #F1F5F9);font-weight:700;">
+                    <td colspan="4">Saldo final del periodo</td>
+                    <td></td><td></td>
+                    <td><?php echo acctFmt($running, $currency); ?></td>
+                </tr>
+                <?php endif; ?>
                 </tbody>
             </table></div>
         <?php endif; ?>
@@ -314,36 +331,104 @@ foreach ($accounts as $account) {
         JSON_UNESCAPED_UNICODE | JSON_NUMERIC_CHECK | JSON_HEX_TAG | JSON_HEX_AMP
     );
     $balWarnings = $mb['meta']['warnings'] ?? [];
+    $balSources = $mb['meta']['sources'] ?? [];
+    $periodLabel = (string)($mb['meta']['period_label'] ?? ('Enero – Diciembre ' . (int)$balanceYear));
+    $periodFrom = (string)($mb['meta']['from'] ?? ($balanceYear . '-01-01'));
+    $periodTo = (string)($mb['meta']['to'] ?? ($balanceYear . '-12-31'));
+    $warnLabels = [
+        'ventas' => 'ventas',
+        'nc_venta' => 'notas crédito venta',
+        'compras' => 'facturas de compra',
+        'abonos' => 'abonos a proveedores',
+        'pagos_contado' => 'pagos de contado',
+        'gastos' => 'gastos',
+        'costo_sin_cargar' => 'costo de venta en 0 (revise precio de compra en inventario)',
+    ];
     ?>
     <style>
-        .bal-table thead th{font-size:14px;font-weight:700;color:#000;white-space:nowrap;vertical-align:bottom;padding:10px 12px;}
+        .bal-table{border-collapse:separate;border-spacing:0;width:100%;}
+        .bal-table thead th{font-size:13px;font-weight:700;color:#000;white-space:nowrap;vertical-align:bottom;padding:10px 12px;border-bottom:1px solid #CBD5E1;}
         .bal-group-facturas{background:#FB923C;color:#000;text-align:center;}
         .bal-group-utilidad{background:#86EFAC;color:#000;text-align:center;}
         .bal-th-util{background:#4ADE80;color:#000;}
         .bal-th-base{background:#86EFAC;color:#000;}
-        .bal-total-ingresos{background:#991B1B;color:#fff;font-weight:700;}
-        .bal-totals-row td{font-weight:700;background:#F8FAFC;font-size:13px;}
+        .bal-totals-row td{font-weight:700;background:var(--dmb-F1F5F9, #F1F5F9);font-size:13px;padding:10px 12px;border-top:2px solid #94A3B8;border-bottom:2px solid #94A3B8;color:var(--dmc-0F172A, #0F172A);}
+        /* Más específico que .bal-totals-row td para que el rojo/blanco no se pierda */
+        .bal-totals-row td.bal-total-ingresos{background:#991B1B !important;color:#fff !important;font-weight:800;}
+        .bal-month-cell{min-width:168px;white-space:nowrap;}
+        .bal-month-num{display:inline-block;min-width:2.2em;color:var(--dmc-64748B, #64748B);font-variant-numeric:tabular-nums;}
+        .bal-month-name{font-weight:700;color:var(--dmc-0F172A, #0F172A);}
+        .bal-month-range{display:block;font-size:11px;font-weight:500;color:var(--dmc-64748B, #64748B);margin-top:2px;}
+        .bal-row-active td{background:var(--dmb-FFFBEB, #FFFBEB);}
         .bal-charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-bottom:16px;}
         .bal-chart-card{min-height:280px;}
         .bal-chart-card .card-body{position:relative;height:240px;}
         .bal-chart-card canvas{max-height:240px;}
         .bal-chart-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--color-text-secondary);font-size:13px;}
+        .bal-sources{margin:10px 0 0;padding:10px 12px;background:var(--dmb-F8FAFC, #F8FAFC);border:1px solid #E2E8F0;border-radius:8px;font-size:12px;color:var(--color-text-secondary);line-height:1.45;}
+        .bal-sources strong{color:var(--color-text);}
+        .bal-sources ul{margin:6px 0 0;padding-left:18px;}
+        .bal-period-badge{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 0;padding:8px 12px;background:var(--dmb-EFF6FF, #EFF6FF);border:1px solid #BFDBFE;border-radius:8px;font-size:13px;color:var(--dmc-1E3A8A, #1E3A8A);}
+        .bal-howto{margin:10px 0 0;font-size:12px;color:var(--color-text-secondary);max-width:820px;line-height:1.45;}
     </style>
 
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
         <div>
-            <h3 style="margin:0 0 4px;">Balance <?php echo (int)$balanceYear; ?></h3>
-            <p style="margin:0;font-size:13px;color:var(--color-text-secondary);max-width:720px;">
-                Resumen mensual: ventas completadas (menos NC), costo de venta, facturas de compra recibidas y utilidades
-                (bruta = ingresos − costo; operacional = bruta − gastos operativos; neta = operacional − gastos fijos/financieros).
+            <h3 style="margin:0 0 4px;">Balance operativo <?php echo (int)$balanceYear; ?></h3>
+            <div class="bal-period-badge">
+                <strong>Periodo:</strong>
+                <span><?php echo htmlspecialchars($periodLabel); ?></span>
+                <span style="opacity:.75;">·</span>
+                <span><?php echo htmlspecialchars(date('d/m/Y', strtotime($periodFrom) ?: time())); ?>
+                    → <?php echo htmlspecialchars(date('d/m/Y', strtotime($periodTo) ?: time())); ?></span>
+            </div>
+            <p class="bal-howto">
+                Cada fila es un <strong>mes calendario</strong> del año seleccionado (arriba, filtro «Año»).
+                La fila sombreada bajo los encabezados es el <strong>total del año</strong>.
+                Ingresos y costo salen de ventas de caja; Facturas = compras recibidas; Utilidad se calcula de esas columnas.
+            </p>
+            <p style="margin:8px 0 0;font-size:13px;color:var(--color-text-secondary);max-width:720px;">
+                Bruta = ingresos − costo · Operacional = bruta − gastos operativos · Neta = operacional − gastos fijos/financieros.
             </p>
             <?php if (!empty($balWarnings)): ?>
-                <p style="margin:8px 0 0;font-size:12px;color:#B45309;">
-                    Algunas fuentes no respondieron (<?php echo htmlspecialchars(implode(', ', $balWarnings)); ?>). Revise logs si los totales lucen incompletos.
+                <?php
+                $warnTxt = [];
+                foreach ($balWarnings as $w) {
+                    $warnTxt[] = $warnLabels[(string)$w] ?? (string)$w;
+                }
+                ?>
+                <p style="margin:8px 0 0;font-size:12px;color:var(--dmc-B45309, #B45309);">
+                    Atención: <?php echo htmlspecialchars(implode('; ', $warnTxt)); ?>.
                 </p>
             <?php endif; ?>
+            <?php if (!empty($balSources)): ?>
+                <details class="bal-sources">
+                    <summary style="cursor:pointer;font-weight:600;color:var(--color-text);">De dónde salen los datos</summary>
+                    <ul>
+                        <?php if (!empty($balSources['ingresos'])): ?>
+                            <li><strong>Ingresos:</strong> <?php echo htmlspecialchars((string)$balSources['ingresos']); ?></li>
+                        <?php endif; ?>
+                        <?php if (!empty($balSources['costo_venta'])): ?>
+                            <li><strong>Costo de venta:</strong> <?php echo htmlspecialchars((string)$balSources['costo_venta']); ?></li>
+                        <?php endif; ?>
+                        <?php if (!empty($balSources['facturas'])): ?>
+                            <li><strong>Facturas:</strong> <?php echo htmlspecialchars((string)$balSources['facturas']); ?></li>
+                        <?php endif; ?>
+                        <?php if (!empty($balSources['facturas_pagadas'])): ?>
+                            <li><strong>$ Fact. pagadas:</strong> <?php echo htmlspecialchars((string)$balSources['facturas_pagadas']); ?></li>
+                        <?php endif; ?>
+                        <?php if (!empty($balSources['utilidad_bruta'])): ?>
+                            <li><strong>Utilidad:</strong>
+                                <?php echo htmlspecialchars((string)$balSources['utilidad_bruta']); ?>;
+                                <?php echo htmlspecialchars((string)($balSources['utilidad_operacional'] ?? '')); ?>;
+                                <?php echo htmlspecialchars((string)($balSources['utilidad_neta'] ?? '')); ?>.
+                            </li>
+                        <?php endif; ?>
+                    </ul>
+                </details>
+            <?php endif; ?>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start;">
             <?php if ($canExport): ?>
                 <a class="btn btn-secondary" href="<?php echo htmlspecialchars($exportUrl); ?>">Exportar CSV</a>
             <?php endif; ?>
@@ -352,8 +437,8 @@ foreach ($accounts as $account) {
 
     <div class="stats-grid" style="margin-bottom:16px;">
         <div class="stat-card neumorphic">
-            <h4>Ingresos año</h4>
-            <div class="stat-value" style="font-size:20px;color:#991B1B;"><?php echo acctFmt((float)($mt['ingresos'] ?? 0), $currency); ?></div>
+            <h4>Ingresos <?php echo (int)$balanceYear; ?></h4>
+            <div class="stat-value" style="font-size:20px;color:var(--dmc-991B1B, #991B1B);"><?php echo acctFmt((float)($mt['ingresos'] ?? 0), $currency); ?></div>
         </div>
         <div class="stat-card neumorphic">
             <h4>Costo de venta</h4>
@@ -361,7 +446,7 @@ foreach ($accounts as $account) {
         </div>
         <div class="stat-card neumorphic">
             <h4>Utilidad bruta</h4>
-            <div class="stat-value" style="font-size:20px;color:#059669;"><?php echo $fmtCell((float)($mt['utilidad_bruta'] ?? 0), $currency); ?></div>
+            <div class="stat-value" style="font-size:20px;color:var(--dmc-059669, #059669);"><?php echo $fmtCell((float)($mt['utilidad_bruta'] ?? 0), $currency); ?></div>
         </div>
         <div class="stat-card neumorphic">
             <h4>Utilidad neta</h4>
@@ -373,29 +458,33 @@ foreach ($accounts as $account) {
 
     <div class="bal-charts">
         <div class="card neumorphic bal-chart-card">
-            <div class="card-header"><h3 style="margin:0;font-size:15px;">Ingresos vs costo de venta</h3></div>
+            <div class="card-header"><h3 style="margin:0;font-size:15px;">Ingresos vs costo · <?php echo (int)$balanceYear; ?></h3></div>
             <div class="card-body"><canvas id="balChartIncome" aria-label="Gráfico ingresos vs costo"></canvas></div>
         </div>
         <div class="card neumorphic bal-chart-card">
-            <div class="card-header"><h3 style="margin:0;font-size:15px;">Utilidades del año</h3></div>
+            <div class="card-header"><h3 style="margin:0;font-size:15px;">Utilidades · <?php echo (int)$balanceYear; ?></h3></div>
             <div class="card-body"><canvas id="balChartProfit" aria-label="Gráfico utilidades"></canvas></div>
         </div>
         <div class="card neumorphic bal-chart-card">
-            <div class="card-header"><h3 style="margin:0;font-size:15px;">Facturas vs pagos a proveedores</h3></div>
+            <div class="card-header"><h3 style="margin:0;font-size:15px;">Facturas vs pagos · <?php echo (int)$balanceYear; ?></h3></div>
             <div class="card-body"><canvas id="balChartInvoices" aria-label="Gráfico facturas vs pagos"></canvas></div>
         </div>
     </div>
 
     <div class="card neumorphic" style="margin-bottom:16px;">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+            <h3 style="margin:0;font-size:15px;">Tabla mensual · <?php echo htmlspecialchars($periodLabel); ?></h3>
+            <span style="font-size:12px;color:var(--color-text-secondary);">Fila «Total año» = suma de los 12 meses</span>
+        </div>
         <div class="card-body" style="padding:0;">
             <div class="table-container" style="overflow-x:auto;">
-                <table class="bal-table" style="min-width:1100px;">
+                <table class="bal-table" style="min-width:1180px;">
                     <thead>
                         <tr>
-                            <th rowspan="2" class="bal-th-base">Mes</th>
+                            <th rowspan="2" class="bal-th-base">Mes / periodo</th>
                             <th rowspan="2" class="bal-th-base">Ingresos</th>
                             <th rowspan="2" class="bal-th-base">Costo de venta</th>
-                            <th colspan="6" class="bal-group-facturas">Facturas</th>
+                            <th colspan="6" class="bal-group-facturas">Facturas de compra</th>
                             <th colspan="3" class="bal-group-utilidad">Utilidad</th>
                         </tr>
                         <tr>
@@ -410,7 +499,10 @@ foreach ($accounts as $account) {
                             <th class="bal-th-util">Neta</th>
                         </tr>
                         <tr class="bal-totals-row">
-                            <td></td>
+                            <td class="bal-month-cell">
+                                <span class="bal-month-name">Total <?php echo (int)$balanceYear; ?></span>
+                                <span class="bal-month-range"><?php echo htmlspecialchars($periodLabel); ?></span>
+                            </td>
                             <td class="bal-total-ingresos" style="text-align:right;"><?php echo acctFmt((float)($mt['ingresos'] ?? 0), $currency); ?></td>
                             <td style="text-align:right;"><?php echo $fmtCell((float)($mt['costo_venta'] ?? 0), $currency); ?></td>
                             <td style="text-align:right;"><?php echo $fmtCell((float)($mt['facturas_total'] ?? 0), $currency); ?></td>
@@ -426,8 +518,30 @@ foreach ($accounts as $account) {
                     </thead>
                     <tbody>
                     <?php foreach (($mb['months'] ?? []) as $row): ?>
-                        <tr>
-                            <td><strong><?php echo htmlspecialchars((string)$row['month_label']); ?></strong></td>
+                        <?php
+                        $hasData = abs((float)$row['ingresos'])
+                            + abs((float)$row['costo_venta'])
+                            + abs((float)$row['facturas_total'])
+                            + abs((float)$row['utilidad_neta']) > 0.009;
+                        $mName = (string)($row['month_name'] ?? '');
+                        $mNum = (string)($row['month_num'] ?? $row['month_label'] ?? '');
+                        $pFrom = (string)($row['period_from'] ?? '');
+                        $pTo = (string)($row['period_to'] ?? '');
+                        $rangeTxt = '';
+                        if ($pFrom !== '' && $pTo !== '') {
+                            $rangeTxt = date('d/m/Y', strtotime($pFrom) ?: time())
+                                . ' – '
+                                . date('d/m/Y', strtotime($pTo) ?: time());
+                        }
+                        ?>
+                        <tr class="<?php echo $hasData ? 'bal-row-active' : ''; ?>">
+                            <td class="bal-month-cell">
+                                <span class="bal-month-num"><?php echo htmlspecialchars($mNum); ?></span>
+                                <span class="bal-month-name"><?php echo htmlspecialchars($mName !== '' ? $mName : (string)$row['month_label']); ?></span>
+                                <?php if ($rangeTxt !== ''): ?>
+                                    <span class="bal-month-range"><?php echo htmlspecialchars($rangeTxt); ?></span>
+                                <?php endif; ?>
+                            </td>
                             <td style="text-align:right;"><?php echo $fmtCell((float)$row['ingresos'], $currency); ?></td>
                             <td style="text-align:right;"><?php echo $fmtCell((float)$row['costo_venta'], $currency); ?></td>
                             <td style="text-align:right;"><?php echo $fmtCell((float)$row['facturas_total'], $currency); ?></td>
@@ -560,6 +674,11 @@ foreach ($accounts as $account) {
     </script>
 
 <?php elseif ($tab === 'statements'): ?>
+    <p style="margin:0 0 12px;font-size:13px;color:var(--color-text-secondary);max-width:900px;">
+        Situación financiera = saldos acumulados a la fecha «Hasta». Resultados = movimiento del periodo (Desde–Hasta).
+        Aún no hay asiento de cierre a utilidad del ejercicio: el patrimonio no incluye automáticamente el resultado del periodo
+        (Activo puede diferir de Pasivo + Patrimonio).
+    </p>
     <div class="accounting-statements">
         <div class="card neumorphic"><div class="card-header"><h3>Estado de situación financiera</h3></div><div class="card-body">
             <?php foreach (['assets' => 'Activos', 'liabilities' => 'Pasivos', 'equity' => 'Patrimonio'] as $group => $label): ?>
@@ -569,6 +688,29 @@ foreach ($accounts as $account) {
                 <?php endforeach; ?>
                 <div class="accounting-statement-total"><span>Total <?php echo strtolower($label); ?></span><strong><?php echo acctFmt((float)($statements['totals'][$group] ?? 0), $currency); ?></strong></div>
             <?php endforeach; ?>
+            <?php
+            $stmtProfit = (float)($statements['profit'] ?? 0);
+            $equityWithProfit = (float)($statements['totals']['equity'] ?? 0) + $stmtProfit;
+            $assetsTot = (float)($statements['totals']['assets'] ?? 0);
+            $liabTot = (float)($statements['totals']['liabilities'] ?? 0);
+            ?>
+            <div class="accounting-statement-row" style="margin-top:10px;border-top:1px dashed #CBD5E1;padding-top:8px;">
+                <span>Resultado del periodo (referencia, sin cerrar)</span>
+                <strong style="color:<?php echo $stmtProfit >= 0 ? '#059669' : '#DC2626'; ?>;"><?php echo acctFmt($stmtProfit, $currency); ?></strong>
+            </div>
+            <div class="accounting-statement-total">
+                <span>Pasivo + patrimonio + resultado</span>
+                <strong><?php echo acctFmt($liabTot + $equityWithProfit, $currency); ?></strong>
+            </div>
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:8px 0 0;">
+                Activos <?php echo acctFmt($assetsTot, $currency); ?>
+                <?php if (abs($assetsTot - ($liabTot + $equityWithProfit)) >= 1): ?>
+                    · diferencia vs pasivo+patrimonio+resultado:
+                    <?php echo acctFmt($assetsTot - ($liabTot + $equityWithProfit), $currency); ?>
+                <?php else: ?>
+                    · cuadra con pasivo + patrimonio + resultado (referencia)
+                <?php endif; ?>
+            </p>
         </div></div>
         <div class="card neumorphic"><div class="card-header"><h3>Estado de resultados</h3></div><div class="card-body">
             <h4>Ingresos</h4>
@@ -900,10 +1042,12 @@ foreach ($accounts as $account) {
     <div class="card neumorphic" style="margin-bottom:16px;">
         <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
             <h3 style="margin:0;">Trazabilidad de facturas de compra</h3>
+            <?php if ($canExport): ?>
             <a class="btn btn-sm btn-secondary"
                href="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=export&report=invoice-trace&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>&q=<?php echo urlencode($invoiceTraceQ); ?>">
                 Exportar CSV
             </a>
+            <?php endif; ?>
         </div>
         <div class="card-body">
             <p style="color:var(--color-text-secondary);margin-top:0;">
@@ -961,7 +1105,7 @@ foreach ($accounts as $account) {
                                     <td>
                                         <?php echo acctFmt((float)$o['total'], $currency); ?>
                                         <?php if ($bal > 0.009): ?>
-                                            <div style="font-size:11px;color:#DC2626;">Saldo <?php echo acctFmt($bal, $currency); ?></div>
+                                            <div style="font-size:11px;color:var(--dmc-DC2626, #DC2626);">Saldo <?php echo acctFmt($bal, $currency); ?></div>
                                         <?php endif; ?>
                                     </td>
                                     <td>
@@ -1018,13 +1162,13 @@ foreach ($accounts as $account) {
                     + '<div style="margin-top:10px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;">'
                     + '<div style="padding:8px 10px;border-radius:8px;background:rgba(30,58,138,0.08);border:1px solid rgba(30,58,138,0.2);">'
                     + '<div style="font-size:11px;color:var(--color-text-secondary);">Fecha de factura</div>'
-                    + '<div style="font-weight:700;color:#1e3a8a;">' + esc(formatTimelineAt(o.invoice_date)) + '</div></div>'
+                    + '<div style="font-weight:700;color:var(--dmc-1E3A8A, #1e3a8a);">' + esc(formatTimelineAt(o.invoice_date)) + '</div></div>'
                     + '<div style="padding:8px 10px;border-radius:8px;background:rgba(180,83,9,0.08);border:1px solid rgba(180,83,9,0.25);">'
                     + '<div style="font-size:11px;color:var(--color-text-secondary);">Vencimiento de pago</div>'
-                    + '<div style="font-weight:700;color:#B45309;">' + esc(formatTimelineAt(o.due_date)) + '</div></div>'
+                    + '<div style="font-weight:700;color:var(--dmc-B45309, #B45309);">' + esc(formatTimelineAt(o.due_date)) + '</div></div>'
                     + '<div style="padding:8px 10px;border-radius:8px;background:rgba(4,120,87,0.08);border:1px solid rgba(4,120,87,0.25);">'
                     + '<div style="font-size:11px;color:var(--color-text-secondary);">Recepción de bodega</div>'
-                    + '<div style="font-weight:700;color:#047857;">' + esc(formatTimelineAt(o.warehouse_date)) + '</div></div>'
+                    + '<div style="font-weight:700;color:var(--dmc-047857, #047857);">' + esc(formatTimelineAt(o.warehouse_date)) + '</div></div>'
                     + '</div>';
                 var list = document.getElementById('invoiceTimelineList');
                 list.innerHTML = '';
@@ -1144,10 +1288,12 @@ foreach ($accounts as $account) {
     <div class="card neumorphic" style="margin-bottom:16px;">
         <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
             <h3 style="margin:0;">Libro IVA</h3>
+            <?php if ($canExport): ?>
             <a class="btn btn-sm btn-secondary"
                href="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=export&report=vat&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">
                 Exportar CSV
             </a>
+            <?php endif; ?>
         </div>
         <div class="card-body">
             <p style="color:var(--color-text-secondary);margin-top:0;">
@@ -1665,7 +1811,7 @@ function showAccountingEntry(id) {
             document.getElementById('entryDetailBody').innerHTML = html;
         })
         .catch(function(error){
-            document.getElementById('entryDetailBody').innerHTML = '<p class="dashboard-empty" style="color:#DC2626;">' + escapeAccounting(error.message) + '</p>';
+            document.getElementById('entryDetailBody').innerHTML = '<p class="dashboard-empty" style="color:var(--dmc-DC2626, #DC2626);">' + escapeAccounting(error.message) + '</p>';
         });
 }
 
@@ -1687,11 +1833,11 @@ function testIntegrationProvider(btn, provider) {
         .then(function(response){ return response.json(); })
         .then(function(data){
             result.textContent = data.message || (data.success ? 'Conexión OK' : 'Error');
-            result.style.color = data.success ? '#10B981' : '#DC2626';
+            result.style.color = data.success ? '#10B981' : 'var(--dmc-DC2626, #DC2626)';
         })
         .catch(function(){
             result.textContent = 'No se pudo probar la conexión';
-            result.style.color = '#DC2626';
+            result.style.color = 'var(--dmc-DC2626, #DC2626)';
         })
         .finally(function(){ btn.disabled = false; });
 }

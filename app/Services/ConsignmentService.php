@@ -1128,4 +1128,558 @@ class ConsignmentService
              LIMIT {$limit}"
         )->fetchAll() ?: [];
     }
+
+    public const STATUS_LABELS = ['active' => 'Activo', 'inactive' => 'Inactivo'];
+
+    public const STOCK_STATE_LABELS = [
+        'with_stock' => 'Con stock',
+        'no_stock' => 'Sin stock',
+        'pending' => 'Vendidos por liquidar',
+        'sold' => 'Con ventas',
+        'unsold' => 'Sin ventas',
+    ];
+
+    public const SORT_LABELS = [
+        'name' => 'Nombre A-Z',
+        'consignor' => 'Consignante',
+        'stock_desc' => 'Mayor stock',
+        'sold_desc' => 'Más vendidos',
+        'profit_desc' => 'Mayor utilidad',
+        'margin_desc' => 'Mayor margen %',
+        'pending_desc' => 'Mayor saldo por liquidar',
+    ];
+
+    public const TRACE_TYPE_LABELS = [
+        'consignment_in' => 'Ingreso remesa',
+        'sale' => 'Venta',
+        'return' => 'Anulación de venta',
+        'sale_credit_note' => 'Nota crédito',
+        'consignment_return' => 'Devolución a consignante',
+        'adjustment' => 'Ajuste',
+        'settlement' => 'Liquidación pagada',
+    ];
+
+    private ?bool $saleItemsHasDiscount = null;
+
+    /** Ingreso de la línea consignada (con IVA, neto de descuento) prorrateado a la qty vigente de la deuda. */
+    private function debtRevenueSql(string $d = 'd', string $si = 'si', string $p = 'pp'): string
+    {
+        if ($this->saleItemsHasDiscount === null) {
+            try {
+                $this->saleItemsHasDiscount = (bool)$this->db->query("SHOW COLUMNS FROM sale_items LIKE 'discount_amount'")->fetch();
+            } catch (\Throwable $e) {
+                $this->saleItemsHasDiscount = false;
+            }
+        }
+        $lineNet = $this->saleItemsHasDiscount
+            ? "({$si}.subtotal - COALESCE({$si}.discount_amount, 0))"
+            : "{$si}.subtotal";
+        return "CASE WHEN {$si}.id IS NOT NULL AND {$si}.quantity > 0
+                     THEN {$lineNet} * {$d}.qty / {$si}.quantity
+                     ELSE {$d}.qty * COALESCE({$p}.sale_price, 0) END";
+    }
+
+    /**
+     * Normaliza filtros del catálogo consignado.
+     *
+     * @return array{consignor_id:int,supplier_id:int,q:string,status:string,stock_state:string,sort:string}
+     */
+    public static function normalizeProductFilters(array $raw): array
+    {
+        $status = (string)($raw['status'] ?? 'active');
+        if (!in_array($status, ['active', 'inactive', 'all'], true)) {
+            $status = 'active';
+        }
+        $stockState = (string)($raw['stock_state'] ?? '');
+        if (!isset(self::STOCK_STATE_LABELS[$stockState])) {
+            $stockState = '';
+        }
+        $sort = (string)($raw['sort'] ?? 'name');
+        if (!isset(self::SORT_LABELS[$sort])) {
+            $sort = 'name';
+        }
+        return [
+            'consignor_id' => max(0, (int)($raw['consignor_id'] ?? 0)),
+            'supplier_id' => max(0, (int)($raw['supplier_id'] ?? 0)),
+            'q' => trim((string)($raw['q'] ?? '')),
+            'status' => $status,
+            'stock_state' => $stockState,
+            'sort' => $sort,
+        ];
+    }
+
+    /**
+     * Catálogo consignado con métricas de venta acumuladas (vendido, ingreso, costo pactado, utilidad, por liquidar).
+     */
+    public function listProductsDetailed(array $filters, int $limit = 1000): array
+    {
+        $f = self::normalizeProductFilters($filters);
+        $where = ["p.ownership = 'consignment'", "p.product_type = 'product'"];
+        $params = [];
+        if ($f['status'] !== 'all') {
+            $where[] = 'p.status = ?';
+            $params[] = $f['status'];
+        }
+        if ($f['supplier_id'] > 0) {
+            $where[] = 'c.supplier_id = ?';
+            $params[] = $f['supplier_id'];
+        } elseif ($f['consignor_id'] > 0) {
+            $where[] = 'p.consignor_id = ?';
+            $params[] = $f['consignor_id'];
+        }
+        if ($f['q'] !== '') {
+            $search = \SoftNova\Core\multi_term_like_clause($f['q'], [
+                'p.name',
+                'p.code',
+                "COALESCE(p.barcode,'')",
+                "COALESCE(c.name,'')",
+            ]);
+            $where[] = $search['sql'];
+            foreach ($search['params'] as $sp) {
+                $params[] = $sp;
+            }
+        }
+        switch ($f['stock_state']) {
+            case 'with_stock':
+                $where[] = 'p.stock > 0';
+                break;
+            case 'no_stock':
+                $where[] = 'p.stock <= 0';
+                break;
+            case 'pending':
+                $where[] = 'COALESCE(ds.units_pending, 0) > 0';
+                break;
+            case 'sold':
+                $where[] = 'COALESCE(ds.units_sold, 0) > 0';
+                break;
+            case 'unsold':
+                $where[] = 'COALESCE(ds.units_sold, 0) = 0';
+                break;
+        }
+        $order = match ($f['sort']) {
+            'consignor' => 'c.name ASC, p.name ASC',
+            'stock_desc' => 'p.stock DESC, p.name ASC',
+            'sold_desc' => 'units_sold DESC, p.name ASC',
+            'profit_desc' => '(COALESCE(ds.revenue,0) - COALESCE(ds.cost_sold,0)) DESC, p.name ASC',
+            'margin_desc' => 'CASE WHEN COALESCE(ds.revenue,0) > 0 THEN (ds.revenue - ds.cost_sold) / ds.revenue ELSE -1 END DESC, p.name ASC',
+            'pending_desc' => 'amount_pending DESC, p.name ASC',
+            default => 'p.name ASC',
+        };
+        $rev = $this->debtRevenueSql();
+        $limit = max(1, min(5000, $limit));
+        $sql = "SELECT p.*, c.name AS consignor_name, c.supplier_id AS consignor_supplier_id,
+                       COALESCE(ds.units_sold, 0) AS units_sold,
+                       COALESCE(ds.revenue, 0) AS revenue,
+                       COALESCE(ds.cost_sold, 0) AS cost_sold,
+                       COALESCE(ds.units_pending, 0) AS units_pending,
+                       COALESCE(ds.amount_pending, 0) AS amount_pending,
+                       COALESCE(ds.units_settled, 0) AS units_settled,
+                       ds.last_sale_date
+                FROM products p
+                LEFT JOIN consignors c ON c.id = p.consignor_id
+                LEFT JOIN (
+                    SELECT d.product_id,
+                           SUM(d.qty) AS units_sold,
+                           SUM({$rev}) AS revenue,
+                           SUM(d.qty * d.unit_cost) AS cost_sold,
+                           SUM(CASE WHEN d.status IN ('open','partial') THEN d.qty - d.qty_settled ELSE 0 END) AS units_pending,
+                           SUM(CASE WHEN d.status IN ('open','partial') THEN (d.qty - d.qty_settled) * d.unit_cost ELSE 0 END) AS amount_pending,
+                           SUM(d.qty_settled) AS units_settled,
+                           MAX(s.sale_date) AS last_sale_date
+                    FROM consignment_sale_debts d
+                    LEFT JOIN sale_items si ON si.id = d.sale_item_id
+                    LEFT JOIN sales s ON s.id = d.sale_id
+                    LEFT JOIN products pp ON pp.id = d.product_id
+                    WHERE d.status <> 'void' AND d.qty > 0 AND COALESCE(s.status, '') <> 'cancelled'
+                    GROUP BY d.product_id
+                ) ds ON ds.product_id = p.id
+                WHERE " . implode(' AND ', $where) . "
+                ORDER BY {$order}
+                LIMIT {$limit}";
+        $stmt = $this->db->prepare($sql);
+        $stmt->execute($params);
+        $rows = $stmt->fetchAll() ?: [];
+        foreach ($rows as &$r) {
+            $r = self::withMarginFields($r);
+        }
+        unset($r);
+        return $rows;
+    }
+
+    /** Agrega utilidad, margen realizado y margen unitario (precio vs costo pactado). */
+    private static function withMarginFields(array $r): array
+    {
+        $revenue = round((float)($r['revenue'] ?? 0), 2);
+        $cost = round((float)($r['cost_sold'] ?? 0), 2);
+        $r['revenue'] = $revenue;
+        $r['cost_sold'] = $cost;
+        $r['amount_pending'] = round((float)($r['amount_pending'] ?? 0), 2);
+        $r['profit'] = round($revenue - $cost, 2);
+        $r['margin_pct'] = $revenue > 0.009 ? round(($revenue - $cost) / $revenue * 100, 1) : null;
+        if (array_key_exists('sale_price', $r)) {
+            $price = (float)($r['sale_price'] ?? 0);
+            $unitCost = (float)($r['purchase_price'] ?? 0);
+            $r['unit_margin'] = round($price - $unitCost, 2);
+            $r['unit_margin_pct'] = $price > 0.009 ? round(($price - $unitCost) / $price * 100, 1) : null;
+            $r['stock_value_cost'] = round(max(0, (int)($r['stock'] ?? 0)) * $unitCost, 2);
+            $r['stock_value_sale'] = round(max(0, (int)($r['stock'] ?? 0)) * $price, 2);
+        }
+        return $r;
+    }
+
+    /**
+     * Agrupa productos detallados por consignante con subtotales y datos de liquidaciones pagadas.
+     *
+     * @return list<array<string,mixed>>
+     */
+    public function groupByConsignor(array $products): array
+    {
+        $settled = [];
+        try {
+            foreach ($this->db->query(
+                'SELECT consignor_id, COUNT(*) AS n, COALESCE(SUM(amount),0) AS amount, MAX(settlement_date) AS last_date
+                 FROM consignment_settlements GROUP BY consignor_id'
+            )->fetchAll() ?: [] as $s) {
+                $settled[(int)$s['consignor_id']] = $s;
+            }
+        } catch (\Throwable $e) {
+            // tabla vacía o inexistente en installs viejas
+        }
+
+        $groups = [];
+        foreach ($products as $p) {
+            $cid = (int)($p['consignor_id'] ?? 0);
+            if (!isset($groups[$cid])) {
+                $groups[$cid] = [
+                    'consignor_id' => $cid,
+                    'consignor_name' => (string)($p['consignor_name'] ?? 'Sin consignante'),
+                    'products' => [],
+                    'product_count' => 0,
+                    'stock' => 0,
+                    'stock_value_cost' => 0.0,
+                    'stock_value_sale' => 0.0,
+                    'units_sold' => 0,
+                    'revenue' => 0.0,
+                    'cost_sold' => 0.0,
+                    'units_pending' => 0,
+                    'amount_pending' => 0.0,
+                    'settled_count' => (int)($settled[$cid]['n'] ?? 0),
+                    'settled_amount' => round((float)($settled[$cid]['amount'] ?? 0), 2),
+                    'last_settlement' => $settled[$cid]['last_date'] ?? null,
+                ];
+            }
+            $g = &$groups[$cid];
+            $g['products'][] = $p;
+            $g['product_count']++;
+            $g['stock'] += max(0, (int)($p['stock'] ?? 0));
+            $g['stock_value_cost'] += (float)($p['stock_value_cost'] ?? 0);
+            $g['stock_value_sale'] += (float)($p['stock_value_sale'] ?? 0);
+            $g['units_sold'] += (int)($p['units_sold'] ?? 0);
+            $g['revenue'] += (float)($p['revenue'] ?? 0);
+            $g['cost_sold'] += (float)($p['cost_sold'] ?? 0);
+            $g['units_pending'] += (int)($p['units_pending'] ?? 0);
+            $g['amount_pending'] += (float)($p['amount_pending'] ?? 0);
+            unset($g);
+        }
+        foreach ($groups as &$g) {
+            $g = self::withMarginFields($g);
+            $g['stock_value_cost'] = round($g['stock_value_cost'], 2);
+            $g['stock_value_sale'] = round($g['stock_value_sale'], 2);
+        }
+        unset($g);
+        usort($groups, static fn($a, $b) => strcasecmp($a['consignor_name'], $b['consignor_name']));
+        return $groups;
+    }
+
+    /**
+     * Margen de venta de productos consignados en un rango (ingreso vs costo pactado), por producto.
+     *
+     * @return array{rows:list<array<string,mixed>>,by_consignor:list<array<string,mixed>>,totals:array<string,mixed>}
+     */
+    public function marginReport(string $from, string $to, int $consignorId = 0, string $q = ''): array
+    {
+        $where = [
+            "d.status <> 'void'",
+            'd.qty > 0',
+            "COALESCE(s.status, '') <> 'cancelled'",
+            's.sale_date BETWEEN ? AND ?',
+        ];
+        $params = [$from . ' 00:00:00', $to . ' 23:59:59'];
+        if ($consignorId > 0) {
+            $where[] = 'd.consignor_id = ?';
+            $params[] = $consignorId;
+        }
+        if ($q !== '') {
+            $search = \SoftNova\Core\multi_term_like_clause($q, [
+                'pp.name',
+                'pp.code',
+                "COALESCE(pp.barcode,'')",
+                "COALESCE(s.invoice_number,'')",
+            ]);
+            $where[] = $search['sql'];
+            foreach ($search['params'] as $sp) {
+                $params[] = $sp;
+            }
+        }
+        $rev = $this->debtRevenueSql();
+        $stmt = $this->db->prepare(
+            "SELECT d.product_id, pp.code AS product_code, pp.name AS product_name,
+                    d.consignor_id, c.name AS consignor_name,
+                    SUM(d.qty) AS units_sold,
+                    SUM({$rev}) AS revenue,
+                    SUM(d.qty * d.unit_cost) AS cost_sold,
+                    COUNT(DISTINCT d.sale_id) AS sales_count,
+                    SUM(CASE WHEN d.status IN ('open','partial') THEN (d.qty - d.qty_settled) * d.unit_cost ELSE 0 END) AS amount_pending
+             FROM consignment_sale_debts d
+             JOIN sales s ON s.id = d.sale_id
+             LEFT JOIN sale_items si ON si.id = d.sale_item_id
+             LEFT JOIN products pp ON pp.id = d.product_id
+             LEFT JOIN consignors c ON c.id = d.consignor_id
+             WHERE " . implode(' AND ', $where) . "
+             GROUP BY d.product_id, pp.code, pp.name, d.consignor_id, c.name
+             ORDER BY revenue DESC
+             LIMIT 2000"
+        );
+        $stmt->execute($params);
+        $rows = [];
+        $byConsignor = [];
+        $totals = ['units_sold' => 0, 'revenue' => 0.0, 'cost_sold' => 0.0, 'amount_pending' => 0.0, 'sales_count' => 0];
+        foreach ($stmt->fetchAll() ?: [] as $r) {
+            $r = self::withMarginFields($r);
+            $rows[] = $r;
+            $cid = (int)$r['consignor_id'];
+            $byConsignor[$cid] ??= [
+                'consignor_id' => $cid,
+                'consignor_name' => (string)($r['consignor_name'] ?? 'Sin consignante'),
+                'product_count' => 0,
+                'units_sold' => 0,
+                'revenue' => 0.0,
+                'cost_sold' => 0.0,
+                'amount_pending' => 0.0,
+            ];
+            $byConsignor[$cid]['product_count']++;
+            foreach (['units_sold', 'revenue', 'cost_sold', 'amount_pending'] as $k) {
+                $byConsignor[$cid][$k] += $r[$k];
+                $totals[$k] += $r[$k];
+            }
+        }
+        $byConsignor = array_map(static fn($g) => self::withMarginFields($g), array_values($byConsignor));
+        usort($byConsignor, static fn($a, $b) => $b['revenue'] <=> $a['revenue']);
+
+        try {
+            $cnt = $this->db->prepare(
+                "SELECT COUNT(DISTINCT d.sale_id)
+                 FROM consignment_sale_debts d
+                 JOIN sales s ON s.id = d.sale_id
+                 LEFT JOIN products pp ON pp.id = d.product_id
+                 WHERE " . implode(' AND ', $where)
+            );
+            $cnt->execute($params);
+            $totals['sales_count'] = (int)$cnt->fetchColumn();
+        } catch (\Throwable $e) {
+            $totals['sales_count'] = 0;
+        }
+
+        return ['rows' => $rows, 'by_consignor' => $byConsignor, 'totals' => self::withMarginFields($totals)];
+    }
+
+    /**
+     * Trazabilidad de mercancía consignada: movimientos de stock + liquidaciones pagadas, más recientes primero.
+     *
+     * @param array{from?:string,to?:string,consignor_id?:int,product_id?:int,type?:string,q?:string} $filters
+     * @return array{rows:list<array<string,mixed>>,truncated:bool}
+     */
+    public function traceability(array $filters, int $limit = 1000): array
+    {
+        $from = (string)($filters['from'] ?? '');
+        $to = (string)($filters['to'] ?? '');
+        $consignorId = (int)($filters['consignor_id'] ?? 0);
+        $productId = (int)($filters['product_id'] ?? 0);
+        $type = (string)($filters['type'] ?? '');
+        $q = trim((string)($filters['q'] ?? ''));
+        $limit = max(1, min(5000, $limit));
+        $validDate = static fn($d) => preg_match('/^\d{4}-\d{2}-\d{2}$/', $d) === 1;
+
+        $rows = [];
+        if ($type !== 'settlement') {
+            $dateExpr = "COALESCE(NULLIF(sm.movement_date, '0000-00-00'), DATE(sm.created_at))";
+            $where = ["p.ownership = 'consignment'"];
+            $params = [];
+            if ($validDate($from)) {
+                $where[] = "{$dateExpr} >= ?";
+                $params[] = $from;
+            }
+            if ($validDate($to)) {
+                $where[] = "{$dateExpr} <= ?";
+                $params[] = $to;
+            }
+            if ($consignorId > 0) {
+                $where[] = 'p.consignor_id = ?';
+                $params[] = $consignorId;
+            }
+            if ($productId > 0) {
+                $where[] = 'sm.product_id = ?';
+                $params[] = $productId;
+            }
+            if ($type === 'adjustment') {
+                $where[] = "(sm.reference_type = 'adjustment' OR sm.type = 'adjustment')";
+            } elseif ($type !== '' && isset(self::TRACE_TYPE_LABELS[$type])) {
+                $where[] = 'sm.reference_type = ?';
+                $params[] = $type;
+            }
+            if ($q !== '') {
+                $search = \SoftNova\Core\multi_term_like_clause($q, [
+                    'p.name',
+                    'p.code',
+                    "COALESCE(p.barcode,'')",
+                    "COALESCE(sm.notes,'')",
+                    "COALESCE(s.invoice_number,'')",
+                    "COALESCE(r.receipt_number,'')",
+                ]);
+                $where[] = $search['sql'];
+                foreach ($search['params'] as $sp) {
+                    $params[] = $sp;
+                }
+            }
+            $stmt = $this->db->prepare(
+                "SELECT sm.id, {$dateExpr} AS event_date, sm.created_at, sm.type AS movement_type,
+                        sm.reference_type, sm.reference_id, sm.quantity, sm.unit_cost, sm.stock_after, sm.notes,
+                        p.id AS product_id, p.code AS product_code, p.name AS product_name,
+                        c.id AS consignor_id, c.name AS consignor_name,
+                        s.invoice_number, r.receipt_number, u.name AS user_name
+                 FROM stock_movements sm
+                 JOIN products p ON p.id = sm.product_id
+                 LEFT JOIN consignors c ON c.id = p.consignor_id
+                 LEFT JOIN sales s ON s.id = sm.reference_id AND sm.reference_type IN ('sale', 'return')
+                 LEFT JOIN consignment_receipts r ON r.id = sm.reference_id AND sm.reference_type = 'consignment_in'
+                 LEFT JOIN users u ON u.id = sm.user_id
+                 WHERE " . implode(' AND ', $where) . "
+                 ORDER BY {$dateExpr} DESC, sm.created_at DESC, sm.id DESC
+                 LIMIT " . ($limit + 1)
+            );
+            $stmt->execute($params);
+            foreach ($stmt->fetchAll() ?: [] as $m) {
+                $ref = (string)($m['reference_type'] ?? '');
+                $qty = abs((int)$m['quantity']);
+                $signed = match ((string)$m['movement_type']) {
+                    'out' => -$qty,
+                    'in' => $qty,
+                    default => (int)$m['quantity'],
+                };
+                $kind = $ref === 'adjustment' || $m['movement_type'] === 'adjustment' ? 'adjustment' : $ref;
+                $doc = match ($kind) {
+                    'consignment_in' => (string)($m['receipt_number'] ?? ''),
+                    'sale', 'return' => (string)($m['invoice_number'] ?? ('#' . (int)$m['reference_id'])),
+                    'sale_credit_note' => 'NC #' . (int)$m['reference_id'],
+                    default => '',
+                };
+                $unitCost = (float)($m['unit_cost'] ?? 0);
+                $rows[] = [
+                    'kind' => $kind,
+                    'kind_label' => self::TRACE_TYPE_LABELS[$kind] ?? ($ref !== '' ? $ref : 'Movimiento'),
+                    'event_date' => (string)$m['event_date'],
+                    'created_at' => (string)($m['created_at'] ?? ''),
+                    'product_id' => (int)$m['product_id'],
+                    'product_code' => (string)($m['product_code'] ?? ''),
+                    'product_name' => (string)($m['product_name'] ?? ''),
+                    'consignor_id' => (int)($m['consignor_id'] ?? 0),
+                    'consignor_name' => (string)($m['consignor_name'] ?? ''),
+                    'document' => $doc,
+                    'qty' => $signed,
+                    'unit_cost' => $unitCost,
+                    'amount' => round(abs($signed) * $unitCost, 2),
+                    'stock_after' => $m['stock_after'] !== null ? (int)$m['stock_after'] : null,
+                    'user_name' => (string)($m['user_name'] ?? ''),
+                    'notes' => (string)($m['notes'] ?? ''),
+                ];
+            }
+        }
+
+        if ($type === '' || $type === 'settlement') {
+            $where = ['1=1'];
+            $params = [];
+            if ($validDate($from)) {
+                $where[] = 'cs.settlement_date >= ?';
+                $params[] = $from;
+            }
+            if ($validDate($to)) {
+                $where[] = 'cs.settlement_date <= ?';
+                $params[] = $to;
+            }
+            if ($consignorId > 0) {
+                $where[] = 'cs.consignor_id = ?';
+                $params[] = $consignorId;
+            }
+            if ($productId > 0) {
+                $where[] = 'd.product_id = ?';
+                $params[] = $productId;
+            }
+            if ($q !== '') {
+                $search = \SoftNova\Core\multi_term_like_clause($q, [
+                    'p.name',
+                    'p.code',
+                    "COALESCE(p.barcode,'')",
+                    "COALESCE(cs.notes,'')",
+                    "COALESCE(s.invoice_number,'')",
+                ]);
+                $where[] = $search['sql'];
+                foreach ($search['params'] as $sp) {
+                    $params[] = $sp;
+                }
+            }
+            try {
+                $stmt = $this->db->prepare(
+                    "SELECT cs.id AS settlement_id, cs.settlement_date, cs.created_at, cs.payment_method, cs.notes,
+                            csi.qty, csi.amount, d.unit_cost,
+                            p.id AS product_id, p.code AS product_code, p.name AS product_name,
+                            c.id AS consignor_id, c.name AS consignor_name,
+                            s.invoice_number, u.name AS user_name
+                     FROM consignment_settlement_items csi
+                     JOIN consignment_settlements cs ON cs.id = csi.settlement_id
+                     JOIN consignment_sale_debts d ON d.id = csi.debt_id
+                     LEFT JOIN products p ON p.id = d.product_id
+                     LEFT JOIN consignors c ON c.id = cs.consignor_id
+                     LEFT JOIN sales s ON s.id = d.sale_id
+                     LEFT JOIN users u ON u.id = cs.user_id
+                     WHERE " . implode(' AND ', $where) . "
+                     ORDER BY cs.settlement_date DESC, cs.id DESC
+                     LIMIT " . ($limit + 1)
+                );
+                $stmt->execute($params);
+                foreach ($stmt->fetchAll() ?: [] as $s) {
+                    $rows[] = [
+                        'kind' => 'settlement',
+                        'kind_label' => self::TRACE_TYPE_LABELS['settlement'],
+                        'event_date' => (string)$s['settlement_date'],
+                        'created_at' => (string)($s['created_at'] ?? ''),
+                        'product_id' => (int)($s['product_id'] ?? 0),
+                        'product_code' => (string)($s['product_code'] ?? ''),
+                        'product_name' => (string)($s['product_name'] ?? ''),
+                        'consignor_id' => (int)($s['consignor_id'] ?? 0),
+                        'consignor_name' => (string)($s['consignor_name'] ?? ''),
+                        'document' => 'Liq. #' . (int)$s['settlement_id']
+                            . (!empty($s['invoice_number']) ? ' · ' . $s['invoice_number'] : ''),
+                        'qty' => (int)$s['qty'],
+                        'unit_cost' => (float)($s['unit_cost'] ?? 0),
+                        'amount' => round((float)($s['amount'] ?? 0), 2),
+                        'stock_after' => null,
+                        'user_name' => (string)($s['user_name'] ?? ''),
+                        'notes' => trim(PaymentMethodCatalog::label((string)($s['payment_method'] ?? ''))
+                            . (!empty($s['notes']) ? ' · ' . $s['notes'] : '')),
+                    ];
+                }
+            } catch (\Throwable $e) {
+                error_log('ConsignmentService::traceability settlements: ' . $e->getMessage());
+            }
+        }
+
+        usort($rows, static function ($a, $b) {
+            return [$b['event_date'], $b['created_at']] <=> [$a['event_date'], $a['created_at']];
+        });
+        $truncated = count($rows) > $limit;
+        if ($truncated) {
+            $rows = array_slice($rows, 0, $limit);
+        }
+        return ['rows' => $rows, 'truncated' => $truncated];
+    }
 }

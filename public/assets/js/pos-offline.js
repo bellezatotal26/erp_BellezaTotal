@@ -114,39 +114,51 @@
     /** Reconstruye items desde claves planas items[0][product_id]. */
     function rebuildItems(obj) {
         if (!obj || typeof obj !== 'object') return [];
-        if (Array.isArray(obj.items)) {
-            return obj.items.filter(function (it) {
-                return it && Number(it.product_id) > 0 && Number(it.quantity) > 0;
-            }).map(function (it) {
+
+        function mapComboOrProduct(it) {
+            if (!it) return null;
+            var isCombo = !!(it.is_combo || it.product_type === 'combo' || it.components_json || (it.components && it.components.length));
+            var components = [];
+            if (Array.isArray(it.components)) {
+                components = it.components;
+            } else if (it.components_json) {
+                try {
+                    var parsed = typeof it.components_json === 'string'
+                        ? JSON.parse(it.components_json)
+                        : it.components_json;
+                    if (Array.isArray(parsed)) components = parsed;
+                } catch (e) {
+                    components = [];
+                }
+            }
+            if (isCombo) {
+                if (components.length < 2) return null;
                 return {
-                    product_id: Number(it.product_id),
-                    quantity: Number(it.quantity),
+                    is_combo: 1,
+                    product_type: 'combo',
+                    combo_id: Number(it.combo_id) || 0,
+                    product_id: 0,
+                    quantity: Number(it.quantity) || 0,
                     unit_price: it.unit_price != null ? Number(it.unit_price) : 0,
-                    product_name: String(it.product_name || ''),
+                    product_name: String(it.product_name || it.combo_name || 'Combo'),
                     subtotal: it.subtotal != null ? Number(it.subtotal) : undefined,
                     tax_rate: it.tax_rate != null && it.tax_rate !== '' ? Number(it.tax_rate) : undefined,
-                    is_open_item: it.is_open_item ? 1 : 0,
-                    stock_oversell_reason: String(it.stock_oversell_reason || ''),
-                    stock_oversell_note: String(it.stock_oversell_note || ''),
-                    is_consignment: it.is_consignment ? 1 : 0,
-                    ownership: String(it.ownership || (it.is_consignment ? 'consignment' : 'owned')),
-                    consignor_id: Number(it.consignor_id) || 0
+                    price_manual: 1,
+                    components_json: JSON.stringify(components.map(function (c) {
+                        return {
+                            product_id: Number(c.product_id) || 0,
+                            quantity: Number(c.quantity) || 0,
+                            quantity_per_pack: Number(c.quantity_per_pack) || 0
+                        };
+                    })),
+                    components: components
                 };
-            });
-        }
-        var items = [];
-        Object.keys(obj).forEach(function (key) {
-            var m = key.match(/^items\[(\d+)\]\[(\w+)\]$/);
-            if (!m) return;
-            var idx = parseInt(m[1], 10);
-            if (!items[idx]) items[idx] = {};
-            items[idx][m[2]] = obj[key];
-        });
-        return items.filter(Boolean).map(function (it) {
+            }
+            if (!(Number(it.product_id) > 0 && Number(it.quantity) > 0)) return null;
             return {
-                product_id: Number(it.product_id) || 0,
-                quantity: Number(it.quantity) || 0,
-                unit_price: Number(it.unit_price) || 0,
+                product_id: Number(it.product_id),
+                quantity: Number(it.quantity),
+                unit_price: it.unit_price != null ? Number(it.unit_price) : 0,
                 product_name: String(it.product_name || ''),
                 subtotal: it.subtotal != null ? Number(it.subtotal) : undefined,
                 tax_rate: it.tax_rate != null && it.tax_rate !== '' ? Number(it.tax_rate) : undefined,
@@ -157,8 +169,35 @@
                 ownership: String(it.ownership || (it.is_consignment ? 'consignment' : 'owned')),
                 consignor_id: Number(it.consignor_id) || 0
             };
-        }).filter(function (it) {
-            return it.product_id > 0 && it.quantity > 0;
+        }
+
+        if (Array.isArray(obj.items)) {
+            return obj.items.map(mapComboOrProduct).filter(Boolean).filter(function (it) {
+                return it.is_combo ? (it.quantity > 0) : (it.product_id > 0 && it.quantity > 0);
+            });
+        }
+        var items = [];
+        Object.keys(obj).forEach(function (key) {
+            // items[0][field] o items[0][components][1][product_id]
+            var m = key.match(/^items\[(\d+)\]\[(\w+)\]$/);
+            var mComp = key.match(/^items\[(\d+)\]\[components\]\[(\d+)\]\[(\w+)\]$/);
+            if (mComp) {
+                var idxC = parseInt(mComp[1], 10);
+                var cIdx = parseInt(mComp[2], 10);
+                var cField = mComp[3];
+                if (!items[idxC]) items[idxC] = {};
+                if (!items[idxC].components) items[idxC].components = [];
+                if (!items[idxC].components[cIdx]) items[idxC].components[cIdx] = {};
+                items[idxC].components[cIdx][cField] = obj[key];
+                return;
+            }
+            if (!m) return;
+            var idx = parseInt(m[1], 10);
+            if (!items[idx]) items[idx] = {};
+            items[idx][m[2]] = obj[key];
+        });
+        return items.filter(Boolean).map(mapComboOrProduct).filter(Boolean).filter(function (it) {
+            return it.is_combo ? (it.quantity > 0) : (it.product_id > 0 && it.quantity > 0);
         });
     }
 
@@ -249,6 +288,28 @@
         });
         (src.items || []).forEach(function (it, i) {
             if (!it) return;
+            if (it.is_combo || it.product_type === 'combo') {
+                fd.append('items[' + i + '][is_combo]', '1');
+                fd.append('items[' + i + '][product_type]', 'combo');
+                fd.append('items[' + i + '][combo_id]', String(it.combo_id || 0));
+                fd.append('items[' + i + '][product_id]', '0');
+                fd.append('items[' + i + '][quantity]', String(it.quantity));
+                if (it.unit_price != null) fd.append('items[' + i + '][unit_price]', String(it.unit_price));
+                if (it.product_name) fd.append('items[' + i + '][product_name]', String(it.product_name));
+                if (it.subtotal != null) fd.append('items[' + i + '][subtotal]', String(it.subtotal));
+                fd.append('items[' + i + '][price_manual]', '1');
+                if (it.tax_rate != null && it.tax_rate !== '') {
+                    fd.append('items[' + i + '][tax_rate]', String(it.tax_rate));
+                }
+                var compsJson = it.components_json;
+                if (!compsJson && Array.isArray(it.components)) {
+                    compsJson = JSON.stringify(it.components);
+                }
+                if (compsJson) {
+                    fd.append('items[' + i + '][components_json]', String(compsJson));
+                }
+                return;
+            }
             fd.append('items[' + i + '][product_id]', String(it.product_id));
             fd.append('items[' + i + '][quantity]', String(it.quantity));
             if (it.unit_price != null) fd.append('items[' + i + '][unit_price]', String(it.unit_price));

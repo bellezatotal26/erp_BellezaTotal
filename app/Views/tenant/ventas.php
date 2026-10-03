@@ -109,10 +109,206 @@ function fmtV(float $a, array $c): string
 </div>
 <?php return; endif; ?>
 
-<div class="stats-grid">
-    <div class="stat-card neumorphic"><h4>Ventas Hoy</h4><div class="stat-value"><?php echo (int)$todayCount; ?></div></div>
-    <div class="stat-card neumorphic"><h4>Total Hoy</h4><div class="stat-value" style="color:#10B981;"><?php echo fmtV($todayTotal, $currency); ?></div></div>
+<?php
+$salesSummary = $salesSummary ?? ['from' => date('Y-m-d'), 'to' => date('Y-m-d'), 'count' => (int)$todayCount, 'total' => (float)$todayTotal, 'discount' => 0, 'by_method' => [], 'collected' => 0, 'pending' => 0];
+$sumToday = date('Y-m-d');
+$sumIsToday = $salesSummary['from'] === $sumToday && $salesSummary['to'] === $sumToday;
+$sumLabel = $sumIsToday ? 'Hoy' : ($salesSummary['from'] === $salesSummary['to']
+    ? date('d/m/Y', strtotime($salesSummary['from']))
+    : date('d/m/Y', strtotime($salesSummary['from'])) . ' – ' . date('d/m/Y', strtotime($salesSummary['to'])));
+$sumKeep = array_diff_key($filters['query'] ?? [], ['sum_from' => 1, 'sum_to' => 1, 'page' => 1]);
+$sumPresetUrl = static function (string $from, string $to) use ($ventasBase, $sumKeep): string {
+    return $ventasBase . '?' . http_build_query($sumKeep + ['sum_from' => $from, 'sum_to' => $to]);
+};
+?>
+<div class="card neumorphic" style="margin-bottom:14px;">
+    <div class="card-body" style="padding:10px 16px;">
+        <form method="GET" action="<?php echo $ventasBase; ?>" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;">
+            <?php foreach ($sumKeep as $k => $v): if (is_array($v)) continue; ?>
+                <input type="hidden" name="<?php echo htmlspecialchars((string)$k); ?>" value="<?php echo htmlspecialchars((string)$v); ?>">
+            <?php endforeach; ?>
+            <strong style="font-size:13px;align-self:center;">Resumen de ventas</strong>
+            <div class="form-group" style="margin:0;"><label style="font-size:12px;">Desde</label><input class="form-control" type="date" name="sum_from" value="<?php echo htmlspecialchars($salesSummary['from']); ?>"></div>
+            <div class="form-group" style="margin:0;"><label style="font-size:12px;">Hasta</label><input class="form-control" type="date" name="sum_to" value="<?php echo htmlspecialchars($salesSummary['to']); ?>"></div>
+            <button class="btn btn-primary btn-sm" type="submit">Ver</button>
+            <a class="btn btn-secondary btn-sm" href="<?php echo htmlspecialchars($sumPresetUrl($sumToday, $sumToday)); ?>">Hoy</a>
+            <a class="btn btn-secondary btn-sm" href="<?php echo htmlspecialchars($sumPresetUrl(date('Y-m-d', strtotime('-1 day')), date('Y-m-d', strtotime('-1 day')))); ?>">Ayer</a>
+            <a class="btn btn-secondary btn-sm" href="<?php echo htmlspecialchars($sumPresetUrl(date('Y-m-d', strtotime('-6 days')), $sumToday)); ?>">7 días</a>
+            <a class="btn btn-secondary btn-sm" href="<?php echo htmlspecialchars($sumPresetUrl(date('Y-m-01'), $sumToday)); ?>">Este mes</a>
+        </form>
+    </div>
 </div>
+
+<div class="stats-grid">
+    <div class="stat-card neumorphic"><h4>Ventas <?php echo htmlspecialchars($sumLabel); ?></h4><div class="stat-value"><?php echo (int)$salesSummary['count']; ?></div></div>
+    <div class="stat-card neumorphic">
+        <h4>Total <?php echo htmlspecialchars($sumLabel); ?></h4>
+        <div class="stat-value" style="color:#10B981;"><?php echo fmtV((float)$salesSummary['total'], $currency); ?></div>
+        <?php if ((float)$salesSummary['discount'] > 0.009): ?>
+            <small style="color:var(--color-text-secondary);">Descuentos: <?php echo fmtV((float)$salesSummary['discount'], $currency); ?></small>
+        <?php endif; ?>
+    </div>
+</div>
+
+<?php
+$sumMethods = $salesSummary['by_method'] ?? [];
+$sumPending = (float)($salesSummary['pending'] ?? 0);
+$sumTotal = (float)($salesSummary['total'] ?? 0);
+$sumExportQs = http_build_query(['sum_from' => $salesSummary['from'], 'sum_to' => $salesSummary['to']]);
+$sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6', '#6366F1', '#EF4444'];
+?>
+<details class="card neumorphic sales-pay-summary" id="salesPaySummary">
+    <summary class="sales-pay-summary__head">
+        <span class="sales-pay-summary__chevron" aria-hidden="true">▸</span>
+        <strong>Medios de pago</strong>
+        <span class="sales-pay-summary__period"><?php echo htmlspecialchars($sumLabel); ?></span>
+        <?php if ($sumTotal > 0.009): ?>
+            <span class="sales-pay-summary__bar" title="Distribución por medio de pago">
+                <?php foreach ($sumMethods as $i => $pm):
+                    $w = max(0.5, ((float)$pm['amount'] / $sumTotal) * 100); ?>
+                    <span style="width:<?php echo round($w, 2); ?>%;background:<?php echo $sumPalette[$i % count($sumPalette)]; ?>;" title="<?php echo htmlspecialchars($pm['label']); ?>"></span>
+                <?php endforeach; ?>
+                <?php if ($sumPending > 0.009): ?>
+                    <span style="width:<?php echo round(($sumPending / $sumTotal) * 100, 2); ?>%;background:#F59E0B;opacity:.55;" title="Por cobrar"></span>
+                <?php endif; ?>
+            </span>
+            <span class="sales-pay-summary__hint"><?php echo count($sumMethods); ?> medio(s)</span>
+        <?php else: ?>
+            <span class="sales-pay-summary__hint">Sin ventas en el periodo</span>
+        <?php endif; ?>
+        <?php if ($canExportSale && $sumTotal > 0.009): ?>
+            <span class="sales-pay-summary__actions" onclick="event.stopPropagation();">
+                <a class="btn btn-secondary btn-sm" data-export-download href="<?php echo $ventasBase; ?>?action=summary_csv&amp;<?php echo htmlspecialchars($sumExportQs); ?>" title="Descargar resumen en CSV">CSV</a>
+                <a class="btn btn-secondary btn-sm" data-export-download href="<?php echo $ventasBase; ?>?action=summary_pdf&amp;<?php echo htmlspecialchars($sumExportQs); ?>" title="Descargar resumen en PDF">PDF</a>
+            </span>
+        <?php endif; ?>
+    </summary>
+    <?php if ($sumTotal > 0.009): ?>
+    <div class="sales-pay-summary__body">
+        <?php foreach ($sumMethods as $i => $pm):
+            $pct = round(((float)$pm['amount'] / $sumTotal) * 100, 1);
+            $color = $sumPalette[$i % count($sumPalette)]; ?>
+            <div class="sales-pay-chip" style="border-left-color:<?php echo $color; ?>;">
+                <div class="sales-pay-chip__label"><?php echo htmlspecialchars($pm['label']); ?></div>
+                <div class="sales-pay-chip__amount"><?php echo fmtV((float)$pm['amount'], $currency); ?></div>
+                <div class="sales-pay-chip__meta"><?php echo (int)$pm['count']; ?> venta(s) · <?php echo str_replace('.', ',', (string)$pct); ?>%</div>
+                <div class="sales-pay-chip__track"><span style="width:<?php echo $pct; ?>%;background:<?php echo $color; ?>;"></span></div>
+            </div>
+        <?php endforeach; ?>
+        <?php if ($sumPending > 0.009):
+            $pct = round(($sumPending / $sumTotal) * 100, 1); ?>
+            <div class="sales-pay-chip sales-pay-chip--pending">
+                <div class="sales-pay-chip__label">Por cobrar (crédito)</div>
+                <div class="sales-pay-chip__amount"><?php echo fmtV($sumPending, $currency); ?></div>
+                <div class="sales-pay-chip__meta">Saldo pendiente · <?php echo str_replace('.', ',', (string)$pct); ?>%</div>
+                <div class="sales-pay-chip__track"><span style="width:<?php echo $pct; ?>%;background:#F59E0B;"></span></div>
+            </div>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+</details>
+<style>
+.sales-pay-summary { margin-bottom: 18px; padding: 0; overflow: hidden; }
+.sales-pay-summary__head {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 16px; cursor: pointer; list-style: none; font-size: 13px; user-select: none;
+}
+.sales-pay-summary__head::-webkit-details-marker { display: none; }
+.sales-pay-summary__chevron { display: inline-block; transition: transform .2s; color: var(--color-text-secondary); }
+.sales-pay-summary[open] .sales-pay-summary__chevron { transform: rotate(90deg); }
+.sales-pay-summary__period { color: var(--color-text-secondary); font-size: 12px; }
+.sales-pay-summary__bar {
+    display: inline-flex; flex: 1; min-width: 120px; max-width: 360px; height: 8px;
+    border-radius: 99px; overflow: hidden; background: var(--color-border);
+}
+.sales-pay-summary__bar span { display: block; height: 100%; }
+.sales-pay-summary__hint { font-size: 12px; color: var(--color-text-secondary); }
+.sales-pay-summary__actions { margin-left: auto; display: inline-flex; gap: 6px; }
+.sales-pay-summary__body {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px;
+    padding: 12px 16px 14px; border-top: 1px dashed var(--color-border);
+}
+.sales-pay-chip {
+    padding: 10px 12px; border: 1px solid var(--color-border); border-left: 4px solid #10B981;
+    border-radius: 8px;
+}
+.sales-pay-chip__label { font-size: 12px; color: var(--color-text-secondary); }
+.sales-pay-chip__amount { font-size: 16px; font-weight: 700; margin: 2px 0; }
+.sales-pay-chip__meta { font-size: 11px; color: var(--color-text-secondary); }
+.sales-pay-chip__track { height: 4px; margin-top: 6px; border-radius: 99px; background: var(--color-border); overflow: hidden; }
+.sales-pay-chip__track span { display: block; height: 100%; }
+.sales-pay-chip--pending { border-left-color: #F59E0B; background: rgba(245, 158, 11, 0.06); }
+.sales-pay-chip--pending .sales-pay-chip__label,
+.sales-pay-chip--pending .sales-pay-chip__amount { color: var(--dmc-B45309, #B45309); }
+</style>
+<script>
+(function () {
+    var el = document.getElementById('salesPaySummary');
+    if (!el) return;
+    var key = 'seri_ventas_pay_summary_open';
+    try { if (localStorage.getItem(key) === '1') el.open = true; } catch (e) {}
+    el.addEventListener('toggle', function () {
+        try { localStorage.setItem(key, el.open ? '1' : '0'); } catch (e) {}
+    });
+})();
+
+(function () {
+    function notify(msg, type) {
+        if (typeof showAlert === 'function') { showAlert(msg, type); } else { alert(msg); }
+    }
+    function fileNameFrom(res, fallback) {
+        var cd = res.headers.get('Content-Disposition') || '';
+        var m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+        return m ? decodeURIComponent(m[1]) : fallback;
+    }
+    document.addEventListener('click', function (e) {
+        var link = e.target.closest('a[data-export-download]');
+        if (!link || e.ctrlKey || e.metaKey || e.shiftKey || !window.fetch) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (link.dataset.busy === '1') return;
+        var original = link.textContent;
+        link.dataset.busy = '1';
+        link.classList.add('disabled');
+        link.setAttribute('aria-busy', 'true');
+        link.textContent = 'Generando…';
+        fetch(link.href, { credentials: 'same-origin' })
+            .then(function (res) {
+                var type = (res.headers.get('Content-Type') || '').toLowerCase();
+                var isFile = type.indexOf('application/pdf') !== -1 || type.indexOf('text/csv') !== -1;
+                if (!res.ok || !isFile) {
+                    return res.text().then(function (txt) {
+                        var msg = type.indexOf('text/plain') !== -1 && txt.trim() !== ''
+                            ? txt.trim().slice(0, 300)
+                            : 'No se pudo generar el archivo (sesión expirada o sin permiso). Recargue la página e intente de nuevo.';
+                        throw new Error(msg);
+                    });
+                }
+                var name = fileNameFrom(res, type.indexOf('pdf') !== -1 ? 'reporte.pdf' : 'export.csv');
+                return res.blob().then(function (blob) {
+                    var url = URL.createObjectURL(blob);
+                    var a = document.createElement('a');
+                    a.href = url;
+                    a.download = name;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
+                    notify('Descarga lista: ' + name, 'success');
+                });
+            })
+            .catch(function (err) {
+                notify(err && err.message ? err.message : 'Error de red al exportar', 'error');
+            })
+            .finally(function () {
+                link.dataset.busy = '';
+                link.classList.remove('disabled');
+                link.removeAttribute('aria-busy');
+                link.textContent = original;
+            });
+    }, true);
+})();
+</script>
 
 <div style="display:flex;gap:15px;margin-bottom:20px;flex-wrap:wrap;">
     <?php if ($canCreateSale): ?>
@@ -120,8 +316,8 @@ function fmtV(float $a, array $c): string
     <?php endif; ?>
     <a href="<?php echo $ventasBase; ?>?action=notas_credito" class="btn btn-secondary" title="Panel de notas de crédito">Notas de crédito</a>
     <?php if ($canExportSale): ?>
-        <a href="<?php echo $ventasBase; ?>?action=export<?php echo $filterQuery !== '' ? '&' . $filterQuery : ''; ?>" class="btn btn-secondary" title="Exportar CSV filtrado">Exportar CSV</a>
-        <a href="<?php echo $ventasBase; ?>?action=report_pdf<?php echo $filterQuery !== '' ? '&' . $filterQuery : ''; ?>" class="btn btn-secondary" target="_blank" title="Descargar PDF filtrado">Reporte PDF</a>
+        <a href="<?php echo $ventasBase; ?>?action=export<?php echo $filterQuery !== '' ? '&amp;' . htmlspecialchars($filterQuery) : ''; ?>" class="btn btn-secondary" data-export-download title="Exportar CSV con los filtros del listado">Exportar CSV</a>
+        <a href="<?php echo $ventasBase; ?>?action=report_pdf<?php echo $filterQuery !== '' ? '&amp;' . htmlspecialchars($filterQuery) : ''; ?>" class="btn btn-secondary" data-export-download title="Descargar PDF con los filtros del listado (sin fechas: máx. 1200 ventas)">Reporte PDF</a>
     <?php endif; ?>
 </div>
 
@@ -130,6 +326,9 @@ function fmtV(float $a, array $c): string
         <form method="GET" action="<?php echo $ventasBase; ?>" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;">
             <input type="hidden" name="sort" value="<?php echo htmlspecialchars($filters['sort']); ?>">
             <input type="hidden" name="dir" value="<?php echo htmlspecialchars($filters['dir']); ?>">
+            <?php foreach (['sum_from', 'sum_to'] as $sk): if (!empty($filters['query'][$sk])): ?>
+                <input type="hidden" name="<?php echo $sk; ?>" value="<?php echo htmlspecialchars((string)$filters['query'][$sk]); ?>">
+            <?php endif; endforeach; ?>
             <div class="form-group" style="margin:0;min-width:200px;flex:1;">
                 <label>Buscar</label>
                 <input class="form-control" type="search" name="q" value="<?php echo htmlspecialchars($filters['q']); ?>" placeholder="Factura, cliente o documento..." title="Buscar ventas">

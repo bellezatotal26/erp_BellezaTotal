@@ -316,7 +316,7 @@ class TenantDashboardController extends TenantController
         }
         return match ($group) {
             \SoftNova\Services\CustomOptionService::GROUP_EXPENSE_CATEGORY =>
-                TenantMiddleware::getRole() === 'admin',
+                TenantMiddleware::isManagement(),
             \SoftNova\Services\CustomOptionService::GROUP_PAYMENT_METHOD =>
                 TenantMiddleware::canDo('create', 'ventas')
                 || TenantMiddleware::canDo('create', 'caja')

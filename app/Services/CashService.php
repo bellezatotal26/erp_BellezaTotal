@@ -29,15 +29,170 @@ class CashService
         return $stmt;
     }
     
-    public function getOpenSession(): ?array
+    public function getOpenSession(?int $userId = null): ?array
     {
+        // Preferir la caja abierta del usuario actual (evita registrar cobros en otra sesión).
+        if ($userId === null) {
+            $userId = (int)($_SESSION['tenant_user_id'] ?? 0);
+        }
+        if ($userId > 0) {
+            $mine = $this->query(
+                "SELECT id FROM cash_sessions
+                 WHERE status = 'open' AND user_id = ?
+                 ORDER BY id DESC LIMIT 1",
+                [$userId]
+            )->fetch();
+            if ($mine) {
+                return $mine;
+            }
+        }
+
         $session = $this->query(
             "SELECT id FROM cash_sessions WHERE status = 'open' ORDER BY id DESC LIMIT 1"
         )->fetch();
-        
+
         return $session ?: null;
     }
-    
+
+    /**
+     * Efectivo esperado en cajón (fuente canónica del arqueo).
+     * = apertura + neto de TODOS los movimientos de la sesión + orphans estrictos
+     * (ventas cash sin movimiento en NINGUNA sesión).
+     */
+    public function expectedCashForSession(array $session, ?string $until = null): float
+    {
+        $sessionId = (int)($session['id'] ?? 0);
+        $opening = round((float)($session['opening_amount'] ?? 0), 2);
+        if ($sessionId <= 0) {
+            return $opening;
+        }
+
+        $mov = $this->query(
+            "SELECT
+                COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS incomes,
+                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS expenses
+             FROM cash_movements
+             WHERE cash_session_id = ?",
+            [$sessionId]
+        )->fetch() ?: ['incomes' => 0, 'expenses' => 0];
+
+        $cash = $opening + (float)$mov['incomes'] - (float)$mov['expenses'];
+        $orphans = $this->orphanCashSalesForSession($session, $until);
+
+        return round($cash + $orphans, 2);
+    }
+
+    /**
+     * Esperado unificado de varias sesiones abiertas (sin doble-contar orphans).
+     *
+     * @param list<array<string,mixed>> $sessions
+     */
+    public function expectedCashForSessions(array $sessions): float
+    {
+        if ($sessions === []) {
+            return 0.0;
+        }
+        $opening = 0.0;
+        $ids = [];
+        foreach ($sessions as $s) {
+            $opening += (float)($s['opening_amount'] ?? 0);
+            $id = (int)($s['id'] ?? 0);
+            if ($id > 0) {
+                $ids[] = $id;
+            }
+        }
+        $ids = array_values(array_unique($ids));
+        $movNet = 0.0;
+        if ($ids !== []) {
+            $totals = $this->query(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS incomes,
+                    COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS expenses
+                 FROM cash_movements
+                 WHERE cash_session_id IN (" . implode(',', array_fill(0, count($ids), '?')) . ')',
+                $ids
+            )->fetch() ?: ['incomes' => 0, 'expenses' => 0];
+            $movNet = (float)$totals['incomes'] - (float)$totals['expenses'];
+        }
+
+        // Orphans una sola vez, anclados a la apertura más antigua.
+        usort($sessions, static fn($a, $b) => strcmp((string)($a['opening_date'] ?? ''), (string)($b['opening_date'] ?? '')));
+        $anchor = $sessions[0];
+        $anchor['id'] = 0; // forzar orphan "sin sesión" = sin movimiento en ninguna
+        $orphans = $this->orphanCashSalesGlobal((string)($anchor['opening_date'] ?? ''));
+
+        return round($opening + $movNet + $orphans, 2);
+    }
+
+    /**
+     * Ventas cash del periodo sin movimiento de caja en NINGUNA sesión (legacy).
+     */
+    public function orphanCashSalesForSession(array $session, ?string $until = null): float
+    {
+        $sessionId = (int)($session['id'] ?? 0);
+        $openingDate = (string)($session['opening_date'] ?? '');
+        if ($openingDate === '') {
+            return 0.0;
+        }
+
+        $params = [$openingDate];
+        $untilSql = '';
+        if ($until) {
+            $untilSql = ' AND s.sale_date <= ?';
+            $params[] = $until;
+        }
+
+        // Cubierta si tiene movimiento sale-linked en CUALQUIER sesión (evita cross-sesión).
+        try {
+            $orphan = $this->query(
+                "SELECT COALESCE(SUM(paid_cash), 0) FROM (
+                    SELECT s.id,
+                           COALESCE((
+                               SELECT SUM(sp.amount)
+                               FROM sale_payments sp
+                               WHERE sp.sale_id = s.id
+                                 AND COALESCE(sp.payment_method, '') IN ('cash', '')
+                           ), CASE
+                               WHEN COALESCE(s.payment_method, 'cash') IN ('cash', '')
+                                    AND s.payment_status = 'paid'
+                                    AND COALESCE(s.payment_terms, 'cash') = 'cash'
+                                    AND NOT EXISTS (SELECT 1 FROM sale_payments sp2 WHERE sp2.sale_id = s.id)
+                               THEN s.total
+                               ELSE 0
+                           END) AS paid_cash
+                    FROM sales s
+                    WHERE s.status != 'cancelled'
+                      AND s.sale_date >= ?" . $untilSql . "
+                      AND NOT EXISTS (
+                            SELECT 1 FROM cash_movements cm
+                            WHERE cm.reference_type IN ('sale', 'sale_cancel', 'sale_payment_adjust')
+                              AND cm.reference_id = s.id
+                      )
+                      AND NOT EXISTS (
+                            SELECT 1 FROM cash_movements cm
+                            INNER JOIN sale_payments sp ON sp.id = cm.reference_id
+                            WHERE cm.reference_type = 'sale_payment'
+                              AND sp.sale_id = s.id
+                      )
+                 ) orphan",
+                $params
+            )->fetchColumn();
+            return round((float)$orphan, 2);
+        } catch (\Throwable $e) {
+            error_log('orphanCashSalesForSession: ' . $e->getMessage());
+            return 0.0;
+        }
+    }
+
+    /** Orphans globales desde una fecha (multi-sesión). */
+    public function orphanCashSalesGlobal(string $openingDate, ?string $until = null): float
+    {
+        return $this->orphanCashSalesForSession(
+            ['id' => 0, 'opening_date' => $openingDate, 'opening_amount' => 0],
+            $until
+        );
+    }
+
     /**
      * Registrar ingreso o egreso en la caja abierta (si existe).
      *
@@ -215,6 +370,103 @@ class CashService
         return $ok;
     }
     
+    /** Referencias de movimiento ligadas a una venta (afectan el cajón). */
+    public const SALE_CASH_REF_TYPES = ['sale', 'sale_cancel', 'sale_payment', 'sale_payment_adjust'];
+
+    /**
+     * Neto de efectivo en cajón por una venta en una sesión (ingresos − egresos).
+     * Incluye abonos (sale_payment) aunque las filas de pago se hayan reemplazado:
+     * pase $paymentIds conocidos antes de borrarlas.
+     *
+     * @param list<int> $paymentIds
+     */
+    public function saleCashNetInSession(int $sessionId, int $saleId, array $paymentIds = []): float
+    {
+        if ($sessionId <= 0 || $saleId <= 0) {
+            return 0.0;
+        }
+
+        $paymentIds = array_values(array_unique(array_filter(
+            array_map('intval', $paymentIds),
+            static fn(int $id): bool => $id > 0
+        )));
+
+        try {
+            $livePayIds = $this->query(
+                'SELECT id FROM sale_payments WHERE sale_id = ?',
+                [$saleId]
+            )->fetchAll(\PDO::FETCH_COLUMN) ?: [];
+            foreach ($livePayIds as $pid) {
+                $pid = (int)$pid;
+                if ($pid > 0) {
+                    $paymentIds[] = $pid;
+                }
+            }
+        } catch (\Throwable $e) {
+            // esquema sin sale_payments
+        }
+        $paymentIds = array_values(array_unique(array_filter($paymentIds, static fn(int $id): bool => $id > 0)));
+
+        $sql = "SELECT
+                    COALESCE(SUM(CASE WHEN cm.type = 'income' THEN cm.amount ELSE 0 END), 0) AS incomes,
+                    COALESCE(SUM(CASE WHEN cm.type = 'expense' THEN cm.amount ELSE 0 END), 0) AS expenses
+                 FROM cash_movements cm
+                 WHERE cm.cash_session_id = ?
+                   AND (
+                        (cm.reference_type IN ('sale', 'sale_cancel', 'sale_payment_adjust')
+                         AND cm.reference_id = ?)";
+        $params = [$sessionId, $saleId];
+        if ($paymentIds !== []) {
+            $ph = implode(',', array_fill(0, count($paymentIds), '?'));
+            $sql .= " OR (cm.reference_type = 'sale_payment' AND cm.reference_id IN ({$ph}))";
+            foreach ($paymentIds as $pid) {
+                $params[] = $pid;
+            }
+        }
+        $sql .= ')';
+
+        $row = $this->query($sql, $params)->fetch() ?: [];
+        return round((float)($row['incomes'] ?? 0) - (float)($row['expenses'] ?? 0), 2);
+    }
+
+    /**
+     * Deja el neto de efectivo de la venta en $desiredCash dentro de la caja abierta.
+     * cash→transfer: desired=0 (egreso de ajuste). transfer→cash: desired=monto (ingreso).
+     */
+    public function syncSaleCashInOpenSession(
+        int $saleId,
+        string $label,
+        float $desiredCash,
+        array $paymentIdsForNet = []
+    ): bool {
+        $openSession = $this->getOpenSession();
+        if (!$openSession) {
+            return false;
+        }
+        $sessionId = (int)$openSession['id'];
+        $desiredCash = round(max(0.0, $desiredCash), 2);
+        $current = $this->saleCashNetInSession($sessionId, $saleId, $paymentIdsForNet);
+        $delta = round($desiredCash - $current, 2);
+        if (abs($delta) < 0.009) {
+            return true;
+        }
+        if ($delta > 0) {
+            return $this->registerIncome(
+                $delta,
+                'Ajuste medio de pago (entra efectivo): ' . $label,
+                'sale_payment_adjust',
+                $saleId
+            );
+        }
+        return $this->registerMovement(
+            abs($delta),
+            'Ajuste medio de pago (sale efectivo → otro medio): ' . $label,
+            'expense',
+            'sale_payment_adjust',
+            $saleId
+        );
+    }
+
     /**
      * Revertir ingresos de una venta cancelada en la caja abierta
      */
@@ -225,19 +477,18 @@ class CashService
             return 0.0;
         }
 
-        // Neto de ingresos/egresos ligados a la venta (incluye ajustes de medio de pago).
-        $row = $this->query(
-            "SELECT
-                COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS incomes,
-                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS expenses
-             FROM cash_movements
-             WHERE cash_session_id = ?
-               AND reference_id = ?
-               AND reference_type IN ('sale', 'sale_payment', 'sale_payment_adjust')",
-            [$openSession['id'], $saleId]
-        )->fetch();
+        $payIds = [];
+        try {
+            $payIds = $this->query(
+                'SELECT id FROM sale_payments WHERE sale_id = ?',
+                [$saleId]
+            )->fetchAll(\PDO::FETCH_COLUMN) ?: [];
+        } catch (\Throwable $e) {
+            $payIds = [];
+        }
+        $payIds = array_map('intval', $payIds);
 
-        $net = round((float)($row['incomes'] ?? 0) - (float)($row['expenses'] ?? 0), 2);
+        $net = $this->saleCashNetInSession((int)$openSession['id'], $saleId, $payIds);
         if (abs($net) <= 0.009) {
             return 0.0;
         }

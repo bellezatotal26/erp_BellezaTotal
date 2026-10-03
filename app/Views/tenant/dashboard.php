@@ -51,7 +51,7 @@ $csrf = \SoftNova\Core\csrf_token();
 
 <div class="dashboard-topbar">
     <div>
-        <h2 style="color: var(--color-primary); margin:0;">Bienvenido, <?php echo htmlspecialchars($userName); ?></h2>
+        <h2 style="color: var(--color-accent-text, var(--color-primary)); margin:0;">Bienvenido, <?php echo htmlspecialchars($userName); ?></h2>
         <p style="color: var(--color-text-secondary); margin:6px 0 0;"><?php echo htmlspecialchars($tenantName); ?> · Seri ERP</p>
     </div>
     <button type="button" class="btn btn-secondary" id="screenOptionsToggle" aria-expanded="false">
@@ -146,7 +146,7 @@ $csrf = \SoftNova\Core\csrf_token();
                             <?php endif; ?>
                         <?php elseif ($wid === 'receivables'): ?>
                             <?php if (!empty($receivablesError)): ?>
-                                <p class="dashboard-empty" style="color:#DC2626;"><?php echo htmlspecialchars($receivablesError); ?></p>
+                                <p class="dashboard-empty" style="color:var(--dmc-DC2626, #DC2626);"><?php echo htmlspecialchars($receivablesError); ?></p>
                             <?php else: ?>
                             <?php
                             $rxTotalBalance = 0.0;
@@ -156,7 +156,7 @@ $csrf = \SoftNova\Core\csrf_token();
                             ?>
                             <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--color-border);">
                                 <span style="font-size:13px;color:var(--color-text-secondary);">Total por cobrar</span>
-                                <strong style="font-size:20px;color:#DC2626;"><?php echo formatCurrencyDashboard($rxTotalBalance); ?></strong>
+                                <strong style="font-size:20px;color:var(--dmc-DC2626, #DC2626);"><?php echo formatCurrencyDashboard($rxTotalBalance); ?></strong>
                             </div>
                             <div style="margin-bottom:14px;">
                                 <h4 style="margin:0 0 8px;font-size:13px;color:var(--color-text-secondary);">Pendientes de cobro</h4>
@@ -172,7 +172,7 @@ $csrf = \SoftNova\Core\csrf_token();
                                                     <td><a href="<?php echo $viewInstance->route('app/ventas'); ?>"><?php echo htmlspecialchars($r['invoice_number']); ?></a></td>
                                                     <td><?php echo htmlspecialchars($r['customer_name'] ?? 'Consumidor Final'); ?></td>
                                                     <td><?php echo !empty($r['due_date']) ? date('d/m/Y', strtotime($r['due_date'])) : '-'; ?></td>
-                                                    <td style="color:#DC2626;font-weight:600;"><?php echo formatCurrencyDashboard((float)$r['balance']); ?></td>
+                                                    <td style="color:var(--dmc-DC2626, #DC2626);font-weight:600;"><?php echo formatCurrencyDashboard((float)$r['balance']); ?></td>
                                                     <td>
                                                         <span class="badge <?php echo ($r['status'] ?? '') === 'partial' ? 'badge-warning' : 'badge-info'; ?>">
                                                             <?php echo ($r['status'] ?? '') === 'partial' ? 'Parcial' : 'Pendiente'; ?>
@@ -213,11 +213,11 @@ $csrf = \SoftNova\Core\csrf_token();
                             <?php endif; ?>
                         <?php elseif ($wid === 'payables'): ?>
                             <?php if (!empty($payablesError)): ?>
-                                <p class="dashboard-empty" style="color:#DC2626;"><?php echo htmlspecialchars($payablesError); ?></p>
+                                <p class="dashboard-empty" style="color:var(--dmc-DC2626, #DC2626);"><?php echo htmlspecialchars($payablesError); ?></p>
                             <?php else: ?>
                             <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--color-border);">
                                 <span style="font-size:13px;color:var(--color-text-secondary);">Total por pagar</span>
-                                <strong style="font-size:20px;color:#B45309;"><?php echo formatCurrencyDashboard((float)$payablesTotal); ?></strong>
+                                <strong style="font-size:20px;color:var(--dmc-B45309, #B45309);"><?php echo formatCurrencyDashboard((float)$payablesTotal); ?></strong>
                             </div>
                             <div style="margin-bottom:8px;">
                                 <h4 style="margin:0 0 8px;font-size:13px;color:var(--color-text-secondary);">Pendientes a proveedores</h4>
@@ -249,7 +249,7 @@ $csrf = \SoftNova\Core\csrf_token();
                                                             <br><span class="badge badge-danger">Vencida</span>
                                                         <?php endif; ?>
                                                     </td>
-                                                    <td style="color:#B45309;font-weight:600;"><?php echo formatCurrencyDashboard($bal); ?></td>
+                                                    <td style="color:var(--dmc-B45309, #B45309);font-weight:600;"><?php echo formatCurrencyDashboard($bal); ?></td>
                                                     <td>
                                                         <span class="badge <?php echo $status === 'partial' ? 'badge-warning' : 'badge-info'; ?>">
                                                             <?php echo $status === 'partial' ? 'Parcial' : 'Pendiente'; ?>
@@ -310,7 +310,7 @@ $csrf = \SoftNova\Core\csrf_token();
                                         <?php foreach ($lowStockProducts as $p): ?>
                                             <tr>
                                                 <td><?php echo htmlspecialchars($p['name']); ?></td>
-                                                <td style="color:#DC2626;font-weight:600;"><?php echo (int)$p['stock']; ?></td>
+                                                <td style="color:var(--dmc-DC2626, #DC2626);font-weight:600;"><?php echo (int)$p['stock']; ?></td>
                                                 <td><?php echo (int)$p['min_stock']; ?></td>
                                             </tr>
                                         <?php endforeach; ?>

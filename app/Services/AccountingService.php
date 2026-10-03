@@ -355,17 +355,33 @@ class AccountingService
         $placeholders = implode(',', array_fill(0, count($electronic), '?'));
         $params = array_merge($electronic, [$from, $to]);
 
-        $sales = $this->query(
-            "SELECT payment_method,
-                    COUNT(*) cnt,
-                    COALESCE(SUM(total), 0) total
-             FROM sales
-             WHERE status = 'completed'
-               AND payment_method IN ({$placeholders})
-               AND DATE(sale_date) BETWEEN ? AND ?
-             GROUP BY payment_method",
-            $params
-        )->fetchAll();
+        // Montos reales por medio (incluye la parte electrónica de pagos mixtos).
+        try {
+            $sales = $this->query(
+                "SELECT sp.payment_method,
+                        COUNT(DISTINCT sp.sale_id) cnt,
+                        COALESCE(SUM(sp.amount), 0) total
+                 FROM sale_payments sp
+                 INNER JOIN sales s ON s.id = sp.sale_id
+                 WHERE COALESCE(s.status, '') <> 'cancelled'
+                   AND sp.payment_method IN ({$placeholders})
+                   AND DATE(s.sale_date) BETWEEN ? AND ?
+                 GROUP BY sp.payment_method",
+                $params
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $sales = $this->query(
+                "SELECT payment_method,
+                        COUNT(*) cnt,
+                        COALESCE(SUM(total), 0) total
+                 FROM sales
+                 WHERE COALESCE(status, '') <> 'cancelled'
+                   AND payment_method IN ({$placeholders})
+                   AND DATE(sale_date) BETWEEN ? AND ?
+                 GROUP BY payment_method",
+                $params
+            )->fetchAll();
+        }
 
         $salesTotal = 0.0;
         $dataphoneSales = 0.0;
@@ -439,6 +455,9 @@ class AccountingService
      */
     public function marginByChannel(string $from, string $to): array
     {
+        $hiddenSql = $this->schemaHasColumn('sale_items', 'document_hidden')
+            ? ' AND COALESCE(si.document_hidden, 0) = 0'
+            : '';
         $rows = $this->query(
             "SELECT COALESCE(NULLIF(p.source_channel,''), 'manual') channel,
                     SUM(si.quantity) qty,
@@ -447,7 +466,7 @@ class AccountingService
              FROM sale_items si
              JOIN sales s ON s.id = si.sale_id
              LEFT JOIN products p ON p.id = si.product_id
-             WHERE s.status = 'completed' AND DATE(s.sale_date) BETWEEN ? AND ?
+             WHERE COALESCE(s.status, '') <> 'cancelled' AND DATE(s.sale_date) BETWEEN ? AND ?{$hiddenSql}
              GROUP BY COALESCE(NULLIF(p.source_channel,''), 'manual')
              ORDER BY revenue DESC",
             [$from, $to]
@@ -748,6 +767,10 @@ class AccountingService
         }
 
         // Costo: mercancía propia (CMV ↔ inventario) vs consignada (costo ↔ CxP consignante).
+        // Excluir document_hidden (componentes de combo): el costo va en la línea padre.
+        $hideSql = $this->schemaHasColumn('sale_items', 'document_hidden')
+            ? ' AND COALESCE(si.document_hidden, 0) = 0'
+            : '';
         $costOwned = 0.0;
         $costConsignment = 0.0;
         try {
@@ -758,7 +781,8 @@ class AccountingService
                  WHERE si.sale_id = ?
                    AND COALESCE(p.product_type, 'product') = 'product'
                    AND COALESCE(p.ownership, 'owned') = 'owned'
-                   AND COALESCE(si.is_consignment, 0) = 0",
+                   AND COALESCE(si.is_consignment, 0) = 0
+                   {$hideSql}",
                 [$saleId]
             )->fetchColumn();
             $costConsignment = (float)$this->query(
@@ -770,7 +794,8 @@ class AccountingService
                    AND (
                         COALESCE(si.is_consignment, 0) = 1
                         OR COALESCE(p.ownership, 'owned') = 'consignment'
-                   )",
+                   )
+                   {$hideSql}",
                 [$saleId]
             )->fetchColumn();
         } catch (\Throwable $e) {
@@ -779,7 +804,8 @@ class AccountingService
                 "SELECT COALESCE(SUM(si.quantity * COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)), 0)
                  FROM sale_items si
                  JOIN products p ON p.id = si.product_id
-                 WHERE si.sale_id = ? AND COALESCE(p.product_type, 'product') = 'product'",
+                 WHERE si.sale_id = ? AND COALESCE(p.product_type, 'product') = 'product'
+                   {$hideSql}",
                 [$saleId]
             )->fetchColumn();
         }
@@ -1062,8 +1088,11 @@ class AccountingService
         }
         $sum = $this->query(
             "SELECT
-                COALESCE(SUM(salary_base + transport_aid + COALESCE(prima,0) + COALESCE(cesantias,0)
-                    + COALESCE(cesantias_interest,0) + COALESCE(incapacity_pay,0) + other_earnings),0) labor,
+                COALESCE(SUM(salary_base + transport_aid + COALESCE(prima,0)
+                    + COALESCE(incapacity_pay,0) + other_earnings),0) labor,
+                COALESCE(SUM(COALESCE(cesantias,0) + COALESCE(cesantias_interest,0)),0) cesantias,
+                COALESCE(SUM(COALESCE(commission_amount,0)),0) commission,
+                COALESCE(SUM(COALESCE(vacation_provision,0)),0) vacation,
                 COALESCE(SUM(health_employee),0) health_emp,
                 COALESCE(SUM(pension_employee),0) pension_emp,
                 COALESCE(SUM(health_employer),0) health_er,
@@ -1078,6 +1107,9 @@ class AccountingService
         )->fetch() ?: [];
 
         $labor = round((float)$sum['labor'], 2);
+        $cesantias = round((float)$sum['cesantias'], 2);
+        $commission = round((float)($sum['commission'] ?? 0), 2);
+        $vacation = round((float)($sum['vacation'] ?? 0), 2);
         $healthEmp = round((float)$sum['health_emp'], 2);
         $pensionEmp = round((float)$sum['pension_emp'], 2);
         $healthEr = round((float)$sum['health_er'], 2);
@@ -1089,7 +1121,7 @@ class AccountingService
         $net = round((float)$sum['net'], 2);
         $employerCost = round($healthEr + $pensionEr + $arl + $caja + $sena + $icbf, 2);
 
-        if ($labor <= 0 && $employerCost <= 0) {
+        if ($labor <= 0 && $employerCost <= 0 && $cesantias <= 0 && $commission <= 0 && $vacation <= 0) {
             throw new \RuntimeException('Liquidación sin montos contables');
         }
 
@@ -1100,6 +1132,30 @@ class AccountingService
                 $labor,
                 0,
                 'Devengados nómina ' . $run['run_number']
+            );
+        }
+        if ($commission > 0) {
+            $lines[] = $this->line(
+                $this->setting('payroll_commission_account', '510518'),
+                $commission,
+                0,
+                'Comisiones fijas (no salariales) ' . $run['run_number']
+            );
+        }
+        if ($cesantias > 0) {
+            $lines[] = $this->line(
+                $this->setting('payroll_expense_account', '510503'),
+                $cesantias,
+                0,
+                'Provisión cesantías ' . $run['run_number']
+            );
+        }
+        if ($vacation > 0) {
+            $lines[] = $this->line(
+                $this->setting('vacation_expense_account', '510539'),
+                $vacation,
+                0,
+                'Provisión vacaciones ' . $run['run_number']
             );
         }
         if ($employerCost > 0) {
@@ -1130,6 +1186,22 @@ class AccountingService
         }
         if ($icbf > 0) {
             $lines[] = $this->line($this->setting('icbf_payable_account', '237007'), 0, $icbf, 'ICBF por pagar');
+        }
+        if ($cesantias > 0) {
+            $lines[] = $this->line(
+                $this->setting('cesantias_payable_account', '261005'),
+                0,
+                $cesantias,
+                'Cesantías por pagar'
+            );
+        }
+        if ($vacation > 0) {
+            $lines[] = $this->line(
+                $this->setting('vacation_payable_account', '261015'),
+                0,
+                $vacation,
+                'Vacaciones consolidadas'
+            );
         }
         if ($net > 0) {
             $creditNet = $this->payrollNetCreditAccount((string)($run['payment_method'] ?? 'transfer'), $payNow);
@@ -2194,10 +2266,19 @@ class AccountingService
     {
         if (!array_key_exists($table, self::$schemaTableCache)) {
             try {
-                $safe = str_replace(['`', ';', '%', '_'], '', $table);
-                self::$schemaTableCache[$table] = (bool)$this->db
-                    ->query('SHOW TABLES LIKE ' . $this->db->quote($safe))
-                    ->fetch();
+                // information_schema: comparación exacta (SHOW TABLES LIKE trata "_" como comodín
+                // y el escape previo borraba guiones bajos → sale_items / purchase_orders daban false).
+                if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+                    self::$schemaTableCache[$table] = false;
+                } else {
+                    $stmt = $this->query(
+                        'SELECT 1 FROM information_schema.TABLES
+                         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+                         LIMIT 1',
+                        [$table]
+                    );
+                    self::$schemaTableCache[$table] = (bool)$stmt->fetchColumn();
+                }
             } catch (\Throwable $e) {
                 self::$schemaTableCache[$table] = false;
             }
@@ -2210,10 +2291,17 @@ class AccountingService
         $key = $table . '.' . $column;
         if (!array_key_exists($key, self::$schemaColumnCache)) {
             try {
-                $safeTable = str_replace(['`', ';'], '', $table);
-                self::$schemaColumnCache[$key] = (bool)$this->db
-                    ->query("SHOW COLUMNS FROM `{$safeTable}` LIKE " . $this->db->quote($column))
-                    ->fetch();
+                if (!preg_match('/^[A-Za-z0-9_]+$/', $table) || !preg_match('/^[A-Za-z0-9_]+$/', $column)) {
+                    self::$schemaColumnCache[$key] = false;
+                } else {
+                    $stmt = $this->query(
+                        'SELECT 1 FROM information_schema.COLUMNS
+                         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+                         LIMIT 1',
+                        [$table, $column]
+                    );
+                    self::$schemaColumnCache[$key] = (bool)$stmt->fetchColumn();
+                }
             } catch (\Throwable $e) {
                 self::$schemaColumnCache[$key] = false;
             }
@@ -2243,10 +2331,48 @@ class AccountingService
         $toExcl = sprintf('%04d-01-01', $year + 1);
         $warnings = [];
 
-        $empty = static function (int $m): array {
+        $empty = static function (int $m) use ($year): array {
+            $names = [
+                1 => 'Enero', 2 => 'Febrero', 3 => 'Marzo', 4 => 'Abril',
+                5 => 'Mayo', 6 => 'Junio', 7 => 'Julio', 8 => 'Agosto',
+                9 => 'Septiembre', 10 => 'Octubre', 11 => 'Noviembre', 12 => 'Diciembre',
+            ];
+            if ($m < 1 || $m > 12) {
+                return [
+                    'month' => $m,
+                    'month_num' => '',
+                    'month_name' => '',
+                    'month_label' => '',
+                    'month_short' => '',
+                    'period_from' => '',
+                    'period_to' => '',
+                    'ingresos' => 0.0,
+                    'costo_venta' => 0.0,
+                    'facturas_total' => 0.0,
+                    'facturas_contado' => 0.0,
+                    'facturas_credito' => 0.0,
+                    'facturas_pagadas' => 0.0,
+                    'facturas_descuentos' => 0.0,
+                    'facturas_pendientes' => 0.0,
+                    'utilidad_bruta' => 0.0,
+                    'utilidad_operacional' => 0.0,
+                    'utilidad_neta' => 0.0,
+                    'gastos_operativos' => 0.0,
+                    'gastos_fijos' => 0.0,
+                    'gastos_financieros' => 0.0,
+                ];
+            }
+            $num = str_pad((string)$m, 2, '0', STR_PAD_LEFT);
+            $name = $names[$m];
+            $fromDay = sprintf('%04d-%02d-01', $year, $m);
             return [
                 'month' => $m,
-                'month_label' => str_pad((string)$m, 2, '0', STR_PAD_LEFT),
+                'month_num' => $num,
+                'month_name' => $name,
+                'month_label' => $num . ' · ' . $name . ' ' . $year,
+                'month_short' => $num . '/' . $year,
+                'period_from' => $fromDay,
+                'period_to' => date('Y-m-t', strtotime($fromDay) ?: time()),
                 'ingresos' => 0.0,
                 'costo_venta' => 0.0,
                 'facturas_total' => 0.0,
@@ -2279,8 +2405,13 @@ class AccountingService
         $costExpr = $this->schemaHasColumn('sale_items', 'unit_cost')
             ? 'COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)'
             : 'COALESCE(p.purchase_price, 0)';
+        // Mismo criterio que cierre de caja: el costo del combo va en la línea padre
+        // (document_hidden = componentes internos, unit_cost = 0 para no doble contar).
+        $hideSql = $this->schemaHasColumn('sale_items', 'document_hidden')
+            ? ' AND COALESCE(si.document_hidden, 0) = 0'
+            : '';
 
-        // —— Ventas completed (mismo criterio que dashboard / reportes / contabilidad)
+        // —— Ventas completed (mismo criterio que dashboard / reportes / contabilidad / caja)
         if ($this->schemaHasTable('sales')) {
             try {
                 $salesRows = $this->query(
@@ -2305,6 +2436,7 @@ class AccountingService
                          LEFT JOIN products p ON p.id = si.product_id
                          WHERE s.sale_date >= ? AND s.sale_date < ?
                            AND s.status = 'completed'
+                           {$hideSql}
                          GROUP BY MONTH(s.sale_date)",
                         [$from, $toExcl]
                     )->fetchAll();
@@ -2533,8 +2665,17 @@ class AccountingService
         }
 
         $totals = $empty(0);
-        unset($totals['month'], $totals['month_label']);
+        unset(
+            $totals['month'],
+            $totals['month_label'],
+            $totals['month_num'],
+            $totals['month_name'],
+            $totals['month_short'],
+            $totals['period_from'],
+            $totals['period_to']
+        );
         $months = [];
+        $monthsWithIncomeNoCost = 0;
         foreach ($byMonth as $row) {
             // Evitar negativos fantasma por redondeo en NC > ventas del mes
             $row['ingresos'] = round((float)$row['ingresos'], 2);
@@ -2550,14 +2691,22 @@ class AccountingService
                 - (float)$row['gastos_financieros'],
                 2
             );
+            if ($row['ingresos'] > 0.009 && $row['costo_venta'] < 0.009) {
+                $monthsWithIncomeNoCost++;
+            }
             $months[] = $row;
             foreach ($totals as $k => $_) {
                 $totals[$k] = round((float)($totals[$k] ?? 0) + (float)($row[$k] ?? 0), 2);
             }
         }
 
+        if ($monthsWithIncomeNoCost > 0) {
+            $warnings[] = 'costo_sin_cargar';
+        }
+
         $chart = [
-            'labels' => array_map(static fn(array $r): string => (string)$r['month_label'], $months),
+            'labels' => array_map(static fn(array $r): string => (string)($r['month_short'] ?? $r['month_label']), $months),
+            'labels_full' => array_map(static fn(array $r): string => (string)$r['month_label'], $months),
             'ingresos' => array_map(static fn(array $r): float => round((float)$r['ingresos'], 2), $months),
             'costo_venta' => array_map(static fn(array $r): float => round((float)$r['costo_venta'], 2), $months),
             'facturas_total' => array_map(static fn(array $r): float => round((float)$r['facturas_total'], 2), $months),
@@ -2575,14 +2724,45 @@ class AccountingService
             'meta' => [
                 'from' => $from,
                 'to' => sprintf('%04d-12-31', $year),
+                'period_label' => 'Enero – Diciembre ' . $year,
                 'warnings' => array_values(array_unique($warnings)),
+                'sources' => [
+                    'ingresos' => 'Ventas de caja/POS con estado completed (misma base que el cierre de caja)',
+                    'costo_venta' => 'Ítems de venta: unit_cost de la línea o purchase_price del producto (excluye componentes ocultos de combos, igual que el ojo de costo en caja)',
+                    'facturas' => 'Órdenes de compra en estado received (fecha factura / bodega / recepción)',
+                    'facturas_pagadas' => 'Abonos a proveedores + compras de contado al recibir',
+                    'utilidad_bruta' => 'Ingresos − costo de venta',
+                    'utilidad_operacional' => 'Bruta − gastos operativos',
+                    'utilidad_neta' => 'Operacional − gastos fijos − gastos financieros',
+                ],
             ],
         ];
     }
 
+    /**
+     * Mayor de una cuenta en un rango.
+     * Incluye saldo de apertura (movimientos anteriores a $from) para que la columna Saldo sea usable.
+     *
+     * @return array{opening_balance:float,rows:list<array<string,mixed>>}
+     */
     public function ledger(int $accountId, string $from, string $to): array
     {
-        return $this->query(
+        $opening = 0.0;
+        try {
+            $opening = (float)$this->query(
+                "SELECT COALESCE(SUM(l.debit - l.credit), 0)
+                 FROM accounting_lines l
+                 JOIN accounting_entries e ON e.id = l.entry_id
+                 WHERE l.account_id = ?
+                   AND e.entry_date < ?
+                   AND e.status IN ('posted','reversed')",
+                [$accountId, $from]
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            $opening = 0.0;
+        }
+
+        $rows = $this->query(
             "SELECT e.id entry_id, e.entry_number, e.entry_date, e.description entry_description,
                     l.description, l.debit, l.credit, l.third_party_name
              FROM accounting_lines l
@@ -2592,6 +2772,11 @@ class AccountingService
              ORDER BY e.entry_date, e.id, l.id",
             [$accountId, $from, $to]
         )->fetchAll();
+
+        return [
+            'opening_balance' => round($opening, 2),
+            'rows' => $rows ?: [],
+        ];
     }
 
     public function financialStatements(string $from, string $to): array

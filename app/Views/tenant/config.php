@@ -14,6 +14,7 @@ $avatarUrl = !empty($settings['user_avatar'])
     ? \SoftNova\Core\media_url((string)$settings['user_avatar'])
     : null;
 $isAdmin = $isAdmin ?? (\SoftNova\Core\TenantMiddleware::getRole() === 'admin');
+$isManagement = $isManagement ?? \SoftNova\Core\TenantMiddleware::isManagement();
 $teamUsers = $teamUsers ?? [];
 $jobsPending = $jobsPending ?? 0;
 $auditLogs = $auditLogs ?? [];
@@ -57,27 +58,29 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
 .config-tab-panel{display:none;}
 .config-tab-panel.active{display:block;}
 .audit-action-badge{font-size:11px;padding:2px 8px;border-radius:999px;font-weight:600;display:inline-block;}
-.audit-action-create{background:rgba(16,185,129,.15);color:#059669;}
-.audit-action-update{background:rgba(59,130,246,.15);color:#2563EB;}
-.audit-action-delete{background:rgba(220,38,38,.12);color:#DC2626;}
-.audit-action-payment,.audit-action-open,.audit-action-close,.audit-action-movement,.audit-action-receive,.audit-action-adjust,.audit-action-note{background:rgba(245,158,11,.15);color:#D97706;}
-.audit-action-cancel,.audit-action-anomaly{background:rgba(220,38,38,.12);color:#DC2626;}
-.audit-action-default{background:rgba(100,116,139,.15);color:#475569;}
+.audit-action-create{background:rgba(16,185,129,.15);color:var(--dmc-059669, #059669);}
+.audit-action-update{background:rgba(59,130,246,.15);color:var(--dmc-2563EB, #2563EB);}
+.audit-action-delete{background:rgba(220,38,38,.12);color:var(--dmc-DC2626, #DC2626);}
+.audit-action-payment,.audit-action-open,.audit-action-close,.audit-action-movement,.audit-action-receive,.audit-action-adjust,.audit-action-note{background:rgba(245,158,11,.15);color:var(--dmc-D97706, #D97706);}
+.audit-action-cancel,.audit-action-anomaly{background:rgba(220,38,38,.12);color:var(--dmc-DC2626, #DC2626);}
+.audit-action-default{background:rgba(100,116,139,.15);color:var(--dmc-475569, #475569);}
 .audit-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px;align-items:end;}
 .audit-anomaly-box{border:1px solid rgba(220,38,38,.25);background:rgba(220,38,38,.05);border-radius:10px;padding:12px 14px;margin-bottom:14px;}
 .audit-anomaly-box.ok{border-color:rgba(16,185,129,.3);background:rgba(16,185,129,.06);}
 .audit-anomaly-item{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid rgba(0,0,0,.06);font-size:13px;}
 .audit-anomaly-item:first-child{border-top:none;padding-top:0;}
 .audit-sev{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:2px 6px;border-radius:4px;flex-shrink:0;}
-.audit-sev-danger{background:#FEE2E2;color:#B91C1C;}
-.audit-sev-warning{background:#FEF3C7;color:#B45309;}
-.audit-sev-info{background:#E0E7FF;color:#3730A3;}
+.audit-sev-danger{background:var(--dmb-FEE2E2, #FEE2E2);color:var(--dmc-B91C1C, #B91C1C);}
+.audit-sev-warning{background:var(--dmb-FEF3C7, #FEF3C7);color:var(--dmc-B45309, #B45309);}
+.audit-sev-info{background:var(--dmb-E0E7FF, #E0E7FF);color:var(--dmc-3730A3, #3730A3);}
 </style>
 
 <nav class="config-tabs" role="tablist" aria-label="Secciones de configuracion">
     <button type="button" class="config-tab-btn active" data-config-tab="general">General</button>
     <?php if ($isAdmin): ?>
     <button type="button" class="config-tab-btn" data-config-tab="usuarios">Usuarios</button>
+    <?php endif; ?>
+    <?php if ($isManagement): ?>
     <button type="button" class="config-tab-btn" data-config-tab="auditoria">Auditoría</button>
     <button type="button" class="config-tab-btn" data-config-tab="gastos-admin">Administración de gastos</button>
     <?php endif; ?>
@@ -164,7 +167,8 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
         </div>
         <div class="card-body">
             <p style="font-size:13px;color:var(--color-text-secondary);margin-bottom:12px;">
-                Roles: <strong>User</strong> (elige módulos y permisos), <strong>POS</strong> (Caja/Ventas; gastos y préstamos desde Caja sin ver esos módulos).
+                Roles: <strong>User</strong> (elige módulos y permisos), <strong>POS</strong> (Caja/Ventas; gastos y préstamos desde Caja sin ver esos módulos),
+                <strong>Gerencia</strong> (módulos marcados + Configuración; requiere su contraseña de administrador).
                 El rol <strong>Administrativo</strong> no se crea desde aqui.
             </p>
             <?php if (empty($teamUsers)): ?>
@@ -177,7 +181,7 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
                         <tr>
                             <td><?php echo htmlspecialchars($tu['name']); ?></td>
                             <td><?php echo htmlspecialchars($tu['email']); ?></td>
-                            <td><span class="badge badge-info"><?php echo htmlspecialchars($teamRoleLabels[$tu['role']] ?? $tu['role']); ?></span></td>
+                            <td><span class="badge <?php echo ($tu['role'] ?? '') === 'gerencia' ? 'badge-warning' : 'badge-info'; ?>"><?php echo htmlspecialchars($teamRoleLabels[$tu['role']] ?? $tu['role']); ?></span></td>
                             <td>
                                 <?php if (($tu['status'] ?? '') === 'active'): ?>
                                     <span class="badge badge-success">Activo</span>
@@ -236,8 +240,25 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
                             <input type="password" name="password" id="teamUserPassword" class="form-control" minlength="6" autocomplete="new-password">
                         </div>
                     </div>
+                    <div id="gerenciaRoleBox" style="display:none;margin-top:4px;padding:12px 14px;border-radius:10px;border:1px solid rgba(217,119,6,.35);background:rgba(245,158,11,.08);">
+                        <p style="margin:0 0 10px;font-size:13px;">
+                            <strong>Rol Gerencia:</strong> accede a los módulos marcados abajo y a <strong>Configuración</strong>
+                            (empresa, documentos, sistema, auditoría y categorías de gasto). La gestión de usuarios, copias de seguridad,
+                            caja de arena y borrado general siguen reservadas al administrador.
+                        </p>
+                        <div class="form-group" id="gerenciaAdminPassGroup" style="margin:0;">
+                            <label>Contraseña del administrador * <span class="field-tip" data-tip="Por seguridad, confirme su propia contraseña para asignar el rol Gerencia." tabindex="0">?</span></label>
+                            <input type="password" name="admin_password" id="teamAdminPassword" class="form-control" autocomplete="current-password" placeholder="Su contraseña de administrador">
+                        </div>
+                    </div>
                     <div id="permMatrixWrap" style="margin-top:12px;">
-                        <h4 style="margin-bottom:8px;">Permisos por modulo (rol User)</h4>
+                        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+                            <h4 style="margin:0;">Permisos por módulo</h4>
+                            <div style="display:flex;gap:6px;">
+                                <button type="button" class="btn btn-sm btn-secondary" onclick="setAllPerms(true)">Marcar todo</button>
+                                <button type="button" class="btn btn-sm btn-secondary" onclick="setAllPerms(false)">Desmarcar todo</button>
+                            </div>
+                        </div>
                         <p style="font-size:12px;color:var(--color-text-secondary);margin-bottom:8px;">
                             Marque Ver / Crear / Editar / Eliminar / Exportar por cada módulo.
                             En <strong>Gastos</strong> y <strong>Préstamos</strong>: solo <em>Crear</em> (sin Ver) permite registrar desde Caja sin ver esos menús.
@@ -277,6 +298,11 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
         </div>
     </div>
     <script>
+    var teamUserOriginalRole = '';
+    var teamUserLastRole = '';
+    function setAllPerms(on) {
+        document.querySelectorAll('.perm-check').forEach(function(c) { c.checked = !!on; });
+    }
     function openTeamUserModal() {
         document.getElementById('teamUserModalTitle').textContent = 'Crear usuario';
         document.getElementById('teamUserForm').action = '<?php echo $configBase; ?>?action=createUser';
@@ -287,7 +313,10 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
         document.getElementById('teamUserPassword').required = true;
         document.getElementById('teamPassHint').textContent = '*';
         document.getElementById('teamUserPassword').value = '';
-        document.querySelectorAll('.perm-check').forEach(function(c) { c.checked = false; });
+        document.getElementById('teamAdminPassword').value = '';
+        teamUserOriginalRole = '';
+        teamUserLastRole = 'user';
+        setAllPerms(false);
         togglePermMatrix();
         document.getElementById('teamUserModal').style.display = 'flex';
     }
@@ -301,6 +330,9 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
         document.getElementById('teamUserPassword').required = false;
         document.getElementById('teamPassHint').textContent = '(opcional)';
         document.getElementById('teamUserPassword').value = '';
+        document.getElementById('teamAdminPassword').value = '';
+        teamUserOriginalRole = u.role || 'user';
+        teamUserLastRole = teamUserOriginalRole;
         document.querySelectorAll('.perm-check').forEach(function(c) {
             var mod = c.getAttribute('data-module');
             var act = c.getAttribute('data-action');
@@ -312,11 +344,28 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
     function togglePermMatrix() {
         var role = document.getElementById('teamUserRole').value;
         var isPos = role === 'pos';
+        var isGerencia = role === 'gerencia';
+        var needsAdminPass = isGerencia && teamUserOriginalRole !== 'gerencia';
+        // Al pasar a Gerencia (nuevo o desde otro rol) se marca todo; el admin desmarca lo que no aplique.
+        if (needsAdminPass && teamUserLastRole !== 'gerencia') {
+            setAllPerms(true);
+        }
+        teamUserLastRole = role;
         document.getElementById('permMatrixWrap').style.display = isPos ? 'none' : '';
         document.getElementById('posRoleHint').style.display = isPos ? '' : 'none';
+        document.getElementById('gerenciaRoleBox').style.display = isGerencia ? '' : 'none';
+        document.getElementById('gerenciaAdminPassGroup').style.display = needsAdminPass ? '' : 'none';
+        var adminPass = document.getElementById('teamAdminPassword');
+        adminPass.required = needsAdminPass;
+        if (!needsAdminPass) {
+            adminPass.value = '';
+        }
     }
     </script>
 </div><!-- /tab usuarios -->
+    <?php endif; ?>
+
+    <?php if ($isManagement): ?>
 
 <div class="config-tab-panel" id="configTab-auditoria">
     <div class="card neumorphic">
@@ -330,10 +379,10 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
             <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 14px;">
                 Historial cruzado de ventas, caja, inventario, facturas de compra, usuarios y configuración.
                 El detalle muestra la cadena relacionada (p. ej. venta ↔ salida de stock, factura ↔ entrada).
-                Solo visible para administradores.
+                Solo visible para administración y gerencia.
             </p>
 
-            <?php if ($isAdmin): ?>
+            <?php if ($isManagement): ?>
                 <?php if (empty($auditAnomalies)): ?>
                     <div class="audit-anomaly-box ok">
                         <strong style="font-size:13px;">Sin anomalías detectadas</strong>
@@ -532,7 +581,7 @@ if (!empty($_SERVER['REQUEST_URI']) && str_contains((string)$_SERVER['REQUEST_UR
 
     <?php endif; ?>
 
-<?php if ($isAdmin): ?>
+<?php if ($isManagement): ?>
 <div class="config-tab-panel" id="configTab-gastos-admin">
     <?php $viewInstance->partial('expense_admin_config', [
         'expenseCategories' => $expenseCategories,
@@ -1267,7 +1316,7 @@ function expCatEdit(id, name, kind, account) {
     <!-- Zona de peligro: borrado general -->
     <div class="card neumorphic" style="grid-column: 1 / -1;border:1px solid #DC2626;">
         <div class="card-header" style="background:rgba(220,38,38,0.08);">
-            <h3 style="color:#B91C1C;">Zona de peligro — Borrado general<?php echo !empty($sandboxStatus['active']) ? ' (solo espejo)' : ''; ?></h3>
+            <h3 style="color:var(--dmc-B91C1C, #B91C1C);">Zona de peligro — Borrado general<?php echo !empty($sandboxStatus['active']) ? ' (solo espejo)' : ''; ?></h3>
         </div>
         <div class="card-body">
             <p style="color:var(--color-text-secondary);font-size:13px;margin-bottom:12px;">
@@ -1400,7 +1449,7 @@ function expCatEdit(id, name, kind, account) {
     </div>
 </div>
 
-<?php if ($isAdmin): ?>
+<?php if ($isManagement): ?>
 <div id="auditDetailModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:640px;">
         <div class="modal-header">
@@ -1524,7 +1573,7 @@ function showAuditDetail(id) {
             body.innerHTML = html;
         })
         .catch(function(err){
-            body.innerHTML = '<p class="dashboard-empty" style="color:#DC2626;">' + escapeAuditHtml(err.message || 'Error') + '</p>';
+            body.innerHTML = '<p class="dashboard-empty" style="color:var(--dmc-DC2626, #DC2626);">' + escapeAuditHtml(err.message || 'Error') + '</p>';
         });
 }
 function openWipeDangerModal(e) {
@@ -1765,6 +1814,9 @@ function previewAndUploadCompanyLogo(input) {
 
 (function(){
     window.activateConfigTab = function(name) {
+        if (!document.querySelector('.config-tab-btn[data-config-tab="' + name + '"]')) {
+            name = 'general';
+        }
         document.querySelectorAll('.config-tab-btn').forEach(function(btn) {
             btn.classList.toggle('active', btn.getAttribute('data-config-tab') === name);
         });

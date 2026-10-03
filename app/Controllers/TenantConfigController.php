@@ -202,6 +202,7 @@ class TenantConfigController extends Controller
         $this->ensureUsersSchema();
         $teamUsers = [];
         $isAdmin = \SoftNova\Core\TenantMiddleware::getRole() === 'admin';
+        $isManagement = \SoftNova\Core\TenantMiddleware::isManagement();
         $jobsPending = 0;
         if ($isAdmin) {
             try {
@@ -213,14 +214,14 @@ class TenantConfigController extends Controller
                 $teamUsers = $this->query(
                     "SELECT id, name, email, role, permissions, status, last_login_at, created_at
                      FROM users
-                     WHERE role IN ('user', 'pos')
-                     ORDER BY name ASC"
+                     WHERE role IN ('user', 'pos', 'gerencia')
+                     ORDER BY FIELD(role, 'gerencia', 'user', 'pos'), name ASC"
                 )->fetchAll();
             } catch (\Throwable $e) {
                 $teamUsers = $this->query(
                     "SELECT id, name, email, role, status, last_login_at, created_at
                      FROM users
-                     WHERE role IN ('user', 'pos')
+                     WHERE role IN ('user', 'pos', 'gerencia')
                      ORDER BY name ASC"
                 )->fetchAll();
             }
@@ -245,7 +246,7 @@ class TenantConfigController extends Controller
         ];
         $auditModuleOptions = [];
         $auditActionOptions = [];
-        if ($isAdmin) {
+        if ($isManagement) {
             try {
                 $auditSvcClass = \SoftNova\Services\TenantAuditService::class;
                 if (class_exists($auditSvcClass) && method_exists($auditSvcClass, 'listLogs')) {
@@ -329,7 +330,7 @@ class TenantConfigController extends Controller
         
         $expenseCategories = [];
         $expenseSubgroups = [];
-        if ($isAdmin) {
+        if ($isManagement) {
             try {
                 $expCatSvc = new \SoftNova\Services\ExpenseCategoryService($this->db);
                 $expenseCategories = $expCatSvc->listAll(true);
@@ -353,6 +354,7 @@ class TenantConfigController extends Controller
             'backupPagination' => $backupPagination,
             'teamUsers' => $teamUsers,
             'isAdmin' => $isAdmin,
+            'isManagement' => $isManagement,
             'jobsPending' => $jobsPending,
             'managedModules' => \SoftNova\Core\TenantMiddleware::MANAGED_MODULES,
             'permActions' => \SoftNova\Core\TenantMiddleware::ACTIONS,
@@ -374,7 +376,7 @@ class TenantConfigController extends Controller
 
     private function auditDetailJson(): void
     {
-        if (\SoftNova\Core\TenantMiddleware::getRole() !== 'admin') {
+        if (!\SoftNova\Core\TenantMiddleware::isManagement()) {
             $this->json(['success' => false, 'message' => 'No autorizado'], 403);
             return;
         }
@@ -424,11 +426,12 @@ class TenantConfigController extends Controller
         try {
             $roleCol = $this->db->query("SHOW COLUMNS FROM users LIKE 'role'")->fetch();
             $type = strtolower((string)($roleCol['Type'] ?? ''));
-            $needs = !str_contains($type, "'user'") || !str_contains($type, "'pos'");
+            $needs = str_starts_with($type, 'enum(')
+                && (!str_contains($type, "'user'") || !str_contains($type, "'pos'") || !str_contains($type, "'gerencia'"));
             if ($needs) {
                 $this->db->exec(
                     "ALTER TABLE users
-                     MODIFY COLUMN role ENUM('admin','manager','cashier','viewer','auxiliar','user','pos','mesero') DEFAULT 'admin'"
+                     MODIFY COLUMN role ENUM('admin','manager','cashier','viewer','auxiliar','user','pos','mesero','gerencia') DEFAULT 'admin'"
                 );
             }
         } catch (\Throwable $e) {
@@ -443,6 +446,31 @@ class TenantConfigController extends Controller
             return false;
         }
         return true;
+    }
+
+    private const MAX_ACTIVE_GERENCIA = 2;
+
+    private function activeGerenciaCount(int $excludeId = 0): int
+    {
+        return (int)$this->query(
+            "SELECT COUNT(*) FROM users WHERE role = 'gerencia' AND status = 'active' AND id <> ?",
+            [$excludeId]
+        )->fetchColumn();
+    }
+
+    /**
+     * Asignar rol Gerencia exige la contraseña del administrador y respeta el cupo.
+     * @return string Mensaje de error ('' si procede)
+     */
+    private function gerenciaAssignmentError(int $excludeId = 0): string
+    {
+        if (!$this->verifyAdminPassword((string)$this->request->post('admin_password', ''))) {
+            return 'Contraseña del administrador incorrecta. Es obligatoria para asignar el rol Gerencia.';
+        }
+        if ($this->activeGerenciaCount($excludeId) >= self::MAX_ACTIVE_GERENCIA) {
+            return 'No es posible asignar más usuarios con rol Gerencia. Contacte al proveedor del sistema.';
+        }
+        return '';
     }
 
     private function buildPermissionsFromPost(string $role): string
@@ -470,7 +498,7 @@ class TenantConfigController extends Controller
             $role = \SoftNova\Core\TenantMiddleware::normalizeRole((string)$this->request->post('role', 'user'));
 
             if (!isset(\SoftNova\Core\TenantMiddleware::teamRoleLabels()[$role])) {
-                $this->respond(false, 'Rol no permitido. Solo User o User POS.', '/app/configuracion#usuarios');
+                $this->respond(false, 'Rol no permitido. Solo User, POS o Gerencia.', '/app/configuracion#usuarios');
                 return;
             }
             if ($name === '' || $email === '' || $password === '') {
@@ -490,6 +518,13 @@ class TenantConfigController extends Controller
             if ($exists) {
                 $this->respond(false, 'Ya existe un usuario con ese email', '/app/configuracion#usuarios');
                 return;
+            }
+            if ($role === 'gerencia') {
+                $gerenciaError = $this->gerenciaAssignmentError();
+                if ($gerenciaError !== '') {
+                    $this->respond(false, $gerenciaError, '/app/configuracion#usuarios');
+                    return;
+                }
             }
 
             $hash = Security::hashPassword($password);
@@ -548,13 +583,22 @@ class TenantConfigController extends Controller
             $role = \SoftNova\Core\TenantMiddleware::normalizeRole((string)$this->request->post('role', 'user'));
 
             $user = $this->query("SELECT * FROM users WHERE id = ? LIMIT 1", [$id])->fetch();
-            if (!$user || !in_array($user['role'], ['user', 'pos'], true)) {
+            if (!$user || !in_array($user['role'], ['user', 'pos', 'gerencia'], true)) {
                 $this->respond(false, 'Usuario no encontrado o no editable', '/app/configuracion#usuarios');
                 return;
             }
             if (!isset(\SoftNova\Core\TenantMiddleware::teamRoleLabels()[$role])) {
                 $this->respond(false, 'Rol no permitido', '/app/configuracion#usuarios');
                 return;
+            }
+            if ($role === 'gerencia' && $user['role'] !== 'gerencia') {
+                $gerenciaError = $this->gerenciaAssignmentError(
+                    ($user['status'] ?? '') === 'active' ? $id : 0
+                );
+                if ($gerenciaError !== '') {
+                    $this->respond(false, $gerenciaError, '/app/configuracion#usuarios');
+                    return;
+                }
             }
             if ($name === '' || $email === '') {
                 $this->respond(false, 'Nombre y email son obligatorios', '/app/configuracion#usuarios');
@@ -654,7 +698,7 @@ class TenantConfigController extends Controller
         }
         $id = (int)$this->request->post('id', 0);
         $user = $this->query("SELECT id, role, status FROM users WHERE id = ? LIMIT 1", [$id])->fetch();
-        if (!$user || !in_array($user['role'], ['user', 'pos'], true)) {
+        if (!$user || !in_array($user['role'], ['user', 'pos', 'gerencia'], true)) {
             $this->respond(false, 'Usuario no encontrado', '/app/configuracion');
             return;
         }
@@ -663,6 +707,14 @@ class TenantConfigController extends Controller
             return;
         }
         $newStatus = ($user['status'] ?? '') === 'active' ? 'inactive' : 'active';
+        if (
+            $newStatus === 'active'
+            && $user['role'] === 'gerencia'
+            && $this->activeGerenciaCount((int)$id) >= self::MAX_ACTIVE_GERENCIA
+        ) {
+            $this->respond(false, 'No es posible activar más usuarios con rol Gerencia. Contacte al proveedor del sistema.', '/app/configuracion#usuarios');
+            return;
+        }
         $this->query("UPDATE users SET status = ? WHERE id = ?", [$newStatus, $id]);
         (new \SoftNova\Services\TenantAuditService($this->db))->log(
             'update',
@@ -1501,7 +1553,7 @@ class TenantConfigController extends Controller
 
     private function requireAdminForExpenseCatalog(): bool
     {
-        if (TenantMiddleware::getRole() !== 'admin') {
+        if (!TenantMiddleware::isManagement()) {
             $this->respond(false, 'Solo administradores pueden gestionar categorías de gasto', '/app/configuracion#gastos-admin');
             return false;
         }

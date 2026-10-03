@@ -28,7 +28,7 @@ $tenantName = $tenantName ?? ''; $userName = $userName ?? ''; $ticket = $ticket 
                 <?php foreach($messages as $msg): ?>
                     <div class="chat-message <?php echo $msg['is_staff']?'chat-staff':'chat-client';?>" style="margin-bottom:15px;display:flex;flex-direction:column;align-items:<?php echo $msg['is_staff']?'flex-end':'flex-start';?>;">
                         <div style="max-width:70%;padding:12px 16px;border-radius:16px;<?php echo $msg['is_staff']?'background:linear-gradient(135deg,#3b82f6,#06b6d4);color:#fff;':'background:var(--bg-input);border:1px solid var(--color-border);';?>">
-                            <div style="font-size:12px;font-weight:600;margin-bottom:4px;<?php echo $msg['is_staff']?'color:rgba(255,255,255,0.8);':'color:var(--color-primary);';?>">
+                            <div style="font-size:12px;font-weight:600;margin-bottom:4px;<?php echo $msg['is_staff']?'color:rgba(255,255,255,0.8);':'color:var(--color-accent-text, var(--color-primary));';?>">
                                 <?php echo htmlspecialchars($msg['user_name']);?>
                                 <?php if($msg['is_staff']): ?><span style="font-size:10px;background:rgba(255,255,255,0.2);padding:2px 6px;border-radius:8px;margin-left:5px;">Soporte</span><?php endif; ?>
                             </div>

@@ -73,22 +73,49 @@ session_set_cookie_params([
     'httponly' => $sessionHttpOnly,
     'samesite' => $sessionSameSite,
 ]);
+// Sesiones propias en storage/sessions: el limpiador de cPanel borra
+// /var/cpanel/php/sessions según su php.ini (24 min), ignorando gc_maxlifetime en runtime.
+$sessionSavePath = STORAGE_PATH . '/sessions';
+if (!is_dir($sessionSavePath)) {
+    @mkdir($sessionSavePath, 0700, true);
+}
+if (is_dir($sessionSavePath) && is_writable($sessionSavePath)) {
+    $sessionHtaccess = $sessionSavePath . '/.htaccess';
+    if (!is_file($sessionHtaccess)) {
+        @file_put_contents(
+            $sessionHtaccess,
+            "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n"
+            . "<IfModule !mod_authz_core.c>\n    Deny from all\n</IfModule>\n"
+        );
+    }
+    session_save_path($sessionSavePath);
+    // Carpeta propia: el GC de PHP debe correr (cPanel suele traer probability=0).
+    ini_set('session.gc_probability', '1');
+    ini_set('session.gc_divisor', '1000');
+}
 // Alinear GC del servidor con la cookie (evita sesión muerta con pestaña abierta).
 ini_set('session.gc_maxlifetime', (string)max($sessionLifetime, 57600));
 
 // Iniciar sesión
 session_start();
 
-// Regeneración periódica de ID de sesión (mitiga fijación / robo de cookie).
-if (session_status() === PHP_SESSION_ACTIVE && session_id() !== '') {
-    $regenInterval = (int)\SoftNova\Core\config('security.session_security.regenerate_interval', 300);
-    if ($regenInterval < 60) {
-        $regenInterval = 300;
-    }
+// Petición que llegó con un ID ya rotado (p. ej. AJAX en paralelo al cambiar de módulo).
+\SoftNova\Core\Session::followRotation(1800);
+
+// Rotación periódica del ID (mitiga robo de cookie). Solo en navegación GET de página
+// para no competir con AJAX/POST concurrentes.
+$regenEnabled = (bool)\SoftNova\Core\config('session_security.regenerate_id', true);
+$isPageNavigation = ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET'
+    && empty($_SERVER['HTTP_X_REQUESTED_WITH'])
+    && (($_SERVER['HTTP_SEC_FETCH_MODE'] ?? 'navigate') === 'navigate')
+    && stripos((string)($_SERVER['HTTP_ACCEPT'] ?? 'text/html'), 'text/html') !== false;
+if ($regenEnabled && $isPageNavigation && session_status() === PHP_SESSION_ACTIVE && session_id() !== '') {
+    $regenInterval = max(900, (int)\SoftNova\Core\config('session_security.regenerate_interval', 1800));
     $lastRegen = (int)($_SESSION['_seri_last_regen'] ?? 0);
-    if ($lastRegen <= 0 || (time() - $lastRegen) >= $regenInterval) {
-        @session_regenerate_id(true);
+    if ($lastRegen <= 0) {
         $_SESSION['_seri_last_regen'] = time();
+    } elseif ((time() - $lastRegen) >= $regenInterval) {
+        \SoftNova\Core\Session::rotateId();
     }
 }
 

@@ -179,11 +179,11 @@ function testCatalogProvider(btn, provider) {
         .then(function(response){ return response.json(); })
         .then(function(data){
             result.textContent = data.message || (data.success ? 'Conexión OK' : 'Error');
-            result.style.color = data.success ? '#10B981' : '#DC2626';
+            result.style.color = data.success ? '#10B981' : 'var(--dmc-DC2626, #DC2626)';
         })
         .catch(function(){
             result.textContent = 'Error de red';
-            result.style.color = '#DC2626';
+            result.style.color = 'var(--dmc-DC2626, #DC2626)';
         })
         .finally(function(){ btn.disabled = false; });
 }

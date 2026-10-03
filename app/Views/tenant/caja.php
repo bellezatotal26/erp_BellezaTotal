@@ -22,17 +22,17 @@ if (!function_exists('hoursOpen')) {
 }
 ?>
 <?php echo flashMessage(); ?>
-<div id="posPwaInstallBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#ECFDF5;color:#065F46;border:1px solid #10B981;font-size:13px;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+<div id="posPwaInstallBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:var(--dmb-ECFDF5, #ECFDF5);color:var(--dmc-065F46, #065F46);border:1px solid #10B981;font-size:13px;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
     <span>Instale <strong>Seri Caja</strong> en este computador para usarla como aplicación (incluso sin internet).</span>
     <span style="display:flex;gap:8px;flex-wrap:wrap;">
         <button type="button" class="btn btn-sm btn-primary" id="posPwaInstallBtn">Instalar</button>
         <button type="button" class="btn btn-sm btn-secondary" id="posPwaInstallDismiss">Ahora no</button>
     </span>
 </div>
-<div id="posOfflineBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#FEF3C7;color:#92400E;border:1px solid #F59E0B;font-size:13px;"></div>
-<div id="posNetworkBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#DBEAFE;color:#1E3A8A;border:1px solid #3B82F6;font-size:13px;"></div>
-<div id="posCatalogStaleBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#FFF7ED;color:#9A3412;border:1px solid #FB923C;font-size:13px;"></div>
-<div id="posConflictBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:#FEE2E2;color:#991B1B;border:1px solid #EF4444;font-size:13px;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+<div id="posOfflineBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:var(--dmb-FEF3C7, #FEF3C7);color:var(--dmc-92400E, #92400E);border:1px solid #F59E0B;font-size:13px;"></div>
+<div id="posNetworkBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:var(--dmb-DBEAFE, #DBEAFE);color:var(--dmc-1E3A8A, #1E3A8A);border:1px solid #3B82F6;font-size:13px;"></div>
+<div id="posCatalogStaleBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:var(--dmb-FFF7ED, #FFF7ED);color:var(--dmc-9A3412, #9A3412);border:1px solid #FB923C;font-size:13px;"></div>
+<div id="posConflictBanner" hidden style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:var(--dmb-FEE2E2, #FEE2E2);color:var(--dmc-991B1B, #991B1B);border:1px solid #EF4444;font-size:13px;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
     <span id="posConflictBannerText"></span>
     <button type="button" class="btn btn-sm btn-danger" id="posConflictReviewBtn">Revisar conflictos</button>
 </div>
@@ -65,7 +65,7 @@ if (!function_exists('hoursOpen')) {
 <?php endif; ?>
 <div class="card neumorphic" style="text-align:center;padding:40px;">
     <div style="font-size:64px;margin-bottom:15px;">🔒</div>
-    <h2 style="color:var(--color-primary);margin-bottom:10px;">Caja Cerrada</h2>
+    <h2 style="color:var(--color-accent-text, var(--color-primary));margin-bottom:10px;">Caja Cerrada</h2>
     <p style="color:var(--color-text-secondary);margin-bottom:20px;">No hay ninguna sesión de caja abierta.</p>
     <button onclick="document.getElementById('openCashModal').style.display='flex'" class="btn btn-primary neumorphic-btn" style="font-size:16px;padding:12px 30px;">🔓 Abrir Caja</button>
 </div>
@@ -193,6 +193,7 @@ $invoicePrefix = $invoicePrefix ?? 'FAC-';
 $csrfPos = \SoftNova\Core\csrf_token();
 $searchUrl = $viewInstance->route('app/caja') . '?action=searchProducts';
 $catalogUrl = $viewInstance->route('app/caja') . '?action=catalogSnapshot';
+$combosUrl = $viewInstance->route('app/caja');
 $saleUrl = $viewInstance->route('app/ventas') . '?action=create';
 $syncUrl = $viewInstance->route('app/ventas') . '?action=sync_offline';
 $ventasBase = $viewInstance->route('app/ventas');
@@ -211,6 +212,7 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
 <section class="pos-panel" id="posPanel"
          data-search-url="<?php echo htmlspecialchars($searchUrl); ?>"
          data-catalog-url="<?php echo htmlspecialchars($catalogUrl); ?>"
+         data-combos-url="<?php echo htmlspecialchars($combosUrl); ?>"
          data-sale-url="<?php echo htmlspecialchars($saleUrl); ?>"
          data-sync-url="<?php echo htmlspecialchars($syncUrl); ?>"
          data-csrf="<?php echo htmlspecialchars($csrfPos); ?>"
@@ -310,11 +312,11 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                     <span>Registro: <strong id="posClock"><?php echo date('g:i A'); ?></strong></span>
                 </div>
                 <div id="posSubtotalLine" class="pos-sub-line" style="display:none;">Subtotal: <span id="posSubtotal"><?php echo fmt(0, $currency); ?></span></div>
-                <div id="posDiscountLine" class="pos-sub-line" style="display:none;color:#B45309;">Descuento: <span id="posDiscountAmt"><?php echo fmt(0, $currency); ?></span></div>
-                <div id="posDeliveryLine" class="pos-sub-line" style="display:none;color:#1D4ED8;">Domicilio: <span id="posDeliveryAmt"><?php echo fmt(0, $currency); ?></span></div>
-                <div id="posDeliveryCompanyLine" class="pos-sub-line" style="display:none;color:#7C3AED;">Empresa (transporte): <span id="posDeliveryCompanyAmt"><?php echo fmt(0, $currency); ?></span></div>
-                <div id="posTaxLine" class="pos-sub-line" style="display:none;color:#0F766E;">Impuesto: <span id="posTaxAmt"><?php echo fmt(0, $currency); ?></span></div>
-                <div id="posCreditSurchargeLine" class="pos-sub-line" style="display:none;color:#B45309;">Recargo crédito: <span id="posCreditSurchargeAmt"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posDiscountLine" class="pos-sub-line" style="display:none;color:var(--dmc-B45309, #B45309);">Descuento: <span id="posDiscountAmt"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posDeliveryLine" class="pos-sub-line" style="display:none;color:var(--dmc-1D4ED8, #1D4ED8);">Domicilio: <span id="posDeliveryAmt"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posDeliveryCompanyLine" class="pos-sub-line" style="display:none;color:var(--dmc-7C3AED, #7C3AED);">Empresa (transporte): <span id="posDeliveryCompanyAmt"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posTaxLine" class="pos-sub-line" style="display:none;color:var(--dmc-0F766E, #0F766E);">Impuesto: <span id="posTaxAmt"><?php echo fmt(0, $currency); ?></span></div>
+                <div id="posCreditSurchargeLine" class="pos-sub-line" style="display:none;color:var(--dmc-B45309, #B45309);">Recargo crédito: <span id="posCreditSurchargeAmt"><?php echo fmt(0, $currency); ?></span></div>
                 <div class="pos-total-block">
                     <div class="pos-total-line">TOTAL: <span id="posTotal"><?php echo fmt(0, $currency); ?></span></div>
                     <div class="pos-cash-change" id="posCashChangeBlock">
@@ -438,7 +440,7 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
         ?>
         <?php
         $consignmentProducts = $consignmentProducts ?? [];
-        if ($openItemQuick || !empty($consignmentProducts)):
+        // Barra rápida: siempre visible si hay POS (comodín / consignación / combos).
         ?>
         <div class="pos-open-item-bar">
             <?php if ($openItemQuick): ?>
@@ -454,6 +456,9 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                 Nuevo P. Comodin
             </button>
             <?php endif; ?>
+            <button type="button" class="btn btn-secondary pos-combo-btn" id="posCombosBtn" title="Vender o crear combos (varios productos a un precio)">
+                Combos
+            </button>
             <label class="pos-consign-select-wrap" title="Mercancía de terceros (no inventario propio)">
                 <span class="pos-consign-select-label">Consignación</span>
                 <select id="posConsignmentSelect" class="form-control pos-consign-select" <?php echo empty($consignmentProducts) ? 'disabled' : ''; ?>>
@@ -494,10 +499,9 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                 </select>
             </label>
             <span style="font-size:12px;color:var(--color-text-secondary);">
-                <?php if ($openItemQuick): ?>Ítem libre · <?php endif; ?>consignados fuera del inventario propio
+                <?php if ($openItemQuick): ?>Ítem libre · <?php endif; ?>combos · consignados
             </span>
         </div>
-        <?php endif; ?>
         <?php
         $offerProducts = $offerProducts ?? [];
         if (!empty($offerProducts)):
@@ -539,6 +543,36 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                     </div>
                 </div>
                 <button type="button" class="pos-result-add" title="Agregar">+</button>
+            </div>
+            <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+        <?php
+        $suggestedCombos = $suggestedCombos ?? [];
+        if (!empty($suggestedCombos)):
+        ?>
+        <div class="pos-combo-suggestions" id="posComboSuggestions">
+            <p class="pos-search-hint" style="margin:8px 0 6px;">Combos sugeridos</p>
+            <?php foreach ($suggestedCombos as $sc): ?>
+            <div class="pos-result-row pos-combo-chip"
+                 data-combo-id="<?php echo (int)$sc['id']; ?>"
+                 role="button"
+                 tabindex="0"
+                 title="Agregar combo a la venta">
+                <div class="pos-result-info">
+                    <div class="pos-result-title">
+                        <span class="pos-combo-badge">Combo</span>
+                        <?php echo \SoftNova\Core\e((string)$sc['name']); ?>
+                    </div>
+                    <div class="pos-result-meta">
+                        <?php echo (int)($sc['item_count'] ?? 0); ?> productos ·
+                        <strong><?php echo fmt((float)($sc['sale_price'] ?? 0), $currency); ?></strong>
+                        <?php if (!empty($sc['reason_label'])): ?>
+                            · <?php echo \SoftNova\Core\e((string)$sc['reason_label']); ?>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                <button type="button" class="pos-result-add pos-combo-apply-btn" data-combo-id="<?php echo (int)$sc['id']; ?>" title="Agregar combo">+</button>
             </div>
             <?php endforeach; ?>
         </div>
@@ -679,7 +713,7 @@ foreach ($payBreakDashboard as $pbRow) {
 <?php if (!empty($payBreakDashboard)): ?>
 <div class="card neumorphic" style="margin-bottom:20px;padding:14px 16px;">
     <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
-        <h3 style="margin:0;font-size:15px;color:var(--color-primary);">Totales cobrados por medio de pago</h3>
+        <h3 style="margin:0;font-size:15px;color:var(--color-accent-text, var(--color-primary));">Totales cobrados por medio de pago</h3>
         <span style="font-size:12px;color:var(--color-text-secondary);">
             Suma de cobros de la sesión · Total <?php echo fmt($payBreakTotalSum, $currency); ?>
         </span>
@@ -725,7 +759,7 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
     <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
         <h3>Gastos del cajón (efectivo)<?php echo $todayExpensesCount > 0 ? ' (' . $todayExpensesCount . ')' : ''; ?></h3>
         <?php if ($todayExpensesCount > 0): ?>
-            <span style="font-size:13px;color:#DC2626;font-weight:600;">Total: -<?php echo fmt($todayExpensesTotal, $currency); ?></span>
+            <span style="font-size:13px;color:var(--dmc-DC2626, #DC2626);font-weight:600;">Total: -<?php echo fmt($todayExpensesTotal, $currency); ?></span>
         <?php endif; ?>
     </div>
     <div class="card-body">
@@ -773,7 +807,7 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
                                     <?php echo htmlspecialchars(\SoftNova\Services\PaymentMethodCatalog::label((string)($exp['payment_method'] ?? 'cash'))); ?>
                                 </span>
                             </td>
-                            <td style="color:#DC2626;font-weight:600;">-<?php echo fmt((float)$exp['amount'], $currency); ?></td>
+                            <td style="color:var(--dmc-DC2626, #DC2626);font-weight:600;">-<?php echo fmt((float)$exp['amount'], $currency); ?></td>
                         </tr>
                     <?php endforeach; ?>
                     </tbody>
@@ -784,7 +818,7 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
                 <div style="margin-bottom:18px;">
                     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--color-border);">
                         <strong><?php echo htmlspecialchars((string)$group['user_name']); ?></strong>
-                        <span style="color:#DC2626;font-weight:600;font-size:13px;">-<?php echo fmt((float)$group['total'], $currency); ?> · <?php echo count($group['items']); ?> gasto(s)</span>
+                        <span style="color:var(--dmc-DC2626, #DC2626);font-weight:600;font-size:13px;">-<?php echo fmt((float)$group['total'], $currency); ?> · <?php echo count($group['items']); ?> gasto(s)</span>
                     </div>
                     <div class="table-container">
                         <table>
@@ -819,7 +853,7 @@ $todayExpensesCount = (int)($todayExpensesCount ?? 0);
                                             <?php echo htmlspecialchars(\SoftNova\Services\PaymentMethodCatalog::label((string)($exp['payment_method'] ?? 'cash'))); ?>
                                         </span>
                                     </td>
-                                    <td style="color:#DC2626;font-weight:600;">-<?php echo fmt((float)$exp['amount'], $currency); ?></td>
+                                    <td style="color:var(--dmc-DC2626, #DC2626);font-weight:600;">-<?php echo fmt((float)$exp['amount'], $currency); ?></td>
                                 </tr>
                             <?php endforeach; ?>
                             </tbody>
@@ -843,11 +877,11 @@ $cajaSessionUserName = (string)($openSession['user_name'] ?? 'Caja');
     </div>
     <div class="card-body">
         <?php if (!empty($hiddenVoidedCount)): ?>
-            <p id="cajaVoidedNotice" style="margin:0 0 10px;padding:8px 10px;background:#FFF7ED;border:1px solid #FED7AA;border-radius:8px;font-size:12px;color:#9A3412;">
+            <p id="cajaVoidedNotice" style="margin:0 0 10px;padding:8px 10px;background:var(--dmb-FFF7ED, #FFF7ED);border:1px solid #FED7AA;border-radius:8px;font-size:12px;color:var(--dmc-9A3412, #9A3412);">
                 Se omitieron <?php echo (int)$hiddenVoidedCount; ?> movimiento(s) de compras/gastos ya anulados (neto $0 en el cajón).
             </p>
         <?php else: ?>
-            <p id="cajaVoidedNotice" style="display:none;margin:0 0 10px;padding:8px 10px;background:#FFF7ED;border:1px solid #FED7AA;border-radius:8px;font-size:12px;color:#9A3412;"></p>
+            <p id="cajaVoidedNotice" style="display:none;margin:0 0 10px;padding:8px 10px;background:var(--dmb-FFF7ED, #FFF7ED);border:1px solid #FED7AA;border-radius:8px;font-size:12px;color:var(--dmc-9A3412, #9A3412);"></p>
         <?php endif; ?>
         <?php if (empty($movements)): ?>
             <p id="cajaMovementsEmpty" style="text-align:center;color:var(--color-text-secondary);padding:20px;">No hay movimientos en esta sesión de caja</p>
@@ -922,7 +956,7 @@ window.CajaLiveSyncConfig = <?php echo json_encode([
                     </div>
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
                         <span>Egresos del cajón</span>
-                        <strong id="closeSumExpenses" style="color:#DC2626;">—</strong>
+                        <strong id="closeSumExpenses" style="color:var(--dmc-DC2626, #DC2626);">—</strong>
                     </div>
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
                         <span>Sub-total sin descuentos<br><span style="font-size:11px;color:var(--color-text-secondary);">Todos los medios, antes de descuento</span></span>
@@ -930,13 +964,13 @@ window.CajaLiveSyncConfig = <?php echo json_encode([
                     </div>
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
                         <span>Descuento total aplicado<br><span style="font-size:11px;color:var(--color-text-secondary);">Todos los medios</span></span>
-                        <strong id="closeSumDiscount" style="color:#B45309;">—</strong>
+                        <strong id="closeSumDiscount" style="color:var(--dmc-B45309, #B45309);">—</strong>
                     </div>
                     <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
                         <span>Ventas facturadas (todos los medios)</span>
                         <strong id="closeSumSales">—</strong>
                     </div>
-                    <div id="closeSumPayments" style="margin:10px 0;padding:12px;border:1px solid var(--color-border);border-radius:8px;background:#fff;font-size:13px;">
+                    <div id="closeSumPayments" style="margin:10px 0;padding:12px;border:1px solid var(--color-border);border-radius:8px;background:var(--dmb-FFFFFF, #fff);font-size:13px;">
                         <?php
                         $payBreak = $totals['payment_breakdown'] ?? [];
                         $payBreakSum = 0.0;
@@ -956,7 +990,7 @@ window.CajaLiveSyncConfig = <?php echo json_encode([
                                         <strong><?php echo htmlspecialchars((string)($pb['label'] ?? '')); ?></strong>
                                         <span style="color:var(--color-text-secondary);font-size:11px;"> · <?php echo (int)($pb['count'] ?? 0); ?> cobro(s)</span>
                                     </span>
-                                    <strong style="font-size:15px;<?php echo $isCashMethod ? 'color:#059669;' : ''; ?>">
+                                    <strong style="font-size:15px;<?php echo $isCashMethod ? 'color:var(--dmc-059669, #059669);' : ''; ?>">
                                         <?php echo fmt((float)($pb['total'] ?? 0), $currency); ?>
                                     </strong>
                                 </div>
@@ -1314,7 +1348,7 @@ if ($canLoanFromCaja):
         var qty = parseInt((document.getElementById('cajaLoanQty') || {}).value || '1', 10) || 1;
         if (qty > Math.max(0, stock)) {
             hint.textContent = 'Stock actual: ' + stock + '. Esta salida dejará el inventario en ' + (stock - qty) + '.';
-            hint.style.color = '#B45309';
+            hint.style.color = 'var(--dmc-B45309, #B45309)';
         } else {
             hint.textContent = 'Stock actual: ' + stock;
             hint.style.color = '';
@@ -1477,6 +1511,86 @@ if ($canLoanFromCaja):
         <div class="modal-footer">
             <button type="button" class="btn btn-secondary" onclick="document.getElementById('oversellModal').style.display='none'">Cancelar</button>
             <button type="button" class="btn btn-primary" id="oversellConfirmBtn">Continuar venta</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal Combos -->
+<div id="posComboModal" class="modal-overlay" style="display:none;z-index:1260;">
+    <div class="modal-content neumorphic" style="max-width:720px;max-height:92vh;overflow:auto;">
+        <div class="modal-header">
+            <h3>Combos</h3>
+            <button type="button" class="modal-close" id="posComboModalClose">&times;</button>
+        </div>
+        <div class="modal-body" style="padding-top:8px;">
+            <div class="pos-combo-tabs" style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">
+                <button type="button" class="btn btn-primary btn-sm" id="posComboTabList" data-tab="list">Usar sugerencia</button>
+                <button type="button" class="btn btn-secondary btn-sm" id="posComboTabCreate" data-tab="create">Crear / guardar</button>
+            </div>
+
+            <div id="posComboListPane">
+                <p style="margin:0 0 10px;font-size:13px;color:var(--color-text-secondary);">
+                    Elija un combo guardado. Se agregan los productos al carrito con el precio del combo prorrateado (el stock baja por cada ítem).
+                </p>
+                <div id="posComboList" class="pos-combo-list"></div>
+                <p id="posComboListEmpty" class="pos-search-hint" style="display:none;">Aún no hay combos. Cree uno en la pestaña «Crear / guardar».</p>
+            </div>
+
+            <div id="posComboCreatePane" style="display:none;">
+                <p style="margin:0 0 10px;font-size:13px;color:var(--color-text-secondary);">
+                    Arme un paquete (mín. 2 productos), fije el precio del combo y guárdelo como sugerencia para fechas especiales, tinte+agua, kits, etc.
+                </p>
+                <div class="form-group">
+                    <label>Nombre del combo *</label>
+                    <input type="text" id="posComboName" class="form-control" maxlength="160" placeholder="Ej: Tinte + agua oxigenada">
+                </div>
+                <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                    <div class="form-group" style="flex:1;min-width:140px;">
+                        <label>Precio del combo *</label>
+                        <input type="text" id="posComboPrice" class="form-control money-input" data-money="1" inputmode="decimal" placeholder="0">
+                    </div>
+                    <div class="form-group" style="flex:1;min-width:160px;">
+                        <label>Motivo</label>
+                        <select id="posComboReason" class="form-control">
+                            <?php foreach (\SoftNova\Services\ProductComboService::REASONS as $rk => $rl): ?>
+                                <option value="<?php echo htmlspecialchars($rk); ?>"><?php echo htmlspecialchars($rl); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group" id="posComboReasonNoteWrap" style="display:none;">
+                    <label>Detalle del motivo</label>
+                    <input type="text" id="posComboReasonNote" class="form-control" maxlength="180" placeholder="Ej: Promo abril · Día de la belleza">
+                </div>
+                <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                    <div class="form-group" style="flex:1;min-width:140px;">
+                        <label>Vigente desde (opcional)</label>
+                        <input type="date" id="posComboFrom" class="form-control">
+                    </div>
+                    <div class="form-group" style="flex:1;min-width:140px;">
+                        <label>Vigente hasta (opcional)</label>
+                        <input type="date" id="posComboUntil" class="form-control">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Buscar producto para el combo</label>
+                    <input type="text" id="posComboProductSearch" class="form-control" placeholder="Código o nombre…" autocomplete="off">
+                    <div id="posComboProductResults" class="pos-combo-product-results"></div>
+                </div>
+                <div class="form-group" style="margin-bottom:6px;">
+                    <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+                        <span>Componentes</span>
+                        <button type="button" class="btn btn-secondary btn-sm" id="posComboFromCartBtn" title="Usa los productos actuales del carrito">Desde carrito</button>
+                    </label>
+                    <div id="posComboItems" class="pos-combo-items"></div>
+                    <div id="posComboRetailHint" class="pos-search-hint" style="margin-top:6px;"></div>
+                </div>
+            </div>
+        </div>
+        <div class="modal-footer" style="flex-wrap:wrap;gap:8px;">
+            <button type="button" class="btn btn-secondary" id="posComboCancelBtn">Cerrar</button>
+            <button type="button" class="btn btn-primary" id="posComboSaveBtn" style="display:none;">Guardar sugerencia</button>
+            <button type="button" class="btn btn-success" id="posComboSaveAndApplyBtn" style="display:none;">Guardar y vender</button>
         </div>
     </div>
 </div>
@@ -1670,22 +1784,44 @@ $cajaBase = $viewInstance->route('app/caja');
         <?php if (empty($historySessions)): ?>
             <p style="color:var(--color-text-secondary);text-align:center;padding:12px;">No hay cierres en el período seleccionado.</p>
         <?php else: ?>
+        <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 12px;line-height:1.45;">
+            <strong>Contado cajón</strong> = solo efectivo físico (base + ventas en efectivo − egresos).
+            <strong>Ventas del día</strong> = todos los medios (transferencia, Nequi, tarjetas, efectivo…).
+            Use <strong>Detalle</strong> para ver el desglose completo antes del PDF.
+        </p>
         <div class="table-container"><table>
-            <thead><tr><th>Apertura</th><th>Cierre</th><th>Usuario</th><th>Base</th><th>Contado</th><th>Neto día</th><th>Acciones</th></tr></thead>
+            <thead>
+                <tr>
+                    <th>Apertura</th>
+                    <th>Cierre</th>
+                    <th>Usuario</th>
+                    <th>Base</th>
+                    <th>Ventas<br><span style="font-weight:400;font-size:11px;">(todos los medios)</span></th>
+                    <th>Contado cajón<br><span style="font-weight:400;font-size:11px;">(solo efectivo)</span></th>
+                    <th>Neto cajón</th>
+                    <th>Acciones</th>
+                </tr>
+            </thead>
             <tbody><?php foreach ($historySessions as $h): ?>
                 <?php
-                $diff = (float)($h['closing_amount'] ?? 0) - (float)($h['opening_amount'] ?? 0);
+                $openingAmt = (float)($h['opening_amount'] ?? 0);
+                $countedAmt = (float)($h['closing_amount'] ?? 0);
+                $expectedAmt = (float)($h['report_expected_cash'] ?? $h['expected_amount'] ?? $countedAmt);
+                $cashNet = $expectedAmt - $openingAmt;
+                $salesTotalHist = $h['report_sales_total'] ?? null;
+                $salesCountHist = (int)($h['report_sales_count'] ?? 0);
                 $notesRaw = (string)($h['notes'] ?? '');
                 $isAutoClose = str_contains($notesRaw, '[[AUTO_CLOSE]]')
                     || stripos($notesRaw, 'Cierre automatico a medianoche') !== false
                     || stripos($notesRaw, 'Cierre automático a medianoche') !== false;
+                $payMini = $h['report_payments'] ?? [];
                 ?>
                 <tr>
                     <td><?php echo date('d/m/Y H:i', strtotime($h['opening_date'])); ?></td>
                     <td>
                         <?php echo !empty($h['closing_date']) ? date('d/m/Y H:i', strtotime($h['closing_date'])) : '—'; ?>
                         <?php if ($isAutoClose): ?>
-                            <div style="font-size:11px;color:#B45309;margin-top:2px;">Cierre automático 23:59</div>
+                            <div style="font-size:11px;color:var(--dmc-B45309, #B45309);margin-top:2px;">Cierre automático 23:59</div>
                         <?php endif; ?>
                     </td>
                     <td>
@@ -1694,10 +1830,31 @@ $cajaBase = $viewInstance->route('app/caja');
                             <div style="font-size:11px;color:var(--color-text-secondary);margin-top:2px;">quien abrió (no cerró)</div>
                         <?php endif; ?>
                     </td>
-                    <td title="Fondo de apertura (no es venta)"><?php echo fmt($h['opening_amount'], $currency); ?></td>
-                    <td title="Efectivo contado al cierre (base + ventas − egresos)"><?php echo fmt($h['closing_amount'] ?? 0, $currency); ?></td>
-                    <td style="color:<?php echo $diff >= 0 ? '#10B981' : '#DC2626'; ?>;" title="Contado − base (movimiento neto del día en cajón)"><?php echo ($diff >= 0 ? '+' : '') . fmt($diff, $currency); ?></td>
+                    <td title="Fondo de apertura (no es venta)"><?php echo fmt($openingAmt, $currency); ?></td>
+                    <td title="Total facturado en todos los medios de pago">
+                        <?php if ($salesTotalHist !== null): ?>
+                            <strong><?php echo fmt((float)$salesTotalHist, $currency); ?></strong>
+                            <div style="font-size:11px;color:var(--color-text-secondary);"><?php echo $salesCountHist; ?> venta(s)</div>
+                            <?php if (!empty($payMini)): ?>
+                                <div style="font-size:10px;color:var(--color-text-secondary);margin-top:4px;line-height:1.35;max-width:180px;">
+                                    <?php foreach ($payMini as $pm): ?>
+                                        <div><?php echo htmlspecialchars((string)$pm['label']); ?>: <?php echo fmt((float)$pm['total'], $currency); ?></div>
+                                    <?php endforeach; ?>
+                                </div>
+                            <?php endif; ?>
+                        <?php else: ?>
+                            —
+                        <?php endif; ?>
+                    </td>
+                    <td title="Efectivo físico contado al cierre (no incluye transferencia/tarjeta)">
+                        <?php echo fmt($countedAmt, $currency); ?>
+                        <div style="font-size:10px;color:var(--dmc-059669, #059669);margin-top:2px;">solo efectivo</div>
+                    </td>
+                    <td style="color:<?php echo $cashNet >= 0 ? '#10B981' : '#DC2626'; ?>;" title="Esperado cajón − base (sin otros medios)">
+                        <?php echo ($cashNet >= 0 ? '+' : '') . fmt($cashNet, $currency); ?>
+                    </td>
                     <td style="white-space:nowrap;">
+                        <button type="button" class="btn btn-sm btn-primary" onclick="cajaShowClosingDetail(<?php echo (int)$h['id']; ?>)" title="Ver detalle del cierre">Detalle</button>
                         <a href="<?php echo $cajaBase; ?>?action=pdf&id=<?php echo (int)$h['id']; ?>" class="btn btn-sm btn-info" target="_blank" rel="noopener" title="Descargar PDF">PDF</a>
                         <button type="button" class="btn btn-sm btn-secondary" onclick="cajaShareWhatsapp(<?php echo (int)$h['id']; ?>)" title="Enviar por WhatsApp">WhatsApp</button>
                         <button type="button" class="btn btn-sm btn-secondary" onclick="cajaShareEmail(<?php echo (int)$h['id']; ?>)" title="Enviar por correo">Correo</button>
@@ -1706,6 +1863,24 @@ $cajaBase = $viewInstance->route('app/caja');
             <?php endforeach; ?></tbody>
         </table></div>
         <?php endif; ?>
+    </div>
+</div>
+
+<div id="cajaClosingDetailModal" class="modal-overlay" style="display:none;z-index:1150;">
+    <div class="modal-content neumorphic" style="max-width:720px;max-height:92vh;overflow:auto;">
+        <div class="modal-header">
+            <h3 id="cajaClosingDetailTitle">Detalle de cierre</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('cajaClosingDetailModal').style.display='none'">&times;</button>
+        </div>
+        <div class="modal-body" id="cajaClosingDetailBody">
+            <p style="color:var(--color-text-secondary);">Cargando…</p>
+        </div>
+        <div class="modal-footer" style="flex-wrap:wrap;gap:8px;">
+            <button type="button" class="btn btn-secondary" onclick="document.getElementById('cajaClosingDetailModal').style.display='none'">Cerrar</button>
+            <a href="#" class="btn btn-info" id="cajaClosingDetailPdf" target="_blank" rel="noopener">PDF</a>
+            <button type="button" class="btn btn-secondary" id="cajaClosingDetailWa">WhatsApp</button>
+            <button type="button" class="btn btn-secondary" id="cajaClosingDetailMail">Correo</button>
+        </div>
     </div>
 </div>
 
@@ -1789,6 +1964,151 @@ $cajaBase = $viewInstance->route('app/caja');
     window.cajaTaxRate = <?php echo json_encode((float)($taxRate ?? 0)); ?>;
     window.cajaTaxEnabled = <?php echo json_encode(!empty($taxEnabled ?? true)); ?>;
     window.cajaProductTaxEnabled = <?php echo json_encode(!empty($productTaxEnabled ?? false)); ?>;
+
+    function cajaEsc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function cajaToggleMarginDetail() {
+        var box = document.getElementById('cajaMarginDetail');
+        var label = document.getElementById('cajaMarginEyeLabel');
+        if (!box) return;
+        var show = box.style.display === 'none' || box.style.display === '';
+        // Starts as display:none; first click should show
+        if (box.getAttribute('data-open') === '1') {
+            box.style.display = 'none';
+            box.setAttribute('data-open', '0');
+            if (label) label.textContent = 'Ver costo y utilidad';
+        } else {
+            box.style.display = 'block';
+            box.setAttribute('data-open', '1');
+            if (label) label.textContent = 'Ocultar costo y utilidad';
+        }
+    }
+
+    function cajaShowClosingDetail(sessionId) {
+        var modal = document.getElementById('cajaClosingDetailModal');
+        var body = document.getElementById('cajaClosingDetailBody');
+        var title = document.getElementById('cajaClosingDetailTitle');
+        var pdf = document.getElementById('cajaClosingDetailPdf');
+        var wa = document.getElementById('cajaClosingDetailWa');
+        var mail = document.getElementById('cajaClosingDetailMail');
+        if (title) title.textContent = 'Detalle de cierre #' + sessionId;
+        if (body) body.innerHTML = '<p style="color:var(--color-text-secondary);">Cargando…</p>';
+        if (pdf) pdf.href = window.cajaBase + '?action=pdf&id=' + encodeURIComponent(sessionId);
+        if (wa) wa.onclick = function() { cajaShareWhatsapp(sessionId); };
+        if (mail) mail.onclick = function() { cajaShareEmail(sessionId); };
+        if (modal) modal.style.display = 'flex';
+
+        fetch(window.cajaBase + '?action=report_detail&id=' + encodeURIComponent(sessionId), {
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' }
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (!d || !d.success) {
+                if (body) body.innerHTML = '<p style="color:var(--dmc-DC2626, #DC2626);">' + cajaEsc((d && d.message) || 'No se pudo cargar el detalle') + '</p>';
+                return;
+            }
+            var dr = d.drawer || {};
+            var sa = d.sales || {};
+            var pays = d.payments || [];
+            var canMargin = !!d.can_view_margin;
+            var enCajaHint = (dr.expenses || 0) > 0.009
+                ? 'Base de caja + efectivo de ventas − gastos'
+                : 'Base de caja + efectivo de ventas';
+
+            var kpi = function(label, value, bg, extra) {
+                return '<div style="background:' + bg + ';color:#fff;padding:10px 12px;margin:0 0 6px;border-radius:6px;display:flex;justify-content:space-between;align-items:center;gap:8px;">'
+                    + '<span style="font-weight:700;font-size:13px;">' + label + (extra || '') + '</span>'
+                    + '<strong style="font-size:16px;">' + value + '</strong></div>';
+            };
+            var row = function(label, sign, value, bg, color) {
+                return '<div style="display:flex;justify-content:space-between;gap:8px;padding:8px 10px;border-bottom:1px solid var(--color-border,#e5e7eb);'
+                    + (bg ? 'background:' + bg + ';' : '') + '">'
+                    + '<span style="font-size:13px;' + (bg === '#2563EB' ? 'color:#fff;font-weight:700;' : '') + '">' + label + '</span>'
+                    + '<span style="display:flex;gap:10px;align-items:center;">'
+                    + '<span style="width:14px;text-align:center;font-weight:700;color:'
+                    + (sign === '+' ? 'var(--dmc-059669, #059669)' : (sign === '-' ? 'var(--dmc-DC2626, #DC2626)' : (bg === '#2563EB' ? '#fff' : 'var(--dmc-64748B, #64748B)'))) + ';">' + cajaEsc(sign) + '</span>'
+                    + '<strong style="min-width:100px;text-align:right;' + (color || (bg === '#2563EB' ? 'color:#fff;' : '')) + '">' + value + '</strong></span></div>';
+            };
+
+            var accountHtml = row('Base de apertura', 'i', cajaEsc(dr.opening_fmt), 'var(--dmb-FFFBEB, #FFFBEB)');
+            if ((sa.cancelled || 0) > 0.009 || (sa.cancelled_count || 0) > 0) {
+                accountHtml += row('Anulado (' + (sa.cancelled_count || 0) + ')', 'i', cajaEsc(sa.cancelled_fmt));
+            }
+            pays.forEach(function(p) {
+                if (p.is_cash) return;
+                accountHtml += row(cajaEsc(p.label) + ' (' + (p.count || 0) + ')', 'i', cajaEsc(p.total_fmt));
+            });
+            accountHtml += row('Ventas efectivo', '+', cajaEsc(dr.cash_sales_fmt), 'rgba(16,185,129,.12)', 'color:var(--dmc-059669, #059669);');
+            if ((sa.discount || 0) > 0.009) {
+                accountHtml += row('Descuentos', 'i', cajaEsc(sa.discount_fmt), '', 'color:var(--dmc-B45309, #B45309);');
+            }
+            if ((dr.other_cash || 0) > 0.009) {
+                accountHtml += row('Otros ingresos efectivo', '+', cajaEsc(dr.other_cash_fmt), '', 'color:var(--dmc-059669, #059669);');
+            }
+            accountHtml += row('Gastos efectivo (cajón)', '-', cajaEsc(dr.expenses_fmt), '', 'color:var(--dmc-DC2626, #DC2626);');
+            accountHtml += row(
+                '= En caja (esperado)<br><span style="font-weight:500;font-size:10px;opacity:.9;">' + cajaEsc(enCajaHint) + '</span>',
+                '=',
+                cajaEsc(dr.expected_fmt),
+                '#2563EB',
+                'color:#fff;'
+            );
+            accountHtml += row('Dinero contado (cuadre)', 'i', cajaEsc(dr.counted_fmt), 'var(--dmb-FEF3C7, #FEF3C7)');
+            var diffOk = Math.abs(dr.difference || 0) < 0.05;
+            accountHtml += row(
+                diffOk ? 'Diferencia (cuadrado)' : ((dr.difference || 0) < 0 ? 'Diferencia (faltante)' : 'Diferencia (sobrante)'),
+                diffOk ? '=' : ((dr.difference || 0) < 0 ? '-' : '+'),
+                cajaEsc(dr.difference_fmt),
+                diffOk ? 'rgba(16,185,129,.1)' : 'rgba(220,38,38,.08)',
+                diffOk ? 'color:var(--dmc-059669, #059669);' : 'color:var(--dmc-DC2626, #DC2626);'
+            );
+
+            var marginToggle = '';
+            var marginBlock = '';
+            if (canMargin) {
+                marginToggle = '<button type="button" id="cajaMarginEyeBtn" onclick="cajaToggleMarginDetail()" '
+                    + 'title="Mostrar / ocultar costo y utilidad" '
+                    + 'style="display:inline-flex;align-items:center;gap:6px;margin:0 0 10px;padding:6px 10px;'
+                    + 'border:1px solid var(--color-border,#e5e7eb);border-radius:6px;background:var(--bg-body,#f8fafc);'
+                    + 'cursor:pointer;font-size:12px;color:var(--color-text-secondary);">'
+                    + '<svg id="cajaMarginEyeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">'
+                    + '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>'
+                    + '<circle cx="12" cy="12" r="3"></circle></svg>'
+                    + '<span id="cajaMarginEyeLabel">Ver costo y utilidad</span></button>';
+                marginBlock = '<div id="cajaMarginDetail" style="display:none;margin:0 0 12px;">'
+                    + kpi('COSTO MERCANCÍA', cajaEsc(sa.cost_fmt || '—'), '#DC2626')
+                    + kpi('UTILIDAD BRUTA', cajaEsc(sa.gross_profit_fmt || '—'), '#EA580C',
+                        ' <span style="background:#16A34A;padding:2px 8px;border-radius:3px;font-size:12px;margin-left:6px;">'
+                        + Number(sa.gross_margin_pct || 0).toFixed(2).replace('.', ',') + '%</span>')
+                    + '<p style="margin:4px 0 0;font-size:12px;color:var(--color-text-secondary);">'
+                    + 'Utilidad = facturado − costo (sin restar egresos de caja).</p></div>';
+            }
+
+            if (body) {
+                body.innerHTML = '<p style="margin:0 0 12px;font-size:13px;color:var(--color-text-secondary);">'
+                    + cajaEsc(d.user_name) + ' · ' + cajaEsc(d.opening_date) + ' → ' + cajaEsc(d.closing_date) + '</p>'
+                    + kpi('FACTURADO + BASE', cajaEsc(sa.ventas_totales_con_base_fmt || sa.total_fmt), '#2563EB',
+                        ' <span style="font-weight:500;font-size:11px;opacity:.9;">ventas del día + apertura</span>')
+                    + marginToggle
+                    + marginBlock
+                    + '<p style="margin:4px 0 12px;font-size:12px;color:var(--color-text-secondary);line-height:1.4;">'
+                    + 'Facturado ' + cajaEsc(sa.total_fmt)
+                    + (sa.collected_fmt ? (' · Cobrado (Σ medios) ' + cajaEsc(sa.collected_fmt)) : '')
+                    + ' + base ' + cajaEsc(dr.opening_fmt)
+                    + '. El facturado no incluye facturas viejas cobradas hoy; esos abonos sí entran en Σ medios.</p>'
+                    + '<div style="border:1px solid var(--color-border,#e5e7eb);border-radius:8px;overflow:hidden;margin-bottom:14px;">'
+                    + '<div style="padding:8px 10px;background:var(--bg-body,#f8fafc);font-weight:700;font-size:13px;">Cuentas del día</div>'
+                    + accountHtml + '</div>';
+            }
+        })
+        .catch(function() {
+            if (body) body.innerHTML = '<p style="color:var(--dmc-DC2626, #DC2626);">Error al cargar el detalle.</p>';
+        });
+    }
 
     function cajaShareWhatsapp(sessionId) {
         fetch(window.cajaBase + '?action=report_whatsapp&id=' + sessionId, {

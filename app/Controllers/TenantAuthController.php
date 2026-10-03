@@ -120,7 +120,7 @@ class TenantAuthController extends Controller
                 $localUserId = (int)$localUser['id'];
                 $preserveTeamProfile = in_array(
                     \SoftNova\Core\TenantMiddleware::normalizeRole((string)($localUser['role'] ?? '')),
-                    ['user', 'pos'],
+                    ['user', 'pos', 'gerencia'],
                     true
                 );
                 try {
@@ -158,6 +158,7 @@ class TenantAuthController extends Controller
         }
         
         session_regenerate_id(true);
+        $_SESSION['_seri_last_regen'] = time();
         
         // Guardar sesión del tenant (usar ID local de la BD del tenant)
         $_SESSION['tenant_user_id'] = $localUserId;
@@ -240,6 +241,7 @@ class TenantAuthController extends Controller
 
         $this->clearRateLimit();
         session_regenerate_id(true);
+        $_SESSION['_seri_last_regen'] = time();
 
         $company = (string)\SoftNova\Core\config('app.company_name', \SoftNova\Core\config('app.name', 'Seri ERP'));
         $dbName = (string)\SoftNova\Core\config('database.default.database', '');
@@ -274,11 +276,20 @@ class TenantAuthController extends Controller
      */
     private function ensureTenantUserSchema(\PDO $pdo): void
     {
+        // Solo ALTER si faltan valores: un MODIFY sin 'gerencia' vaciaría ese rol en BD.
         try {
-            $pdo->exec(
-                "ALTER TABLE users
-                 MODIFY COLUMN role ENUM('admin','manager','cashier','viewer','auxiliar','user','pos','mesero') DEFAULT 'admin'"
-            );
+            $roleCol = $pdo->query("SHOW COLUMNS FROM users LIKE 'role'")->fetch();
+            $type = strtolower((string)($roleCol['Type'] ?? ''));
+            if (
+                $type === ''
+                || (str_starts_with($type, 'enum(')
+                    && (!str_contains($type, "'user'") || !str_contains($type, "'pos'") || !str_contains($type, "'gerencia'")))
+            ) {
+                $pdo->exec(
+                    "ALTER TABLE users
+                     MODIFY COLUMN role ENUM('admin','manager','cashier','viewer','auxiliar','user','pos','mesero','gerencia') DEFAULT 'admin'"
+                );
+            }
         } catch (\Throwable $e) {
             // Ya actualizado o sin permisos ALTER
         }

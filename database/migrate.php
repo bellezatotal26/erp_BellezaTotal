@@ -482,6 +482,12 @@ function migrateStepPayrollSchema(PDO $pdo): void
         migrateAddColumn($pdo, 'payroll_items', 'overtime_night_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00');
         migrateAddColumn($pdo, 'payroll_items', 'dominical_hours', 'DECIMAL(8,2) NOT NULL DEFAULT 0.00');
         migrateAddColumn($pdo, 'payroll_items', 'dominical_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00');
+        migrateAddColumn($pdo, 'payroll_items', 'night_surcharge_hours', 'DECIMAL(8,2) NOT NULL DEFAULT 0.00');
+        migrateAddColumn($pdo, 'payroll_items', 'night_surcharge_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00');
+        migrateAddColumn($pdo, 'payroll_items', 'overtime_dom_day_hours', 'DECIMAL(8,2) NOT NULL DEFAULT 0.00');
+        migrateAddColumn($pdo, 'payroll_items', 'overtime_dom_day_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00');
+        migrateAddColumn($pdo, 'payroll_items', 'overtime_dom_night_hours', 'DECIMAL(8,2) NOT NULL DEFAULT 0.00');
+        migrateAddColumn($pdo, 'payroll_items', 'overtime_dom_night_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00');
         migrateAddColumn($pdo, 'payroll_items', 'created_at', 'TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP');
 
         try {
@@ -660,6 +666,18 @@ migrateStepStandalonePerf($pdo);
 migrateStepOpsSchema($pdo, $root);
 migrateStepPayrollSchema($pdo);
 migrateStepProductTax($pdo, $root);
+
+echo "[9/9] Combos de venta — tablas\n";
+migrateRunSqlFile($pdo, $dbDir . '/fix_product_combos_schema.sql');
+if (is_file($root . '/vendor/autoload.php')) {
+    try {
+        (new \SoftNova\Services\ProductComboService($pdo))->ensureSchema();
+        echo "  OK ProductComboService::ensureSchema()\n";
+    } catch (Throwable $e) {
+        echo "  SKIP ProductComboService: " . $e->getMessage() . "\n";
+    }
+}
+echo "\n";
 
 echo "=== Migración completada ===\n";
 echo "Siguiente paso recomendado: exportar backup de la BD (php database/backup.php).\n";

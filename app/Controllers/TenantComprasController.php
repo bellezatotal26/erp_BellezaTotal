@@ -374,6 +374,8 @@ class TenantComprasController extends TenantController
             'openCount' => $openCount,
             'monthReceived' => $monthReceived,
             'paidMonth' => $paidMonth,
+            'invoiceQuick' => $this->purchasing->invoiceQuickSummary($listFilters),
+            'invoiceFiltered' => $this->purchasing->invoiceSummary($payment, $due, $listFilters),
             'payableTotal' => $this->purchasing->payableTotal(),
             'payableOrders' => $this->purchasing->payableOrders(50, in_array($due, ['overdue', 'due_today', 'due_soon'], true) ? $due : ''),
             'pendingInvoices' => $this->invoiceImports()->pendingImports(20),
@@ -1561,23 +1563,40 @@ class TenantComprasController extends TenantController
                 $paid = (float)($o['paid_total'] ?? 0);
                 $credit = (float)($o['credit_total'] ?? 0);
                 $balance = max(0, $total - $paid - $credit);
+                $mode = (string)($o['payment_mode'] ?? 'payable');
+                $isCancelled = ($o['status'] ?? '') === 'cancelled';
+                $stateLabel = $isCancelled
+                    ? 'Anulada'
+                    : ($mode === 'payable' && $balance > 0.009
+                        ? (($paid + $credit) > 0.009 ? 'Abono parcial' : 'Por pagar')
+                        : 'Pagada');
+                $daysOver = isset($o['days_overdue']) ? (int)$o['days_overdue'] : null;
+                $overdueDays = (!$isCancelled && $mode === 'payable' && $balance > 0.009 && !empty($o['due_date']) && $daysOver !== null && $daysOver > 0)
+                    ? (string)$daysOver
+                    : '';
                 $csvRows[] = [
                     (string)($o['invoice_number'] ?? ''),
                     (string)($o['order_number'] ?? ''),
                     substr((string)($o['invoice_date'] ?? $o['warehouse_date'] ?? $o['order_date'] ?? ''), 0, 10),
                     (string)($o['due_date'] ?? ''),
+                    $overdueDays,
                     (string)($o['supplier_name'] ?? ''),
                     number_format($total, 2, '.', ''),
                     number_format($paid, 2, '.', ''),
                     number_format($credit, 2, '.', ''),
                     number_format($balance, 2, '.', ''),
-                    (string)($o['payment_status'] ?? ''),
-                    (string)($o['payment_mode'] ?? ''),
+                    $stateLabel,
+                    match ($mode) {
+                        'cash' => 'Efectivo',
+                        'transfer' => 'Transferencia',
+                        'card' => 'Tarjeta',
+                        default => 'Crédito',
+                    },
                 ];
             }
             $this->exportCsv(
-                'compras_facturas_' . date('Ymd_His') . '.csv',
-                ['Factura', 'OC', 'Fecha', 'Vence', 'Proveedor', 'Total', 'Abonado', 'NC', 'Saldo', 'Estado pago', 'Modo pago'],
+                'compras_facturas_' . ($payment === 'unpaid' ? 'por_pagar_' : '') . date('Ymd_His') . '.csv',
+                ['Factura', 'OC', 'Fecha', 'Vence', 'Días vencida', 'Proveedor', 'Total', 'Abonado', 'NC', 'Saldo', 'Estado pago', 'Modo pago'],
                 $csvRows
             );
             return;

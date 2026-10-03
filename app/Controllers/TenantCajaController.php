@@ -95,6 +95,10 @@ class TenantCajaController extends TenantController
             $this->closingPdf();
             return;
         }
+        if ($action === 'report_detail' && $this->request->method() === 'GET') {
+            $this->reportDetailJson();
+            return;
+        }
         if ($action === 'report_whatsapp' && $this->request->method() === 'GET') {
             $this->reportWhatsapp();
             return;
@@ -109,6 +113,28 @@ class TenantCajaController extends TenantController
         }
         if ($action === 'catalogSnapshot' && $this->request->method() === 'GET') {
             $this->catalogSnapshot();
+            return;
+        }
+        if ($action === 'listCombos' && $this->request->method() === 'GET') {
+            $this->listCombos();
+            return;
+        }
+        if ($action === 'getCombo' && $this->request->method() === 'GET') {
+            $this->getCombo();
+            return;
+        }
+        if ($action === 'expandCombo' && $this->request->method() === 'GET') {
+            $this->expandCombo();
+            return;
+        }
+        if ($action === 'saveCombo' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('caja', 'create');
+            $this->saveCombo();
+            return;
+        }
+        if ($action === 'deleteCombo' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('caja', 'edit');
+            $this->deleteCombo();
             return;
         }
         if ($action === 'liveSync' && $this->request->method() === 'GET') {
@@ -290,11 +316,47 @@ class TenantCajaController extends TenantController
         } catch (\Throwable $e) {
             $historySessions = [];
         }
+        // Enriquecer listado: ventas todos los medios (el cajón solo muestra efectivo).
+        foreach ($historySessions as &$histRow) {
+            try {
+                $ht = $this->computeSessionTotals($histRow, $histRow['closing_date'] ?? null);
+                $histRow['report_sales_total'] = (float)($ht['sales_total'] ?? 0);
+                $histRow['report_sales_count'] = (int)($ht['sales_count'] ?? 0);
+                $histRow['report_cash_sales'] = (float)($ht['cash_sales'] ?? 0);
+                $histRow['report_expenses'] = (float)($ht['expenses'] ?? 0);
+                $histRow['report_expected_cash'] = (float)(
+                    $histRow['expected_amount']
+                    ?? $ht['expected_cash']
+                    ?? 0
+                );
+                $payLabels = [];
+                foreach (($ht['payment_breakdown'] ?? []) as $code => $pb) {
+                    $payLabels[] = [
+                        'code' => (string)$code,
+                        'label' => (string)($pb['label'] ?? $code),
+                        'total' => round((float)($pb['total'] ?? 0), 2),
+                        'count' => (int)($pb['count'] ?? 0),
+                    ];
+                }
+                $histRow['report_payments'] = $payLabels;
+            } catch (\Throwable $e) {
+                $histRow['report_sales_total'] = null;
+                $histRow['report_sales_count'] = 0;
+                $histRow['report_cash_sales'] = null;
+                $histRow['report_expenses'] = null;
+                $histRow['report_expected_cash'] = isset($histRow['expected_amount'])
+                    ? (float)$histRow['expected_amount']
+                    : null;
+                $histRow['report_payments'] = [];
+            }
+        }
+        unset($histRow);
 
         $posCustomers = [];
         $paymentMethods = [];
         $recentProducts = [];
         $offerProducts = [];
+        $suggestedCombos = [];
         $consignmentProducts = [];
         $operationalCats = [];
         $financialCats = [];
@@ -339,6 +401,11 @@ class TenantCajaController extends TenantController
                     );
                 }
                 unset($op);
+                try {
+                    $suggestedCombos = (new \SoftNova\Services\ProductComboService($this->db))->listAvailable(6);
+                } catch (\Throwable $e) {
+                    $suggestedCombos = [];
+                }
                 // Últimos 5 productos vendidos (por fecha de venta más reciente).
                 $recentProducts = $this->query(
                     "SELECT p.id, p.name, p.code, p.sale_price, COALESCE(p.wholesale_price, 0) AS wholesale_price,
@@ -572,6 +639,7 @@ class TenantCajaController extends TenantController
             'paymentMethods' => $paymentMethods,
             'recentProducts' => $recentProducts,
             'offerProducts' => $offerProducts,
+            'suggestedCombos' => $suggestedCombos,
             'consignmentProducts' => $consignmentProducts,
             'operationalCats' => $operationalCats,
             'financialCats' => $financialCats,
@@ -924,6 +992,107 @@ class TenantCajaController extends TenantController
             'has_more' => ($offset + $fetched) < (int)($total ?? ($offset + $fetched)),
         ]);
     }
+
+    private function listCombos(): void
+    {
+        TenantMiddleware::authorize('caja');
+        $svc = new \SoftNova\Services\ProductComboService($this->db);
+        $all = $this->request->get('all') === '1';
+        $combos = $all ? $svc->listCombos(true, 100) : $svc->listAvailable(50);
+        $this->json([
+            'success' => true,
+            'combos' => $combos,
+            'reasons' => \SoftNova\Services\ProductComboService::REASONS,
+        ]);
+    }
+
+    private function getCombo(): void
+    {
+        TenantMiddleware::authorize('caja');
+        $id = (int)$this->request->get('id', 0);
+        $svc = new \SoftNova\Services\ProductComboService($this->db);
+        $combo = $svc->getCombo($id, true);
+        if (!$combo) {
+            $this->json(['success' => false, 'message' => 'Combo no encontrado'], 404);
+            return;
+        }
+        $this->json(['success' => true, 'combo' => $combo]);
+    }
+
+    private function expandCombo(): void
+    {
+        TenantMiddleware::authorize('caja');
+        $id = (int)$this->request->get('id', 0);
+        $packs = max(1, min(99, (int)$this->request->get('packs', 1)));
+        $override = $this->request->get('price', null);
+        $overridePrice = ($override !== null && $override !== '')
+            ? round((float)$override, 2)
+            : null;
+        $svc = new \SoftNova\Services\ProductComboService($this->db);
+        $result = $svc->expandForSale($id, $packs, $overridePrice);
+        if (empty($result['ok'])) {
+            $this->json(['success' => false, 'message' => (string)($result['message'] ?? 'No se pudo aplicar el combo')]);
+            return;
+        }
+        $this->json([
+            'success' => true,
+            'message' => 'Combo listo para la venta',
+            'combo' => $result['combo'] ?? null,
+            'lines' => $result['lines'] ?? [],
+            'combo_price' => $result['combo_price'] ?? 0,
+            'retail_sum' => $result['retail_sum'] ?? 0,
+        ]);
+    }
+
+    private function saveCombo(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/caja')) {
+            return;
+        }
+        $itemsRaw = $this->request->post('items', []);
+        if (!is_array($itemsRaw)) {
+            $itemsRaw = [];
+        }
+        // FormData plano items[0][product_id]
+        if ($itemsRaw === [] && isset($_POST['items']) && is_array($_POST['items'])) {
+            $itemsRaw = $_POST['items'];
+        }
+        $data = [
+            'name' => (string)$this->request->post('name', ''),
+            'sale_price' => \SoftNova\Core\parse_money($this->request->post('sale_price', 0)),
+            'reason' => (string)$this->request->post('reason', 'promocion'),
+            'reason_note' => (string)$this->request->post('reason_note', ''),
+            'valid_from' => (string)$this->request->post('valid_from', ''),
+            'valid_until' => (string)$this->request->post('valid_until', ''),
+            'notes' => (string)$this->request->post('notes', ''),
+            'items' => $itemsRaw,
+        ];
+        $comboId = (int)$this->request->post('id', 0);
+        $userId = (int)($_SESSION['tenant_user_id'] ?? 0);
+        $svc = new \SoftNova\Services\ProductComboService($this->db);
+        $result = $svc->saveCombo($data, $userId ?: null, $comboId > 0 ? $comboId : null);
+        $this->json([
+            'success' => !empty($result['ok']),
+            'message' => (string)($result['message'] ?? ''),
+            'combo' => $result['combo'] ?? null,
+            'csrf_token' => \SoftNova\Core\csrf_token(),
+        ], !empty($result['ok']) ? 200 : 422);
+    }
+
+    private function deleteCombo(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/caja')) {
+            return;
+        }
+        $id = (int)$this->request->post('id', 0);
+        $svc = new \SoftNova\Services\ProductComboService($this->db);
+        $ok = $svc->deactivate($id);
+        $this->json([
+            'success' => $ok,
+            'message' => $ok ? 'Combo archivado' : 'No se pudo archivar el combo',
+            'csrf_token' => \SoftNova\Core\csrf_token(),
+        ]);
+    }
     
     /**
      * Corrige en BD nombres/códigos con mojibake (Ã', Ã±, etc.).
@@ -1126,6 +1295,11 @@ class TenantCajaController extends TenantController
         } catch (\Throwable $e) {
             error_log('caja ConsignmentService: ' . $e->getMessage());
         }
+        try {
+            (new \SoftNova\Services\ProductComboService($this->db))->ensureSchema();
+        } catch (\Throwable $e) {
+            error_log('caja ProductComboService: ' . $e->getMessage());
+        }
     }
 
     /**
@@ -1136,62 +1310,7 @@ class TenantCajaController extends TenantController
     private function computeExpectedCash(array $session, ?string $until = null): float
     {
         $this->ensureCajaRuntimeSchema();
-
-        $sessionId = (int)$session['id'];
-        $opening = (float)($session['opening_amount'] ?? 0);
-
-        $movTotals = $this->query(
-            "SELECT
-                COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) incomes,
-                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) expenses
-             FROM cash_movements
-             WHERE cash_session_id = ?",
-            [$sessionId]
-        )->fetch() ?: ['incomes' => 0, 'expenses' => 0];
-
-        $cash = $opening + (float)$movTotals['incomes'] - (float)$movTotals['expenses'];
-
-        // Ventas/cobros en efectivo sin movimiento de caja asociado (evita doble conteo).
-        // Usa montos de sale_payments cuando existen; fallback a total solo en contado legacy.
-        $params = [$sessionId, $sessionId, (string)($session['opening_date'] ?? '')];
-        $untilSql = '';
-        if ($until) {
-            $untilSql = ' AND s.sale_date <= ?';
-            $params[] = $until;
-        }
-
-        $orphanCashSales = $this->query(
-            "SELECT COALESCE(SUM(paid_cash), 0) FROM (
-                SELECT s.id,
-                       COALESCE((
-                           SELECT SUM(sp.amount)
-                           FROM sale_payments sp
-                           WHERE sp.sale_id = s.id
-                             AND COALESCE(sp.payment_method, '') IN ('cash', '')
-                       ), CASE
-                           WHEN COALESCE(s.payment_method, 'cash') IN ('cash', '')
-                                AND s.payment_status = 'paid'
-                                AND COALESCE(s.payment_terms, 'cash') = 'cash'
-                                AND NOT EXISTS (SELECT 1 FROM sale_payments sp2 WHERE sp2.sale_id = s.id)
-                           THEN s.total
-                           ELSE 0
-                       END) AS paid_cash
-                FROM sales s
-                WHERE s.status != 'cancelled'
-                  AND s.id NOT IN (
-                       SELECT COALESCE(reference_id, 0) FROM cash_movements
-                       WHERE cash_session_id = ? AND reference_type = 'sale'
-                  )
-                  AND s.id NOT IN (
-                       SELECT COALESCE(reference_id, 0) FROM cash_movements
-                       WHERE cash_session_id = ? AND reference_type = 'sale_payment'
-                  )
-                  AND s.sale_date >= ?" . $untilSql . "
-             ) orphan",
-            $params
-        )->fetchColumn();
-
-        return round($cash + (float)$orphanCashSales, 2);
+        return (new \SoftNova\Services\CashService($this->db))->expectedCashForSession($session, $until);
     }
 
     /** El asiento del arqueo no debe impedir el cierre de la caja. */
@@ -1579,12 +1698,14 @@ class TenantCajaController extends TenantController
 
         try {
             $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
+            // Costo/utilidad solo visibles en Detalle (admin + icono ojo); el PDF no los incluye.
             $content = $pdf->generateCashClosing(
                 $report['session'],
                 $report['movements'],
                 $report['totals'],
                 $report['sales'],
-                $report['admin_expenses'] ?? []
+                $report['admin_expenses'] ?? [],
+                false
             );
             $pdf->download($content, 'Cierre_Caja_' . $id . '_' . date('Ymd_His') . '.pdf');
         } catch (\Throwable $e) {
@@ -1594,6 +1715,120 @@ class TenantCajaController extends TenantController
             echo 'No se pudo generar el PDF: ' . $e->getMessage();
             exit;
         }
+    }
+
+    /**
+     * Detalle JSON del cierre (para modal en pantalla antes de PDF/correo).
+     */
+    private function reportDetailJson(): void
+    {
+        TenantMiddleware::authorize('caja');
+        $id = (int)$this->request->get('id', 0);
+        $report = $this->loadClosingReport($id);
+        if ($report === null) {
+            $this->json(['success' => false, 'message' => 'Sesión de caja no encontrada']);
+            return;
+        }
+
+        $session = $report['session'];
+        $totals = $report['totals'];
+        $recon = $totals['reconciliation']
+            ?? \SoftNova\Services\CashClosingReportBuilder::buildReconciliation($totals, $session);
+
+        $opening = (float)($session['opening_amount'] ?? 0);
+        $cashSales = (float)($totals['cash_sales'] ?? 0);
+        $otherCash = (float)($totals['other_cash_incomes'] ?? 0);
+        $expenses = (float)($totals['expenses'] ?? 0);
+        $expected = (float)($totals['expected_cash'] ?? $session['expected_amount'] ?? 0);
+        $counted = (float)($totals['counted_cash'] ?? $session['closing_amount'] ?? 0);
+        $diff = (float)($totals['difference'] ?? ($counted - $expected));
+        $salesTotal = (float)($totals['sales_total'] ?? 0);
+        $salesCount = (int)($totals['sales_count'] ?? 0);
+
+        $payments = [];
+        foreach (($totals['payment_breakdown'] ?? []) as $code => $row) {
+            $payments[] = [
+                'code' => (string)$code,
+                'label' => (string)($row['label'] ?? $code),
+                'total' => round((float)($row['total'] ?? 0), 2),
+                'total_fmt' => $this->formatMoney((float)($row['total'] ?? 0)),
+                'count' => (int)($row['count'] ?? 0),
+                'is_cash' => ((string)$code === 'cash'),
+            ];
+        }
+
+        $isAdmin = TenantMiddleware::getRole() === 'admin';
+        $salesPayload = [
+            'count' => $salesCount,
+            'subtotal' => (float)($totals['sales_subtotal_before_discount'] ?? 0),
+            'subtotal_fmt' => $this->formatMoney((float)($totals['sales_subtotal_before_discount'] ?? 0)),
+            'discount' => (float)($totals['sales_discount_total'] ?? 0),
+            'discount_fmt' => $this->formatMoney((float)($totals['sales_discount_total'] ?? 0)),
+            'tax' => (float)($totals['sales_tax_total'] ?? 0),
+            'tax_fmt' => $this->formatMoney((float)($totals['sales_tax_total'] ?? 0)),
+            'delivery' => (float)($totals['sales_delivery_total'] ?? 0),
+            'delivery_fmt' => $this->formatMoney((float)($totals['sales_delivery_total'] ?? 0)),
+            'total' => $salesTotal,
+            'total_fmt' => $this->formatMoney($salesTotal),
+            'collected' => (float)($totals['collected_total'] ?? 0),
+            'collected_fmt' => $this->formatMoney((float)($totals['collected_total'] ?? 0)),
+            'reconstructed_fmt' => $this->formatMoney((float)($recon['reconstructed_total'] ?? 0)),
+            'ventas_totales_con_base' => (float)($totals['ventas_totales_con_base'] ?? ($salesTotal + $opening)),
+            'ventas_totales_con_base_fmt' => $this->formatMoney(
+                (float)($totals['ventas_totales_con_base'] ?? ($salesTotal + $opening))
+            ),
+            'pay_gap' => (float)(($totals['wiring']['pay_gap'] ?? ($salesTotal - (float)($totals['collected_total'] ?? 0)))),
+            'pay_gap_fmt' => $this->formatMoney(
+                (float)(($totals['wiring']['pay_gap'] ?? ($salesTotal - (float)($totals['collected_total'] ?? 0))))
+            ),
+            'cancelled' => (float)($totals['sales_cancelled_total'] ?? 0),
+            'cancelled_fmt' => $this->formatMoney((float)($totals['sales_cancelled_total'] ?? 0)),
+            'cancelled_count' => (int)($totals['sales_cancelled_count'] ?? 0),
+        ];
+        if ($isAdmin) {
+            $salesPayload['cost'] = (float)($totals['sales_cost_total'] ?? 0);
+            $salesPayload['cost_fmt'] = $this->formatMoney((float)($totals['sales_cost_total'] ?? 0));
+            $salesPayload['gross_profit'] = (float)($totals['gross_profit'] ?? 0);
+            $salesPayload['gross_profit_fmt'] = $this->formatMoney((float)($totals['gross_profit'] ?? 0));
+            $salesPayload['gross_margin_pct'] = (float)($totals['gross_margin_pct'] ?? 0);
+        }
+
+        $this->json([
+            'success' => true,
+            'session_id' => $id,
+            'can_view_margin' => $isAdmin,
+            'user_name' => (string)($session['user_name'] ?? ''),
+            'opening_date' => !empty($session['opening_date'])
+                ? date('d/m/Y H:i', strtotime((string)$session['opening_date']))
+                : '—',
+            'closing_date' => !empty($session['closing_date'])
+                ? date('d/m/Y H:i', strtotime((string)$session['closing_date']))
+                : '—',
+            'drawer' => [
+                'opening' => $opening,
+                'opening_fmt' => $this->formatMoney($opening),
+                'cash_sales' => $cashSales,
+                'cash_sales_fmt' => $this->formatMoney($cashSales),
+                'other_cash' => $otherCash,
+                'other_cash_fmt' => $this->formatMoney($otherCash),
+                'expenses' => $expenses,
+                'expenses_fmt' => $this->formatMoney($expenses),
+                'expected' => $expected,
+                'expected_fmt' => $this->formatMoney($expected),
+                'counted' => $counted,
+                'counted_fmt' => $this->formatMoney($counted),
+                'difference' => $diff,
+                'difference_fmt' => $this->formatMoney($diff),
+                'net_day' => round($expected - $opening, 2),
+                'net_day_fmt' => $this->formatMoney($expected - $opening),
+            ],
+            'sales' => $salesPayload,
+            'payments' => $payments,
+            'payments_sum_fmt' => $this->formatMoney((float)($recon['payments_sum'] ?? 0)),
+            'reconciliation' => $recon,
+            'note' => 'El contado del cajón (efectivo) no es el total de ventas: ese total incluye transferencia, Nequi, tarjetas, etc.',
+            'pdf_url' => rtrim((string)config('app.url', ''), '/') . '/app/caja?action=pdf&id=' . $id,
+        ]);
     }
 
     /** WhatsApp con resumen del cierre (el PDF se descarga aparte). */
@@ -1670,7 +1905,8 @@ class TenantCajaController extends TenantController
                 $report['movements'],
                 $report['totals'],
                 $report['sales'],
-                $report['admin_expenses'] ?? []
+                $report['admin_expenses'] ?? [],
+                false
             );
             $temporal = tempnam(sys_get_temp_dir(), 'caja-') . '.pdf';
             file_put_contents($temporal, $content);
@@ -1687,21 +1923,36 @@ class TenantCajaController extends TenantController
                 . "Usuario: " . ($session['user_name'] ?? '') . "\n"
                 . "Apertura: {$apertura}\n"
                 . "Cierre: {$cierre}\n"
+                . "--- Cajón ---\n"
                 . "Base cajón: " . $this->formatMoney((float)($session['opening_amount'] ?? 0)) . "\n"
                 . "Efectivo ventas del día: " . $this->formatMoney((float)($report['totals']['cash_sales'] ?? 0)) . "\n"
+                . "Egresos cajón: " . $this->formatMoney((float)($report['totals']['expenses'] ?? 0)) . "\n"
                 . "Efectivo esperado en cajón: " . $this->formatMoney((float)($report['totals']['expected_cash'] ?? 0)) . "\n"
+                . "Efectivo contado: " . $this->formatMoney((float)($session['closing_amount'] ?? 0)) . "\n"
+                . "--- Ventas ---\n"
                 . "Sub-total sin descuentos: " . $this->formatMoney((float)($report['totals']['sales_subtotal_before_discount'] ?? 0)) . "\n"
                 . "Descuento total aplicado: " . $this->formatMoney((float)($report['totals']['sales_discount_total'] ?? 0)) . "\n"
+                . "IVA: " . $this->formatMoney((float)($report['totals']['sales_tax_total'] ?? 0)) . "\n"
+                . "Domicilios: " . $this->formatMoney((float)($report['totals']['sales_delivery_total'] ?? 0)) . "\n"
                 . "Ventas facturadas: " . (int)($report['totals']['sales_count'] ?? 0)
                 . " · Total: " . $this->formatMoney((float)($report['totals']['sales_total'] ?? 0)) . "\n"
                 . "Adjunto encontrará el PDF del cierre.\n";
+
+            $bodyHtml = \SoftNova\Services\CashClosingReportBuilder::buildEmailHtml(
+                $empresa,
+                $session,
+                $report['totals'],
+                fn(float $n) => $this->formatMoney($n),
+                $id
+            );
 
             $resultado = (new \SoftNova\Services\MailService($company))->send(
                 $to,
                 'Cierre de caja #' . $id . ' - ' . $empresa,
                 $body,
                 $temporal,
-                $filename
+                $filename,
+                $bodyHtml
             );
         } catch (\Throwable $e) {
             $this->respond(false, 'No se pudo enviar el correo: ' . $e->getMessage(), '/app/caja?share_close=' . $id);
@@ -1775,26 +2026,31 @@ class TenantCajaController extends TenantController
 
         try {
             $fullTotals = $this->computeSessionTotals($session, $session['closing_date'] ?? null);
-            $totals['incomes'] = $fullTotals['incomes'] ?? $totals['incomes'];
-            $totals['expenses'] = $fullTotals['expenses'] ?? $totals['expenses'];
-            $totals['payment_breakdown'] = $fullTotals['payment_breakdown'] ?? [];
-            $totals['sales_total'] = $fullTotals['sales_total'] ?? 0;
-            $totals['sales_count'] = $fullTotals['sales_count'] ?? 0;
-            $totals['sales_subtotal_before_discount'] = $fullTotals['sales_subtotal_before_discount'] ?? 0;
-            $totals['sales_discount_total'] = $fullTotals['sales_discount_total'] ?? 0;
-            $totals['expected_cash'] = $fullTotals['expected_cash'] ?? null;
-            $totals['counted_cash'] = $fullTotals['counted_cash'] ?? null;
-            $totals['difference'] = $fullTotals['difference'] ?? null;
+            $totals = array_merge($totals, $fullTotals);
         } catch (\Throwable $e) {
-            $totals['payment_breakdown'] = [];
+            $totals['payment_breakdown'] = $totals['payment_breakdown'] ?? [];
+        }
+
+        // Preferir arqueo guardado al cerrar (evita recalcular con otra ventana horaria).
+        if (isset($session['expected_amount']) && $session['expected_amount'] !== null) {
+            $totals['expected_cash'] = round((float)$session['expected_amount'], 2);
+        }
+        if (isset($session['closing_amount']) && $session['closing_amount'] !== null) {
+            $totals['counted_cash'] = round((float)$session['closing_amount'], 2);
+        }
+        if (isset($session['difference_amount']) && $session['difference_amount'] !== null) {
+            $totals['difference'] = round((float)$session['difference_amount'], 2);
         }
 
         $sales = [];
         try {
             $sales = $this->salesForCashSessionReport($session);
+            $sales = \SoftNova\Services\CashClosingReportBuilder::attachSaleAdjustments($this->db, $sales);
         } catch (\Throwable $e) {
             $sales = [];
         }
+
+        $totals['reconciliation'] = \SoftNova\Services\CashClosingReportBuilder::buildReconciliation($totals, $session);
 
         return [
             'session' => $session,
@@ -1837,6 +2093,7 @@ class TenantCajaController extends TenantController
                 $addRows($this->query(
                     "SELECT s.id, s.invoice_number, s.sale_date, s.total, s.status, s.payment_method,
                             COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount,
+                            COALESCE(s.tax, 0) AS tax, COALESCE(s.delivery_fee, 0) AS delivery_fee,
                             COALESCE(c.name, 'Publico general') as customer_name
                      FROM sales s
                      LEFT JOIN customers c ON s.customer_id = c.id
@@ -1849,6 +2106,7 @@ class TenantCajaController extends TenantController
                 $addRows($this->query(
                     "SELECT s.id, s.invoice_number, s.sale_date, s.total, s.status, s.payment_method,
                             COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount,
+                            COALESCE(s.tax, 0) AS tax, COALESCE(s.delivery_fee, 0) AS delivery_fee,
                             COALESCE(c.name, 'Publico general') as customer_name
                      FROM sales s
                      LEFT JOIN customers c ON s.customer_id = c.id
@@ -1865,12 +2123,13 @@ class TenantCajaController extends TenantController
             $addRows($this->query(
                 "SELECT s.id, s.invoice_number, s.sale_date, s.total, s.status, s.payment_method,
                         COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount,
+                        COALESCE(s.tax, 0) AS tax, COALESCE(s.delivery_fee, 0) AS delivery_fee,
                         COALESCE(c.name, 'Publico general') as customer_name
                  FROM cash_movements cm
                  INNER JOIN sales s ON s.id = cm.reference_id
                  LEFT JOIN customers c ON s.customer_id = c.id
                  WHERE cm.cash_session_id = ?
-                   AND cm.reference_type IN ('sale', 'sale_cancel')
+                   AND cm.reference_type IN ('sale', 'sale_cancel', 'sale_payment_adjust')
                    AND COALESCE(s.status, '') <> 'cancelled'",
                 [$sessionId]
             )->fetchAll() ?: []);
@@ -1878,13 +2137,14 @@ class TenantCajaController extends TenantController
             $addRows($this->query(
                 "SELECT s.id, s.invoice_number, s.sale_date, s.total, s.status, s.payment_method,
                         COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount,
+                        COALESCE(s.tax, 0) AS tax, COALESCE(s.delivery_fee, 0) AS delivery_fee,
                         COALESCE(c.name, 'Publico general') as customer_name
                  FROM cash_movements cm
                  INNER JOIN sale_payments sp ON sp.id = cm.reference_id
                  INNER JOIN sales s ON s.id = sp.sale_id
                  LEFT JOIN customers c ON s.customer_id = c.id
                  WHERE cm.cash_session_id = ?
-                   AND cm.reference_type IN ('sale_payment', 'sale_payment_adjust')
+                   AND cm.reference_type = 'sale_payment'
                    AND COALESCE(s.status, '') <> 'cancelled'",
                 [$sessionId]
             )->fetchAll() ?: []);
@@ -2000,9 +2260,53 @@ class TenantCajaController extends TenantController
         $cashSvc = new \SoftNova\Services\CashService($this->db);
         $movTotals = $cashSvc->totalsForSession($sessionId);
 
-        // Base cajón (efectivo): movimientos de caja + ventas cash legacy sin movimiento.
-        $cashIncomes = (float)$movTotals['incomes'];
-        $expenses = (float)$movTotals['expenses'];
+        // Clasificar movimientos: los de venta (incl. ajuste de medio) no deben
+        // inflar "otros ingresos efectivo" ni "egresos" del resumen de cuadre.
+        $saleLinkedIncome = 0.0;
+        $saleLinkedExpense = 0.0;
+        $paymentAdjustExpense = 0.0;
+        $manualCashIncomes = 0.0;
+        try {
+            $byRef = $this->query(
+                "SELECT type, COALESCE(reference_type, '') AS reference_type,
+                        COALESCE(SUM(amount), 0) AS total
+                 FROM cash_movements
+                 WHERE cash_session_id = ?
+                 GROUP BY type, COALESCE(reference_type, '')",
+                [$sessionId]
+            )->fetchAll() ?: [];
+            $saleTypes = \SoftNova\Services\CashService::SALE_CASH_REF_TYPES;
+            $revTypes = \SoftNova\Services\CashService::EXPENSE_REVERSAL_TYPES;
+            foreach ($byRef as $br) {
+                $t = (string)($br['type'] ?? '');
+                $rt = (string)($br['reference_type'] ?? '');
+                $amt = round((float)($br['total'] ?? 0), 2);
+                if ($amt < 0.009) {
+                    continue;
+                }
+                if (in_array($rt, $saleTypes, true)) {
+                    if ($t === 'income') {
+                        $saleLinkedIncome = round($saleLinkedIncome + $amt, 2);
+                    } elseif ($t === 'expense') {
+                        $saleLinkedExpense = round($saleLinkedExpense + $amt, 2);
+                        if ($rt === 'sale_payment_adjust') {
+                            $paymentAdjustExpense = round($paymentAdjustExpense + $amt, 2);
+                        }
+                    }
+                    continue;
+                }
+                if ($t === 'income' && !in_array($rt, $revTypes, true)) {
+                    $manualCashIncomes = round($manualCashIncomes + $amt, 2);
+                }
+            }
+        } catch (\Throwable $e) {
+            $manualCashIncomes = max(0.0, (float)$movTotals['incomes'] - $saleLinkedIncome);
+        }
+
+        // Egresos de cajón para KPI/cuadre: sin movimientos ligados a ventas
+        // (ajustes de medio, cancelaciones). Esos ya se reflejan en el desglose
+        // actual de medios y en expected_cash (neto de movimientos).
+        $expenses = round(max(0.0, (float)$movTotals['expenses'] - $saleLinkedExpense), 2);
         $movementsCount = (int)$movTotals['movements_count'];
 
         $movements = $this->query(
@@ -2017,9 +2321,10 @@ class TenantCajaController extends TenantController
             if ($rid <= 0) {
                 continue;
             }
-            if (in_array($rt, ['sale', 'sale_cancel'], true)) {
+            if (in_array($rt, ['sale', 'sale_cancel', 'sale_payment_adjust'], true)) {
+                // sale_payment_adjust guarda sale_id (no id de sale_payments).
                 $coveredSaleIds[$rid] = true;
-            } elseif (in_array($rt, ['sale_payment', 'sale_payment_adjust'], true)) {
+            } elseif ($rt === 'sale_payment') {
                 $paymentRefIds[$rid] = true;
             }
         }
@@ -2042,14 +2347,21 @@ class TenantCajaController extends TenantController
             }
         }
 
-        // Ventas del periodo: por sale_date de la sesión + ventas ligadas a esta caja
-        // (cubre cobros nocturnos mal fechados por UTC en el cliente).
+        // Ventas del periodo:
+        // - "nacidas" en la ventana (sale_date): cuentan en facturado (sales_total)
+        // - solo ligadas por cobro/ajuste de ESTA sesión: no inflan facturado;
+        //   solo aportan el cobro de la sesión al desglose de medios.
         $salesById = [];
-        $mergeSales = static function (array $rows) use (&$salesById): void {
+        $bornSaleIds = [];
+        $mergeSales = static function (array $rows, bool $asBorn = false) use (&$salesById, &$bornSaleIds): void {
             foreach ($rows as $row) {
                 $id = (int)($row['id'] ?? 0);
-                if ($id > 0) {
-                    $salesById[$id] = $row;
+                if ($id <= 0) {
+                    continue;
+                }
+                $salesById[$id] = $row;
+                if ($asBorn) {
+                    $bornSaleIds[$id] = true;
                 }
             }
         };
@@ -2058,90 +2370,146 @@ class TenantCajaController extends TenantController
             try {
                 if ($until) {
                     $mergeSales($this->query(
-                        "SELECT id, total, status, payment_method, payment_status,
-                                COALESCE(subtotal, 0) AS subtotal, COALESCE(discount, 0) AS discount
+                        "SELECT id, total, status, payment_method, payment_status, sale_date,
+                                COALESCE(subtotal, 0) AS subtotal, COALESCE(discount, 0) AS discount,
+                                COALESCE(tax, 0) AS tax, COALESCE(delivery_fee, 0) AS delivery_fee
                          FROM sales WHERE sale_date >= ? AND sale_date <= ?",
                         [$openingDate, $until]
-                    )->fetchAll() ?: []);
+                    )->fetchAll() ?: [], true);
                 } else {
                     $mergeSales($this->query(
-                        "SELECT id, total, status, payment_method, payment_status,
-                                COALESCE(subtotal, 0) AS subtotal, COALESCE(discount, 0) AS discount
+                        "SELECT id, total, status, payment_method, payment_status, sale_date,
+                                COALESCE(subtotal, 0) AS subtotal, COALESCE(discount, 0) AS discount,
+                                COALESCE(tax, 0) AS tax, COALESCE(delivery_fee, 0) AS delivery_fee
                          FROM sales WHERE sale_date >= ?",
                         [$openingDate]
-                    )->fetchAll() ?: []);
+                    )->fetchAll() ?: [], true);
                 }
             } catch (\Throwable $e) {
-                // Esquema sin subtotal/discount
                 if ($until) {
                     $mergeSales($this->query(
-                        "SELECT id, total, status, payment_method, payment_status
+                        "SELECT id, total, status, payment_method, payment_status, sale_date
                          FROM sales WHERE sale_date >= ? AND sale_date <= ?",
                         [$openingDate, $until]
-                    )->fetchAll() ?: []);
+                    )->fetchAll() ?: [], true);
                 } else {
                     $mergeSales($this->query(
-                        "SELECT id, total, status, payment_method, payment_status
+                        "SELECT id, total, status, payment_method, payment_status, sale_date
                          FROM sales WHERE sale_date >= ?",
                         [$openingDate]
-                    )->fetchAll() ?: []);
+                    )->fetchAll() ?: [], true);
                 }
             }
         }
 
+        $sessionPaymentIds = $paymentRefIds; // id pago => true (movimientos sale_payment de esta sesión)
         if ($sessionId > 0) {
             try {
                 $mergeSales($this->query(
-                    "SELECT s.id, s.total, s.status, s.payment_method, s.payment_status,
-                            COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount
+                    "SELECT s.id, s.total, s.status, s.payment_method, s.payment_status, s.sale_date,
+                            COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount,
+                            COALESCE(s.tax, 0) AS tax, COALESCE(s.delivery_fee, 0) AS delivery_fee
                      FROM cash_movements cm
                      INNER JOIN sales s ON s.id = cm.reference_id
                      WHERE cm.cash_session_id = ?
-                       AND cm.reference_type IN ('sale', 'sale_cancel')",
+                       AND cm.reference_type IN ('sale', 'sale_cancel', 'sale_payment_adjust')",
                     [$sessionId]
-                )->fetchAll() ?: []);
+                )->fetchAll() ?: [], false);
+                // Venta con movimiento 'sale' en esta sesión = nace aquí a efectos de facturado.
+                $saleMovIds = $this->query(
+                    "SELECT DISTINCT reference_id FROM cash_movements
+                     WHERE cash_session_id = ? AND reference_type = 'sale' AND reference_id > 0",
+                    [$sessionId]
+                )->fetchAll(\PDO::FETCH_COLUMN) ?: [];
+                foreach ($saleMovIds as $sid) {
+                    $sid = (int)$sid;
+                    if ($sid > 0) {
+                        $bornSaleIds[$sid] = true;
+                    }
+                }
                 $mergeSales($this->query(
-                    "SELECT s.id, s.total, s.status, s.payment_method, s.payment_status,
-                            COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount
+                    "SELECT s.id, s.total, s.status, s.payment_method, s.payment_status, s.sale_date,
+                            COALESCE(s.subtotal, 0) AS subtotal, COALESCE(s.discount, 0) AS discount,
+                            COALESCE(s.tax, 0) AS tax, COALESCE(s.delivery_fee, 0) AS delivery_fee
                      FROM cash_movements cm
                      INNER JOIN sale_payments sp ON sp.id = cm.reference_id
                      INNER JOIN sales s ON s.id = sp.sale_id
                      WHERE cm.cash_session_id = ?
-                       AND cm.reference_type IN ('sale_payment', 'sale_payment_adjust')",
+                       AND cm.reference_type = 'sale_payment'",
                     [$sessionId]
-                )->fetchAll() ?: []);
+                )->fetchAll() ?: [], false);
             } catch (\Throwable $e) {
                 // ignore
             }
         }
 
         $sales = array_values($salesById);
+
+        // Cobros del desglose:
+        // - ventas nacidas: todos sus sale_payments (medios actuales de la factura del día)
+        // - solo abono a factura vieja: únicamente los pagos con movimiento en ESTA sesión
         $payRows = [];
-        if ($salesById !== []) {
-            $saleIdList = array_keys($salesById);
-            $ph = implode(',', array_fill(0, count($saleIdList), '?'));
+        $bornIdList = array_keys($bornSaleIds);
+        if ($bornIdList !== []) {
+            $ph = implode(',', array_fill(0, count($bornIdList), '?'));
             try {
                 $payRows = $this->query(
-                    "SELECT sp.payment_method, sp.amount
+                    "SELECT sp.id, sp.sale_id, sp.payment_method, sp.amount
                      FROM sale_payments sp
                      INNER JOIN sales s ON s.id = sp.sale_id
                      WHERE sp.sale_id IN ({$ph})
                        AND COALESCE(s.status, '') <> 'cancelled'",
-                    $saleIdList
+                    $bornIdList
                 )->fetchAll() ?: [];
             } catch (\Throwable $e) {
                 $payRows = [];
             }
         }
+        $sessionPayIdList = array_keys($sessionPaymentIds);
+        if ($sessionPayIdList !== []) {
+            $ph = implode(',', array_fill(0, count($sessionPayIdList), '?'));
+            try {
+                $extraPays = $this->query(
+                    "SELECT sp.id, sp.sale_id, sp.payment_method, sp.amount
+                     FROM sale_payments sp
+                     INNER JOIN sales s ON s.id = sp.sale_id
+                     WHERE sp.id IN ({$ph})
+                       AND COALESCE(s.status, '') <> 'cancelled'",
+                    $sessionPayIdList
+                )->fetchAll() ?: [];
+                $seenPay = [];
+                foreach ($payRows as $pr) {
+                    $seenPay[(int)($pr['id'] ?? 0)] = true;
+                }
+                foreach ($extraPays as $pr) {
+                    $pid = (int)($pr['id'] ?? 0);
+                    if ($pid > 0 && empty($seenPay[$pid])) {
+                        $payRows[] = $pr;
+                        $seenPay[$pid] = true;
+                    }
+                }
+            } catch (\Throwable $e) {
+                // ignore
+            }
+        }
 
-        // Ventas en efectivo/pagadas SIN movimiento de caja (legacy) → solo cajón.
+        // Facturado = solo ventas nacidas en el periodo (no facturas viejas por abono).
         $orphanCashSales = 0.0;
         $salesCount = 0;
         $salesTotal = 0.0;
         $salesDiscountTotal = 0.0;
         $salesSubtotalBeforeDiscount = 0.0;
+        $salesTaxTotal = 0.0;
+        $salesDeliveryTotal = 0.0;
+        $collectionsOnlyCount = 0;
         foreach ($sales as $sale) {
             if (($sale['status'] ?? '') === 'cancelled') {
+                continue;
+            }
+            $saleId = (int)$sale['id'];
+            $isBorn = isset($bornSaleIds[$saleId]);
+            if (!$isBorn) {
+                $collectionsOnlyCount++;
                 continue;
             }
             $salesCount++;
@@ -2150,12 +2518,12 @@ class TenantCajaController extends TenantController
             $disc = round((float)($sale['discount'] ?? 0), 2);
             $sub = round((float)($sale['subtotal'] ?? 0), 2);
             if ($sub <= 0.009) {
-                // Instalaciones viejas o filas sin subtotal: reconstruir bruto ≈ total + descuento.
                 $sub = round($saleTotal + max(0.0, $disc), 2);
             }
             $salesDiscountTotal += max(0.0, $disc);
             $salesSubtotalBeforeDiscount += max(0.0, $sub);
-            $saleId = (int)$sale['id'];
+            $salesTaxTotal += max(0.0, round((float)($sale['tax'] ?? 0), 2));
+            $salesDeliveryTotal += max(0.0, round((float)($sale['delivery_fee'] ?? 0), 2));
             if (isset($coveredSaleIds[$saleId])) {
                 continue;
             }
@@ -2168,7 +2536,6 @@ class TenantCajaController extends TenantController
                 $orphanCashSales += $saleTotal;
             }
         }
-        $cashIncomes += $orphanCashSales;
 
         $paymentBreakdown = [];
         if ($payRows !== []) {
@@ -2185,9 +2552,13 @@ class TenantCajaController extends TenantController
                 $paymentBreakdown[$methodCode]['count']++;
             }
         } else {
-            // Fallback: ventas sin filas de pago (instalaciones viejas).
+            // Fallback: ventas nacidas sin filas de pago (instalaciones viejas).
             foreach ($sales as $sale) {
                 if (($sale['status'] ?? '') === 'cancelled') {
+                    continue;
+                }
+                $saleId = (int)$sale['id'];
+                if (!isset($bornSaleIds[$saleId])) {
                     continue;
                 }
                 $methodCode = \SoftNova\Services\PaymentMethodCatalog::normalize((string)($sale['payment_method'] ?? 'cash'));
@@ -2205,14 +2576,16 @@ class TenantCajaController extends TenantController
 
         // Cobros en medios que NO entran al cajón (Nequi, transferencia, tarjetas, etc.).
         $otherIncomes = 0.0;
+        $collectedTotal = 0.0;
         foreach ($paymentBreakdown as $code => $row) {
+            $amt = (float)($row['total'] ?? 0);
+            $collectedTotal = round($collectedTotal + $amt, 2);
             if (!\SoftNova\Services\PaymentMethodCatalog::affectsCash((string)$code)) {
-                $otherIncomes += (float)($row['total'] ?? 0);
+                $otherIncomes += $amt;
             }
         }
 
-        // Gastos fuera de cajón (transferencia/tarjeta/contables): informativos, NO inflan
-        // el KPI "Egresos" ni el balance de caja (el arqueo usa solo movimientos reales).
+        // Gastos fuera de cajón: informativos (no inflan KPI egresos).
         $expenseParams = [$openingDate];
         $expenseUntilSql = '';
         if ($until) {
@@ -2234,9 +2607,21 @@ class TenantCajaController extends TenantController
         } catch (\Throwable $e) {
             $orphanExpenses = 0.0;
         }
-        // No sumar orphanExpenses a $expenses (regresión: desalineaba KPI vs cajón).
+        unset($orphanExpenses); // reservado / no suma al KPI
 
-        $incomes = $cashIncomes + $otherIncomes;
+        // Efectivo de ventas (medios) + ingresos manuales de cajón.
+        $cashSalesFromPayments = 0.0;
+        foreach ($paymentBreakdown as $code => $row) {
+            if (\SoftNova\Services\PaymentMethodCatalog::affectsCash((string)$code)) {
+                $cashSalesFromPayments = round($cashSalesFromPayments + (float)($row['total'] ?? 0), 2);
+            }
+        }
+        $cashSales = $cashSalesFromPayments;
+
+        $otherCashIncomes = round(max(0.0, $manualCashIncomes), 2);
+        $cashIncomes = round($cashSales + $otherCashIncomes, 2);
+        // Ingresos del día = cobros (todos los medios) + ingresos manuales de caja.
+        $incomes = round($collectedTotal + $otherCashIncomes, 2);
 
         // Redondear totales y orden preferido (efectivo / billeteras / tarjetas primero).
         $preferred = [
@@ -2261,29 +2646,109 @@ class TenantCajaController extends TenantController
         $incomes = round($incomes, 2);
         $expenses = round($expenses, 2);
         $otherIncomes = round($otherIncomes, 2);
-        $cashSales = round((float)($paymentBreakdown['cash']['total'] ?? 0), 2);
-        $expectedCash = $this->computeExpectedCash($session, $until);
-        $otherCashIncomes = round(max(0.0, $cashIncomes - $cashSales), 2);
+        $cashSales = round($cashSales, 2);
+        // Una sola fuente de verdad para el cajón (misma que closeCash).
+        $expectedCash = $cashSvc->expectedCashForSession($session, $until);
+        $balance = $expectedCash;
+
+        // Costo de mercancía / utilidad bruta (solo ventas facturadas del periodo).
+        $salesCostTotal = 0.0;
+        $activeSaleIds = $bornIdList;
+        if ($activeSaleIds !== []) {
+            $costPh = implode(',', array_fill(0, count($activeSaleIds), '?'));
+            try {
+                $hasUnitCost = (bool)$this->query("SHOW COLUMNS FROM sale_items LIKE 'unit_cost'")->fetch();
+                $hasDocHidden = (bool)$this->query("SHOW COLUMNS FROM sale_items LIKE 'document_hidden'")->fetch();
+                $costExpr = $hasUnitCost
+                    ? 'COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)'
+                    : 'COALESCE(p.purchase_price, 0)';
+                $hideSql = $hasDocHidden ? ' AND COALESCE(si.document_hidden, 0) = 0' : '';
+                $salesCostTotal = (float)$this->query(
+                    "SELECT COALESCE(SUM(si.quantity * {$costExpr}), 0)
+                     FROM sale_items si
+                     LEFT JOIN products p ON p.id = si.product_id
+                     INNER JOIN sales s ON s.id = si.sale_id
+                     WHERE si.sale_id IN ({$costPh})
+                       AND COALESCE(s.status, '') <> 'cancelled'{$hideSql}",
+                    $activeSaleIds
+                )->fetchColumn();
+            } catch (\Throwable $e) {
+                $salesCostTotal = 0.0;
+            }
+        }
+        $salesCostTotal = round($salesCostTotal, 2);
+        $grossProfit = round($salesTotal - $salesCostTotal, 2);
+        $grossMarginPct = $salesTotal > 0.009
+            ? round(($grossProfit / $salesTotal) * 100, 2)
+            : 0.0;
+
+        // Ventas anuladas (informativo; no entran al total facturado).
+        $salesCancelledTotal = 0.0;
+        $salesCancelledCount = 0;
+        if ($openingDate !== '') {
+            try {
+                if ($until) {
+                    $canc = $this->query(
+                        "SELECT COALESCE(SUM(total), 0) AS t, COUNT(*) AS c
+                         FROM sales
+                         WHERE sale_date >= ? AND sale_date <= ?
+                           AND COALESCE(status, '') = 'cancelled'",
+                        [$openingDate, $until]
+                    )->fetch() ?: [];
+                } else {
+                    $canc = $this->query(
+                        "SELECT COALESCE(SUM(total), 0) AS t, COUNT(*) AS c
+                         FROM sales
+                         WHERE sale_date >= ?
+                           AND COALESCE(status, '') = 'cancelled'",
+                        [$openingDate]
+                    )->fetch() ?: [];
+                }
+                $salesCancelledTotal = round((float)($canc['t'] ?? 0), 2);
+                $salesCancelledCount = (int)($canc['c'] ?? 0);
+            } catch (\Throwable $e) {
+                $salesCancelledTotal = 0.0;
+                $salesCancelledCount = 0;
+            }
+        }
+
+        $payGap = round($salesTotal - $collectedTotal, 2);
+        // Narrative drawer check (medios + manual − egresos KPI) vs esperado real.
+        $narrativeDrawer = round($openingAmount + $cashSales + $otherCashIncomes - $expenses, 2);
+        $drawerGap = round($expectedCash - $narrativeDrawer, 2);
 
         return [
             'incomes' => $incomes,
             'expenses' => $expenses,
             'other_incomes' => $otherIncomes,
             'cash_incomes' => round($cashIncomes, 2),
-            // Efectivo cobrado en ventas (sin incluir la base de apertura).
+            // Efectivo cobrado en ventas (desglose de medios affects_cash).
             'cash_sales' => $cashSales,
             // Ingresos en efectivo que no son venta (ajustes manuales, etc.).
             'other_cash_incomes' => $otherCashIncomes,
             'opening_amount' => round($openingAmount, 2),
             // Neto que el día aportó al cajón (esperado − base).
             'cash_day_net' => round($expectedCash - $openingAmount, 2),
-            'balance' => round($openingAmount + $cashIncomes - $expenses, 2),
+            // balance === expected_cash (misma fuente canónica del arqueo).
+            'balance' => $balance,
             'sales_count' => $salesCount,
             'sales_total' => round($salesTotal, 2),
+            // Cobrado en el periodo (Σ medios del desglose acotado a la sesión).
+            'collected_total' => round($collectedTotal, 2),
+            'collections_only_count' => $collectionsOnlyCount,
+            // Ventas facturadas + fondo de apertura (resumen ejecutivo; NO es solo facturado).
+            'ventas_totales_con_base' => round($salesTotal + $openingAmount, 2),
             // Bruto de mercancía antes del descuento de documento (todos los medios).
             'sales_subtotal_before_discount' => round($salesSubtotalBeforeDiscount, 2),
             // Descuento de documento acumulado en ventas del periodo (todos los medios).
             'sales_discount_total' => round($salesDiscountTotal, 2),
+            'sales_tax_total' => round($salesTaxTotal, 2),
+            'sales_delivery_total' => round($salesDeliveryTotal, 2),
+            'sales_cost_total' => $salesCostTotal,
+            'gross_profit' => $grossProfit,
+            'gross_margin_pct' => $grossMarginPct,
+            'sales_cancelled_total' => $salesCancelledTotal,
+            'sales_cancelled_count' => $salesCancelledCount,
             'movements_count' => $movementsCount,
             'payment_breakdown' => $paymentBreakdown,
             // Solo efectivo: es lo que debe cuadrar contra el conteo del cajón.
@@ -2294,6 +2759,14 @@ class TenantCajaController extends TenantController
             'difference' => isset($session['difference_amount']) && $session['difference_amount'] !== null
                 ? round((float)$session['difference_amount'], 2)
                 : null,
+            'wiring' => [
+                'pay_gap' => $payGap,
+                'drawer_gap' => $drawerGap,
+                'narrative_drawer' => $narrativeDrawer,
+                'orphan_cash_hint' => round($orphanCashSales, 2),
+                'sale_linked_income' => round($saleLinkedIncome, 2),
+                'sale_linked_expense' => round($saleLinkedExpense, 2),
+            ],
         ];
     }
 
@@ -2309,6 +2782,7 @@ class TenantCajaController extends TenantController
                 'cash_sales' => 0, 'other_cash_incomes' => 0, 'opening_amount' => 0, 'cash_day_net' => 0,
                 'sales_count' => 0, 'sales_total' => 0, 'movements_count' => 0,
                 'sales_subtotal_before_discount' => 0, 'sales_discount_total' => 0,
+                'sales_tax_total' => 0, 'sales_delivery_total' => 0,
                 'payment_breakdown' => [], 'expected_cash' => 0,
                 'counted_cash' => null, 'difference' => null,
             ];
@@ -2322,29 +2796,41 @@ class TenantCajaController extends TenantController
         ));
         $anchor['opening_amount'] = $opening;
 
-        // Totales de ventas/medios desde ancla; luego reemplazar ingresos/egresos de movimientos por la suma de todas las sesiones.
+        // Totales de ventas/medios desde ancla; luego alinear ingresos/egresos de cajón
+        // con la suma de sesiones sin reintroducir ajustes de medio como "otros ingresos".
         $base = $this->computeSessionTotals($anchor);
         $ids = array_map(static fn($s) => (int)$s['id'], $sessions);
         $cashSvc = new \SoftNova\Services\CashService($this->db);
         $mov = $cashSvc->totalsForSessions($ids);
-        $singleMov = $cashSvc->totalsForSession((int)$anchor['id']);
-
-        // En base, incomes = cash_incomes(movimientos ancla + orphan) + other_incomes.
-        // Sustituir solo la parte de movimientos de caja de la sesión ancla por la de todas las sesiones.
-        $otherIncomes = (float)($base['other_incomes'] ?? 0);
-        $orphanCashPart = (float)($base['cash_incomes'] ?? 0) - (float)$singleMov['incomes'];
-        $cashIncomes = (float)$mov['incomes'] + $orphanCashPart;
-        $incomes = $cashIncomes + $otherIncomes;
-
-        // expenses = solo movimientos de caja (ya no se suman orphan expenses al KPI).
-        $expenses = (float)$mov['expenses'];
-
-        $expectedCash = 0.0;
-        foreach ($sessions as $s) {
-            $expectedCash += $this->computeExpectedCash($s);
-        }
 
         $cashSales = round((float)($base['cash_sales'] ?? 0), 2);
+        $otherIncomes = round((float)($base['other_incomes'] ?? 0), 2);
+        $otherCashIncomes = round((float)($base['other_cash_incomes'] ?? 0), 2);
+        // Egresos KPI ya excluyen ajustes de medio en computeSessionTotals; para multi-sesión
+        // recalcular excluyendo sale-linked de todas las cajas abiertas.
+        $saleLinkedExpenseAll = 0.0;
+        try {
+            if ($ids !== []) {
+                $ph = implode(',', array_fill(0, count($ids), '?'));
+                $saleTypes = \SoftNova\Services\CashService::SALE_CASH_REF_TYPES;
+                $typePh = implode(',', array_fill(0, count($saleTypes), '?'));
+                $saleLinkedExpenseAll = (float)$this->query(
+                    "SELECT COALESCE(SUM(amount), 0)
+                     FROM cash_movements
+                     WHERE cash_session_id IN ({$ph})
+                       AND type = 'expense'
+                       AND reference_type IN ({$typePh})",
+                    array_merge($ids, $saleTypes)
+                )->fetchColumn();
+            }
+        } catch (\Throwable $e) {
+            $saleLinkedExpenseAll = 0.0;
+        }
+        $expenses = round(max(0.0, (float)$mov['expenses'] - $saleLinkedExpenseAll), 2);
+        $cashIncomes = round($cashSales + $otherCashIncomes, 2);
+        $incomes = round($cashSales + $otherIncomes + $otherCashIncomes, 2);
+
+        $expectedCash = $cashSvc->expectedCashForSessions($sessions);
 
         return [
             'incomes' => round($incomes, 2),
@@ -2352,19 +2838,23 @@ class TenantCajaController extends TenantController
             'other_incomes' => round($otherIncomes, 2),
             'cash_incomes' => round($cashIncomes, 2),
             'cash_sales' => $cashSales,
-            'other_cash_incomes' => round(max(0.0, $cashIncomes - $cashSales), 2),
+            'other_cash_incomes' => $otherCashIncomes,
             'opening_amount' => round($opening, 2),
             'cash_day_net' => round($expectedCash - $opening, 2),
-            'balance' => round($opening + $cashIncomes - $expenses, 2),
+            'balance' => round($expectedCash, 2),
             'sales_count' => (int)($base['sales_count'] ?? 0),
             'sales_total' => round((float)($base['sales_total'] ?? 0), 2),
+            'collected_total' => round((float)($base['collected_total'] ?? 0), 2),
             'sales_subtotal_before_discount' => round((float)($base['sales_subtotal_before_discount'] ?? 0), 2),
             'sales_discount_total' => round((float)($base['sales_discount_total'] ?? 0), 2),
+            'sales_tax_total' => round((float)($base['sales_tax_total'] ?? 0), 2),
+            'sales_delivery_total' => round((float)($base['sales_delivery_total'] ?? 0), 2),
             'movements_count' => (int)$mov['movements_count'],
             'payment_breakdown' => $base['payment_breakdown'] ?? [],
             'expected_cash' => round($expectedCash, 2),
             'counted_cash' => null,
             'difference' => null,
+            'wiring' => $base['wiring'] ?? [],
         ];
     }
 
@@ -2756,12 +3246,18 @@ class TenantCajaController extends TenantController
                 continue;
             }
 
-            if ($rt === 'sale') {
+            if ($rt === 'sale' || $rt === 'sale_cancel' || $rt === 'sale_payment_adjust') {
                 $inv = $this->query(
                     "SELECT invoice_number FROM sales WHERE id = ? LIMIT 1",
                     [$rid]
                 )->fetchColumn();
-                $mov['origin_label'] = 'Venta ' . ($inv ?: '#' . $rid);
+                if ($rt === 'sale_payment_adjust') {
+                    $mov['origin_label'] = 'Ajuste medio · ' . ($inv ?: ('#' . $rid));
+                } elseif ($rt === 'sale_cancel') {
+                    $mov['origin_label'] = 'Cancelación · ' . ($inv ?: ('#' . $rid));
+                } else {
+                    $mov['origin_label'] = 'Venta ' . ($inv ?: '#' . $rid);
+                }
                 $mov['origin_url'] = base_url('/app/ventas');
                 continue;
             }

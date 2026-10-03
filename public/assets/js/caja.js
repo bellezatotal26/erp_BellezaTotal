@@ -7,6 +7,7 @@
 
     var searchUrl = panel.getAttribute('data-search-url');
     var catalogUrl = panel.getAttribute('data-catalog-url');
+    var combosUrl = panel.getAttribute('data-combos-url') || '';
     var saleUrl = panel.getAttribute('data-sale-url');
     var syncUrl = panel.getAttribute('data-sync-url');
     var csrf = panel.getAttribute('data-csrf');
@@ -1466,8 +1467,20 @@
     setInterval(tick, 30000);
 
     function cartQty(productId) {
-        var row = items.find(function (i) { return String(i.product_id) === String(productId); });
-        return row ? row.quantity : 0;
+        var n = 0;
+        items.forEach(function (i) {
+            if (i.is_combo && i.components && i.components.length) {
+                var packs = Math.max(1, parseInt(i.quantity, 10) || 1);
+                i.components.forEach(function (c) {
+                    if (String(c.product_id) === String(productId)) {
+                        n += (Math.max(1, parseInt(c.quantity_per_pack, 10) || 1) * packs);
+                    }
+                });
+            } else if (!i.is_combo && String(i.product_id) === String(productId)) {
+                n += parseInt(i.quantity, 10) || 0;
+            }
+        });
+        return n;
     }
 
     function addProduct(p, qty) {
@@ -1696,6 +1709,10 @@
     function bumpQty(idx, delta) {
         var row = items[idx];
         if (!row) return;
+        if (row.is_combo) {
+            bumpComboPack(idx, delta);
+            return;
+        }
         var next = row.quantity + delta;
         if (next <= 0) {
             items.splice(idx, 1);
@@ -1739,9 +1756,209 @@
         applyQty(next, row.stock_oversell_reason || '', row.stock_oversell_note || '');
     }
 
+    function bumpComboPack(idx, delta) {
+        var row = items[idx];
+        if (!row || !row.is_combo) return;
+        var packs = Math.max(1, parseInt(row.quantity, 10) || 1);
+        var nextPacks = packs + delta;
+        if (nextPacks <= 0) {
+            items.splice(idx, 1);
+            renderCart();
+            return;
+        }
+        var comps = row.components || [];
+        for (var i = 0; i < comps.length; i++) {
+            var c = comps[i];
+            var per = Math.max(1, parseInt(c.quantity_per_pack, 10) || 1);
+            var need = per * nextPacks;
+            var stockCap = Math.max(0, parseInt(c.stock, 10) || 0);
+            var isService = (c.product_type || '') === 'service';
+            if (!isService && need > stockCap) {
+                if (c.is_consignment) {
+                    if (typeof showAlert === 'function') {
+                        showAlert((c.product_name || 'Producto') + ': stock consignado insuficiente para otro combo.', 'error');
+                    }
+                    return;
+                }
+                if (typeof showAlert === 'function') {
+                    showAlert(
+                        'Stock insuficiente para ' + (c.product_name || 'producto') +
+                        ' al agregar otro combo (disp. ' + stockCap + ').',
+                        'error'
+                    );
+                }
+                return;
+            }
+        }
+        row.quantity = nextPacks;
+        row.subtotal = round2((parseFloat(row.unit_price) || 0) * nextPacks);
+        row.price_manual = true;
+        renderCart();
+        if (typeof showAlert === 'function' && delta > 0) {
+            showAlert((row.combo_name || row.product_name || 'Combo') + ' ×' + nextPacks, 'info');
+        }
+    }
+
+    function round2(n) {
+        return Math.round((Number(n) || 0) * 100) / 100;
+    }
+
+    function newComboUid() {
+        return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    }
+
+    function applyComboLines(lines, meta) {
+        meta = meta || {};
+        if (!lines || !lines.length) {
+            if (typeof showAlert === 'function') showAlert('El combo no tiene productos', 'error');
+            return false;
+        }
+        var packs = Math.max(1, parseInt(meta.packs, 10) || 1);
+        var comboName = meta.combo_name || 'Combo';
+        var comboId = parseInt(meta.combo_id, 10) || 0;
+        var comboPrice = meta.combo_price != null ? round2(meta.combo_price) : 0;
+        if (comboPrice <= 0.009) {
+            lines.forEach(function (L) {
+                comboPrice = round2(comboPrice + (parseFloat(L.unit_price) || 0) * (parseInt(L.quantity, 10) || 0));
+            });
+            // lines ya vienen con qty * packs; precio total del bloque / packs
+            comboPrice = round2(comboPrice / packs);
+        }
+
+        var components = [];
+        var costSum = 0;
+        var taxRate = 0;
+        for (var i = 0; i < lines.length; i++) {
+            var L = lines[i];
+            var pid = parseInt(L.product_id, 10) || 0;
+            var qtyTotal = parseInt(L.quantity, 10) || 0;
+            if (pid <= 0 || qtyTotal <= 0) continue;
+            var perPack = Math.max(1, Math.round(qtyTotal / packs));
+            var stock = parseInt(L.stock, 10);
+            if (isNaN(stock)) stock = 0;
+            var cost = round2(L.purchase_price);
+            var isService = (L.product_type || '') === 'service';
+            if (!isService && qtyTotal > stock) {
+                if (L.is_consignment) {
+                    if (typeof showAlert === 'function') {
+                        showAlert((L.product_name || 'Producto') + ': stock consignado insuficiente', 'error');
+                    }
+                    return false;
+                }
+                if (typeof showAlert === 'function') {
+                    showAlert(
+                        'Stock insuficiente para ' + (L.product_name || 'producto') +
+                        ' (disp. ' + stock + ', combo pide ' + qtyTotal + ')',
+                        'error'
+                    );
+                }
+                return false;
+            }
+            costSum = round2(costSum + cost * perPack);
+            var tr = resolveProductTaxRate(L.tax_rate, false);
+            if (tr > taxRate) taxRate = tr;
+            components.push({
+                product_id: pid,
+                product_name: L.product_name || '',
+                code: L.code || '',
+                quantity_per_pack: perPack,
+                purchase_price: cost,
+                retail_price: round2(L.retail_price != null ? L.retail_price : L.unit_price),
+                stock: stock,
+                product_type: L.product_type || 'product',
+                is_consignment: !!L.is_consignment,
+                ownership: L.ownership || (L.is_consignment ? 'consignment' : 'owned'),
+                consignor_id: Number(L.consignor_id) || 0,
+                tax_rate: tr
+            });
+        }
+        if (components.length < 2) {
+            if (typeof showAlert === 'function') showAlert('El combo necesita al menos 2 productos válidos', 'error');
+            return false;
+        }
+        if (!assertProductPriceVsCost({
+            name: comboName,
+            sale_price: comboPrice,
+            wholesale_price: comboPrice,
+            purchase_price: costSum,
+            is_open_item: false
+        }, comboPrice)) {
+            return false;
+        }
+
+        items.push({
+            product_id: 0,
+            product_name: comboName,
+            code: '',
+            quantity: packs,
+            unit_price: comboPrice,
+            retail_price: comboPrice,
+            wholesale_price: comboPrice,
+            purchase_price: costSum,
+            subtotal: round2(comboPrice * packs),
+            tax_rate: taxRate,
+            stock: 0,
+            product_type: 'combo',
+            is_open_item: false,
+            is_combo: true,
+            is_consignment: false,
+            ownership: 'owned',
+            consignor_id: 0,
+            stock_oversell_reason: '',
+            stock_oversell_note: '',
+            price_manual: true,
+            combo_uid: newComboUid(),
+            combo_id: comboId,
+            combo_name: comboName,
+            components: components
+        });
+        renderCart();
+        if (typeof showAlert === 'function') {
+            showAlert(comboName + ' agregado como combo (' + components.length + ' productos)', 'info');
+        }
+        return true;
+    }
+
+    function fetchAndApplyCombo(comboId, packs) {
+        packs = packs || 1;
+        if (!combosUrl || !comboId) return;
+        var url = combosUrl + '?action=expandCombo&id=' + encodeURIComponent(comboId) + '&packs=' + encodeURIComponent(packs);
+        fetch(url, {
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
+            credentials: 'same-origin',
+            cache: 'no-store'
+        })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (!d || !d.success) {
+                    if (typeof showAlert === 'function') showAlert((d && d.message) || 'No se pudo aplicar el combo', 'error');
+                    return;
+                }
+                var unitCombo = d.combo_price != null
+                    ? round2((parseFloat(d.combo_price) || 0) / packs)
+                    : round2((d.combo && d.combo.sale_price) || 0);
+                applyComboLines(d.lines || [], {
+                    combo_id: (d.combo && d.combo.id) || comboId,
+                    combo_name: (d.combo && d.combo.name) || 'Combo',
+                    packs: packs,
+                    combo_price: unitCombo
+                });
+            })
+            .catch(function () {
+                if (typeof showAlert === 'function') showAlert('Error de red al cargar el combo', 'error');
+            });
+    }
+
     function setQty(idx, value) {
         var row = items[idx];
         if (!row) return;
+        if (row.is_combo) {
+            var q = parseInt(value, 10);
+            if (isNaN(q) || q < 1) q = 1;
+            var current = Math.max(1, parseInt(row.quantity, 10) || 1);
+            bumpComboPack(idx, q - current);
+            return;
+        }
         var q = parseInt(value, 10);
         if (isNaN(q) || q < 1) q = 1;
         var isService = (row.product_type || '') === 'service' || !!row.is_open_item;
@@ -1811,11 +2028,6 @@
                 applyQtyDiscountToItem(it);
                 subtotal += it.subtotal;
                 count += it.quantity;
-                var remaining = (parseInt(it.stock, 10) || 0) - it.quantity;
-                var remColor = remaining < 0 ? '#B45309' : (remaining <= 0 ? '#DC2626' : (remaining <= 5 ? '#B45309' : '#059669'));
-                var name = it.is_open_item
-                    ? it.product_name
-                    : ((it.code ? it.code + ' — ' : '') + it.product_name);
                 var oversellBadge = it.stock_oversell_reason
                     ? ' <span class="badge badge-warning" title="' + esc(it.stock_oversell_note || '') + '">Sin stock · ' + esc(oversellLabel(it.stock_oversell_reason)) + '</span>'
                     : '';
@@ -1828,19 +2040,66 @@
                 if (it.qty_discount_pct > 0) {
                     oversellBadge += ' <span class="badge badge-success" title="Descuento por cantidad (&gt;' + (it.qty_discount_min || 0) + ' uds)">-' + it.qty_discount_pct + '%</span>';
                 }
-                var stockHint = it.is_open_item
-                    ? '<span style="color:var(--color-text-secondary);">Sin inventario</span>'
-                    : '<span style="color:' + remColor + ';font-weight:600;">Restan ' + remaining + ' / ' + (it.stock || 0) + '</span>';
+
+                var nameHtml;
+                var stockHint;
+                var priceRow;
+
+                if (it.is_combo) {
+                    var comps = it.components || [];
+                    var compNames = comps.map(function (c) {
+                        return (c.quantity_per_pack > 1 ? (c.quantity_per_pack + '× ') : '') + (c.product_name || '');
+                    }).join(' · ');
+                    nameHtml = '<span class="badge badge-info">Combo</span> ' + esc(it.combo_name || it.product_name || 'Combo')
+                        + oversellBadge;
+                    var bottleneck = null;
+                    comps.forEach(function (c) {
+                        if ((c.product_type || '') === 'service') return;
+                        var need = (parseInt(c.quantity_per_pack, 10) || 1) * (parseInt(it.quantity, 10) || 1);
+                        var rem = (parseInt(c.stock, 10) || 0) - need;
+                        if (bottleneck === null || rem < bottleneck.rem) {
+                            bottleneck = { rem: rem, stock: parseInt(c.stock, 10) || 0, name: c.product_name };
+                        }
+                    });
+                    var remColor = '#059669';
+                    if (bottleneck) {
+                        remColor = bottleneck.rem < 0 ? '#B45309' : (bottleneck.rem <= 0 ? '#DC2626' : (bottleneck.rem <= 5 ? '#B45309' : '#059669'));
+                        stockHint = '<span style="color:' + remColor + ';font-weight:600;">Stock combo OK</span>'
+                            + (bottleneck.rem <= 5
+                                ? ' <span style="color:' + remColor + ';">· límite: ' + esc(bottleneck.name || '') + ' (' + bottleneck.rem + ')</span>'
+                                : '');
+                    } else {
+                        stockHint = '<span style="color:var(--color-text-secondary);">' + comps.length + ' productos</span>';
+                    }
+                    priceRow = '<div class="pos-price-row">Precio combo '
+                        + '<input type="number" min="0" step="any" class="pos-price" data-idx="' + idx + '" value="' + it.unit_price + '" title="Precio unitario del combo">'
+                        + ' · Total ' + money(it.subtotal) + '</div>'
+                        + (compNames
+                            ? '<div class="pos-combo-comp-hint" style="font-size:11px;color:var(--color-text-secondary);margin-top:2px;">Incluye: ' + esc(compNames) + '</div>'
+                            : '');
+                } else {
+                    var remaining = (parseInt(it.stock, 10) || 0) - it.quantity;
+                    var remColor2 = remaining < 0 ? '#B45309' : (remaining <= 0 ? '#DC2626' : (remaining <= 5 ? '#B45309' : '#059669'));
+                    var name = it.is_open_item
+                        ? it.product_name
+                        : ((it.code ? it.code + ' — ' : '') + it.product_name);
+                    nameHtml = esc(name) + oversellBadge;
+                    stockHint = it.is_open_item
+                        ? '<span style="color:var(--color-text-secondary);">Sin inventario</span>'
+                        : '<span style="color:' + remColor2 + ';font-weight:600;">Restan ' + remaining + ' / ' + (it.stock || 0) + '</span>';
+                    priceRow = '<div class="pos-price-row">Precio und '
+                        + '<input type="number" min="0" step="any" class="pos-price" data-idx="' + idx + '" value="' + it.unit_price + '" title="Editar precio de venta">'
+                        + ' · Total ' + money(it.subtotal) + '</div>';
+                }
+
                 var tr = document.createElement('tr');
+                if (it.is_combo) tr.className = 'pos-cart-combo-row';
                 tr.innerHTML =
-                    '<td><input type="number" min="1" class="pos-qty" data-idx="' + idx + '" value="' + it.quantity + '"></td>' +
-                    '<td><div class="pos-prod-label">' + esc(name) + oversellBadge +
-                    ' ' + stockHint + '</div>' +
-                    '<div class="pos-price-row">Precio und ' +
-                    '<input type="number" min="0" step="any" class="pos-price" data-idx="' + idx + '" value="' + it.unit_price + '" title="Editar precio de venta">' +
-                    ' · Total ' + money(it.subtotal) + '</div></td>' +
+                    '<td><input type="number" min="1" class="pos-qty" data-idx="' + idx + '" value="' + it.quantity + '" title="' + (it.is_combo ? 'Cantidad de combos' : 'Cantidad') + '"></td>' +
+                    '<td><div class="pos-prod-label">' + nameHtml +
+                    ' ' + stockHint + '</div>' + priceRow + '</td>' +
                     '<td class="pos-actions">' +
-                    '<button type="button" class="pos-btn-plus" data-idx="' + idx + '" title="Sumar">+1</button>' +
+                    '<button type="button" class="pos-btn-plus" data-idx="' + idx + '" title="' + (it.is_combo ? 'Otro combo' : 'Sumar') + '">+1</button>' +
                     '<button type="button" class="pos-btn-del" data-idx="' + idx + '" title="Quitar">&times;</button>' +
                     '</td>';
                 elBody.appendChild(tr);
@@ -2058,7 +2317,7 @@
             if (networkFailed && !opts.autoAddExact) {
                 var note = document.createElement('p');
                 note.className = 'pos-search-hint';
-                note.style.color = '#92400E';
+                note.style.color = 'var(--dmc-92400E, #92400E)';
                 note.textContent = 'Catálogo local (sin conexión)';
                 elResults.insertBefore(note, elResults.firstChild);
             }
@@ -2358,6 +2617,13 @@
         }
         var notes = 'Venta rápida desde caja';
         if (!online) notes += ' | Offline';
+        var comboNames = [];
+        items.forEach(function (it) {
+            if (it.is_combo && it.combo_name) {
+                comboNames.push(it.combo_name + (it.quantity > 1 ? ('×' + it.quantity) : ''));
+            }
+        });
+        if (comboNames.length) notes += ' | Combo: ' + comboNames.join(', ');
         if (mixed) {
             splits.forEach(function (s, i) {
                 fd.append('payment_splits[' + i + '][method]', s.method);
@@ -2404,6 +2670,34 @@
         if (cs > 0.009) fd.append('credit_surcharge', String(cs));
 
         items.forEach(function (it, i) {
+            if (it.is_combo) {
+                fd.append('items[' + i + '][is_combo]', '1');
+                fd.append('items[' + i + '][product_type]', 'combo');
+                fd.append('items[' + i + '][combo_id]', String(it.combo_id || 0));
+                fd.append('items[' + i + '][product_id]', '0');
+                fd.append('items[' + i + '][quantity]', String(it.quantity));
+                fd.append('items[' + i + '][unit_price]', String(it.unit_price));
+                fd.append('items[' + i + '][product_name]', it.combo_name || it.product_name || 'Combo');
+                fd.append('items[' + i + '][subtotal]', String(it.subtotal));
+                fd.append('items[' + i + '][price_manual]', '1');
+                fd.append('items[' + i + '][tax_rate]', String(itemTaxRate(it)));
+                var packsCombo = Math.max(1, parseInt(it.quantity, 10) || 1);
+                var compsPayload = (it.components || []).map(function (c) {
+                    var per = Math.max(1, parseInt(c.quantity_per_pack, 10) || 1);
+                    return {
+                        product_id: Number(c.product_id) || 0,
+                        quantity: per * packsCombo,
+                        quantity_per_pack: per
+                    };
+                });
+                fd.append('items[' + i + '][components_json]', JSON.stringify(compsPayload));
+                compsPayload.forEach(function (c, j) {
+                    fd.append('items[' + i + '][components][' + j + '][product_id]', String(c.product_id));
+                    fd.append('items[' + i + '][components][' + j + '][quantity]', String(c.quantity));
+                    fd.append('items[' + i + '][components][' + j + '][quantity_per_pack]', String(c.quantity_per_pack));
+                });
+                return;
+            }
             fd.append('items[' + i + '][product_id]', it.product_id);
             fd.append('items[' + i + '][quantity]', it.quantity);
             fd.append('items[' + i + '][unit_price]', it.unit_price);
@@ -2612,11 +2906,444 @@
     var pref = document.getElementById('posPrefijo');
     if (pref) pref.textContent = prefix + '…';
 
+    // —— Combos (plantillas + venta) ——
+    (function initCombos() {
+        var modal = document.getElementById('posComboModal');
+        var btnOpen = document.getElementById('posCombosBtn');
+        if (!modal || !btnOpen || !combosUrl) return;
+
+        var listPane = document.getElementById('posComboListPane');
+        var createPane = document.getElementById('posComboCreatePane');
+        var listEl = document.getElementById('posComboList');
+        var listEmpty = document.getElementById('posComboListEmpty');
+        var tabList = document.getElementById('posComboTabList');
+        var tabCreate = document.getElementById('posComboTabCreate');
+        var saveBtn = document.getElementById('posComboSaveBtn');
+        var saveApplyBtn = document.getElementById('posComboSaveAndApplyBtn');
+        var cancelBtn = document.getElementById('posComboCancelBtn');
+        var closeBtn = document.getElementById('posComboModalClose');
+        var nameEl = document.getElementById('posComboName');
+        var priceEl = document.getElementById('posComboPrice');
+        var reasonEl = document.getElementById('posComboReason');
+        var reasonNoteEl = document.getElementById('posComboReasonNote');
+        var reasonNoteWrap = document.getElementById('posComboReasonNoteWrap');
+        var fromEl = document.getElementById('posComboFrom');
+        var untilEl = document.getElementById('posComboUntil');
+        var searchEl = document.getElementById('posComboProductSearch');
+        var resultsEl = document.getElementById('posComboProductResults');
+        var itemsEl = document.getElementById('posComboItems');
+        var hintEl = document.getElementById('posComboRetailHint');
+        var fromCartBtn = document.getElementById('posComboFromCartBtn');
+
+        var draftItems = [];
+        var searchTimer = null;
+
+        function openModal() {
+            modal.style.display = 'flex';
+            showTab('list');
+            loadComboList();
+        }
+        function closeModal() {
+            modal.style.display = 'none';
+        }
+        function showTab(tab) {
+            var isCreate = tab === 'create';
+            if (listPane) listPane.style.display = isCreate ? 'none' : '';
+            if (createPane) createPane.style.display = isCreate ? '' : 'none';
+            if (saveBtn) saveBtn.style.display = isCreate ? '' : 'none';
+            if (saveApplyBtn) saveApplyBtn.style.display = isCreate ? '' : 'none';
+            if (tabList) {
+                tabList.className = 'btn btn-sm ' + (isCreate ? 'btn-secondary' : 'btn-primary');
+            }
+            if (tabCreate) {
+                tabCreate.className = 'btn btn-sm ' + (isCreate ? 'btn-primary' : 'btn-secondary');
+            }
+            if (isCreate) {
+                syncReasonNote();
+                renderDraftItems();
+            }
+        }
+
+        function syncReasonNote() {
+            if (!reasonEl || !reasonNoteWrap) return;
+            var v = reasonEl.value;
+            reasonNoteWrap.style.display = (v === 'otro' || v === 'fecha_especial' || v === 'servicio') ? '' : 'none';
+        }
+
+        function loadComboList() {
+            if (!listEl) return;
+            listEl.innerHTML = '<p class="pos-search-hint">Cargando…</p>';
+            if (listEmpty) listEmpty.style.display = 'none';
+            fetch(combosUrl + '?action=listCombos&all=1', {
+                headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
+                credentials: 'same-origin',
+                cache: 'no-store'
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (d) {
+                    var combos = (d && d.combos) ? d.combos : [];
+                    listEl.innerHTML = '';
+                    if (!combos.length) {
+                        if (listEmpty) listEmpty.style.display = '';
+                        return;
+                    }
+                    if (listEmpty) listEmpty.style.display = 'none';
+                    combos.forEach(function (c) {
+                        var row = document.createElement('div');
+                        row.className = 'pos-combo-list-row' + (c.is_available ? '' : ' is-inactive');
+                        var meta = (c.item_count || 0) + ' prod. · ' + money(c.sale_price);
+                        if (c.reason_label) meta += ' · ' + c.reason_label;
+                        if (!c.is_available) meta += ' · no vigente';
+                        if (c.times_used > 0) meta += ' · usado ' + c.times_used + '×';
+                        row.innerHTML =
+                            '<div class="pos-combo-list-info">' +
+                            '<strong>' + esc(c.name) + '</strong>' +
+                            '<span class="pos-search-hint">' + esc(meta) + '</span></div>' +
+                            '<div class="pos-combo-list-actions">' +
+                            '<button type="button" class="btn btn-success btn-sm" data-apply="' + c.id + '"' +
+                            (c.is_available ? '' : ' disabled') + '>Vender</button>' +
+                            '<button type="button" class="btn btn-secondary btn-sm" data-archive="' + c.id + '" title="Archivar">×</button>' +
+                            '</div>';
+                        listEl.appendChild(row);
+                    });
+                })
+                .catch(function () {
+                    listEl.innerHTML = '<p class="pos-search-hint">No se pudieron cargar los combos</p>';
+                });
+        }
+
+        function retailSum() {
+            var s = 0;
+            draftItems.forEach(function (it) {
+                s += (parseFloat(it.unit_price) || 0) * (parseInt(it.quantity, 10) || 0);
+            });
+            return round2(s);
+        }
+
+        function renderDraftItems() {
+            if (!itemsEl) return;
+            if (!draftItems.length) {
+                itemsEl.innerHTML = '<p class="pos-search-hint" style="margin:0;">Agregue al menos 2 productos</p>';
+            } else {
+                itemsEl.innerHTML = '';
+                draftItems.forEach(function (it, idx) {
+                    var row = document.createElement('div');
+                    row.className = 'pos-combo-draft-row';
+                    row.innerHTML =
+                        '<input type="number" min="1" max="999" class="form-control pos-combo-draft-qty" data-idx="' + idx + '" value="' + it.quantity + '" style="width:64px;">' +
+                        '<span class="pos-combo-draft-name">' + esc((it.code ? it.code + ' — ' : '') + it.product_name) +
+                        ' <small>' + money(it.unit_price) + '</small></span>' +
+                        '<button type="button" class="pos-btn-del" data-rm="' + idx + '" title="Quitar">&times;</button>';
+                    itemsEl.appendChild(row);
+                });
+            }
+            if (hintEl) {
+                var sum = retailSum();
+                var price = parseMoneyInput(priceEl ? priceEl.value : 0);
+                var msg = 'Suma lista: ' + money(sum);
+                if (price > 0.009 && sum > 0.009) {
+                    var sav = round2(sum - price);
+                    if (sav > 0.009) msg += ' · Ahorro vs lista: ' + money(sav);
+                    else if (sav < -0.009) msg += ' · Sobre precio lista: ' + money(-sav);
+                }
+                hintEl.textContent = draftItems.length ? msg : '';
+            }
+        }
+
+        function addDraftProduct(p) {
+            if (!p || !p.id) return;
+            if (typeof isOpenItemProduct === 'function' && isOpenItemProduct(p)) {
+                if (typeof showAlert === 'function') showAlert('El comodín no puede ir en un combo', 'error');
+                return;
+            }
+            var existing = draftItems.find(function (it) { return String(it.product_id) === String(p.id); });
+            if (existing) {
+                existing.quantity += 1;
+            } else {
+                draftItems.push({
+                    product_id: p.id,
+                    product_name: p.name || '',
+                    code: p.code || '',
+                    quantity: 1,
+                    unit_price: parseFloat(p.sale_price) || 0,
+                    purchase_price: productPurchaseCost(p),
+                    stock: parseInt(p.stock, 10) || 0,
+                    product_type: p.product_type || p.type || 'product',
+                    tax_rate: p.tax_rate,
+                    wholesale_price: parseFloat(p.wholesale_price) || 0
+                });
+            }
+            if (!priceEl || !String(priceEl.value || '').trim() || parseMoneyInput(priceEl.value) <= 0) {
+                // sugerir 10% menos que la suma de lista la primera vez
+                var sum = retailSum();
+                if (priceEl && sum > 0) {
+                    priceEl.value = moneyPlain(round2(sum * 0.9));
+                }
+            }
+            renderDraftItems();
+            if (searchEl) searchEl.value = '';
+            if (resultsEl) resultsEl.innerHTML = '';
+        }
+
+        function searchComboProducts(q) {
+            q = (q || '').trim();
+            if (!resultsEl) return;
+            if (q.length < 1) {
+                resultsEl.innerHTML = '';
+                return;
+            }
+            fetch(searchUrl + '&q=' + encodeURIComponent(q), {
+                headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
+                credentials: 'same-origin',
+                cache: 'no-store'
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (d) {
+                    var list = (d && d.products) ? d.products : [];
+                    resultsEl.innerHTML = '';
+                    list.slice(0, 8).forEach(function (p) {
+                        var row = document.createElement('div');
+                        row.className = 'pos-combo-search-hit';
+                        row.innerHTML = '<span>' + esc((p.code ? p.code + ' — ' : '') + p.name) +
+                            '</span><small>' + money(p.sale_price) + ' · stock ' + (p.stock || 0) + '</small>';
+                        row.addEventListener('click', function () { addDraftProduct(p); });
+                        resultsEl.appendChild(row);
+                    });
+                    if (!list.length) {
+                        resultsEl.innerHTML = '<p class="pos-search-hint">Sin resultados</p>';
+                    }
+                })
+                .catch(function () {
+                    resultsEl.innerHTML = '<p class="pos-search-hint">Error de búsqueda</p>';
+                });
+        }
+
+        function buildSavePayload() {
+            var name = nameEl ? String(nameEl.value || '').trim() : '';
+            var price = priceEl ? parseMoneyInput(priceEl.value) : 0;
+            var fd = new FormData();
+            fd.append('_token', currentCsrf());
+            fd.append('name', name);
+            fd.append('sale_price', String(price));
+            fd.append('reason', reasonEl ? reasonEl.value : 'promocion');
+            fd.append('reason_note', reasonNoteEl ? String(reasonNoteEl.value || '').trim() : '');
+            fd.append('valid_from', fromEl ? fromEl.value : '');
+            fd.append('valid_until', untilEl ? untilEl.value : '');
+            draftItems.forEach(function (it, i) {
+                fd.append('items[' + i + '][product_id]', String(it.product_id));
+                fd.append('items[' + i + '][quantity]', String(it.quantity));
+            });
+            return fd;
+        }
+
+        function saveCombo(andApply) {
+            if (draftItems.length < 2) {
+                if (typeof showAlert === 'function') showAlert('Agregue al menos 2 productos al combo', 'error');
+                return;
+            }
+            var name = nameEl ? String(nameEl.value || '').trim() : '';
+            if (name.length < 2) {
+                if (typeof showAlert === 'function') showAlert('Indique el nombre del combo', 'error');
+                return;
+            }
+            var price = priceEl ? parseMoneyInput(priceEl.value) : 0;
+            if (price < 0) {
+                if (typeof showAlert === 'function') showAlert('Precio de combo inválido', 'error');
+                return;
+            }
+            withFreshCsrf().then(function (token) {
+                var fd = buildSavePayload();
+                fd.set('_token', token || currentCsrf());
+                return fetch(combosUrl + '?action=saveCombo', {
+                    method: 'POST',
+                    body: fd,
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Accept': 'application/json',
+                        'X-CSRF-TOKEN': token || ''
+                    },
+                    credentials: 'same-origin'
+                });
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (d) {
+                    if (d && d.csrf_token && window.SeriCsrf) SeriCsrf.apply(d.csrf_token);
+                    if (!d || !d.success) {
+                        if (typeof showAlert === 'function') showAlert((d && d.message) || 'No se pudo guardar', 'error');
+                        return;
+                    }
+                    if (typeof showAlert === 'function') showAlert(d.message || 'Combo guardado', 'success');
+                    if (andApply && d.combo && d.combo.id) {
+                        closeModal();
+                        fetchAndApplyCombo(d.combo.id, 1);
+                    } else {
+                        draftItems = [];
+                        if (nameEl) nameEl.value = '';
+                        if (priceEl) priceEl.value = '';
+                        renderDraftItems();
+                        showTab('list');
+                        loadComboList();
+                    }
+                })
+                .catch(function () {
+                    if (typeof showAlert === 'function') showAlert('Error al guardar el combo', 'error');
+                });
+        }
+
+        function fillFromCart() {
+            draftItems = [];
+            var byId = {};
+            function addComp(pid, name, code, qty, unit, cost, stock, type, tax, wholesale) {
+                pid = String(pid);
+                if (!pid || pid === '0') return;
+                if (!byId[pid]) {
+                    byId[pid] = {
+                        product_id: parseInt(pid, 10),
+                        product_name: name || '',
+                        code: code || '',
+                        quantity: 0,
+                        unit_price: unit || 0,
+                        purchase_price: cost || 0,
+                        stock: stock || 0,
+                        product_type: type || 'product',
+                        tax_rate: tax,
+                        wholesale_price: wholesale || 0
+                    };
+                    draftItems.push(byId[pid]);
+                }
+                byId[pid].quantity += qty;
+            }
+            items.forEach(function (it) {
+                if (it.is_open_item) return;
+                if (it.is_combo && it.components) {
+                    var packs = Math.max(1, parseInt(it.quantity, 10) || 1);
+                    it.components.forEach(function (c) {
+                        addComp(
+                            c.product_id, c.product_name, c.code,
+                            (parseInt(c.quantity_per_pack, 10) || 1) * packs,
+                            parseFloat(c.retail_price) || 0,
+                            parseFloat(c.purchase_price) || 0,
+                            c.stock, c.product_type, c.tax_rate, 0
+                        );
+                    });
+                    return;
+                }
+                addComp(
+                    it.product_id, it.product_name, it.code,
+                    parseInt(it.quantity, 10) || 0,
+                    parseFloat(it.retail_price) || parseFloat(it.unit_price) || 0,
+                    parseFloat(it.purchase_price) || 0,
+                    it.stock, it.product_type, it.tax_rate,
+                    parseFloat(it.wholesale_price) || 0
+                );
+            });
+            if (draftItems.length < 2) {
+                if (typeof showAlert === 'function') showAlert('El carrito necesita al menos 2 productos distintos (sin comodín)', 'error');
+                draftItems = [];
+                return;
+            }
+            var sum = 0;
+            draftItems.forEach(function (it) {
+                sum += (parseFloat(it.unit_price) || 0) * (parseInt(it.quantity, 10) || 0);
+            });
+            if (priceEl) priceEl.value = moneyPlain(round2(sum));
+            if (nameEl && !String(nameEl.value || '').trim()) {
+                nameEl.value = 'Combo ' + new Date().toLocaleDateString('es-CO');
+            }
+            renderDraftItems();
+            if (typeof showAlert === 'function') showAlert('Productos del carrito cargados. Ajuste el precio y guarde.', 'info');
+        }
+
+        btnOpen.addEventListener('click', openModal);
+        if (cancelBtn) cancelBtn.addEventListener('click', closeModal);
+        if (closeBtn) closeBtn.addEventListener('click', closeModal);
+        if (tabList) tabList.addEventListener('click', function () { showTab('list'); loadComboList(); });
+        if (tabCreate) tabCreate.addEventListener('click', function () { showTab('create'); });
+        if (reasonEl) reasonEl.addEventListener('change', syncReasonNote);
+        if (saveBtn) saveBtn.addEventListener('click', function () { saveCombo(false); });
+        if (saveApplyBtn) saveApplyBtn.addEventListener('click', function () { saveCombo(true); });
+        if (fromCartBtn) fromCartBtn.addEventListener('click', fillFromCart);
+        if (priceEl) priceEl.addEventListener('input', renderDraftItems);
+
+        if (searchEl) {
+            searchEl.addEventListener('input', function () {
+                clearTimeout(searchTimer);
+                searchTimer = setTimeout(function () { searchComboProducts(searchEl.value); }, 220);
+            });
+        }
+        if (itemsEl) {
+            itemsEl.addEventListener('click', function (e) {
+                var rm = e.target.closest('[data-rm]');
+                if (!rm) return;
+                var idx = parseInt(rm.getAttribute('data-rm'), 10);
+                draftItems.splice(idx, 1);
+                renderDraftItems();
+            });
+            itemsEl.addEventListener('change', function (e) {
+                var qty = e.target.closest('.pos-combo-draft-qty');
+                if (!qty) return;
+                var idx = parseInt(qty.getAttribute('data-idx'), 10);
+                var q = parseInt(qty.value, 10);
+                if (isNaN(q) || q < 1) q = 1;
+                if (draftItems[idx]) draftItems[idx].quantity = q;
+                renderDraftItems();
+            });
+        }
+        if (listEl) {
+            listEl.addEventListener('click', function (e) {
+                var apply = e.target.closest('[data-apply]');
+                var archive = e.target.closest('[data-archive]');
+                if (apply) {
+                    closeModal();
+                    fetchAndApplyCombo(parseInt(apply.getAttribute('data-apply'), 10), 1);
+                    return;
+                }
+                if (archive) {
+                    var id = parseInt(archive.getAttribute('data-archive'), 10);
+                    if (!id || !confirm('¿Archivar este combo?')) return;
+                    withFreshCsrf().then(function (token) {
+                        var fd = new FormData();
+                        fd.append('_token', token || currentCsrf());
+                        fd.append('id', String(id));
+                        return fetch(combosUrl + '?action=deleteCombo', {
+                            method: 'POST',
+                            body: fd,
+                            headers: {
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'Accept': 'application/json',
+                                'X-CSRF-TOKEN': token || ''
+                            },
+                            credentials: 'same-origin'
+                        });
+                    })
+                        .then(function (r) { return r.json(); })
+                        .then(function (d) {
+                            if (d && d.csrf_token && window.SeriCsrf) SeriCsrf.apply(d.csrf_token);
+                            loadComboList();
+                        });
+                }
+            });
+        }
+
+        // Chips de sugerencia en el panel de búsqueda
+        var sug = document.getElementById('posComboSuggestions');
+        if (sug) {
+            sug.addEventListener('click', function (e) {
+                var btn = e.target.closest('[data-combo-id]');
+                if (!btn) return;
+                e.preventDefault();
+                var id = parseInt(btn.getAttribute('data-combo-id'), 10);
+                if (id) fetchAndApplyCombo(id, 1);
+            });
+        }
+    })();
+
     window.SoftNovaPos = {
         addProduct: addProduct,
         hasPanel: true,
         updateCashChange: updateCashChange,
-        syncCashChangeVisibility: syncCashChangeVisibility
+        syncCashChangeVisibility: syncCashChangeVisibility,
+        applyCombo: fetchAndApplyCombo
     };
 
     if (window.SoftNovaBarcode && typeof SoftNovaBarcode.onScan === 'function') {
@@ -2682,7 +3409,7 @@ function printClosing(id) {
     function setBadge(text, ok) {
         if (!badge) return;
         badge.textContent = text;
-        badge.style.color = ok === false ? '#DC2626' : 'var(--color-text-secondary)';
+        badge.style.color = ok === false ? 'var(--dmc-DC2626, #DC2626)' : 'var(--color-text-secondary)';
     }
 
     function escapeHtml(s) {

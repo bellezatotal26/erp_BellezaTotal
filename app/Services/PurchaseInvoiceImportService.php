@@ -626,7 +626,7 @@ class PurchaseInvoiceImportService
             $tax = $this->resolveLineTaxRateForDocument($kind, $applyProductVat, $current);
             $qty = round((float)($item['quantity'] ?? 0), 3);
             $cost = round((float)($item['unit_cost'] ?? 0), 2);
-            $disc = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))), 2);
+            $disc = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))));
 
             // F. Electrónica: sumar IVA al costo salvo que el Excel ya lo traiga incluido.
             if ($embedVat && $tax > 0.009 && $cost > 0 && !$vatAlreadyIncluded) {
@@ -796,7 +796,7 @@ class PurchaseInvoiceImportService
             // Auto-relacionar solo con identificadores fuertes (EAN / SKU / código / nombre exacto).
             $autoMatch = $match && (int)($match['confidence'] ?? 0) >= 80;
             $costo = round((float)($item['unit_cost'] ?? 0), 2);
-            $descuento = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))), 2);
+            $descuento = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))));
             $impuesto = round(max(0, (float)($item['tax_rate'] ?? 0)), 2);
             // F. Electrónica: costo ya trae IVA; no volver a multiplicar.
             $totalLinea = $vatInCost
@@ -2422,7 +2422,7 @@ class PurchaseInvoiceImportService
             $cantidad = round(max(0, (float)($row['quantity'] ?? 0)), 3);
             $costo = round(max(0, (float)($row['unit_cost'] ?? 0)), 2);
             $impuesto = round(max(0, min(100, (float)($row['tax_rate'] ?? 0))), 2);
-            $descuento = round(max(0, min(100, (float)($row['discount_pct'] ?? 0))), 2);
+            $descuento = round(max(0, min(100, (float)($row['discount_pct'] ?? 0))));
             $productoId = !empty($row['matched_product_id']) ? (int)$row['matched_product_id'] : null;
             $accion = in_array($row['row_action'] ?? '', ['add_stock', 'create_product', 'skip'], true)
                 ? (string)$row['row_action']
@@ -3553,7 +3553,7 @@ class PurchaseInvoiceImportService
             }
 
             // El descuento de línea se traslada al costo: la OC no maneja descuento por ítem.
-            $descuento = (float)($item['discount_pct'] ?? 0);
+            $descuento = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))));
             $costo = round((float)$item['unit_cost'] * (1 - $descuento / 100), 2);
             if ($costo <= 0 && (float)($item['line_total'] ?? 0) > 0) {
                 $costo = round((float)$item['line_total'] / $cantidad, 2);

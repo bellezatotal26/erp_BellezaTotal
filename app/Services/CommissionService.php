@@ -744,38 +744,51 @@ class CommissionService
             $desc = $row['notes'] ?: ('Comisión #' . $row['id']);
             $method = $affectCash ? 'cash' : 'transfer';
 
-            $this->query(
-                "INSERT INTO expenses
-                    (description, amount, category, expense_date, payment_method, notes, user_id)
-                 VALUES (?,?,?,?,?,?,?)",
-                [
-                    $desc,
-                    (float)$row['amount'],
-                    $kind === 'gateway' ? $category : 'sales_commission',
-                    date('Y-m-d'),
-                    $method,
-                    'sales_commission:' . $row['id'],
-                    $row['user_id'] ?? ($_SESSION['tenant_user_id'] ?? null),
-                ]
-            );
-            $expenseId = (int)$this->db->lastInsertId();
-
+            // Gasto + asiento + paid deben ser atómicos: si falla contabilidad, no marcar liquidada.
+            $ownTx = !$this->db->inTransaction();
+            if ($ownTx) {
+                $this->db->beginTransaction();
+            }
             try {
+                $this->query(
+                    "INSERT INTO expenses
+                        (description, amount, category, expense_date, payment_method, notes, user_id)
+                     VALUES (?,?,?,?,?,?,?)",
+                    [
+                        $desc,
+                        (float)$row['amount'],
+                        $kind === 'gateway' ? $category : 'sales_commission',
+                        date('Y-m-d'),
+                        $method,
+                        'sales_commission:' . $row['id'],
+                        $row['user_id'] ?? ($_SESSION['tenant_user_id'] ?? null),
+                    ]
+                );
+                $expenseId = (int)$this->db->lastInsertId();
+
                 if ($kind === 'seller') {
                     $this->postSellerExpense($accounting, $expenseId, (float)$row['amount'], $desc, $affectCash);
                 } else {
                     // Pasarela: gasto financiero contra banco (neto cobrado), no contra CxP.
                     $this->postGatewayExpense($accounting, $expenseId, (float)$row['amount'], $desc);
                 }
-            } catch (\Throwable $e) {
-                error_log('Commission settle accounting: ' . $e->getMessage());
-            }
 
-            $this->query(
-                "UPDATE sales_commissions SET status='paid', expense_id=? WHERE id=?",
-                [$expenseId, $row['id']]
-            );
-            $settled++;
+                $this->query(
+                    "UPDATE sales_commissions SET status='paid', expense_id=? WHERE id=?",
+                    [$expenseId, $row['id']]
+                );
+
+                if ($ownTx) {
+                    $this->db->commit();
+                }
+                $settled++;
+            } catch (\Throwable $e) {
+                if ($ownTx && $this->db->inTransaction()) {
+                    $this->db->rollBack();
+                }
+                error_log('Commission settle accounting #' . $row['id'] . ': ' . $e->getMessage());
+                throw $e;
+            }
         }
 
         return $settled;

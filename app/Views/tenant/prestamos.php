@@ -49,15 +49,15 @@ $searchUrl = $base . '?action=searchProducts';
     </div>
     <div class="stat-card neumorphic">
         <h4>Nos prestaron (pendientes)</h4>
-        <div class="stat-value" style="color:#0369A1;"><?php echo count($receivedLoans); ?></div>
+        <div class="stat-value" style="color:var(--dmc-0369A1, #0369A1);"><?php echo count($receivedLoans); ?></div>
     </div>
     <div class="stat-card neumorphic">
         <h4>Stock negativo</h4>
-        <div class="stat-value" style="color:#DC2626;"><?php echo (int)($stockAlert['negative_count'] ?? 0); ?></div>
+        <div class="stat-value" style="color:var(--dmc-DC2626, #DC2626);"><?php echo (int)($stockAlert['negative_count'] ?? 0); ?></div>
     </div>
     <div class="stat-card neumorphic">
         <h4>Ventas sin stock (deuda)</h4>
-        <div class="stat-value" style="color:#B45309;"><?php echo (int)($stockAlert['sale_debt_count'] ?? 0); ?></div>
+        <div class="stat-value" style="color:var(--dmc-B45309, #B45309);"><?php echo (int)($stockAlert['sale_debt_count'] ?? 0); ?></div>
     </div>
 </div>
 
@@ -357,7 +357,7 @@ $searchUrl = $base . '?action=searchProducts';
                         <button type="button" class="btn btn-sm btn-secondary" onclick="addReturnLine()">+ Agregar producto</button>
                         <button type="button" class="btn btn-sm btn-secondary" onclick="openCreateReturnProduct()">+ Crear producto nuevo</button>
                     </div>
-                    <p id="returnLinesSumHint" style="margin:8px 0 0;font-size:13px;font-weight:600;color:#0369A1;"></p>
+                    <p id="returnLinesSumHint" style="margin:8px 0 0;font-size:13px;font-weight:600;color:var(--dmc-0369A1, #0369A1);"></p>
                     <div id="returnCreateProductBox" style="display:none;margin-top:12px;padding:12px;border:1px dashed var(--color-border);border-radius:8px;background:var(--bg-input,#f8fafc);">
                         <strong style="display:block;margin-bottom:8px;">Alta rápida de producto</strong>
                         <div class="form-group" style="margin-bottom:8px;">
@@ -407,9 +407,9 @@ $searchUrl = $base . '?action=searchProducts';
                         Máximo pendiente: <span id="returnRecvMax">0</span>
                         · Stock actual: <span id="returnRecvStock">0</span>
                     </small>
-                    <p id="returnRecvPreview" style="margin:8px 0 0;font-size:13px;font-weight:600;color:#0369A1;"></p>
+                    <p id="returnRecvPreview" style="margin:8px 0 0;font-size:13px;font-weight:600;color:var(--dmc-0369A1, #0369A1);"></p>
                 </div>
-                <div id="returnRecvSettleWrap" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:8px;background:#FEF3C7;border:1px solid #F59E0B;color:#92400E;font-size:13px;">
+                <div id="returnRecvSettleWrap" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:8px;background:var(--dmb-FEF3C7, #FEF3C7);border:1px solid #F59E0B;color:var(--dmc-92400E, #92400E);font-size:13px;">
                     <p style="margin:0 0 8px;" id="returnRecvSettleText"></p>
                     <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-weight:600;">
                         <input type="checkbox" name="settle_without_stock" id="returnRecvSettle" value="1" style="width:auto;margin-top:2px;">
@@ -536,10 +536,10 @@ function updateReturnLinesHint() {
     if (!hint) return;
     var rem = need - sum;
     if (sum === need && need > 0) {
-        hint.style.color = '#15803D';
+        hint.style.color = 'var(--dmc-15803D, #15803D)';
         hint.textContent = 'OK: ' + sum + ' / ' + need + ' uds asignadas.';
     } else {
-        hint.style.color = rem < 0 ? '#DC2626' : '#B45309';
+        hint.style.color = rem < 0 ? 'var(--dmc-DC2626, #DC2626)' : 'var(--dmc-B45309, #B45309)';
         hint.textContent = 'Asignadas ' + sum + ' / ' + need
             + (rem > 0 ? (' · faltan ' + rem) : (rem < 0 ? (' · sobran ' + Math.abs(rem)) : ''));
     }
@@ -816,7 +816,7 @@ function renderPickerResults(containerId, list, onPick, allowCreateName) {
         if (typed) {
             empty += '<div class="product-picker-row" id="' + containerId + '_create">'
                 + '<span>Usar nombre nuevo: <strong>' + escHtml(typed) + '</strong></span>'
-                + '<span style="color:var(--color-primary);">Crear Prestado</span></div>';
+                + '<span style="color:var(--color-accent-text, var(--color-primary));">Crear Prestado</span></div>';
         }
         box.innerHTML = empty;
         var createRow = document.getElementById(containerId + '_create');
@@ -853,7 +853,7 @@ function renderPickerResults(containerId, list, onPick, allowCreateName) {
         var create = document.createElement('div');
         create.className = 'product-picker-row';
         create.innerHTML = '<span>Usar nombre nuevo: <strong>' + escHtml(typed) + '</strong></span>'
-            + '<span style="color:var(--color-primary);">Crear Prestado</span>';
+            + '<span style="color:var(--color-accent-text, var(--color-primary));">Crear Prestado</span>';
         create.addEventListener('click', function () {
             var hid = document.getElementById('recvProductId');
             if (hid) hid.value = '';
@@ -1010,7 +1010,7 @@ function setRecvProduct(p) {
             + ' <span class="badge badge-info" style="margin-left:6px;">' + escHtml(ownLabel) + '</span>'
             + ' <span style="color:var(--color-text-secondary);">· stock ' + escHtml(p.stock) + '</span>'
             + (own === 'owned'
-                ? '<div style="font-size:12px;color:#B45309;margin-top:4px;">Al registrar el préstamo recibido se marcará como Prestado.</div>'
+                ? '<div style="font-size:12px;color:var(--dmc-B45309, #B45309);margin-top:4px;">Al registrar el préstamo recibido se marcará como Prestado.</div>'
                 : '')
             + ' <button type="button" class="btn btn-sm btn-secondary" style="margin-left:8px;" onclick="clearRecvProduct()">Cambiar</button>';
     }
@@ -1165,7 +1165,7 @@ function updateLoanStockHint() {
     var qty = parseInt((document.getElementById('loanQty') || {}).value || '1', 10) || 1;
     if (qty > Math.max(0, stock)) {
         hint.textContent = 'Stock actual: ' + stock + '. Esta salida dejará el inventario en ' + (stock - qty) + '.';
-        hint.style.color = '#B45309';
+        hint.style.color = 'var(--dmc-B45309, #B45309)';
     } else {
         hint.textContent = 'Stock actual: ' + stock;
         hint.style.color = '';

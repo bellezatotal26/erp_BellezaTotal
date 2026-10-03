@@ -16,6 +16,8 @@ storage/app.key
 /storage/cache/*
 /storage/logs/*
 /storage/sessions/*
+!/storage/sessions/.htaccess
+/storage/expenses/
 /storage/uploads/
 
 # Uploads de usuario

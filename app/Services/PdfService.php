@@ -54,6 +54,9 @@ class PdfService
 
         $itemsHtml = '';
         foreach ($items as $item) {
+            if (!empty($item['document_hidden']) || (string)($item['document_hidden'] ?? '') === '1') {
+                continue;
+            }
             $lineTotal = $this->itemLineTotal($item);
             $sku = trim((string)($item['product_code'] ?? $item['code'] ?? ''));
             $ean = trim((string)($item['barcode'] ?? ''));
@@ -289,7 +292,15 @@ class PdfService
         $rows = '';
         $hasTaxMarkedItems = false;
         foreach ($items as $item) {
+            if (!empty($item['document_hidden']) || (string)($item['document_hidden'] ?? '') === '1') {
+                continue;
+            }
             $name = $esc($item['product_name'] ?? '');
+            if (!empty($item['is_combo']) || (string)($item['is_combo'] ?? '') === '1') {
+                if (!str_contains(mb_strtolower($name), 'combo')) {
+                    $name = 'Combo: ' . $name;
+                }
+            }
             if ($this->saleItemHasTax($item)) {
                 $name .= ' *';
                 $hasTaxMarkedItems = true;
@@ -1164,7 +1175,8 @@ class PdfService
         array $movements,
         array $totals,
         array $sales = [],
-        array $adminExpenses = []
+        array $adminExpenses = [],
+        bool $showCostProfit = false
     ): string
     {
         $currency = $this->currency['symbol'] ?? '$';
@@ -1280,12 +1292,14 @@ class PdfService
         }
 
         $paymentHtml = '';
+        $paymentsSum = 0.0;
         if (!empty($paymentBreakdown)) {
             uasort($paymentBreakdown, static function ($a, $b) {
                 return ((float)($b['total'] ?? 0) <=> (float)($a['total'] ?? 0));
             });
             foreach ($paymentBreakdown as $code => $row) {
                 $isCash = ($code === 'cash');
+                $paymentsSum += (float)($row['total'] ?? 0);
                 $paymentHtml .= '<tr' . ($isCash ? ' style="background:#ECFDF5;"' : '') . '>
                     <td>' . htmlspecialchars((string)($row['label'] ?? '')) . ($isCash ? ' <strong>(cajón)</strong>' : '') . '</td>
                     <td style="text-align:center;">' . (int)($row['count'] ?? 0) . '</td>
@@ -1293,131 +1307,90 @@ class PdfService
                 </tr>';
             }
         }
-        
+
+        $salesTaxTotal = (float)($totals['sales_tax_total'] ?? 0);
+        $salesDeliveryTotal = (float)($totals['sales_delivery_total'] ?? 0);
+        if ($salesTaxTotal <= 0.009 || $salesDeliveryTotal <= 0.009) {
+            $computedTax = 0.0;
+            $computedDel = 0.0;
+            foreach ($sales as $sale) {
+                if (($sale['status'] ?? '') === 'cancelled') {
+                    continue;
+                }
+                $computedTax += max(0.0, round((float)($sale['tax'] ?? 0), 2));
+                $computedDel += max(0.0, round((float)($sale['delivery_fee'] ?? 0), 2));
+            }
+            if ($salesTaxTotal <= 0.009) {
+                $salesTaxTotal = $computedTax;
+            }
+            if ($salesDeliveryTotal <= 0.009) {
+                $salesDeliveryTotal = $computedDel;
+            }
+        }
+
+        $totalsForRecon = array_merge($totals, [
+            'sales_subtotal_before_discount' => $salesSubtotalBeforeDiscount,
+            'sales_discount_total' => $salesDiscountTotal,
+            'sales_total' => $salesTotal,
+            'sales_tax_total' => $salesTaxTotal,
+            'sales_delivery_total' => $salesDeliveryTotal,
+            'payment_breakdown' => $paymentBreakdown,
+            'expected_cash' => $expectedCash,
+            'cash_sales' => $cashSales,
+            'other_cash_incomes' => $otherCashIn,
+            'expenses' => $expenses,
+            'difference' => $diff,
+            'counted_cash' => $session['closing_amount'] ?? null,
+        ]);
+
+        // Asegurar campos de costo/utilidad si vienen en $totals.
+        foreach (['sales_cost_total', 'gross_profit', 'gross_margin_pct', 'ventas_totales_con_base',
+            'sales_cancelled_total', 'sales_cancelled_count'] as $k) {
+            if (isset($totals[$k]) && !isset($totalsForRecon[$k])) {
+                $totalsForRecon[$k] = $totals[$k];
+            }
+        }
+        if (!isset($totalsForRecon['ventas_totales_con_base'])) {
+            $totalsForRecon['ventas_totales_con_base'] = round($salesTotal + $opening, 2);
+        }
+
+        $summaryHtml = CashClosingReportBuilder::buildExecutiveSummaryHtml(
+            $session,
+            $totalsForRecon,
+            $fmt,
+            $showCostProfit
+        );
+        $activityHtml = CashClosingReportBuilder::buildUnifiedActivityHtml($sales, $movements, $fmt);
+
         $html = $this->wrapHtml('CIERRE DE CAJA - REPORTE DEL DIA', $companyName, '
-            <div style="margin-bottom:20px;">
+            <div style="margin-bottom:14px;">
                 <table width="100%" cellpadding="4" cellspacing="0">
                     <tr>
-                        <td width="50%">
+                        <td width="55%">
                             <strong>Caja #:</strong> ' . (int)$session['id'] . '<br>
                             <strong>Apertura:</strong> ' . date('d/m/Y H:i', strtotime($session['opening_date'])) . '<br>
                             <strong>Cierre:</strong> ' . date('d/m/Y H:i', strtotime($session['closing_date'] ?? 'now')) . '
                         </td>
-                        <td width="50%" style="text-align:right;">
+                        <td width="45%" style="text-align:right;">
                             <strong>Usuario:</strong> ' . htmlspecialchars($session['user_name'] ?? 'N/A') . '
                         </td>
                     </tr>
                 </table>
             </div>
-            
-            ' . ($paymentHtml !== '' ? '
-            <h3 style="margin:0 0 8px;background:#ECFDF5;border:1px solid #10B981;padding:8px 10px;border-radius:4px;">
-                Totales cobrados por medio de pago
+
+            ' . $summaryHtml . '
+
+            <h3 style="margin:18px 0 8px;font-size:13px;background:#F1F5F9;border:1px solid #CBD5E1;padding:8px 10px;">
+                Movimientos de caja + Ventas
             </h3>
-            <p style="margin:0 0 10px;font-size:11px;color:#555;">
-                Resumen de cuánto se cobró en efectivo, Nequi, Daviplata, tarjeta y demás medios.
+            <p style="margin:0 0 8px;font-size:10px;color:#64748B;">
+                Una sola lista del día: cada venta aparece una vez; los egresos/ingresos manuales del cajón se suman sin duplicar cobros de venta.
             </p>
-            <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:12px;margin-bottom:16px;">
-                <tr style="background:#f5f5f5;">
-                    <th style="text-align:left;border-bottom:1px solid #ddd;">Medio de pago</th>
-                    <th style="text-align:center;border-bottom:1px solid #ddd;">Cobros</th>
-                    <th style="text-align:right;border-bottom:1px solid #ddd;">Total cobrado</th>
-                </tr>
-                ' . $paymentHtml . '
-            </table>' : '') . '
-
-            <table width="100%" cellpadding="8" cellspacing="0" style="border-collapse:collapse;margin-bottom:20px;">
-                <tr style="background:#f5f5f5;">
-                    <th style="text-align:left;padding:10px;border-bottom:2px solid #ddd;">Concepto</th>
-                    <th style="text-align:right;padding:10px;border-bottom:2px solid #ddd;">Monto</th>
-                </tr>
-                <tr style="background:#FFFBEB;">
-                    <td><strong>Base de apertura (fondo en cajón)</strong><br>
-                        <span style="font-size:10px;color:#666;">No es venta del día: efectivo con el que se abrió</span></td>
-                    <td style="text-align:right;vertical-align:middle;">' . $fmt($opening) . '</td>
-                </tr>
-                <tr>
-                    <td>Efectivo de ventas del día<br>
-                        <span style="font-size:10px;color:#666;">Cobros en efectivo (sin la base)</span></td>
-                    <td style="text-align:right;color:#10B981;vertical-align:middle;">+' . $fmt($cashSales) . '</td>
-                </tr>
-                ' . ($otherCashIn > 0.009 ? '
-                <tr>
-                    <td>Otros ingresos en efectivo<br>
-                        <span style="font-size:10px;color:#666;">Ajustes / ingresos manuales al cajón</span></td>
-                    <td style="text-align:right;color:#10B981;vertical-align:middle;">+' . $fmt($otherCashIn) . '</td>
-                </tr>' : '') . '
-                <tr>
-                    <td>Egresos del cajón</td>
-                    <td style="text-align:right;color:#DC2626;">-' . $fmt($expenses) . '</td>
-                </tr>
-                <tr>
-                    <td>Neto del día en cajón<br>
-                        <span style="font-size:10px;color:#666;">Ventas efectivo ± movimientos − egresos (sin la base)</span></td>
-                    <td style="text-align:right;">' . ($cashDayNet >= 0 ? '+' : '') . $fmt($cashDayNet) . '</td>
-                </tr>
-                <tr>
-                    <td>Sub-total sin descuentos<br>
-                        <span style="font-size:10px;color:#666;">Suma de ventas antes del descuento (todos los medios)</span></td>
-                    <td style="text-align:right;">' . $fmt($salesSubtotalBeforeDiscount) . '</td>
-                </tr>
-                <tr>
-                    <td>Descuento total aplicado<br>
-                        <span style="font-size:10px;color:#666;">Descuentos de documento en ventas del día (todos los medios)</span></td>
-                    <td style="text-align:right;color:#B45309;">-' . $fmt($salesDiscountTotal) . '</td>
-                </tr>
-                <tr>
-                    <td>Total ventas facturadas (todos los medios)</td>
-                    <td style="text-align:right;">' . $fmt($salesTotal) . '</td>
-                </tr>
-                <tr style="font-weight:bold;font-size:14px;background:#ECFDF5;">
-                    <td style="border-top:2px solid #333;padding-top:8px;">Efectivo esperado en cajón<br>
-                        <span style="font-weight:normal;font-size:10px;color:#555;">Base + neto del día</span></td>
-                    <td style="text-align:right;border-top:2px solid #333;padding-top:8px;">' . $fmt($expectedCash) . '</td>
-                </tr>
-                <tr style="font-weight:bold;font-size:14px;">
-                    <td>Efectivo contado</td>
-                    <td style="text-align:right;">' . $fmt($session['closing_amount'] ?? 0) . '</td>
-                </tr>
-                <tr style="font-weight:bold;font-size:14px;">
-                    <td style="border-top:2px solid #333;padding-top:8px;">' . ($diff < 0 ? 'Faltante' : ($diff > 0 ? 'Sobrante' : 'Diferencia')) . '</td>
-                    <td style="text-align:right;border-top:2px solid #333;padding-top:8px;color:' . ($diff == 0 ? '#10B981' : '#DC2626') . ';">' . ($diff >= 0 ? '+' : '') . $fmt($diff) . '</td>
-                </tr>
-            </table>
-            
-            ' . (!empty($salesHtml) ? '
-            <h3 style="margin-top:20px;">Ventas del dia</h3>
-            <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:11px;">
-                <tr style="background:#f5f5f5;">
-                    <th style="text-align:left;border-bottom:1px solid #ddd;">Hora</th>
-                    <th style="text-align:left;border-bottom:1px solid #ddd;">Factura</th>
-                    <th style="text-align:left;border-bottom:1px solid #ddd;">Cliente</th>
-                    <th style="text-align:left;border-bottom:1px solid #ddd;">Pago</th>
-                    <th style="text-align:right;border-bottom:1px solid #ddd;">Total</th>
-                </tr>
-                ' . $salesHtml . '
-                <tr style="font-weight:bold;">
-                    <td colspan="4" style="border-top:1px solid #333;padding-top:6px;">Total ventas</td>
-                    <td style="text-align:right;border-top:1px solid #333;padding-top:6px;">' . $fmt($salesTotal) . '</td>
-                </tr>
-            </table>' : '') . '
-
-            ' . (!empty($movements) ? '
-            <h3 style="margin-top:20px;">Movimientos de caja</h3>
-            <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:11px;">
-                <tr style="background:#f5f5f5;">
-                    <th style="text-align:left;border-bottom:1px solid #ddd;">Hora</th>
-                    <th style="text-align:left;border-bottom:1px solid #ddd;">Usuario</th>
-                    <th style="text-align:left;border-bottom:1px solid #ddd;">Tipo</th>
-                    <th style="text-align:left;border-bottom:1px solid #ddd;">Descripcion</th>
-                    <th style="text-align:right;border-bottom:1px solid #ddd;">Monto</th>
-                </tr>
-                ' . $movementsHtml . '
-            </table>' : '<p style="margin-top:16px;color:#666;">Sin movimientos manuales de caja en esta sesion.</p>') . '
+            ' . $activityHtml . '
 
             ' . $this->cashClosingAdminExpensesHtml($adminExpenses, $fmt) . '
         ');
-        
+
         return $this->generate($html);
     }
 
@@ -1496,20 +1469,38 @@ class PdfService
             ['Salario / días trabajados (' . (int)($item['days_worked'] ?? 0) . ')', $item['salary_base'] ?? 0],
             ['Auxilio de transporte', $item['transport_aid'] ?? 0],
             ['Prima de servicios', $item['prima'] ?? 0],
-            ['Cesantías', $item['cesantias'] ?? 0],
-            ['Intereses cesantías', $item['cesantias_interest'] ?? 0],
             ['Incapacidad (' . (int)($item['incapacity_days'] ?? 0) . ' días)', $item['incapacity_pay'] ?? 0],
         ];
         if ((float)($item['overtime_day_amount'] ?? 0) > 0 || (float)($item['overtime_day_hours'] ?? 0) > 0) {
-            $rows[] = ['HE diurnas (' . number_format((float)($item['overtime_day_hours'] ?? 0), 2, ',', '.') . ' h)', $item['overtime_day_amount'] ?? 0];
+            $rows[] = ['HE diurnas HED (' . number_format((float)($item['overtime_day_hours'] ?? 0), 2, ',', '.') . ' h)', $item['overtime_day_amount'] ?? 0];
         }
         if ((float)($item['overtime_night_amount'] ?? 0) > 0 || (float)($item['overtime_night_hours'] ?? 0) > 0) {
-            $rows[] = ['HE nocturnas (' . number_format((float)($item['overtime_night_hours'] ?? 0), 2, ',', '.') . ' h)', $item['overtime_night_amount'] ?? 0];
+            $rows[] = ['HE nocturnas HEN (' . number_format((float)($item['overtime_night_hours'] ?? 0), 2, ',', '.') . ' h)', $item['overtime_night_amount'] ?? 0];
+        }
+        if ((float)($item['night_surcharge_amount'] ?? 0) > 0 || (float)($item['night_surcharge_hours'] ?? 0) > 0) {
+            $rows[] = ['Recargo noct. RNO (' . number_format((float)($item['night_surcharge_hours'] ?? 0), 2, ',', '.') . ' h)', $item['night_surcharge_amount'] ?? 0];
         }
         if ((float)($item['dominical_amount'] ?? 0) > 0 || (float)($item['dominical_hours'] ?? 0) > 0) {
             $rows[] = ['Dominical/festivo (' . number_format((float)($item['dominical_hours'] ?? 0), 2, ',', '.') . ' h)', $item['dominical_amount'] ?? 0];
         }
+        if ((float)($item['overtime_dom_day_amount'] ?? 0) > 0 || (float)($item['overtime_dom_day_hours'] ?? 0) > 0) {
+            $rows[] = ['HE dom. diurna HEDD (' . number_format((float)($item['overtime_dom_day_hours'] ?? 0), 2, ',', '.') . ' h)', $item['overtime_dom_day_amount'] ?? 0];
+        }
+        if ((float)($item['overtime_dom_night_amount'] ?? 0) > 0 || (float)($item['overtime_dom_night_hours'] ?? 0) > 0) {
+            $rows[] = ['HE dom. nocturna HEND (' . number_format((float)($item['overtime_dom_night_hours'] ?? 0), 2, ',', '.') . ' h)', $item['overtime_dom_night_amount'] ?? 0];
+        }
+        if ((float)($item['commission_amount'] ?? 0) > 0) {
+            $q = PayrollService::quincenasInPeriod((int)($run['days_worked'] ?? 30));
+            $rows[] = ['Comisión fija (' . $q . ' quincena' . ($q > 1 ? 's' : '') . ', no salarial)', $item['commission_amount']];
+        }
         $rows[] = ['(+) Total devengado', $item['gross_pay'] ?? 0];
+        $cesProv = (float)($item['cesantias'] ?? 0) + (float)($item['cesantias_interest'] ?? 0);
+        if ($cesProv > 0) {
+            $rows[] = ['(info) Provisión cesantías (no neto)', $cesProv];
+        }
+        if ((float)($item['vacation_provision'] ?? 0) > 0) {
+            $rows[] = ['(info) Provisión vacaciones (no neto)', $item['vacation_provision']];
+        }
         $rows[] = ['(-) Salud empleado', -1 * (float)($item['health_employee'] ?? 0)];
         $rows[] = ['(-) Pensión empleado', -1 * (float)($item['pension_employee'] ?? 0)];
         $rows[] = ['(=) Neto a pagar', $item['net_pay'] ?? 0];
@@ -1581,8 +1572,10 @@ class PdfService
                 <tr><td>Bruto</td><td style="text-align:right;">' . $fmt($run['gross_total'] ?? 0) . '</td></tr>
                 <tr><td>Primas</td><td style="text-align:right;">' . $fmt($run['prima_total'] ?? 0) . '</td></tr>
                 <tr><td>Cesantías</td><td style="text-align:right;">' . $fmt($run['cesantias_total'] ?? 0) . '</td></tr>
+                <tr><td>Provisión vacaciones</td><td style="text-align:right;">' . $fmt($run['vacation_total'] ?? 0) . '</td></tr>
                 <tr><td>Incapacidades</td><td style="text-align:right;">' . $fmt($run['incapacity_total'] ?? 0) . '</td></tr>
                 <tr><td>HE / dominicales</td><td style="text-align:right;">' . $fmt($run['overtime_total'] ?? 0) . '</td></tr>
+                <tr><td>Comisiones fijas (no salariales)</td><td style="text-align:right;">' . $fmt($run['commission_total'] ?? 0) . '</td></tr>
                 <tr><td>Deducciones empleados</td><td style="text-align:right;">' . $fmt($run['deductions_total'] ?? 0) . '</td></tr>
                 <tr><td>Aportes empleador</td><td style="text-align:right;">' . $fmt($run['employer_total'] ?? 0) . '</td></tr>
                 <tr><td>Parafiscales</td><td style="text-align:right;">' . $fmt($run['parafiscal_total'] ?? 0) . '</td></tr>
@@ -1593,13 +1586,283 @@ class PdfService
     }
 
     /**
+     * Listado de empleados de nómina (respeta filtros de la pestaña Empleados).
+     * @param list<array<string,mixed>> $employees
+     * @param array<int, array<string,mixed>> $schedules
+     * @param list<string> $filterText
+     */
+    public function generatePayrollEmployeesReport(array $employees, array $schedules, array $filterText = []): string
+    {
+        $currency = $this->currency['symbol'] ?? '$';
+        $decimals = (int)($this->currency['decimals'] ?? 0);
+        $fmt = fn ($n) => $currency . ' ' . number_format((float)$n, $decimals, $this->currency['decimal'] ?? ',', $this->currency['thousands'] ?? '.');
+        $esc = fn ($s) => htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
+        $companyName = $esc($this->company['company_name'] ?? 'Mi Empresa');
+
+        $rows = '';
+        $salaryTotal = $commissionTotal = 0.0;
+        $active = 0;
+        foreach ($employees as $e) {
+            $isActive = ($e['status'] ?? '') === 'active';
+            $active += $isActive ? 1 : 0;
+            $salaryTotal += (float)($e['salary'] ?? 0);
+            $commissionTotal += (float)($e['fixed_commission'] ?? 0);
+            $rows .= '<tr>
+                <td>' . $esc(trim(($e['document_type'] ?? '') . ' ' . ($e['document_number'] ?? ''))) . '</td>
+                <td>' . $esc(trim(($e['first_name'] ?? '') . ' ' . ($e['last_name'] ?? ''))) . '</td>
+                <td>' . $esc(($e['position_title'] ?? '') ?: '-') . '</td>
+                <td>' . (!empty($e['hire_date']) ? date('d/m/Y', strtotime((string)$e['hire_date'])) : '-') . '</td>
+                <td style="text-align:right;">' . $fmt($e['salary'] ?? 0) . '</td>
+                <td style="text-align:right;">' . $fmt($e['fixed_commission'] ?? 0) . '</td>
+                <td style="text-align:center;">' . (!empty($e['has_transport_aid']) ? 'Sí' : 'No') . '</td>
+                <td>' . $esc($schedules[(int)($e['schedule_id'] ?? 0)]['name'] ?? 'Sin horario') . '</td>
+                <td>' . ($isActive ? 'Activo' : 'Inactivo') . '</td>
+            </tr>';
+        }
+        if ($rows === '') {
+            $rows = '<tr><td colspan="9" style="text-align:center;color:#666;">Sin empleados para los filtros aplicados</td></tr>';
+        }
+
+        $html = $this->wrapHtml('EMPLEADOS DE NÓMINA', $companyName, '
+            <p style="margin:0 0 6px;">' . ($filterText ? $esc(implode(' · ', $filterText)) : 'Todos los empleados') . '</p>
+            <p style="margin:0 0 12px;"><strong>Empleados:</strong> ' . count($employees) . ' (' . $active . ' activos)
+               &nbsp;|&nbsp; <strong>Total salarios:</strong> ' . $fmt($salaryTotal) . '
+               &nbsp;|&nbsp; <strong>Comisiones fijas por quincena:</strong> ' . $fmt($commissionTotal) . '</p>
+            <table width="100%" cellpadding="5" cellspacing="0" style="border-collapse:collapse;font-size:9px;">
+                <tr style="background:#0D7C4A;color:#fff;">
+                    <th style="text-align:left;">Documento</th><th style="text-align:left;">Nombre</th><th style="text-align:left;">Cargo</th>
+                    <th style="text-align:left;">Ingreso</th><th style="text-align:right;">Salario</th><th style="text-align:right;">Comisión quinc.</th>
+                    <th>Aux. transp.</th><th style="text-align:left;">Horario</th><th style="text-align:left;">Estado</th>
+                </tr>
+                ' . $rows . '
+            </table>
+        ');
+        return $this->generate($html, 'A4');
+    }
+
+    /**
+     * Listado de liquidaciones de nómina con totales (respeta filtros de la pestaña Liquidaciones).
+     * @param list<array<string,mixed>> $runs
+     * @param list<string> $filterText
+     * @param array<string,string> $statusLabels
+     */
+    public function generatePayrollRunsReport(array $runs, array $filterText = [], array $statusLabels = []): string
+    {
+        $currency = $this->currency['symbol'] ?? '$';
+        $decimals = (int)($this->currency['decimals'] ?? 0);
+        $fmt = fn ($n) => $currency . ' ' . number_format((float)$n, $decimals, $this->currency['decimal'] ?? ',', $this->currency['thousands'] ?? '.');
+        $esc = fn ($s) => htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
+        $companyName = $esc($this->company['company_name'] ?? 'Mi Empresa');
+
+        $keys = ['gross_total', 'deductions_total', 'net_total', 'employer_total', 'parafiscal_total', 'prima_total', 'cesantias_total', 'vacation_total'];
+        $totals = array_fill_keys($keys, 0.0);
+        $rows = '';
+        foreach ($runs as $r) {
+            $cancelled = ($r['status'] ?? '') === 'cancelled';
+            if (!$cancelled) {
+                foreach ($keys as $k) {
+                    $totals[$k] += (float)($r[$k] ?? 0);
+                }
+            }
+            $rows .= '<tr' . ($cancelled ? ' style="color:#999;"' : '') . '>
+                <td>' . $esc($r['run_number'] ?? '') . '</td>
+                <td>' . $esc($r['period_label'] ?? '') . '</td>
+                <td>' . date('d/m/Y', strtotime((string)($r['pay_date'] ?? 'now'))) . '</td>
+                <td style="text-align:center;">' . (int)($r['employee_count'] ?? 0) . '</td>
+                <td>' . $esc($statusLabels[$r['status'] ?? ''] ?? ($r['status'] ?? '')) . '</td>';
+            foreach ($keys as $k) {
+                $rows .= '<td style="text-align:right;">' . $fmt($r[$k] ?? 0) . '</td>';
+            }
+            $rows .= '</tr>';
+        }
+        if ($rows === '') {
+            $rows = '<tr><td colspan="13" style="text-align:center;color:#666;">Sin liquidaciones para los filtros aplicados</td></tr>';
+        }
+        $totalRow = '<tr style="font-weight:bold;background:#f5f5f5;"><td colspan="5">Total (sin canceladas)</td>';
+        foreach ($keys as $k) {
+            $totalRow .= '<td style="text-align:right;">' . $fmt($totals[$k]) . '</td>';
+        }
+        $totalRow .= '</tr>';
+
+        $html = $this->wrapHtml('LIQUIDACIONES DE NÓMINA', $companyName, '
+            <p style="margin:0 0 12px;">' . ($filterText ? $esc(implode(' · ', $filterText)) : 'Todas las liquidaciones') . ' · ' . count($runs) . ' liquidación(es)</p>
+            <table width="100%" cellpadding="4" cellspacing="0" style="border-collapse:collapse;font-size:8px;">
+                <tr style="background:#0D7C4A;color:#fff;">
+                    <th style="text-align:left;">Nº</th><th style="text-align:left;">Periodo</th><th style="text-align:left;">Pago</th>
+                    <th>Emp.</th><th style="text-align:left;">Estado</th>
+                    <th style="text-align:right;">Bruto</th><th style="text-align:right;">Deducciones</th><th style="text-align:right;">Neto</th>
+                    <th style="text-align:right;">Aportes emp.</th><th style="text-align:right;">Parafiscales</th>
+                    <th style="text-align:right;">Primas</th><th style="text-align:right;">Cesantías</th><th style="text-align:right;">Vacaciones</th>
+                </tr>
+                ' . $rows . $totalRow . '
+            </table>
+        ');
+        return $this->generate($html, [0, 0, 841.89, 595.28]);
+    }
+
+    /**
+     * Reporte tabular de consignación (productos, margen, trazabilidad) en horizontal.
+     * Las celdas llegan ya formateadas; filas con style=group ocupan todo el ancho, style=total va en negrita.
+     *
+     * @param list<array{label:string,align?:string}> $headers
+     * @param list<array{cells:list<string>,style?:string}> $rows
+     */
+    public function generateConsignmentReport(string $title, string $subtitle, array $headers, array $rows, string $note = ''): string
+    {
+        $esc = fn ($s) => htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
+        $companyName = $esc($this->company['company_name'] ?? 'Mi Empresa');
+        $cols = max(1, count($headers));
+
+        $head = '';
+        foreach ($headers as $h) {
+            $head .= '<th style="text-align:' . (($h['align'] ?? '') === 'right' ? 'right' : 'left') . ';">' . $esc($h['label']) . '</th>';
+        }
+        $body = '';
+        foreach ($rows as $r) {
+            $style = (string)($r['style'] ?? '');
+            $cells = $r['cells'] ?? [];
+            if ($style === 'group') {
+                $body .= '<tr style="background:#E8F3EC;"><td colspan="' . $cols . '" style="font-weight:bold;color:#0D7C4A;padding-top:8px;">'
+                    . $esc($cells[0] ?? '') . '</td></tr>';
+                continue;
+            }
+            $trStyle = $style === 'total' ? ' style="font-weight:bold;background:#f5f5f5;"' : '';
+            $body .= '<tr' . $trStyle . '>';
+            foreach ($headers as $i => $h) {
+                $align = ($h['align'] ?? '') === 'right' ? 'right' : 'left';
+                $body .= '<td style="text-align:' . $align . ';border-bottom:1px solid #eee;">' . $esc($cells[$i] ?? '') . '</td>';
+            }
+            $body .= '</tr>';
+        }
+        if ($body === '') {
+            $body = '<tr><td colspan="' . $cols . '" style="text-align:center;color:#666;padding:16px;">Sin registros para los filtros aplicados</td></tr>';
+        }
+
+        $html = $this->wrapHtml($esc($title), $companyName, '
+            <p style="margin:0 0 10px;">' . $esc($subtitle) . '</p>
+            <table width="100%" cellpadding="4" cellspacing="0" style="border-collapse:collapse;font-size:8px;">
+                <tr style="background:#0D7C4A;color:#fff;">' . $head . '</tr>
+                ' . $body . '
+            </table>
+            ' . ($note !== '' ? '<p style="margin:10px 0 0;font-size:9px;color:#666;">' . $esc($note) . '</p>' : '') . '
+        ');
+        return $this->generate($html, [0, 0, 841.89, 595.28]);
+    }
+
+    /**
      * Reporte PDF del listado de ventas (respeta filtros).
      * Incluye desglose de productos por cada venta.
      * @param list<array<string,mixed>> $sales cada venta puede traer clave `items`
      * @param array<string,mixed> $filters
      */
-    public function generateSalesListReport(array $sales, array $filters = [], ?\PDO $db = null): string
+    /**
+     * Resumen de ventas por medio de pago (SalesPeriodSummary::build).
+     *
+     * @param array<string,mixed> $summary
+     */
+    public function generateSalesPaymentSummary(array $summary): string
     {
+        $currency = $this->currency['symbol'] ?? '$';
+        $decimals = $this->currency['decimals'] ?? 0;
+        $thousands = $this->currency['thousands'] ?? '.';
+        $decimal = $this->currency['decimal'] ?? ',';
+        $fmt = fn($n) => $currency . ' ' . number_format((float)$n, $decimals, $decimal, $thousands);
+        $companyName = htmlspecialchars($this->company['company_name'] ?? 'Mi Empresa');
+
+        $from = (string)($summary['from'] ?? '');
+        $to = (string)($summary['to'] ?? '');
+        $period = $from === $to
+            ? date('d/m/Y', strtotime($from))
+            : date('d/m/Y', strtotime($from)) . ' al ' . date('d/m/Y', strtotime($to));
+        $total = (float)($summary['total'] ?? 0);
+
+        $rows = '';
+        foreach (($summary['by_method'] ?? []) as $pm) {
+            $pct = $total > 0.009 ? round(((float)$pm['amount'] / $total) * 100, 1) : 0;
+            $rows .= '<tr>
+                <td>' . htmlspecialchars((string)$pm['label']) . '</td>
+                <td style="text-align:center;">' . (int)$pm['count'] . '</td>
+                <td style="text-align:right;">' . $fmt($pm['amount']) . '</td>
+                <td style="text-align:right;">' . number_format($pct, 1, ',', '.') . '%</td>
+            </tr>';
+        }
+        if ((float)($summary['pending'] ?? 0) > 0.009) {
+            $pct = $total > 0.009 ? round(((float)$summary['pending'] / $total) * 100, 1) : 0;
+            $rows .= '<tr style="color:#B45309;">
+                <td>Por cobrar (crédito)</td>
+                <td style="text-align:center;">—</td>
+                <td style="text-align:right;">' . $fmt($summary['pending']) . '</td>
+                <td style="text-align:right;">' . number_format($pct, 1, ',', '.') . '%</td>
+            </tr>';
+        }
+        if ($rows === '') {
+            $rows = '<tr><td colspan="4" style="text-align:center;color:#666;padding:16px;">Sin ventas en el periodo</td></tr>';
+        }
+
+        $discountLine = (float)($summary['discount'] ?? 0) > 0.009
+            ? ' &nbsp;|&nbsp; <strong>Descuentos:</strong> ' . $fmt($summary['discount'])
+            : '';
+
+        $profitHtml = '';
+        $profit = $summary['profit'] ?? null;
+        if (is_array($profit)) {
+            $pv = (float)$profit['profit'];
+            $pColor = $pv < 0 ? '#B91C1C' : '#0D7C4A';
+            $noCost = (int)($profit['items_without_cost'] ?? 0);
+            $profitHtml = '
+            <h3 style="margin:22px 0 8px;font-size:13px;color:#0D7C4A;">Utilidad del periodo</h3>
+            <table width="100%" cellpadding="7" cellspacing="0" style="border-collapse:collapse;font-size:11px;">
+                <tr><td>Ventas netas (sin domicilio)</td><td style="text-align:right;">' . $fmt($profit['revenue']) . '</td></tr>
+                <tr><td>− Costo de ventas</td><td style="text-align:right;">' . $fmt($profit['cost']) . '</td></tr>
+                <tr style="border-top:2px solid ' . $pColor . ';font-weight:700;color:' . $pColor . ';">
+                    <td>Utilidad bruta</td>
+                    <td style="text-align:right;">' . $fmt($pv) . ' (' . number_format((float)$profit['margin_pct'], 1, ',', '.') . '%)</td>
+                </tr>
+            </table>'
+            . ($noCost > 0
+                ? '<p style="margin-top:6px;font-size:9px;color:#B45309;">' . $noCost . ' línea(s) de producto sin costo registrado: la utilidad puede estar sobrestimada.</p>'
+                : '');
+        }
+
+        $html = $this->wrapHtml('Resumen de ventas por medio de pago', $companyName, '
+            <p style="margin:0 0 6px;color:#555;font-size:11px;">Periodo: <strong>' . htmlspecialchars($period) . '</strong> · Excluye ventas anuladas</p>
+            <p style="margin:0 0 14px;"><strong>Ventas:</strong> ' . (int)($summary['count'] ?? 0)
+            . ' &nbsp;|&nbsp; <strong>Total facturado:</strong> ' . $fmt($total) . $discountLine . '</p>
+            <table width="100%" cellpadding="7" cellspacing="0" style="border-collapse:collapse;font-size:11px;">
+                <tr style="background:#0D7C4A;color:#fff;">
+                    <th style="text-align:left;">Medio de pago</th>
+                    <th style="text-align:center;">Ventas</th>
+                    <th style="text-align:right;">Monto</th>
+                    <th style="text-align:right;">%</th>
+                </tr>
+                ' . $rows . '
+                <tr style="border-top:2px solid #0D7C4A;font-weight:700;">
+                    <td>Total facturado</td>
+                    <td style="text-align:center;">' . (int)($summary['count'] ?? 0) . '</td>
+                    <td style="text-align:right;">' . $fmt($total) . '</td>
+                    <td style="text-align:right;">100%</td>
+                </tr>
+            </table>
+            <p style="margin-top:10px;font-size:9px;color:#888;">Una venta con pago mixto cuenta en cada medio usado.</p>
+            ' . $profitHtml . '
+        ');
+        return $this->generate($html, 'A4');
+    }
+
+    /**
+     * @param array{with_items?:bool,truncated?:bool,items_max?:int} $opts
+     */
+    public function generateSalesListReport(array $sales, array $filters = [], ?\PDO $db = null, array $opts = []): string
+    {
+        $withItems = (bool)($opts['with_items'] ?? true);
+        $truncated = (bool)($opts['truncated'] ?? false);
+        $labelCache = [];
+        $payLabel = static function (string $m) use (&$labelCache, $db): string {
+            if (!isset($labelCache[$m])) {
+                $labelCache[$m] = PaymentMethodCatalog::label($m, $db);
+            }
+            return $labelCache[$m];
+        };
         $currency = $this->currency['symbol'] ?? '$';
         $decimals = $this->currency['decimals'] ?? 0;
         $thousands = $this->currency['thousands'] ?? '.';
@@ -1632,11 +1895,29 @@ class PdfService
         $filterBits[] = 'Registro: ' . ($rsMap[$rs] ?? $rs);
         $filterLine = $filterBits !== [] ? implode(' · ', $filterBits) : 'Sin filtros adicionales';
 
+        $tableOpen = '<table width="100%" cellpadding="' . ($withItems ? 6 : 4) . '" cellspacing="0" style="border-collapse:collapse;font-size:' . ($withItems ? 10 : 9) . 'px;">
+                <tr style="background:#0D7C4A;color:#fff;">
+                    <th style="text-align:left;">Factura</th>
+                    <th style="text-align:left;">Cliente</th>
+                    <th style="text-align:left;">Fecha</th>
+                    <th style="text-align:right;">Total</th>
+                    <th style="text-align:right;">Pagado</th>
+                    <th style="text-align:left;">Método</th>
+                    <th style="text-align:left;">Estado</th>
+                </tr>';
+        // Tablas cortas: una sola tabla gigante vuelve a Dompdf extremadamente lento.
+        $salesPerTable = $withItems ? 25 : 60;
+
         $rowsHtml = '';
         $sumTotal = 0.0;
         $sumPaid = 0.0;
         $itemLines = 0;
+        $n = 0;
         foreach ($sales as $s) {
+            if ($n > 0 && $n % $salesPerTable === 0) {
+                $rowsHtml .= '</table>' . $tableOpen;
+            }
+            $n++;
             $total = (float)($s['total'] ?? 0);
             $paid = (($s['payment_status'] ?? '') === 'paid')
                 ? $total
@@ -1653,10 +1934,13 @@ class PdfService
                 <td>' . (!empty($s['sale_date']) ? date('d/m/Y H:i', strtotime((string)$s['sale_date'])) : '') . '</td>
                 <td style="text-align:right;">' . $fmt($total) . '</td>
                 <td style="text-align:right;">' . $fmt($paid) . '</td>
-                <td>' . htmlspecialchars(PaymentMethodCatalog::label((string)($s['payment_method'] ?? 'cash'), $db)) . '</td>
+                <td>' . htmlspecialchars($payLabel((string)($s['payment_method'] ?? 'cash'))) . '</td>
                 <td>' . htmlspecialchars($status) . '</td>
             </tr>';
 
+            if (!$withItems) {
+                continue;
+            }
             $items = is_array($s['items'] ?? null) ? $s['items'] : [];
             if ($items === []) {
                 $rowsHtml .= '<tr>
@@ -1700,24 +1984,24 @@ class PdfService
             $rowsHtml = '<tr><td colspan="7" style="text-align:center;color:#666;padding:16px;">Sin ventas con estos filtros</td></tr>';
         }
 
+        $notes = '';
+        if ($truncated) {
+            $notes .= '<p style="margin:0 0 8px;padding:6px 10px;background:#FEF3C7;color:#92400E;font-size:10px;">'
+                . 'Se muestran solo las primeras ' . count($sales) . ' ventas. Filtre por fechas o use «Exportar CSV» para el listado completo.</p>';
+        }
+        if (!$withItems && $sales !== []) {
+            $notes .= '<p style="margin:0 0 8px;padding:6px 10px;background:#EFF6FF;color:#1E40AF;font-size:10px;">'
+                . 'Con más de ' . (int)($opts['items_max'] ?? 250) . ' ventas el PDF no incluye el detalle de productos. Filtre un rango menor para verlo o use «Exportar CSV».</p>';
+        }
+
         $html = $this->wrapHtml('Reporte de ventas', $companyName, '
             <p style="margin:0 0 12px;color:#555;font-size:11px;">' . $filterLine . '</p>
+            ' . $notes . '
             <p style="margin:0 0 14px;"><strong>Ventas:</strong> ' . count($sales)
-            . ' &nbsp;|&nbsp; <strong>Líneas de producto:</strong> ' . $itemLines
+            . ($withItems ? ' &nbsp;|&nbsp; <strong>Líneas de producto:</strong> ' . $itemLines : '')
             . ' &nbsp;|&nbsp; <strong>Total:</strong> ' . $fmt($sumTotal)
             . ' &nbsp;|&nbsp; <strong>Pagado:</strong> ' . $fmt($sumPaid) . '</p>
-            <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:10px;">
-                <tr style="background:#0D7C4A;color:#fff;">
-                    <th style="text-align:left;">Factura</th>
-                    <th style="text-align:left;">Cliente</th>
-                    <th style="text-align:left;">Fecha</th>
-                    <th style="text-align:right;">Total</th>
-                    <th style="text-align:right;">Pagado</th>
-                    <th style="text-align:left;">Método</th>
-                    <th style="text-align:left;">Estado</th>
-                </tr>
-                ' . $rowsHtml . '
-            </table>
+            ' . $tableOpen . $rowsHtml . '</table>
         ');
 
         return $this->generate($html, 'A4');
@@ -2079,7 +2363,7 @@ class PdfService
         }
         $payRows = '';
         foreach ($payMethods as $pm) {
-            $payRows .= '<tr><td>' . htmlspecialchars($payNames[$pm['payment_method']] ?? (string)$pm['payment_method'])
+            $payRows .= '<tr><td>' . htmlspecialchars((string)($pm['label'] ?? ($payNames[$pm['payment_method']] ?? $pm['payment_method'])))
                 . '</td><td class="num">' . (int)$pm['count'] . '</td><td class="num">' . $fmt($pm['total'] ?? 0) . '</td></tr>';
         }
 

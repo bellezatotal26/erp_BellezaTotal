@@ -3,6 +3,31 @@ var saleItems = [];
 var curSym = document.querySelector('meta[name="currency-symbol"]')?.content || '$';
 var curDec = parseInt(document.querySelector('meta[name="currency-decimals"]')?.content || '0');
 
+function ventasFmtMoney(n) {
+    var x = parseFloat(n) || 0;
+    if (window.SeriMoney && typeof SeriMoney.format === 'function') {
+        return curSym + ' ' + SeriMoney.format(x);
+    }
+    var parts = x.toFixed(curDec).split('.');
+    parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+    return curSym + ' ' + (parts.length > 1 ? parts[0] + ',' + parts[1] : parts[0]);
+}
+
+function ventasPayMethodLabel(code) {
+    code = String(code || '');
+    if (!code) return '';
+    var tpl = document.getElementById('editPayMethodOptionsTpl') || document.getElementById('posPayMethodOptionsTpl');
+    if (tpl) {
+        var box = document.createElement('select');
+        box.innerHTML = tpl.innerHTML;
+        for (var i = 0; i < box.options.length; i++) {
+            if (box.options[i].value.toLowerCase() === code.toLowerCase()) return box.options[i].text;
+        }
+    }
+    var names = { cash: 'Efectivo', card: 'Tarjeta', transfer: 'Transferencia', credit: 'Crédito', mixed: 'Mixto', dataphone: 'Datáfono', nequi: 'Nequi', other: 'Otro' };
+    return names[code] || code;
+}
+
 function openCancelSaleModal(id, invoice) {
     var modal = document.getElementById('cancelSaleModal');
     var idEl = document.getElementById('cancelSaleId');
@@ -364,12 +389,12 @@ function renderItems() {
             '<td>' + it.quantity + '</td>' +
             '<td><input type="text" inputmode="decimal" class="form-control money-input" data-money="1" style="width:110px;padding:4px 8px;" value="' + (window.SeriMoney ? SeriMoney.format(it.unit_price) : it.unit_price) + '" onchange="setSaleItemPrice(' + i + ', this.value)" title="Editar precio de venta"></td>' +
             stockCell +
-            '<td>' + curSym + ' ' + it.subtotal.toFixed(curDec) + '</td>' +
+            '<td>' + ventasFmtMoney(it.subtotal) + '</td>' +
             '<td><button type="button" class="btn btn-sm btn-danger" onclick="removeItem(' + i + ')">X</button></td>' +
             '</tr>';
     });
-    document.getElementById('saleTotal').textContent = curSym + ' ' + t.toFixed(curDec);
-    document.getElementById('submitSaleBtn').textContent = 'Completar Venta (' + curSym + ' ' + t.toFixed(curDec) + ')';
+    document.getElementById('saleTotal').textContent = ventasFmtMoney(t);
+    document.getElementById('submitSaleBtn').textContent = 'Completar Venta (' + ventasFmtMoney(t) + ')';
 }
 
 function prepareSaleItems() {
@@ -471,7 +496,7 @@ function openPaymentModal(id, total, paid) {
     var payEl = document.getElementById('payAmount');
     payEl.value = window.SeriMoney ? SeriMoney.format(bal) : bal.toFixed(curDec);
     if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(payEl);
-    document.getElementById('payInfo').textContent = 'Total: ' + curSym + ' ' + total.toFixed(curDec) + ' | Pagado: ' + curSym + ' ' + paid.toFixed(curDec) + ' | Pendiente: ' + curSym + ' ' + (total - paid).toFixed(curDec);
+    document.getElementById('payInfo').textContent = 'Total: ' + ventasFmtMoney(total) + ' | Pagado: ' + ventasFmtMoney(paid) + ' | Pendiente: ' + ventasFmtMoney(total - paid);
     document.getElementById('paymentModal').style.display = 'flex';
 }
 
@@ -608,9 +633,9 @@ function openEditPaymentMethodModal(id, invoice, currentMethod) {
         var el = document.getElementById('editPayMixedSummary');
         if (el) {
             var diff = Math.round((editPayTarget - sum) * 100) / 100;
-            el.textContent = 'Asignado: ' + sum.toFixed(2) + ' / ' + editPayTarget.toFixed(2)
-                + (Math.abs(diff) > 0.02 ? ' (faltan ' + diff.toFixed(2) + ')' : ' ✓');
-            el.style.color = Math.abs(diff) > 0.02 ? '#B45309' : '#059669';
+            el.textContent = 'Asignado: ' + ventasFmtMoney(sum) + ' / ' + ventasFmtMoney(editPayTarget)
+                + (Math.abs(diff) > 0.02 ? ' (faltan ' + ventasFmtMoney(diff) + ')' : ' ✓');
+            el.style.color = Math.abs(diff) > 0.02 ? 'var(--dmc-B45309, #B45309)' : 'var(--dmc-059669, #059669)';
         }
     }
 
@@ -649,7 +674,7 @@ function openEditPaymentMethodModal(id, invoice, currentMethod) {
             }
             return;
         }
-        if (targetEl) targetEl.textContent = (window.curSym || '$') + ' ' + editPayTarget.toFixed(window.curDec || 2);
+        if (targetEl) targetEl.textContent = ventasFmtMoney(editPayTarget);
         var method = (d && d.payment_method) || currentMethod || 'cash';
         var isMixed = method === 'mixed' || splits.length > 1;
         setMixedMode(isMixed);
@@ -731,16 +756,36 @@ function viewDetail(id) {
         if (d.error) return;
         var s = d.sale;
         function moneyVal(n) {
-            return curSym + ' ' + (parseFloat(n) || 0).toFixed(curDec);
+            return ventasFmtMoney(n);
         }
+        var statusNames = { paid: 'Pagado', partial: 'Parcial', pending: 'Pendiente' };
+        var statusLabel = (s.status || '') === 'cancelled' ? 'Cancelado' : (statusNames[s.payment_status] || s.payment_status || '');
         var h = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:15px;">';
         h += '<div><strong>Factura:</strong> ' + esc(s.invoice_number) + '</div>';
         h += '<div><strong>Fecha:</strong> ' + (s.sale_date || '').substr(0, 16) + '</div>';
         h += '<div><strong>Cliente:</strong> ' + esc(s.customer_name || 'General') + '</div>';
-        h += '<div><strong>Estado:</strong> ' + s.payment_status + '</div>';
+        h += '<div><strong>Estado:</strong> ' + esc(statusLabel) + '</div>';
         h += '<div><strong>Subtotal:</strong> ' + moneyVal(s.subtotal) + '</div>';
         if (parseFloat(s.discount || 0) > 0.009) {
             h += '<div><strong>Descuento:</strong> ' + moneyVal(s.discount) + '</div>';
+        }
+        var pf = d.profit;
+        if (pf) {
+            var pfProfit = parseFloat(pf.profit) || 0;
+            var pfColor = pfProfit < 0 ? '#DC2626' : '#059669';
+            h += '<div style="grid-column:1 / -1;padding:8px 10px;border-radius:8px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);">' +
+                '<strong>Utilidad de la venta:</strong> <span style="color:' + pfColor + ';font-weight:700;">' + moneyVal(pfProfit) + '</span>' +
+                ' <span style="color:var(--color-text-secondary);">(' + String(pf.margin_pct).replace('.', ',') + '% de margen)</span>' +
+                '<div style="font-size:12px;color:var(--color-text-secondary);margin-top:2px;">Venta de productos ' + moneyVal(pf.revenue) +
+                ' − Costo ' + moneyVal(pf.cost) + '</div>';
+            if (parseInt(pf.items_without_cost, 10) > 0) {
+                h += '<div style="font-size:12px;color:var(--dmc-B45309, #B45309);margin-top:2px;">' + parseInt(pf.items_without_cost, 10) +
+                    ' producto(s) sin costo registrado: la utilidad puede estar sobreestimada.</div>';
+            }
+            if (d.credit_notes && d.credit_notes.length > 0) {
+                h += '<div style="font-size:12px;color:var(--dmc-B45309, #B45309);margin-top:2px;">No descuenta las notas de crédito emitidas.</div>';
+            }
+            h += '</div>';
         }
         if (parseFloat(s.tax || 0) > 0.009) {
             h += '<div><strong>Impuesto:</strong> ' + moneyVal(s.tax) + '</div>';
@@ -764,16 +809,41 @@ function viewDetail(id) {
         if (d.items) {
             h += '<h4>Productos</h4><table><thead><tr><th>Producto</th><th>Cant</th><th>P.Unit</th><th>Subtotal</th></tr></thead><tbody>';
             d.items.forEach(function(i) {
-                h += '<tr><td>' + esc(i.product_name) + '</td><td>' + i.quantity + '</td><td>' + moneyVal(i.unit_price) + '</td><td>' + moneyVal(i.subtotal) + '</td></tr>';
+                if (parseInt(i.document_hidden, 10) === 1) return;
+                var name = i.product_name || '';
+                if (parseInt(i.is_combo, 10) === 1 && name.toLowerCase().indexOf('combo') !== 0) {
+                    name = 'Combo: ' + name;
+                }
+                h += '<tr><td>' + esc(name) + (parseInt(i.is_combo, 10) === 1 ? ' <span class="badge badge-info">Combo</span>' : '') + '</td><td>' + i.quantity + '</td><td>' + moneyVal(i.unit_price) + '</td><td>' + moneyVal(i.subtotal) + '</td></tr>';
             });
             h += '</tbody></table>';
         }
         if (d.payments && d.payments.length > 0) {
             h += '<h4>Pagos / abonos</h4><table><thead><tr><th>Fecha</th><th>Monto</th><th>Método</th><th>Notas</th></tr></thead><tbody>';
             d.payments.forEach(function(p) {
-                h += '<tr><td>' + (p.payment_date || '').substr(0, 16) + '</td><td>' + moneyVal(p.amount) + '</td><td>' + esc(p.payment_method) + '</td><td>' + esc(p.notes || '') + '</td></tr>';
+                h += '<tr><td>' + (p.payment_date || '').substr(0, 16) + '</td><td>' + moneyVal(p.amount) + '</td><td>' + esc(ventasPayMethodLabel(p.payment_method)) + '</td><td>' + esc(p.notes || '') + '</td></tr>';
             });
             h += '</tbody></table>';
+        }
+        var changes = d.payment_changes || [];
+        if (changes.length > 0) {
+            h += '<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.25);">';
+            h += '<strong>Cambio de medio de pago</strong> <span class="badge badge-info">' + changes.length + '</span>';
+            changes.forEach(function(ch) {
+                var delta = ch.delta_cash != null ? parseFloat(ch.delta_cash) : 0;
+                var when = (ch.at || '').substr(0, 16);
+                h += '<div style="font-size:13px;margin-top:4px;">Antes: <strong>' + esc(ch.from || '—') + '</strong> → Ahora: <strong>' + esc(ch.to || '—') + '</strong>';
+                if (when || ch.user) {
+                    h += ' <span style="color:var(--color-text-secondary);">(' + esc(when) + (ch.user ? ' · ' + esc(ch.user) : '') + ')</span>';
+                }
+                if (Math.abs(delta) > 0.009) {
+                    h += ' <span style="color:var(--color-text-secondary);">· ' + (delta < 0 ? 'sale del cajón ' : 'entra al cajón ') + moneyVal(Math.abs(delta)) + '</span>';
+                }
+                h += '</div>';
+            });
+            h += '</div>';
+        } else if (d.payments && d.payments.length > 0) {
+            h += '<div style="margin-top:6px;font-size:12px;color:var(--color-text-secondary);">Sin cambios de medio de pago.</div>';
         }
         if (d.credit_notes && d.credit_notes.length > 0) {
             h += '<h4>Notas de crédito</h4><table><thead><tr><th>Número</th><th>Fecha</th><th>Motivo</th><th>Stock</th><th>Total</th><th></th></tr></thead><tbody>';

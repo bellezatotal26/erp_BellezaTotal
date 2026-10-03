@@ -123,7 +123,7 @@ class TenantGastosController extends TenantController
             $params[] = $supplierFilter;
         }
 
-        $isAdmin = \SoftNova\Core\TenantMiddleware::getRole() === 'admin';
+        $isAdmin = \SoftNova\Core\TenantMiddleware::isManagement();
         $ownUserId = (int)($_SESSION['tenant_user_id'] ?? 0);
         if (!$isAdmin && $ownUserId > 0) {
             $whereParts[] = 'e.user_id = ?';
@@ -446,7 +446,7 @@ class TenantGastosController extends TenantController
             return;
         }
 
-        $isAdmin = \SoftNova\Core\TenantMiddleware::getRole() === 'admin';
+        $isAdmin = \SoftNova\Core\TenantMiddleware::isManagement();
         $ownUserId = (int)($_SESSION['tenant_user_id'] ?? 0);
         $existing = $this->query("SELECT * FROM expenses WHERE id = ?", [$id])->fetch();
         if (!$existing) {
@@ -784,7 +784,7 @@ class TenantGastosController extends TenantController
             $whereParts[] = 'e.supplier_id = ?';
             $params[] = $supplierFilter;
         }
-        if (\SoftNova\Core\TenantMiddleware::getRole() !== 'admin') {
+        if (!\SoftNova\Core\TenantMiddleware::isManagement()) {
             $whereParts[] = 'e.user_id = ?';
             $params[] = (int)($_SESSION['tenant_user_id'] ?? 0);
         }

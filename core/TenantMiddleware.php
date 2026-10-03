@@ -109,7 +109,38 @@ class TenantMiddleware
         return [
             'user' => 'User',
             'pos' => 'POS',
+            'gerencia' => 'Gerencia',
         ];
+    }
+
+    /** Roles con matriz de permisos editable (se recargan desde BD en cada request). */
+    public const MATRIX_ROLES = ['user', 'gerencia'];
+
+    public static function isGerencia(): bool
+    {
+        return self::getRole() === 'gerencia';
+    }
+
+    /**
+     * Administrador o Gerencia: visibilidad de negocio (todos los usuarios, KPIs de valor,
+     * auditoría, catálogos). Acciones críticas siguen exigiendo getRole() === 'admin'.
+     */
+    public static function isManagement(): bool
+    {
+        $role = self::getRole();
+        return $role === 'admin' || $role === 'gerencia';
+    }
+
+    /** Matriz completa (todos los módulos y acciones): valor por defecto al crear Gerencia. */
+    public static function fullPermissions(): array
+    {
+        $map = [];
+        foreach (self::MANAGED_MODULES as $mod) {
+            foreach (self::ACTIONS as $action) {
+                $map[$mod][$action] = true;
+            }
+        }
+        return $map;
     }
 
     /**
@@ -196,7 +227,7 @@ class TenantMiddleware
             return;
         }
 
-        if ($role === 'user') {
+        if (in_array($role, self::MATRIX_ROLES, true)) {
             $map = self::normalizePermissions($permissionsRaw);
             $_SESSION['tenant_permissions_map'] = $map;
             $_SESSION['tenant_permissions'] = array_keys(array_filter($map, static fn($a) => !empty($a['view'])));
@@ -312,7 +343,7 @@ class TenantMiddleware
         if (in_array($role, ['auxiliar', 'mesero'], true)) {
             return '/app/ventas';
         }
-        if ($role === 'user') {
+        if (in_array($role, self::MATRIX_ROLES, true)) {
             $map = $_SESSION['tenant_permissions_map'] ?? [];
             if (!empty($map['dashboard']['view'])) {
                 return '/app/dashboard';
@@ -332,6 +363,9 @@ class TenantMiddleware
             if (!empty($map['caja']['create']) || !empty($map['gastos']['create']) || !empty($map['prestamos']['create'])) {
                 return '/app/caja';
             }
+            if ($role === 'gerencia') {
+                return '/app/configuracion';
+            }
         }
         return '/app/dashboard';
     }
@@ -347,9 +381,9 @@ class TenantMiddleware
             return true;
         }
 
-        // Configuración solo admin
+        // Configuración: admin y Gerencia (secciones críticas se validan aparte en el controlador).
         if ($module === 'configuracion') {
-            return false;
+            return $role === 'gerencia';
         }
 
         $map = $_SESSION['tenant_permissions_map'] ?? null;
@@ -380,6 +414,10 @@ class TenantMiddleware
         $action = strtolower(trim($action));
         if (!in_array($action, self::ACTIONS, true)) {
             return false;
+        }
+
+        if ($module === 'configuracion') {
+            return $role === 'gerencia' && in_array($action, ['view', 'edit'], true);
         }
 
         $map = $_SESSION['tenant_permissions_map'] ?? null;
@@ -416,7 +454,7 @@ class TenantMiddleware
         }
 
         $role = self::normalizeRole((string)($_SESSION['tenant_user_role'] ?? 'viewer'));
-        if ($role === 'user') {
+        if (in_array($role, self::MATRIX_ROLES, true)) {
             self::refreshUserPermissionsFromDb();
             return;
         }

@@ -78,6 +78,7 @@
     ?>
 </head>
 <body>
+    <script>try { if (localStorage.getItem('theme') === 'dark') document.body.classList.add('dark-mode'); } catch (e) {}</script>
     <?php
     $layoutSandboxActive = !empty($_SESSION['sandbox_mode']);
     if ($layoutSandboxActive):
@@ -276,10 +277,17 @@
             setMobileMenuExpanded(false);
         }
 
+        function applySidebarCollapsed(collapsed) {
+            var btn = document.getElementById('sidebarToggleBtn');
+            document.documentElement.classList.toggle('sb-collapsed', collapsed);
+            if (btn) {
+                btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+                btn.setAttribute('aria-label', collapsed ? 'Expandir menú' : 'Contraer menú');
+            }
+        }
+
         function toggleSidebar() {
             var sidebar = document.getElementById('sidebar');
-            var mainContent = document.getElementById('mainContent');
-            var toggleIcon = document.getElementById('sidebarToggleIcon');
             if (!sidebar) return;
 
             if (isMobileNav()) {
@@ -288,16 +296,23 @@
                 return;
             }
 
-            sidebar.classList.toggle('collapsed');
-            if (mainContent) mainContent.classList.toggle('expanded');
-            if (toggleIcon) {
-                toggleIcon.textContent = sidebar.classList.contains('collapsed') ? '»' : '«';
-            }
+            var collapsed = !document.documentElement.classList.contains('sb-collapsed');
+            applySidebarCollapsed(collapsed);
+            if (window.SeriSidebarTip) window.SeriSidebarTip.hide();
+            try { localStorage.setItem('seri.sidebar', collapsed ? 'collapsed' : 'expanded'); } catch (e) {}
         }
 
-        (function initMobileSidebar() {
+        (function initSidebar() {
+            var root = document.documentElement;
             var overlay = document.getElementById('sidebarOverlay');
             var sidebar = document.getElementById('sidebar');
+            var nav = document.getElementById('sidebarNav');
+
+            applySidebarCollapsed(root.classList.contains('sb-collapsed'));
+            requestAnimationFrame(function () {
+                requestAnimationFrame(function () { root.classList.remove('sb-preload'); });
+            });
+
             if (overlay) {
                 overlay.addEventListener('click', closeMobileSidebar);
             }
@@ -307,6 +322,20 @@
                         if (isMobileNav()) closeMobileSidebar();
                     });
                 });
+
+                var touchX = null, touchY = null;
+                sidebar.addEventListener('touchstart', function (e) {
+                    if (!sidebar.classList.contains('mobile-open') || !e.touches.length) return;
+                    touchX = e.touches[0].clientX;
+                    touchY = e.touches[0].clientY;
+                }, { passive: true });
+                sidebar.addEventListener('touchend', function (e) {
+                    if (touchX === null || !e.changedTouches.length) return;
+                    var dx = e.changedTouches[0].clientX - touchX;
+                    var dy = Math.abs(e.changedTouches[0].clientY - touchY);
+                    touchX = touchY = null;
+                    if (dx < -60 && dy < 50) closeMobileSidebar();
+                }, { passive: true });
             }
             document.addEventListener('keydown', function (e) {
                 if (e.key === 'Escape') closeMobileSidebar();
@@ -314,6 +343,48 @@
             window.addEventListener('resize', function () {
                 if (!isMobileNav()) closeMobileSidebar();
             });
+
+            // Tooltip con el nombre del módulo cuando el menú está colapsado
+            if (!sidebar) return;
+            var tip = document.createElement('div');
+            tip.className = 'sb-tooltip';
+            tip.setAttribute('role', 'tooltip');
+            tip.setAttribute('aria-hidden', 'true');
+            document.body.appendChild(tip);
+            var current = null;
+
+            function canShow() {
+                return root.classList.contains('sb-collapsed') && !isMobileNav();
+            }
+            function show(el) {
+                if (!canShow()) return;
+                var label = el.getAttribute('data-sb-label');
+                if (!label) return;
+                current = el;
+                tip.textContent = label;
+                var rect = el.getBoundingClientRect();
+                var sbRect = sidebar.getBoundingClientRect();
+                // Con zoom CSS en <html>, getBoundingClientRect puede venir escalado; normalizar.
+                var scale = sidebar.offsetWidth ? (sbRect.width / sidebar.offsetWidth) : 1;
+                if (!scale || !isFinite(scale)) scale = 1;
+                tip.style.left = ((sbRect.right / scale) + 10) + 'px';
+                tip.style.top = (((rect.top + rect.height / 2) / scale)) + 'px';
+                tip.classList.add('is-visible');
+            }
+            function hide() {
+                current = null;
+                tip.classList.remove('is-visible');
+            }
+            window.SeriSidebarTip = { hide: hide };
+
+            sidebar.querySelectorAll('[data-sb-label]').forEach(function (el) {
+                el.addEventListener('mouseenter', function () { show(el); });
+                el.addEventListener('mouseleave', hide);
+                el.addEventListener('focus', function () { show(el); });
+                el.addEventListener('blur', hide);
+            });
+            if (nav) nav.addEventListener('scroll', function () { if (current) show(current); }, { passive: true });
+            window.addEventListener('resize', hide);
         })();
         
         function updateDateTime() {

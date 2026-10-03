@@ -106,6 +106,11 @@ class TenantVentasController extends TenantController
             $this->exportSales();
             return;
         }
+        if (($action === 'summary_csv' || $action === 'summary_pdf') && $this->request->method() === 'GET') {
+            TenantMiddleware::authorize('ventas', 'export');
+            $this->exportSalesSummary($action === 'summary_pdf' ? 'pdf' : 'csv');
+            return;
+        }
         if ($action === 'credit_note' && $this->request->method() === 'POST') {
             TenantMiddleware::authorize('ventas', 'create');
             $this->creditNote();
@@ -153,13 +158,10 @@ class TenantVentasController extends TenantController
             $params
         )->fetchAll();
         
-        $todayStats = $this->query(
-            "SELECT COALESCE(SUM(total), 0) as t, COUNT(*) as c
-             FROM sales
-             WHERE DATE(sale_date) = CURDATE() AND status != 'cancelled'"
-        )->fetch();
-        $todayTotal = (float)($todayStats['t'] ?? 0);
-        $todayCount = (int)($todayStats['c'] ?? 0);
+        [$sumFrom, $sumTo] = $this->salesSummaryRange();
+        $salesSummary = \SoftNova\Services\SalesPeriodSummary::build($this->db, $sumFrom, $sumTo);
+        $todayTotal = (float)$salesSummary['total'];
+        $todayCount = (int)$salesSummary['count'];
         
         try {
             $products = $this->query(
@@ -190,6 +192,7 @@ class TenantVentasController extends TenantController
             'sales' => $sales,
             'todayTotal' => $todayTotal,
             'todayCount' => $todayCount,
+            'salesSummary' => $salesSummary,
             'products' => $products,
             'customers' => $customers,
             'pagination' => $pagination,
@@ -247,6 +250,8 @@ class TenantVentasController extends TenantController
             'record_status' => $recordStatus !== 'active' ? $recordStatus : null,
             'sort' => $base['sort'] !== 'date' ? $base['sort'] : null,
             'dir' => ($base['sort'] !== 'date' || $base['dir'] !== 'desc') ? $base['dir'] : null,
+            'sum_from' => preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)$this->request->get('sum_from', '')) ? (string)$this->request->get('sum_from') : null,
+            'sum_to' => preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)$this->request->get('sum_to', '')) ? (string)$this->request->get('sum_to') : null,
         ], static fn($v) => $v !== null && $v !== '');
 
         return $base;
@@ -366,11 +371,28 @@ class TenantVentasController extends TenantController
                         ), 0) AS credited_qty
                  FROM sale_items si
                  WHERE si.sale_id = ?
+                   AND COALESCE(si.document_hidden, 0) = 0
                  ORDER BY si.id",
                 [$id]
             )->fetchAll();
         } catch (\Throwable $e) {
-            $items = $this->query("SELECT * FROM sale_items WHERE sale_id = ?", [$id])->fetchAll();
+            try {
+                $items = $this->query(
+                    "SELECT si.*,
+                            COALESCE((
+                                SELECT SUM(ci.quantity)
+                                FROM sale_credit_note_items ci
+                                INNER JOIN sale_credit_notes cn ON cn.id = ci.credit_note_id
+                                WHERE ci.sale_item_id = si.id AND cn.status = 'posted'
+                            ), 0) AS credited_qty
+                     FROM sale_items si
+                     WHERE si.sale_id = ?
+                     ORDER BY si.id",
+                    [$id]
+                )->fetchAll();
+            } catch (\Throwable $e2) {
+                $items = $this->query("SELECT * FROM sale_items WHERE sale_id = ?", [$id])->fetchAll();
+            }
         }
         $payments = $this->query(
             "SELECT * FROM sale_payments WHERE sale_id = ? ORDER BY payment_date DESC",
@@ -385,12 +407,98 @@ class TenantVentasController extends TenantController
             $creditNotes = [];
         }
 
+        $paymentChanges = [];
+        try {
+            $withChanges = \SoftNova\Services\CashClosingReportBuilder::attachSaleAdjustments($this->db, [$sale]);
+            $paymentChanges = $withChanges[0]['payment_changes'] ?? [];
+            foreach ($paymentChanges as &$ch) {
+                $ch['to'] = $this->paymentChangeLabel((string)($ch['to'] ?? ''));
+                $ch['from'] = $this->paymentChangeLabel((string)($ch['from'] ?? ''));
+            }
+            unset($ch);
+        } catch (\Throwable $e) {
+            $paymentChanges = [];
+        }
+
         $this->json([
             'sale' => $sale,
             'items' => $items,
             'payments' => $payments,
             'credit_notes' => $creditNotes,
+            'payment_changes' => $paymentChanges,
+            'profit' => $this->saleProfitSummary($sale),
         ]);
+    }
+
+    /** "Mixto: Efectivo 1000.00 + Transferencia 500.00" → montos en formato moneda. */
+    private function paymentChangeLabel(string $label): string
+    {
+        $label = trim($label);
+        if ($label === '') {
+            return '';
+        }
+        return (string)preg_replace_callback(
+            '/(?<![\d.,])(\d+)\.(\d{2})(?![\d.,])/',
+            static fn(array $m) => '$ ' . number_format((float)($m[1] . '.' . $m[2]), 2, ',', '.'),
+            $label
+        );
+    }
+
+    /**
+     * Utilidad bruta de la venta: lo cobrado por productos (total sin domicilio al cliente)
+     * menos el costo de lo vendido. Solo para quien ve reportes o contabilidad.
+     *
+     * @return array{revenue:float,cost:float,profit:float,margin_pct:float,items_without_cost:int}|null
+     */
+    private function saleProfitSummary(array $sale): ?array
+    {
+        if (!TenantMiddleware::canAccess('reportes') && !TenantMiddleware::canAccess('contabilidad')) {
+            return null;
+        }
+        $id = (int)($sale['id'] ?? 0);
+        if ($id <= 0 || ($sale['status'] ?? '') === 'cancelled') {
+            return null;
+        }
+        $costExpr = 'COALESCE(NULLIF(si.unit_cost, 0), p.purchase_price, 0)';
+        $row = null;
+        foreach ([
+            // Las líneas ocultas de un combo no llevan costo propio: el costo va en la línea visible.
+            "SELECT COALESCE(SUM(si.quantity * {$costExpr}), 0) AS cost,
+                    SUM(CASE WHEN {$costExpr} <= 0 THEN 1 ELSE 0 END) AS without_cost
+             FROM sale_items si
+             LEFT JOIN products p ON p.id = si.product_id
+             WHERE si.sale_id = ? AND COALESCE(si.document_hidden, 0) = 0",
+            "SELECT COALESCE(SUM(si.quantity * {$costExpr}), 0) AS cost,
+                    SUM(CASE WHEN {$costExpr} <= 0 THEN 1 ELSE 0 END) AS without_cost
+             FROM sale_items si
+             LEFT JOIN products p ON p.id = si.product_id
+             WHERE si.sale_id = ?",
+            "SELECT COALESCE(SUM(si.quantity * COALESCE(p.purchase_price, 0)), 0) AS cost,
+                    SUM(CASE WHEN COALESCE(p.purchase_price, 0) <= 0 THEN 1 ELSE 0 END) AS without_cost
+             FROM sale_items si
+             LEFT JOIN products p ON p.id = si.product_id
+             WHERE si.sale_id = ?",
+        ] as $sql) {
+            try {
+                $row = $this->query($sql, [$id])->fetch(\PDO::FETCH_ASSOC) ?: null;
+                break;
+            } catch (\Throwable $e) {
+                $row = null;
+            }
+        }
+        if ($row === null) {
+            return null;
+        }
+        $cost = round((float)($row['cost'] ?? 0), 2);
+        $revenue = round(max(0, (float)($sale['total'] ?? 0) - (float)($sale['delivery_fee'] ?? 0)), 2);
+        $profit = round($revenue - $cost, 2);
+        return [
+            'revenue' => $revenue,
+            'cost' => $cost,
+            'profit' => $profit,
+            'margin_pct' => $revenue > 0.009 ? round(($profit / $revenue) * 100, 1) : 0.0,
+            'items_without_cost' => (int)($row['without_cost'] ?? 0),
+        ];
     }
 
     /** Emite NC de venta (devolución parcial o total de productos). */
@@ -779,6 +887,53 @@ class TenantVentasController extends TenantController
         }
         $initialPayment = \SoftNova\Core\parse_money($this->request->post('initial_payment', 0));
         $items = $this->request->post('items', []);
+        if (!is_array($items)) {
+            $items = [];
+        }
+        // Reconstruir desde claves planas si el proxy no anidó arrays (combo incluido).
+        if ($items === []) {
+            foreach ($_POST as $key => $value) {
+                if (!is_string($key)) {
+                    continue;
+                }
+                if (preg_match('/^items\[(\d+)\]\[components\]\[(\d+)\]\[(\w+)\]$/', $key, $m)) {
+                    $idx = (int)$m[1];
+                    $cIdx = (int)$m[2];
+                    if (!isset($items[$idx]) || !is_array($items[$idx])) {
+                        $items[$idx] = [];
+                    }
+                    if (!isset($items[$idx]['components']) || !is_array($items[$idx]['components'])) {
+                        $items[$idx]['components'] = [];
+                    }
+                    if (!isset($items[$idx]['components'][$cIdx]) || !is_array($items[$idx]['components'][$cIdx])) {
+                        $items[$idx]['components'][$cIdx] = [];
+                    }
+                    $items[$idx]['components'][$cIdx][$m[3]] = $value;
+                    continue;
+                }
+                if (preg_match('/^items\[(\d+)\]\[(\w+)\]$/', $key, $m)) {
+                    $idx = (int)$m[1];
+                    if (!isset($items[$idx]) || !is_array($items[$idx])) {
+                        $items[$idx] = [];
+                    }
+                    $items[$idx][$m[2]] = $value;
+                }
+            }
+        }
+        // Normalizar components_json → components en cada ítem.
+        foreach ($items as $k => $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+            $comps = $item['components'] ?? null;
+            if ((!is_array($comps) || $comps === []) && !empty($item['components_json'])) {
+                $decoded = json_decode((string)$item['components_json'], true);
+                if (is_array($decoded)) {
+                    $items[$k]['components'] = $decoded;
+                    $items[$k]['is_combo'] = '1';
+                }
+            }
+        }
         $notes = trim((string)$this->request->post('notes', ''));
         $discountPercent = (float)$this->request->post('discount_percent', 0);
         if ($discountPercent < 0) {
@@ -843,8 +998,14 @@ class TenantVentasController extends TenantController
             return;
         }
 
-        // Agrupa cantidades del mismo producto (excepto comodín) para no aprobar 3+3 con stock 5.
+        // Agrupa cantidades del mismo producto (excepto comodín / combos) para no aprobar 3+3 con stock 5.
         $items = $this->aggregateCartItemsByProduct($items);
+
+        try {
+            (new \SoftNova\Services\ProductComboService($this->db))->ensureSchema();
+        } catch (\Throwable $e) {
+            // ignore
+        }
 
         $prefix = \SoftNova\Services\SalesDocumentService::prefixFor($documentType);
         if ($documentType === 'invoice') {
@@ -864,6 +1025,218 @@ class TenantVentasController extends TenantController
         \SoftNova\Services\TaxService::ensureSchema($this->db);
         $defaultTax = \SoftNova\Services\TaxService::defaultRate($this->db);
         foreach ($items as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+
+            // —— Combo: 1 renglón visible + componentes (stock / costo ocultos en factura) ——
+            $isCombo = !empty($item['is_combo'])
+                || (string)($item['is_combo'] ?? '') === '1'
+                || (string)($item['is_combo'] ?? '') === 'true'
+                || (string)($item['product_type'] ?? '') === 'combo'
+                || !empty($item['components_json'])
+                || (isset($item['components']) && is_array($item['components']) && count($item['components']) >= 2
+                    && (int)($item['product_id'] ?? 0) <= 0);
+            if ($isCombo) {
+                $packs = (int)($item['quantity'] ?? 0);
+                if ($packs <= 0) {
+                    $this->respond(false, 'Cantidad de combo inválida', '/app/caja');
+                    return;
+                }
+                $comboPrice = round((float)($item['unit_price'] ?? 0), 2);
+                if ($comboPrice < 0) {
+                    $comboPrice = 0.0;
+                }
+                $comboName = trim((string)($item['product_name'] ?? $item['combo_name'] ?? 'Combo'));
+                if ($comboName === '') {
+                    $comboName = 'Combo';
+                }
+                if (mb_strlen($comboName) > 255) {
+                    $comboName = mb_substr($comboName, 0, 255);
+                }
+                if (!str_starts_with(mb_strtolower($comboName), 'combo')) {
+                    $comboName = 'Combo: ' . $comboName;
+                }
+                $comboId = (int)($item['combo_id'] ?? 0);
+                $components = $item['components'] ?? [];
+                if ((!is_array($components) || count($components) < 2) && !empty($item['components_json'])) {
+                    $decoded = json_decode((string)$item['components_json'], true);
+                    if (is_array($decoded)) {
+                        $components = $decoded;
+                    }
+                }
+                if (!is_array($components)) {
+                    $components = [];
+                }
+                $components = array_values(array_filter($components, static function ($c) {
+                    return is_array($c) && (int)($c['product_id'] ?? 0) > 0;
+                }));
+                if (count($components) < 2) {
+                    $this->respond(
+                        false,
+                        'El combo «' . $comboName . '» no llegó con sus productos. Actualice la página (Ctrl+F5) e intente de nuevo.',
+                        '/app/caja'
+                    );
+                    return;
+                }
+
+                $costSumPerPack = 0.0;
+                $taxRateCombo = 0.0;
+                $compValid = [];
+                foreach ($components as $comp) {
+                    if (!is_array($comp)) {
+                        continue;
+                    }
+                    $pid = (int)($comp['product_id'] ?? 0);
+                    $qtyTotal = (int)($comp['quantity'] ?? 0);
+                    $perPack = (int)($comp['quantity_per_pack'] ?? 0);
+                    if ($pid <= 0) {
+                        continue;
+                    }
+                    if ($qtyTotal <= 0 && $perPack > 0) {
+                        $qtyTotal = $perPack * $packs;
+                    }
+                    if ($qtyTotal <= 0) {
+                        continue;
+                    }
+                    if ($perPack <= 0) {
+                        $perPack = max(1, (int)round($qtyTotal / max(1, $packs)));
+                    }
+                    $product = $this->query(
+                        "SELECT * FROM products WHERE id = ? AND status = 'active'",
+                        [$pid]
+                    )->fetch();
+                    if (!$product) {
+                        $this->respond(false, 'Producto del combo no disponible (#' . $pid . ')', '/app/caja');
+                        return;
+                    }
+                    if (\SoftNova\Services\OpenItemProduct::isOpenItem($product)) {
+                        $this->respond(false, 'El comodín no puede formar parte de un combo en venta', '/app/caja');
+                        return;
+                    }
+                    $unitCost = round((float)($product['purchase_price'] ?? 0), 2);
+                    $costSumPerPack += $unitCost * $perPack;
+                    $lineTax = \SoftNova\Services\TaxService::resolveProductRate(
+                        $product,
+                        $defaultTax,
+                        $this->db
+                    );
+                    if ($lineTax > $taxRateCombo) {
+                        $taxRateCombo = $lineTax;
+                    }
+                    $isService = (($product['product_type'] ?? 'product') === 'service');
+                    $available = (int)($product['stock'] ?? 0);
+                    $isConsignment = (($product['ownership'] ?? 'owned') === 'consignment');
+                    $oversellReason = '';
+                    $oversellNote = '';
+                    if (!$isService && $qtyTotal > max(0, $available)) {
+                        if ($isConsignment) {
+                            $this->respond(
+                                false,
+                                'Stock consignado insuficiente para ' . $product['name']
+                                . ' dentro del combo (disponible: ' . $available . ').',
+                                '/app/caja'
+                            );
+                            return;
+                        }
+                        try {
+                            $parsed = \SoftNova\Services\StockOversell::parse(
+                                $item['stock_oversell_reason'] ?? ($comp['stock_oversell_reason'] ?? null),
+                                $item['stock_oversell_note'] ?? ($comp['stock_oversell_note'] ?? null)
+                            );
+                        } catch (\InvalidArgumentException $e) {
+                            $this->respond(false, $e->getMessage() . ' (' . $product['name'] . ')', '/app/caja');
+                            return;
+                        }
+                        if ($parsed === null) {
+                            $this->respond(
+                                false,
+                                'Stock insuficiente para ' . $product['name']
+                                . ' en el combo (disponible: ' . $available . ').',
+                                '/app/caja'
+                            );
+                            return;
+                        }
+                        $oversellReason = $parsed['reason'];
+                        $oversellNote = $parsed['note'];
+                    }
+                    $compValid[] = [
+                        'product_id' => $pid,
+                        'product_name' => (string)$product['name'],
+                        'quantity' => $qtyTotal,
+                        'unit_price' => 0.0,
+                        'catalog_price' => round((float)($product['sale_price'] ?? 0), 2),
+                        'sync_catalog_price' => false,
+                        'unit_cost' => 0.0, // costo va en la línea del combo (evita doble conteo)
+                        'stock_unit_cost' => $unitCost, // para decrease()
+                        'subtotal' => 0.0,
+                        'tax_rate' => 0.0,
+                        'product_type' => $product['product_type'] ?? 'product',
+                        'stock' => $available,
+                        'stock_oversell_reason' => $oversellReason,
+                        'stock_oversell_note' => $oversellNote,
+                        'is_open_item' => false,
+                        'is_consignment' => $isConsignment,
+                        'consignor_id' => $isConsignment ? (int)($product['consignor_id'] ?? 0) : 0,
+                        'is_combo' => false,
+                        'document_hidden' => true,
+                        'combo_id' => $comboId > 0 ? $comboId : null,
+                        'skip_stock' => false,
+                    ];
+                }
+                if (count($compValid) < 2) {
+                    $this->respond(false, 'El combo «' . $comboName . '» no tiene componentes válidos', '/app/caja');
+                    return;
+                }
+                $costSumPerPack = round($costSumPerPack, 2);
+                if ($costSumPerPack > 0.009 && !\SoftNova\Services\ProductPriceGuard::saleExceedsCost($comboPrice, $costSumPerPack)) {
+                    $this->respond(
+                        false,
+                        \SoftNova\Services\ProductPriceGuard::message($comboName, $comboPrice, $costSumPerPack),
+                        '/app/caja'
+                    );
+                    return;
+                }
+                $postedTax = array_key_exists('tax_rate', $item)
+                    ? round((float)$item['tax_rate'], 2)
+                    : $taxRateCombo;
+                $lineSub = round($comboPrice * $packs, 2);
+                $subtotal += $lineSub;
+                $validItems[] = [
+                    'product_id' => null,
+                    'product_name' => $comboName,
+                    'quantity' => $packs,
+                    'unit_price' => $comboPrice,
+                    'catalog_price' => $comboPrice,
+                    'sync_catalog_price' => false,
+                    'unit_cost' => $costSumPerPack,
+                    'subtotal' => $lineSub,
+                    'tax_rate' => $postedTax,
+                    'product_type' => 'combo',
+                    'stock' => 0,
+                    'stock_oversell_reason' => '',
+                    'stock_oversell_note' => '',
+                    'is_open_item' => false,
+                    'is_consignment' => false,
+                    'consignor_id' => 0,
+                    'is_combo' => true,
+                    'document_hidden' => false,
+                    'combo_id' => $comboId > 0 ? $comboId : null,
+                    'skip_stock' => true,
+                ];
+                foreach ($compValid as $cv) {
+                    $validItems[] = $cv;
+                }
+                if ($comboId > 0) {
+                    try {
+                        (new \SoftNova\Services\ProductComboService($this->db))->recordUsage($comboId);
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+                }
+                continue;
+            }
+
             $productId = (int)($item['product_id'] ?? 0);
             $quantity = (int)($item['quantity'] ?? 0);
             if ($productId <= 0 || $quantity <= 0) {
@@ -969,6 +1342,10 @@ class TenantVentasController extends TenantController
                 'consignor_id' => (($product['ownership'] ?? 'owned') === 'consignment')
                     ? (int)($product['consignor_id'] ?? 0)
                     : 0,
+                'is_combo' => false,
+                'document_hidden' => false,
+                'combo_id' => null,
+                'skip_stock' => $isOpenItem,
             ];
             $lastIdx = count($validItems) - 1;
             $isService = ($validItems[$lastIdx]['product_type'] ?? 'product') === 'service';
@@ -1193,17 +1570,27 @@ class TenantVentasController extends TenantController
             
             foreach ($validItems as $vi) {
                 $isConsignment = !empty($vi['is_consignment']);
+                $isComboLine = !empty($vi['is_combo']);
+                $docHidden = !empty($vi['document_hidden']);
+                $comboIdVal = !empty($vi['combo_id']) ? (int)$vi['combo_id'] : null;
+                $productIdVal = $vi['product_id'] !== null && $vi['product_id'] !== ''
+                    ? (int)$vi['product_id']
+                    : null;
+                if ($productIdVal !== null && $productIdVal <= 0) {
+                    $productIdVal = null;
+                }
                 try {
                     $this->query(
                         "INSERT INTO sale_items
                             (sale_id, product_id, product_name, quantity, unit_price, unit_cost,
                              is_consignment, consignor_id, subtotal, tax_rate, tax_amount,
                              discount_amount, taxable,
-                             stock_oversell_reason, stock_oversell_note)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             stock_oversell_reason, stock_oversell_note,
+                             is_combo, document_hidden, combo_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         [
                             $saleId,
-                            $vi['product_id'],
+                            $productIdVal,
                             $vi['product_name'],
                             $vi['quantity'],
                             $vi['unit_price'],
@@ -1217,6 +1604,9 @@ class TenantVentasController extends TenantController
                             round((float)($vi['taxable'] ?? $vi['subtotal'] ?? 0), 2),
                             $vi['stock_oversell_reason'] !== '' ? $vi['stock_oversell_reason'] : null,
                             $vi['stock_oversell_note'] !== '' ? $vi['stock_oversell_note'] : null,
+                            $isComboLine ? 1 : 0,
+                            $docHidden ? 1 : 0,
+                            $comboIdVal,
                         ]
                     );
                 } catch (\Throwable $e) {
@@ -1229,7 +1619,7 @@ class TenantVentasController extends TenantController
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             [
                                 $saleId,
-                                $vi['product_id'],
+                                $productIdVal,
                                 $vi['product_name'],
                                 $vi['quantity'],
                                 $vi['unit_price'],
@@ -1252,7 +1642,7 @@ class TenantVentasController extends TenantController
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             [
                                 $saleId,
-                                $vi['product_id'],
+                                $productIdVal,
                                 $vi['product_name'],
                                 $vi['quantity'],
                                 $vi['unit_price'],
@@ -1266,20 +1656,23 @@ class TenantVentasController extends TenantController
                         $this->query(
                             "INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, subtotal)
                              VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            [$saleId, $vi['product_id'], $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['unit_cost'] ?? 0, $vi['subtotal']]
+                            [$saleId, $productIdVal, $vi['product_name'], $vi['quantity'], $vi['unit_price'], $vi['unit_cost'] ?? 0, $vi['subtotal']]
                         );
                     }
                     }
                 }
                 $saleItemId = (int)$this->db->lastInsertId();
-                if (!empty($vi['sync_catalog_price'])) {
+                if (!empty($vi['sync_catalog_price']) && $productIdVal) {
                     $this->sales->stock()->recordSalePriceChange(
-                        (int)$vi['product_id'],
+                        (int)$productIdVal,
                         (float)$vi['catalog_price'],
                         (float)$vi['unit_price'],
                         $saleId,
                         $invoiceNumber
                     );
+                }
+                if (!empty($vi['skip_stock']) || !$productIdVal) {
+                    continue;
                 }
                 $oversell = null;
                 if (!empty($vi['stock_oversell_reason'])) {
@@ -1289,22 +1682,25 @@ class TenantVentasController extends TenantController
                         'sale_item_id' => $saleItemId,
                     ];
                 }
+                $stockCost = array_key_exists('stock_unit_cost', $vi)
+                    ? (float)$vi['stock_unit_cost']
+                    : (float)($vi['unit_cost'] ?? 0);
                 $this->sales->stock()->decrease(
-                    $vi['product_id'],
+                    $productIdVal,
                     $vi['quantity'],
                     'sale',
                     $saleId,
-                    'Venta: ' . $invoiceNumber,
-                    (float)($vi['unit_cost'] ?? 0),
+                    'Venta: ' . $invoiceNumber . ($docHidden ? ' (combo)' : ''),
+                    $stockCost,
                     $oversell
                 );
                 if ($isConsignment) {
                     (new \SoftNova\Services\ConsignmentService($this->db, $this->sales->stock()))->registerSaleDebt(
                         $saleId,
                         $saleItemId,
-                        (int)$vi['product_id'],
+                        (int)$productIdVal,
                         (int)$vi['quantity'],
-                        (float)($vi['unit_cost'] ?? 0),
+                        $stockCost,
                         (int)($vi['consignor_id'] ?? 0) ?: null
                     );
                 }
@@ -1687,6 +2083,23 @@ class TenantVentasController extends TenantController
         if ($oldRows === [] && PaymentMethodCatalog::affectsCash((string)$sale['payment_method'])) {
             $oldCash = round((float)$sale['total'], 2);
         }
+        $oldByMethod = [];
+        foreach ($oldRows as $r) {
+            $m = PaymentMethodCatalog::normalize((string)$r['payment_method']);
+            $oldByMethod[$m] = round(($oldByMethod[$m] ?? 0) + (float)$r['amount'], 2);
+        }
+        if (count($oldByMethod) > 1) {
+            $oldParts = [];
+            foreach ($oldByMethod as $m => $amt) {
+                $oldParts[] = PaymentMethodCatalog::label($m, $this->db) . ' ' . number_format($amt, 2, '.', '');
+            }
+            $oldLabel = 'Mixto: ' . implode(' + ', $oldParts);
+        } else {
+            $oldLabel = PaymentMethodCatalog::label(
+                $oldByMethod !== [] ? (string)array_key_first($oldByMethod) : (string)$sale['payment_method'],
+                $this->db
+            );
+        }
 
         $isMixed = $this->request->post('is_mixed', '0') === '1'
             || strtolower(trim((string)$this->request->post('payment_method', ''))) === 'mixed';
@@ -1820,33 +2233,52 @@ class TenantVentasController extends TenantController
             error_log('Comisiones after payment edit ' . $saleId . ': ' . $e->getMessage());
         }
 
-        $deltaCash = round($newCash - $oldCash, 2);
-        if (abs($deltaCash) > 0.009) {
-            if ($deltaCash > 0) {
-                $this->cash->registerIncome(
-                    $deltaCash,
-                    'Ajuste medio de pago (entra a efectivo): ' . $label,
-                    'sale_payment_adjust',
-                    $saleId
-                );
-            } else {
-                $this->cash->registerMovement(
-                    abs($deltaCash),
-                    'Ajuste medio de pago (sale de efectivo): ' . $label,
-                    'expense',
-                    'sale_payment_adjust',
-                    $saleId
-                );
+        $deltaCash = 0.0;
+        try {
+            // Sincronizar cajón al neto real de movimientos de esta venta (no solo al
+            // cálculo teórico de medios). Así cash→transfer saca el efectivo y no
+            // deja un ingreso huérfano que el cuadre interpreta como "entrada".
+            $this->cash->syncSaleCashInOpenSession(
+                $saleId,
+                $label,
+                $newCash,
+                $oldPaymentIds
+            );
+            $deltaCash = round($newCash - $oldCash, 2);
+        } catch (\Throwable $e) {
+            error_log('syncSaleCash after payment edit ' . $saleId . ': ' . $e->getMessage());
+            // Fallback legacy por delta teórico
+            $deltaCash = round($newCash - $oldCash, 2);
+            if (abs($deltaCash) > 0.009) {
+                if ($deltaCash > 0) {
+                    $this->cash->registerIncome(
+                        $deltaCash,
+                        'Ajuste medio de pago (entra efectivo): ' . $label,
+                        'sale_payment_adjust',
+                        $saleId
+                    );
+                } else {
+                    $this->cash->registerMovement(
+                        abs($deltaCash),
+                        'Ajuste medio de pago (sale efectivo → otro medio): ' . $label,
+                        'expense',
+                        'sale_payment_adjust',
+                        $saleId
+                    );
+                }
             }
         }
 
+        $newLabel = $plan['label'] !== '' ? $plan['label'] : PaymentMethodCatalog::label($newMethod, $this->db);
         try {
             (new \SoftNova\Services\TenantAuditService($this->db))->log(
                 'update',
                 'ventas',
-                'Medio(s) de pago ' . $label . ' → ' . ($plan['label'] !== '' ? $plan['label'] : PaymentMethodCatalog::label($newMethod, $this->db)),
+                'Medio(s) de pago ' . $label . ': ' . $oldLabel . ' → ' . $newLabel
+                    . (abs($deltaCash) > 0.009 ? (' · Δ efectivo ' . number_format($deltaCash, 2, '.', '')) : ''),
                 'sale',
-                $saleId
+                $saleId,
+                ['from' => $oldLabel, 'to' => $newLabel, 'delta_cash' => $deltaCash]
             );
         } catch (\Throwable $e) {
         }
@@ -1989,16 +2421,30 @@ class TenantVentasController extends TenantController
                 exit;
             }
 
-            $items = $this->query(
-                "SELECT si.*,
-                        COALESCE(p.code, '') AS product_code,
-                        COALESCE(p.barcode, '') AS barcode
-                 FROM sale_items si
-                 LEFT JOIN products p ON p.id = si.product_id
-                 WHERE si.sale_id = ?
-                 ORDER BY si.id ASC",
-                [$id]
-            )->fetchAll();
+            try {
+                $items = $this->query(
+                    "SELECT si.*,
+                            COALESCE(p.code, '') AS product_code,
+                            COALESCE(p.barcode, '') AS barcode
+                     FROM sale_items si
+                     LEFT JOIN products p ON p.id = si.product_id
+                     WHERE si.sale_id = ?
+                       AND COALESCE(si.document_hidden, 0) = 0
+                     ORDER BY si.id ASC",
+                    [$id]
+                )->fetchAll();
+            } catch (\Throwable $e) {
+                $items = $this->query(
+                    "SELECT si.*,
+                            COALESCE(p.code, '') AS product_code,
+                            COALESCE(p.barcode, '') AS barcode
+                     FROM sale_items si
+                     LEFT JOIN products p ON p.id = si.product_id
+                     WHERE si.sale_id = ?
+                     ORDER BY si.id ASC",
+                    [$id]
+                )->fetchAll();
+            }
             $payments = $this->query(
                 "SELECT * FROM sale_payments WHERE sale_id = ? ORDER BY id ASC",
                 [$id]
@@ -2062,31 +2508,168 @@ class TenantVentasController extends TenantController
         $this->respond($result['success'], $result['message'], '/app/ventas');
     }
     
-    private function reportPdf(): void
+    /** Dompdf no escala con miles de filas: por encima de esto se recorta el PDF. */
+    private const REPORT_PDF_MAX_SALES = 1200;
+    /** Por encima de esto el PDF lista solo encabezados de venta (sin ítems). */
+    private const REPORT_PDF_ITEMS_MAX_SALES = 250;
+
+    /** @var array<string,string> */
+    private array $payLabelCache = [];
+
+    private function payMethodLabel(string $method): string
     {
-        try {
-            $filters = $this->salesListFilters();
-            $sales = $this->attachSaleItems($this->fetchFilteredSales($filters, 5000));
-            $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
-            $content = $pdf->generateSalesListReport($sales, $filters, $this->db);
-            $pdf->download($content, 'reporte_ventas_' . date('Ymd_His') . '.pdf');
-        } catch (\Throwable $e) {
-            error_log('reportPdf ventas: ' . $e->getMessage());
+        if (!isset($this->payLabelCache[$method])) {
+            $this->payLabelCache[$method] = PaymentMethodCatalog::label($method, $this->db);
+        }
+        return $this->payLabelCache[$method];
+    }
+
+    /**
+     * Libera el bloqueo de sesión (si no, el resto del ERP queda colgado mientras se genera)
+     * y amplía límites para exportaciones grandes.
+     */
+    private function prepareExportResponse(): void
+    {
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            session_write_close();
+        }
+        @set_time_limit(300);
+        @ini_set('memory_limit', '512M');
+        while (ob_get_level() > 0) {
+            @ob_end_clean();
+        }
+    }
+
+    private function exportError(string $message, \Throwable $e): void
+    {
+        error_log($message . ': ' . $e->getMessage());
+        while (ob_get_level() > 0) {
+            @ob_end_clean();
+        }
+        if (!headers_sent()) {
             http_response_code(500);
             header('Content-Type: text/plain; charset=utf-8');
-            echo "No se pudo generar el PDF.\n" . $e->getMessage();
-            exit;
         }
+        echo $message . '. ' . $this->clientErrorMessage($e, 'Intente con un rango de fechas menor.');
+        exit;
+    }
+
+    private function reportPdf(): void
+    {
+        $this->prepareExportResponse();
+        try {
+            $filters = $this->salesListFilters();
+            $sales = $this->fetchFilteredSales($filters, self::REPORT_PDF_MAX_SALES + 1);
+            $truncated = count($sales) > self::REPORT_PDF_MAX_SALES;
+            if ($truncated) {
+                $sales = array_slice($sales, 0, self::REPORT_PDF_MAX_SALES);
+            }
+            $withItems = count($sales) <= self::REPORT_PDF_ITEMS_MAX_SALES;
+            if ($withItems) {
+                $sales = $this->attachSaleItems($sales);
+            }
+            $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
+            $content = $pdf->generateSalesListReport($sales, $filters, $this->db, [
+                'with_items' => $withItems,
+                'truncated' => $truncated,
+                'items_max' => self::REPORT_PDF_ITEMS_MAX_SALES,
+            ]);
+            $pdf->download($content, 'reporte_ventas_' . date('Ymd_His') . '.pdf');
+        } catch (\Throwable $e) {
+            $this->exportError('No se pudo generar el PDF de ventas', $e);
+        }
+    }
+
+    /** Rango del resumen de ventas (sum_from / sum_to); por defecto hoy. */
+    private function salesSummaryRange(): array
+    {
+        $today = date('Y-m-d');
+        $validDay = static function (string $d): bool {
+            $dt = \DateTimeImmutable::createFromFormat('Y-m-d', $d);
+            return $dt && $dt->format('Y-m-d') === $d;
+        };
+        $from = (string)$this->request->get('sum_from', '');
+        $to = (string)$this->request->get('sum_to', '');
+        $from = $validDay($from) ? $from : $today;
+        $to = $validDay($to) ? $to : $from;
+        if ($from > $to) {
+            [$from, $to] = [$to, $from];
+        }
+        return [$from, $to];
+    }
+
+    private function exportSalesSummary(string $format): void
+    {
+        $this->prepareExportResponse();
+        [$from, $to] = $this->salesSummaryRange();
+        try {
+            $summary = \SoftNova\Services\SalesPeriodSummary::build($this->db, $from, $to);
+            $summary['profit'] = (TenantMiddleware::canAccess('reportes') || TenantMiddleware::canAccess('contabilidad'))
+                ? \SoftNova\Services\SalesPeriodSummary::profit($this->db, $from, $to)
+                : null;
+        } catch (\Throwable $e) {
+            $this->exportError('No se pudo calcular el resumen de ventas', $e);
+            return;
+        }
+        $suffix = $from === $to ? $from : $from . '_a_' . $to;
+
+        if ($format === 'pdf') {
+            try {
+                $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
+                $pdf->download($pdf->generateSalesPaymentSummary($summary), 'resumen_ventas_' . $suffix . '.pdf');
+            } catch (\Throwable $e) {
+                $this->exportError('No se pudo generar el PDF del resumen', $e);
+            }
+            return;
+        }
+
+        $total = (float)$summary['total'];
+        $pct = static fn(float $v) => $total > 0.009 ? number_format(($v / $total) * 100, 1, ',', '') : '0';
+        $money = static fn(float $v) => number_format($v, 2, ',', '');
+        $rows = [];
+        foreach ($summary['by_method'] as $pm) {
+            $rows[] = [$pm['label'], (int)$pm['count'], $money((float)$pm['amount']), $pct((float)$pm['amount'])];
+        }
+        if ((float)$summary['pending'] > 0.009) {
+            $rows[] = ['Por cobrar (crédito)', '', $money((float)$summary['pending']), $pct((float)$summary['pending'])];
+        }
+        $rows[] = ['Total facturado', (int)$summary['count'], $money($total), '100'];
+        if ((float)$summary['discount'] > 0.009) {
+            $rows[] = ['Descuentos aplicados', '', $money((float)$summary['discount']), ''];
+        }
+        $profit = $summary['profit'] ?? null;
+        if (is_array($profit)) {
+            $rows[] = ['', '', '', ''];
+            $rows[] = ['Ventas netas (sin domicilio)', '', $money((float)$profit['revenue']), ''];
+            $rows[] = ['Costo de ventas', '', $money((float)$profit['cost']), ''];
+            $rows[] = ['Utilidad bruta', '', $money((float)$profit['profit']), number_format((float)$profit['margin_pct'], 1, ',', '')];
+            if ((int)$profit['items_without_cost'] > 0) {
+                $rows[] = ['Líneas sin costo registrado', (int)$profit['items_without_cost'], '', ''];
+            }
+        }
+        $rows[] = ['Periodo', $from . ' a ' . $to, '', ''];
+
+        $this->exportCsv(
+            'resumen_ventas_' . $suffix . '.csv',
+            ['Medio de pago', 'Ventas', 'Monto', '%'],
+            $rows
+        );
     }
 
     private function exportSales(): void
     {
-        $filters = $this->salesListFilters();
-        $rows = $this->attachSaleItems($this->fetchFilteredSales($filters, 10000));
+        $this->prepareExportResponse();
+        try {
+            $filters = $this->salesListFilters();
+            $rows = $this->attachSaleItems($this->fetchFilteredSales($filters, 10000));
+        } catch (\Throwable $e) {
+            $this->exportError('No se pudo exportar el CSV de ventas', $e);
+            return;
+        }
 
         $csvRows = [];
         foreach ($rows as $r) {
-            $payLabel = PaymentMethodCatalog::label((string)$r['payment_method'], $this->db);
+            $payLabel = $this->payMethodLabel((string)$r['payment_method']);
             $statusLabel = (($r['status'] ?? '') === 'cancelled')
                 ? 'Cancelado'
                 : ($r['payment_status'] === 'paid' ? 'Pagado' : ($r['payment_status'] === 'partial' ? 'Parcial' : 'Pendiente'));
@@ -2162,9 +2745,26 @@ class TenantVentasController extends TenantController
             if (!is_array($item)) {
                 continue;
             }
-            $productId = (int)($item['product_id'] ?? 0);
             $quantity = (int)($item['quantity'] ?? 0);
-            if ($productId <= 0 || $quantity <= 0) {
+            if ($quantity <= 0) {
+                continue;
+            }
+
+            // Combos: product_id=0 + components — NUNCA descartar por product_id.
+            $isCombo = !empty($item['is_combo'])
+                || (string)($item['is_combo'] ?? '') === '1'
+                || (string)($item['is_combo'] ?? '') === 'true'
+                || (string)($item['product_type'] ?? '') === 'combo'
+                || !empty($item['components_json'])
+                || (isset($item['components']) && is_array($item['components']) && count($item['components']) >= 2
+                    && (int)($item['product_id'] ?? 0) <= 0);
+            if ($isCombo) {
+                $openLines[] = $item;
+                continue;
+            }
+
+            $productId = (int)($item['product_id'] ?? 0);
+            if ($productId <= 0) {
                 continue;
             }
             $isOpen = !empty($item['is_open_item'])
@@ -2193,7 +2793,21 @@ class TenantVentasController extends TenantController
                 $grouped[$productId] = $item;
                 $grouped[$productId]['quantity'] = $quantity;
             } else {
-                $grouped[$productId]['quantity'] = (int)$grouped[$productId]['quantity'] + $quantity;
+                $prevQty = (int)$grouped[$productId]['quantity'];
+                $prevPrice = (float)($grouped[$productId]['unit_price'] ?? 0);
+                $newPrice = array_key_exists('unit_price', $item)
+                    ? (float)$item['unit_price']
+                    : $prevPrice;
+                $totalQty = $prevQty + $quantity;
+                if ($totalQty > 0 && (abs($prevPrice - $newPrice) > 0.0001)) {
+                    // Precio ponderado si se mezclan líneas (p. ej. combo + venta suelta).
+                    $grouped[$productId]['unit_price'] = round(
+                        (($prevPrice * $prevQty) + ($newPrice * $quantity)) / $totalQty,
+                        2
+                    );
+                    $grouped[$productId]['price_manual'] = '1';
+                }
+                $grouped[$productId]['quantity'] = $totalQty;
                 $r = (string)($item['stock_oversell_reason'] ?? $item['oversell_reason'] ?? '');
                 if ($r !== '') {
                     $grouped[$productId]['stock_oversell_reason'] = $r;

@@ -892,18 +892,74 @@ class PurchasingService
     public function listInvoices(int $limit = 50, int $offset = 0, string $paymentFilter = '', string $dueFilter = '', array $filters = []): array
     {
         [$whereSql, $params] = $this->invoiceFilters($paymentFilter, $dueFilter, $filters);
-        $limit = max(1, min(200, $limit));
+        $limit = max(1, min(20000, $limit));
         $offset = max(0, $offset);
+        $byDue = strtolower(trim($paymentFilter)) === 'unpaid'
+            || in_array(strtolower(trim($dueFilter)), ['overdue', 'due_today', 'due_soon'], true);
+        $orderBy = $byDue
+            ? 'po.due_date IS NULL, po.due_date ASC, po.id ASC'
+            : 'COALESCE(po.invoice_date, po.warehouse_date, po.order_date) DESC, po.id DESC';
         return $this->query(
             "SELECT po.*, s.name supplier_name,
                     DATEDIFF(CURDATE(), po.due_date) AS days_overdue
              FROM purchase_orders po
              LEFT JOIN suppliers s ON s.id = po.supplier_id
              {$whereSql}
-             ORDER BY COALESCE(po.invoice_date, po.warehouse_date, po.order_date) DESC, po.id DESC
+             ORDER BY {$orderBy}
              LIMIT {$limit} OFFSET {$offset}",
             $params
         )->fetchAll();
+    }
+
+    /**
+     * Conteo y saldo pendiente (solo facturas a crédito) para un filtro de facturas.
+     *
+     * @return array{count:int,balance:float}
+     */
+    public function invoiceSummary(string $paymentFilter = '', string $dueFilter = '', array $filters = []): array
+    {
+        [$whereSql, $params] = $this->invoiceFilters($paymentFilter, $dueFilter, $filters);
+        try {
+            $row = $this->query(
+                "SELECT COUNT(*) AS cnt,
+                        COALESCE(SUM(CASE
+                            WHEN po.status = 'received' AND COALESCE(po.payment_mode, 'payable') = 'payable'
+                            THEN GREATEST(po.total - COALESCE(po.paid_total, 0) - COALESCE(po.credit_total, 0), 0)
+                            ELSE 0 END), 0) AS balance
+                 FROM purchase_orders po
+                 LEFT JOIN suppliers s ON s.id = po.supplier_id
+                 {$whereSql}",
+                $params
+            )->fetch() ?: [];
+        } catch (\Throwable $e) {
+            $row = [];
+        }
+        return [
+            'count' => (int)($row['cnt'] ?? 0),
+            'balance' => round((float)($row['balance'] ?? 0), 2),
+        ];
+    }
+
+    /**
+     * Resumen por filtro rápido de facturas (respeta búsqueda, proveedor y fechas).
+     *
+     * @return array<string,array{count:int,balance:float}>
+     */
+    public function invoiceQuickSummary(array $filters = []): array
+    {
+        $map = [
+            'all' => ['', ''],
+            'unpaid' => ['unpaid', ''],
+            'overdue' => ['', 'overdue'],
+            'due_soon' => ['', 'due_soon'],
+            'paid_only' => ['paid_only', ''],
+            'voided' => ['voided', ''],
+        ];
+        $out = [];
+        foreach ($map as $key => [$payment, $due]) {
+            $out[$key] = $this->invoiceSummary($payment, $due, $filters);
+        }
+        return $out;
     }
 
     public function countInvoices(string $paymentFilter = '', string $dueFilter = '', array $filters = []): int
@@ -3326,12 +3382,13 @@ class PurchasingService
         }
         $events = $deduped;
 
+        // Más reciente primero (trazabilidad Contabilidad / Compras).
         usort($events, static function ($a, $b) {
-            $cmp = strcmp((string)$a['at'], (string)$b['at']);
+            $cmp = strcmp((string)$b['at'], (string)$a['at']);
             if ($cmp !== 0) {
                 return $cmp;
             }
-            return strcmp((string)($a['type'] ?? ''), (string)($b['type'] ?? ''));
+            return strcmp((string)($b['type'] ?? ''), (string)($a['type'] ?? ''));
         });
 
         $order['payments'] = $this->orderPayments($orderId);

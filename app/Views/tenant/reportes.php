@@ -82,7 +82,7 @@ foreach ($marginByChannel as $ch) {
 
 $payMethodLabels = []; $payMethodData = [];
 $payNames = ['cash'=>'Efectivo','card'=>'Tarjeta','transfer'=>'Transferencia','credit'=>'Credito','other'=>'Otro','dataphone'=>'Datafono'];
-foreach ($paymentMethods as $pm) { $payMethodLabels[] = $payNames[$pm['payment_method']] ?? $pm['payment_method']; $payMethodData[] = (int)$pm['count']; }
+foreach ($paymentMethods as $pm) { $payMethodLabels[] = $pm['label'] ?? ($payNames[$pm['payment_method']] ?? $pm['payment_method']); $payMethodData[] = round((float)($pm['total'] ?? 0), 2); }
 
 $trendLabels = []; $trendCurrent = []; $trendLast = [];
 foreach ($productTrend as $t) { $trendLabels[] = $t['name']; $trendCurrent[] = (int)$t['current_month']; $trendLast[] = (int)$t['last_month']; }
@@ -183,7 +183,7 @@ if (!function_exists('rptChartTypeSelect')) {
     </div>
     <div class="stat-card neumorphic">
         <h4>Ticket promedio</h4>
-        <div class="stat-value" style="color:var(--color-primary);"><?php echo fmtR((float)$avgTicket, $currency); ?></div>
+        <div class="stat-value" style="color:var(--color-accent-text, var(--color-primary));"><?php echo fmtR((float)$avgTicket, $currency); ?></div>
         <small>por venta</small>
         <?php if ($reportsFull): ?>
         <div style="margin-top:6px;font-size:12px;color:<?php echo trendColor((float)$ticketTrend); ?>;">
@@ -208,10 +208,14 @@ if (!function_exists('rptChartTypeSelect')) {
     <div class="card neumorphic">
         <div class="card-header"><h3>Utilidad del periodo</h3></div>
         <div class="card-body">
-            <div class="rpt-row"><span>Ingresos (subtotal ítems)</span><strong style="color:#10B981;"><?php echo fmtR((float)$profitSummary['revenue'], $currency); ?></strong></div>
-            <div class="rpt-row muted"><span>Total facturado (con impuestos)</span><span><?php echo fmtR((float)($profitSummary['billed'] ?? $totalSales), $currency); ?></span></div>
+            <div class="rpt-row"><span>Ventas brutas (subtotal ítems)</span><strong style="color:#10B981;"><?php echo fmtR((float)$profitSummary['revenue'], $currency); ?></strong></div>
+            <?php if ((float)($profitSummary['discounts'] ?? 0) > 0.009): ?>
+            <div class="rpt-row"><span>− Descuentos</span><span style="color:var(--dmc-B45309, #B45309);"><?php echo fmtR((float)$profitSummary['discounts'], $currency); ?></span></div>
+            <div class="rpt-row muted"><span>Ventas netas</span><span><?php echo fmtR((float)($profitSummary['net_revenue'] ?? $profitSummary['revenue']), $currency); ?></span></div>
+            <?php endif; ?>
+            <div class="rpt-row muted"><span>Total facturado (con impuestos y domicilios)</span><span><?php echo fmtR((float)($profitSummary['billed'] ?? $totalSales), $currency); ?></span></div>
             <div class="rpt-row"><span>− Costo de ventas</span><span><?php echo fmtR((float)$profitSummary['cost'], $currency); ?></span></div>
-            <div class="rpt-row rpt-row-sep"><span>Utilidad bruta</span><strong><?php echo fmtR((float)$profitSummary['gross'], $currency); ?></strong></div>
+            <div class="rpt-row rpt-row-sep"><span>Utilidad bruta <small style="color:var(--color-text-secondary);">(<?php echo (float)($profitSummary['gross_margin'] ?? 0); ?>%)</small></span><strong><?php echo fmtR((float)$profitSummary['gross'], $currency); ?></strong></div>
             <div class="rpt-row muted"><span>− Gastos fijos</span><span><?php echo fmtR((float)($profitSummary['expenses_fixed'] ?? 0), $currency); ?></span></div>
             <div class="rpt-row muted"><span>− Gastos financieros</span><span><?php echo fmtR((float)($profitSummary['expenses_financial'] ?? 0), $currency); ?></span></div>
             <div class="rpt-row muted"><span>− Otros gastos</span><span><?php echo fmtR((float)($profitSummary['expenses_operating'] ?? 0), $currency); ?></span></div>
@@ -244,6 +248,29 @@ if (!function_exists('rptChartTypeSelect')) {
                         </span>
                     </div>
                 <?php endforeach; ?>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <div class="card neumorphic">
+        <div class="card-header"><h3>Ventas por medio de pago</h3></div>
+        <div class="card-body">
+            <?php $ss = $salesSummary ?? ['by_method' => [], 'pending' => 0, 'total' => 0]; ?>
+            <?php if (empty($ss['by_method']) && (float)($ss['pending'] ?? 0) <= 0.009): ?>
+                <p class="rpt-empty">Sin ventas en el periodo</p>
+            <?php else: ?>
+                <?php foreach ($ss['by_method'] as $pm):
+                    $pct = (float)$ss['total'] > 0.009 ? round(((float)$pm['amount'] / (float)$ss['total']) * 100, 1) : 0;
+                ?>
+                    <div class="rpt-row">
+                        <span><?php echo htmlspecialchars($pm['label']); ?> <small style="color:var(--color-text-secondary);">(<?php echo (int)$pm['count']; ?> · <?php echo str_replace('.', ',', (string)$pct); ?>%)</small></span>
+                        <strong><?php echo fmtR((float)$pm['amount'], $currency); ?></strong>
+                    </div>
+                <?php endforeach; ?>
+                <?php if ((float)($ss['pending'] ?? 0) > 0.009): ?>
+                    <div class="rpt-row"><span style="color:var(--dmc-B45309, #B45309);">Por cobrar (crédito)</span><strong style="color:var(--dmc-B45309, #B45309);"><?php echo fmtR((float)$ss['pending'], $currency); ?></strong></div>
+                <?php endif; ?>
+                <div class="rpt-row rpt-row-total"><strong>Total facturado</strong><strong><?php echo fmtR((float)$ss['total'], $currency); ?></strong></div>
             <?php endif; ?>
         </div>
     </div>
@@ -400,7 +427,7 @@ if (!function_exists('rptChartTypeSelect')) {
                             <td><?php echo htmlspecialchars($lp['name']); ?></td>
                             <td><span class="badge badge-danger"><?php echo (int)$lp['stock']; ?></span></td>
                             <td><?php echo (int)$lp['min_stock']; ?></td>
-                            <td style="color:#DC2626;font-weight:600;"><?php echo (int)$lp['min_stock'] - (int)$lp['stock']; ?></td>
+                            <td style="color:var(--dmc-DC2626, #DC2626);font-weight:600;"><?php echo (int)$lp['min_stock'] - (int)$lp['stock']; ?></td>
                         </tr>
                     <?php endforeach; ?>
                     </tbody>
@@ -416,14 +443,14 @@ if (!function_exists('rptChartTypeSelect')) {
         <div class="card-header"><h3>Cuentas por cobrar</h3></div>
         <div class="card-body">
             <div style="text-align:center;margin-bottom:12px;">
-                <div style="font-size:24px;font-weight:700;color:var(--color-primary);"><?php echo fmtR((float)$receivablesAging['total'], $currency); ?></div>
+                <div style="font-size:24px;font-weight:700;color:var(--color-accent-text, var(--color-primary));"><?php echo fmtR((float)$receivablesAging['total'], $currency); ?></div>
                 <small style="color:var(--color-text-secondary);"><?php echo (int)$receivablesAging['cnt']; ?> facturas pendientes</small>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:13px;">
                 <div class="rpt-row"><span>0-30 días</span><strong><?php echo fmtR((float)$receivablesAging['d0'], $currency); ?></strong></div>
                 <div class="rpt-row"><span>31-60</span><strong><?php echo fmtR((float)$receivablesAging['d30'], $currency); ?></strong></div>
                 <div class="rpt-row"><span>61-90</span><strong style="color:#F59E0B;"><?php echo fmtR((float)$receivablesAging['d60'], $currency); ?></strong></div>
-                <div class="rpt-row"><span>+90 días</span><strong style="color:#DC2626;"><?php echo fmtR((float)$receivablesAging['d90'], $currency); ?></strong></div>
+                <div class="rpt-row"><span>+90 días</span><strong style="color:var(--dmc-DC2626, #DC2626);"><?php echo fmtR((float)$receivablesAging['d90'], $currency); ?></strong></div>
             </div>
             <?php if (!empty($topDebtors)): ?>
                 <div style="margin-top:12px;border-top:1px dashed var(--color-border);padding-top:8px;">
@@ -445,8 +472,8 @@ if (!function_exists('rptChartTypeSelect')) {
             <?php if ($cashSummary['session']): ?>
                 <div class="rpt-row muted"><span>Base inicial</span><span><?php echo fmtR((float)$cashSummary['opening'], $currency); ?></span></div>
                 <div class="rpt-row muted"><span>+ Ingresos</span><strong style="color:#10B981;"><?php echo fmtR((float)$cashSummary['income'], $currency); ?></strong></div>
-                <div class="rpt-row muted"><span>− Egresos</span><strong style="color:#DC2626;"><?php echo fmtR((float)$cashSummary['expense'], $currency); ?></strong></div>
-                <div class="rpt-row rpt-row-total"><strong>Esperado en caja</strong><strong style="color:var(--color-primary);"><?php echo fmtR((float)$cashSummary['expected'], $currency); ?></strong></div>
+                <div class="rpt-row muted"><span>− Egresos</span><strong style="color:var(--dmc-DC2626, #DC2626);"><?php echo fmtR((float)$cashSummary['expense'], $currency); ?></strong></div>
+                <div class="rpt-row rpt-row-total"><strong>Esperado en caja</strong><strong style="color:var(--color-accent-text, var(--color-primary));"><?php echo fmtR((float)$cashSummary['expected'], $currency); ?></strong></div>
                 <small style="color:var(--color-text-secondary);">Sesión de <?php echo htmlspecialchars($cashSummary['session']['user_name'] ?? 'Usuario'); ?></small>
             <?php else: ?>
                 <p class="rpt-empty">No hay caja abierta. <a href="<?php echo $viewInstance->route('app/caja'); ?>">Abrir caja</a></p>
@@ -614,7 +641,7 @@ function rptPreset(key) {
 (function() {
     var isDark = document.body.classList.contains('dark-mode');
     var gridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
-    var textColor = isDark ? '#94A3B8' : '#64748B';
+    var textColor = isDark ? '#CBD5E1' : '#64748B';
     var reportsFull = <?php echo $reportsFull ? 'true' : 'false'; ?>;
     var symbol = <?php echo json_encode($currency['symbol'] ?? '$'); ?>;
     var palette = ['#0D7C4A','#10B981','#34D399','#7C3AED','#F59E0B','#3B82F6','#EF4444','#EC4899','#059669','#047857'];
@@ -632,7 +659,7 @@ function rptPreset(key) {
         chartTrend: 'bar'
     };
 
-    function moneyTick(v) { return symbol + Number(v).toLocaleString(); }
+    function moneyTick(v) { return symbol + ' ' + Number(v).toLocaleString('es-CO', { maximumFractionDigits: 0 }); }
     function isCircular(t) { return t === 'pie' || t === 'doughnut'; }
 
     function loadPrefs() {
@@ -836,11 +863,11 @@ function rptPreset(key) {
                 type: type,
                 data: {
                     labels: <?php echo json_encode($payMethodLabels); ?>,
-                    datasets: [makeDataset('Pagos', <?php echo json_encode($payMethodData); ?>, type, {
+                    datasets: [makeDataset('Monto', <?php echo json_encode($payMethodData); ?>, type, {
                         colors: palette, fill: 'rgba(59,130,246,0.55)', border: circular ? (isDark ? '#1E293B' : '#fff') : '#3B82F6'
                     })]
                 },
-                options: baseOptions(circular, false, !circular)
+                options: baseOptions(circular, true, false)
             });
         };
 
