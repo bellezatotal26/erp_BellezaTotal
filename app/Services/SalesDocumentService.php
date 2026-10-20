@@ -139,8 +139,27 @@ class SalesDocumentService
         };
     }
 
+    /** Días de un plazo personalizado "net_N" (1..3650) o null si no aplica. */
+    public static function customTermDays(string $terms): ?int
+    {
+        if (!preg_match('/^net_(\d{1,4})$/', $terms, $m)) {
+            return null;
+        }
+        $days = (int)$m[1];
+        return ($days >= 1 && $days <= 3650) ? $days : null;
+    }
+
+    public static function isValidTerms(string $terms): bool
+    {
+        return isset(self::paymentTerms()[$terms]) || self::customTermDays($terms) !== null;
+    }
+
     public static function termDays(string $terms): int
     {
+        $custom = self::customTermDays($terms);
+        if ($custom !== null) {
+            return $custom;
+        }
         return match ($terms) {
             'cash' => 0,
             'net_15' => 15,
@@ -156,6 +175,10 @@ class SalesDocumentService
     public static function resolveDueDate(string $terms, string $saleDate): ?string
     {
         $base = strtotime($saleDate) ?: time();
+        $custom = self::customTermDays($terms);
+        if ($custom !== null) {
+            return date('Y-m-d', strtotime('+' . $custom . ' days', $base));
+        }
         return match ($terms) {
             'cash' => date('Y-m-d', $base),
             'net_15' => date('Y-m-d', strtotime('+15 days', $base)),
@@ -171,5 +194,39 @@ class SalesDocumentService
     public static function label(string $documentType): string
     {
         return self::documentTypes()[$documentType] ?? 'Documento';
+    }
+
+    /**
+     * Observación humana de la venta (sin metadatos de cobro/sistema).
+     * Sirve para listados, detalle y reporte de caja.
+     */
+    public static function displayNotes(string $notes): string
+    {
+        $notes = trim($notes);
+        if ($notes === '') {
+            return '';
+        }
+        $parts = preg_split('/\s*[·|]\s*/u', $notes) ?: [];
+        $keep = [];
+        foreach ($parts as $part) {
+            $part = trim($part);
+            if ($part === '') {
+                continue;
+            }
+            if (preg_match(
+                '/^(venta\s*r[aá]pida\s*desde\s*caja|offline|combo\s*:|mixto\s*:|recibido(?:\s+efectivo)?\s*:|cambio\s*:|vueltas\s*:|pago\s*mixto|domicilio\s*:|venta\s+al\s+por\s+mayor|descuento|recargo\s+cr[eé]dito|abono\s+inicial)/iu',
+                $part
+            )) {
+                continue;
+            }
+            if (preg_match('/^(medio|efectivo|transferencia|dat[aá]fono|tarjeta|nequi)\b/iu', $part)) {
+                continue;
+            }
+            if (preg_match('/^\d+[\d.,]*\s*$/', $part)) {
+                continue;
+            }
+            $keep[] = $part;
+        }
+        return trim(implode(' · ', $keep));
     }
 }

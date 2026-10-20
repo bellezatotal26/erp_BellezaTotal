@@ -10,6 +10,25 @@ namespace SoftNova\Services;
  */
 class CommissionService
 {
+    /** Columnas añadidas después de la versión inicial de sales_commissions. */
+    private const EXTRA_COLUMNS = [
+        'fixed_fee' => 'DECIMAL(12,2) NOT NULL DEFAULT 0.00',
+        'vat_amount' => 'DECIMAL(12,2) NOT NULL DEFAULT 0.00',
+        'withholding_renta' => 'DECIMAL(12,2) NOT NULL DEFAULT 0.00',
+        'withholding_iva' => 'DECIMAL(12,2) NOT NULL DEFAULT 0.00',
+        'withholding_ica' => 'DECIMAL(12,2) NOT NULL DEFAULT 0.00',
+        'accrual_date' => 'DATE NULL',
+        'last_error' => 'VARCHAR(255) NULL',
+    ];
+
+    /** Medios que cobra un adquirente (datáfono o pasarela web). */
+    public const GATEWAY_METHODS = ['debit_card', 'credit_card', 'card', 'dataphone', 'payment_link'];
+
+    /** @var array<int,array<string,bool>> */
+    private static array $columnCache = [];
+
+    private ?array $configCache = null;
+
     public function __construct(private \PDO $db)
     {
         TenantOpsSchema::ensure($db);
@@ -28,7 +47,8 @@ class CommissionService
     {
         static $done = [];
         $oid = spl_object_id($this->db);
-        if (isset($done[$oid])) {
+        // El DDL hace commit implícito: nunca dentro de una transacción abierta.
+        if (isset($done[$oid]) || $this->db->inTransaction()) {
             return;
         }
         $done[$oid] = true;
@@ -66,14 +86,53 @@ class CommissionService
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
         );
 
+        unset(self::$columnCache[$oid]);
+        $cols = $this->commissionColumns();
+        foreach (self::EXTRA_COLUMNS as $name => $definition) {
+            if (isset($cols[$name])) {
+                continue;
+            }
+            try {
+                $this->db->exec("ALTER TABLE sales_commissions ADD COLUMN {$name} {$definition}");
+                self::$columnCache[$oid][$name] = true;
+            } catch (\Throwable $e) {
+                error_log('sales_commissions add column ' . $name . ': ' . $e->getMessage());
+            }
+        }
+
         try {
             $this->query(
                 "INSERT IGNORE INTO accounting_accounts (code, name, account_type, nature, is_system)
-                 VALUES ('510508', 'Comisiones sobre ventas', 'expense', 'debit', 1)"
+                 VALUES ('510508', 'Comisiones sobre ventas', 'expense', 'debit', 1),
+                        ('135517', 'Impuesto a las ventas retenido (ReteIVA)', 'asset', 'debit', 1),
+                        ('135518', 'Impuesto de industria y comercio retenido (ReteICA)', 'asset', 'debit', 1)"
             );
         } catch (\Throwable $e) {
             // Contabilidad aún no provisionada en este tenant.
         }
+    }
+
+    /** @return array<string,bool> */
+    private function commissionColumns(): array
+    {
+        $oid = spl_object_id($this->db);
+        if (!isset(self::$columnCache[$oid])) {
+            $cols = [];
+            try {
+                foreach ($this->db->query('SHOW COLUMNS FROM sales_commissions')->fetchAll() as $c) {
+                    $cols[(string)$c['Field']] = true;
+                }
+            } catch (\Throwable $e) {
+                // Tabla aún no creada.
+            }
+            self::$columnCache[$oid] = $cols;
+        }
+        return self::$columnCache[$oid];
+    }
+
+    private function hasColumn(string $column): bool
+    {
+        return isset($this->commissionColumns()[$column]);
     }
 
     private function seedDefaults(): void
@@ -85,20 +144,31 @@ class CommissionService
             'seller_commission_trigger' => 'on_payment', // on_sale|on_payment
             'seller_commission_auto_expense' => '1',
             'gateway_commission_auto' => '1',
-            'dataphone_commission_rate' => '2.5',
-            'card_commission_rate' => '2.8',
+            'dataphone_fixed_fee' => '0',
             'payment_link_commission_rate' => '2.5',
             'debit_card_commission_rate' => '1.5',
             'credit_card_commission_rate' => '2.8',
             'seller_commission_account' => '510508',
             'gateway_commission_account' => '530505',
+            'gateway_vat_rate' => '0',
+            'gateway_vat_deductible' => '1',
+            'gateway_withholding_renta_rate' => '0',
+            'gateway_withholding_iva_rate' => '0',
+            'gateway_withholding_ica_rate' => '0',
+            'gateway_withholding_renta_account' => '135515',
+            'gateway_withholding_iva_account' => '135517',
+            'gateway_withholding_ica_account' => '135518',
         ];
+        $params = [];
         foreach ($defaults as $k => $v) {
-            $this->query(
-                "INSERT IGNORE INTO accounting_settings (setting_key, setting_value) VALUES (?, ?)",
-                [$k, $v]
-            );
+            $params[] = $k;
+            $params[] = $v;
         }
+        $this->query(
+            "INSERT IGNORE INTO accounting_settings (setting_key, setting_value) VALUES "
+                . implode(',', array_fill(0, count($defaults), '(?, ?)')),
+            $params
+        );
     }
 
     private function setting(string $key, string $default = ''): string
@@ -112,15 +182,17 @@ class CommissionService
 
     public function config(): array
     {
-        return [
+        if ($this->configCache !== null) {
+            return $this->configCache;
+        }
+        return $this->configCache = [
             'seller_enabled' => $this->setting('seller_commission_enabled', '0') === '1',
             'seller_rate' => (float)$this->setting('seller_commission_rate', '3'),
             'seller_base' => $this->setting('seller_commission_base', 'total'),
             'seller_trigger' => $this->setting('seller_commission_trigger', 'on_payment'),
             'seller_auto_expense' => $this->setting('seller_commission_auto_expense', '1') === '1',
             'gateway_auto' => $this->setting('gateway_commission_auto', '1') === '1',
-            'dataphone_rate' => (float)$this->setting('dataphone_commission_rate', '2.5'),
-            'card_rate' => (float)$this->setting('card_commission_rate', '2.8'),
+            'dataphone_fixed_fee' => (float)$this->setting('dataphone_fixed_fee', '0'),
             'payment_link_rate' => (float)$this->setting('payment_link_commission_rate', '2.5'),
             'debit_card_rate' => (float)$this->setting('debit_card_commission_rate', '1.5'),
             'credit_card_rate' => (float)$this->setting('credit_card_commission_rate', '2.8'),
@@ -130,6 +202,18 @@ class CommissionService
             'quantity_discount_tiers' => $this->quantityDiscountTiers(),
             'seller_account' => $this->setting('seller_commission_account', '510508'),
             'gateway_account' => $this->setting('gateway_commission_account', '530505'),
+            // IVA que cobra el adquirente sobre su comisión.
+            'gateway_vat_rate' => (float)$this->setting('gateway_vat_rate', '0'),
+            'gateway_vat_deductible' => $this->setting('gateway_vat_deductible', '1') === '1',
+            'gateway_vat_account' => $this->setting('vat_deductible_account', '240802'),
+            // Retenciones que practica el adquirente sobre la venta: renta e ICA sobre la base sin IVA,
+            // reteIVA sobre el IVA del pago. ICA en por mil (‰).
+            'withholding_renta_rate' => (float)$this->setting('gateway_withholding_renta_rate', '0'),
+            'withholding_iva_rate' => (float)$this->setting('gateway_withholding_iva_rate', '0'),
+            'withholding_ica_rate' => (float)$this->setting('gateway_withholding_ica_rate', '0'),
+            'withholding_renta_account' => $this->setting('gateway_withholding_renta_account', '135515'),
+            'withholding_iva_account' => $this->setting('gateway_withholding_iva_account', '135517'),
+            'withholding_ica_account' => $this->setting('gateway_withholding_ica_account', '135518'),
         ];
     }
 
@@ -329,14 +413,29 @@ class CommissionService
                 ? $input['seller_trigger'] : 'on_payment',
             'seller_commission_auto_expense' => !empty($input['seller_auto_expense']) ? '1' : '0',
             'gateway_commission_auto' => !empty($input['gateway_auto']) ? '1' : '0',
-            'dataphone_commission_rate' => (string)max(0, min(30, (float)($input['dataphone_rate'] ?? 2.5))),
-            'card_commission_rate' => (string)max(0, min(30, (float)($input['card_rate'] ?? 2.8))),
+            'dataphone_fixed_fee' => (string)round(max(0, min(1000000, \SoftNova\Core\parse_money($input['dataphone_fixed_fee'] ?? 0))), 2),
             'payment_link_commission_rate' => (string)max(0, min(30, (float)($input['payment_link_rate'] ?? 2.5))),
             'debit_card_commission_rate' => (string)max(0, min(30, (float)($input['debit_card_rate'] ?? 1.5))),
             'credit_card_commission_rate' => (string)max(0, min(30, (float)($input['credit_card_rate'] ?? 2.8))),
             'credit_over_60_surcharge_rate' => (string)max(0, min(100, (float)($input['credit_over_60_rate'] ?? 0))),
             'credit_over_60_surcharge_days' => (string)max(1, min(365, (int)($input['credit_over_60_days'] ?? 60))),
         ];
+
+        $taxFields = [
+            'gateway_vat_rate' => 100.0,
+            'gateway_withholding_renta_rate' => 100.0,
+            'gateway_withholding_iva_rate' => 100.0,
+            'gateway_withholding_ica_rate' => 1000.0,
+        ];
+        foreach ($taxFields as $field => $max) {
+            if (array_key_exists($field, $input)) {
+                $value = (float)str_replace(',', '.', (string)$input[$field]);
+                $map[$field] = (string)round(max(0, min($max, $value)), 4);
+            }
+        }
+        if (array_key_exists('gateway_vat_deductible', $input)) {
+            $map['gateway_vat_deductible'] = !empty($input['gateway_vat_deductible']) ? '1' : '0';
+        }
 
         $tiers = self::normalizeCreditSurchargeTiers($input['credit_surcharge_tiers'] ?? null);
         // Si el formulario envía arrays paralelos days[] / rate[]
@@ -395,6 +494,7 @@ class CommissionService
         foreach ($map as $k => $v) {
             $stmt->execute([$k, $v]);
         }
+        $this->configCache = null;
     }
 
     public function saveUserRate(int $userId, float $rate, bool $enabled = true): void
@@ -436,17 +536,83 @@ class CommissionService
         return $cfg['seller_rate']; // global
     }
 
+    /** Débito/crédito (y sus códigos legado card/dataphone) se cobran por datáfono. */
+    public static function isDataphoneMethod(string $method): bool
+    {
+        return in_array(strtolower($method), ['debit_card', 'credit_card', 'card', 'dataphone'], true);
+    }
+
     public function gatewayRate(string $method): float
     {
         $cfg = $this->config();
         return match (strtolower($method)) {
-            'dataphone' => $cfg['dataphone_rate'],
             'payment_link' => $cfg['payment_link_rate'],
-            'debit_card' => $cfg['debit_card_rate'],
-            'credit_card' => $cfg['credit_card_rate'],
-            'card' => $cfg['card_rate'],
+            'debit_card', 'dataphone' => $cfg['debit_card_rate'],
+            'credit_card', 'card' => $cfg['credit_card_rate'],
             default => 0.0,
         };
+    }
+
+    public function gatewayFixedFee(string $method): float
+    {
+        return self::isDataphoneMethod($method) ? (float)$this->config()['dataphone_fixed_fee'] : 0.0;
+    }
+
+    /**
+     * @return array{rate:float,fixed:float,percent_amount:float,amount:float}
+     */
+    public function gatewayCommission(string $method, float $base): array
+    {
+        $rate = $this->gatewayRate($method);
+        $fixed = $base > 0 ? $this->gatewayFixedFee($method) : 0.0;
+        $pct = $base > 0 ? round($base * $rate / 100, 2) : 0.0;
+        return [
+            'rate' => $rate,
+            'fixed' => round($fixed, 2),
+            'percent_amount' => $pct,
+            'amount' => round($pct + $fixed, 2),
+        ];
+    }
+
+    /**
+     * Comisión + IVA sobre la comisión + retenciones del adquirente para un pago.
+     *
+     * @param float $taxRatio Proporción de IVA dentro del pago (impuesto / total de la venta).
+     * @return array{rate:float,fixed:float,percent_amount:float,amount:float,vat:float,ret_renta:float,ret_iva:float,ret_ica:float,withholdings:float}
+     */
+    public function gatewayBreakdown(string $method, float $base, float $taxRatio = 0.0): array
+    {
+        $calc = $this->gatewayCommission($method, $base) + [
+            'vat' => 0.0, 'ret_renta' => 0.0, 'ret_iva' => 0.0, 'ret_ica' => 0.0, 'withholdings' => 0.0,
+        ];
+        if ($calc['amount'] <= 0) {
+            return $calc;
+        }
+        $cfg = $this->config();
+        $taxRatio = max(0.0, min(1.0, $taxRatio));
+        $vatPart = $base * $taxRatio;
+        $netBase = $base - $vatPart;
+        $calc['vat'] = round($calc['amount'] * $cfg['gateway_vat_rate'] / 100, 2);
+        $calc['ret_renta'] = round($netBase * $cfg['withholding_renta_rate'] / 100, 2);
+        $calc['ret_iva'] = round($vatPart * $cfg['withholding_iva_rate'] / 100, 2);
+        $calc['ret_ica'] = round($netBase * $cfg['withholding_ica_rate'] / 1000, 2);
+        $calc['withholdings'] = round($calc['ret_renta'] + $calc['ret_iva'] + $calc['ret_ica'], 2);
+        return $calc;
+    }
+
+    private static function saleTaxRatio(array $sale): float
+    {
+        $total = (float)($sale['total'] ?? 0);
+        if ($total <= 0) {
+            return 0.0;
+        }
+        return max(0.0, min(1.0, (float)($sale['tax'] ?? 0) / $total));
+    }
+
+    private static function paymentDate(array $pay): string
+    {
+        $ts = strtotime((string)($pay['payment_date'] ?? $pay['created_at'] ?? ''));
+        return $ts ? date('Y-m-d', $ts) : date('Y-m-d');
     }
 
     private function saleBaseAmount(array $sale, string $base): float
@@ -574,6 +740,8 @@ class CommissionService
             return null;
         }
 
+        $saleTs = strtotime((string)($sale['sale_date'] ?? $sale['created_at'] ?? ''));
+
         return $this->insertCommission([
             'kind' => 'seller',
             'sale_id' => (int)$sale['id'],
@@ -583,6 +751,7 @@ class CommissionService
             'base_amount' => $base,
             'rate' => $rate,
             'amount' => $amount,
+            'accrual_date' => $saleTs ? date('Y-m-d', $saleTs) : date('Y-m-d'),
             'notes' => 'Comisión vendedor · venta #' . ($sale['invoice_number'] ?? $sale['id']),
         ], $cfg['seller_auto_expense']);
     }
@@ -637,6 +806,7 @@ class CommissionService
             'base_amount' => $base,
             'rate' => $rate,
             'amount' => $amount,
+            'accrual_date' => self::paymentDate($pay),
             'notes' => 'Comisión vendedor · abono venta #' . ($sale['invoice_number'] ?? $sale['id']),
         ], $cfg['seller_auto_expense']);
     }
@@ -648,9 +818,24 @@ class CommissionService
             return null;
         }
         $method = (string)($pay['payment_method'] ?? '');
-        $rate = $this->gatewayRate($method);
-        if ($rate <= 0) {
+        $base = (float)$pay['amount'];
+        if ($this->gatewayCommission($method, $base)['amount'] <= 0) {
             return null;
+        }
+        // Cobro a una pasarela por liquidar (Bold): la comisión/retención real llega con el reporte.
+        // Guard: evita fatal si Bancos/Bold aún no está desplegado en el servidor.
+        // H3: no auto-accrue si el medio ya tiene clearing, o si hay pasarela activa y el medio es de datáfono/link.
+        if (class_exists(BankingService::class)) {
+            $payDate = self::paymentDate($pay);
+            if (BankingService::clearingAccountFor($this->db, $method, $payDate) !== null) {
+                return null;
+            }
+            if (
+                in_array(strtolower($method), self::GATEWAY_METHODS, true)
+                && BankingService::hasActiveGatewayAccount($this->db)
+            ) {
+                return null;
+            }
         }
         $exists = $this->query(
             "SELECT id FROM sales_commissions
@@ -661,12 +846,23 @@ class CommissionService
             return null;
         }
 
-        $base = (float)$pay['amount'];
-        $amount = round($base * $rate / 100, 2);
-        if ($amount <= 0) {
-            return null;
+        $sale = $this->query(
+            'SELECT invoice_number, total, tax FROM sales WHERE id=?',
+            [(int)$pay['sale_id']]
+        )->fetch() ?: [];
+        $calc = $this->gatewayBreakdown($method, $base, self::saleTaxRatio($sale));
+
+        $label = PaymentMethodCatalog::label($method, $this->db);
+        if (self::isDataphoneMethod($method)) {
+            $label = 'Datáfono · ' . $label;
         }
-        $sale = $this->query('SELECT invoice_number FROM sales WHERE id=?', [(int)$pay['sale_id']])->fetch();
+        $detail = [];
+        if ($calc['rate'] > 0) {
+            $detail[] = rtrim(rtrim(number_format($calc['rate'], 2, ',', '.'), '0'), ',') . '%';
+        }
+        if ($calc['fixed'] > 0) {
+            $detail[] = '$ ' . number_format($calc['fixed'], 0, ',', '.') . ' fijo';
+        }
 
         return $this->insertCommission([
             'kind' => 'gateway',
@@ -675,24 +871,38 @@ class CommissionService
             'user_id' => null,
             'payment_method' => $method,
             'base_amount' => $base,
-            'rate' => $rate,
-            'amount' => $amount,
-            'notes' => 'Comisión ' . $method . ' · venta #' . ($sale['invoice_number'] ?? $pay['sale_id']),
+            'rate' => $calc['rate'],
+            'amount' => $calc['amount'],
+            'fixed_fee' => $calc['fixed'],
+            'vat_amount' => $calc['vat'],
+            'withholding_renta' => $calc['ret_renta'],
+            'withholding_iva' => $calc['ret_iva'],
+            'withholding_ica' => $calc['ret_ica'],
+            'accrual_date' => self::paymentDate($pay),
+            'notes' => mb_substr('Comisión ' . $label . ($detail ? ' (' . implode(' + ', $detail) . ')' : '')
+                . ' · venta #' . ($sale['invoice_number'] ?? $pay['sale_id']), 0, 255),
         ], true); // pasarela siempre genera gasto automático
     }
 
     private function insertCommission(array $data, bool $autoExpense): ?array
     {
+        $cols = ['commission_kind', 'sale_id', 'sale_payment_id', 'user_id', 'payment_method',
+            'base_amount', 'rate', 'amount', 'status', 'notes'];
+        $values = [
+            $data['kind'], $data['sale_id'], $data['sale_payment_id'], $data['user_id'],
+            $data['payment_method'], $data['base_amount'], $data['rate'], $data['amount'],
+            'pending', $data['notes'],
+        ];
+        foreach (array_keys(self::EXTRA_COLUMNS) as $extra) {
+            if (array_key_exists($extra, $data) && $this->hasColumn($extra)) {
+                $cols[] = $extra;
+                $values[] = $data[$extra];
+            }
+        }
         $this->query(
-            "INSERT INTO sales_commissions
-                (commission_kind, sale_id, sale_payment_id, user_id, payment_method,
-                 base_amount, rate, amount, status, notes)
-             VALUES (?,?,?,?,?,?,?,?, 'pending', ?)",
-            [
-                $data['kind'], $data['sale_id'], $data['sale_payment_id'], $data['user_id'],
-                $data['payment_method'], $data['base_amount'], $data['rate'], $data['amount'],
-                $data['notes'],
-            ]
+            'INSERT INTO sales_commissions (' . implode(', ', $cols) . ')
+             VALUES (' . implode(',', array_fill(0, count($cols), '?')) . ')',
+            $values
         );
         $id = (int)$this->db->lastInsertId();
         $row = $this->query('SELECT * FROM sales_commissions WHERE id=?', [$id])->fetch();
@@ -734,15 +944,20 @@ class CommissionService
             $kind = $row['commission_kind'];
             $category = $kind === 'gateway'
                 ? (match ((string)$row['payment_method']) {
-                    'dataphone' => 'dataphone_commission',
+                    'dataphone', 'debit_card', 'credit_card', 'card' => 'dataphone_commission',
                     'payment_link' => 'payment_link_commission',
-                    'debit_card', 'credit_card', 'card' => 'card_commission',
                     default => 'financial',
                 })
                 : 'sales_commission'; // comisión vendedor
 
             $desc = $row['notes'] ?: ('Comisión #' . $row['id']);
             $method = $affectCash ? 'cash' : 'transfer';
+            $date = $this->accrualDate($row);
+
+            $commission = round((float)$row['amount'], 2);
+            $vat = $kind === 'gateway' ? round((float)($row['vat_amount'] ?? 0), 2) : 0.0;
+            // IVA no descontable = mayor valor del gasto.
+            $expenseAmount = $cfg['gateway_vat_deductible'] ? $commission : round($commission + $vat, 2);
 
             // Gasto + asiento + paid deben ser atómicos: si falla contabilidad, no marcar liquidada.
             $ownTx = !$this->db->inTransaction();
@@ -756,9 +971,9 @@ class CommissionService
                      VALUES (?,?,?,?,?,?,?)",
                     [
                         $desc,
-                        (float)$row['amount'],
+                        $expenseAmount,
                         $kind === 'gateway' ? $category : 'sales_commission',
-                        date('Y-m-d'),
+                        $date,
                         $method,
                         'sales_commission:' . $row['id'],
                         $row['user_id'] ?? ($_SESSION['tenant_user_id'] ?? null),
@@ -767,14 +982,16 @@ class CommissionService
                 $expenseId = (int)$this->db->lastInsertId();
 
                 if ($kind === 'seller') {
-                    $this->postSellerExpense($accounting, $expenseId, (float)$row['amount'], $desc, $affectCash);
+                    $this->postSellerExpense($accounting, $expenseId, $commission, $date, $desc, $affectCash);
                 } else {
                     // Pasarela: gasto financiero contra banco (neto cobrado), no contra CxP.
-                    $this->postGatewayExpense($accounting, $expenseId, (float)$row['amount'], $desc);
+                    $this->postGatewayExpense($accounting, $expenseId, $row, $date, $desc);
                 }
 
                 $this->query(
-                    "UPDATE sales_commissions SET status='paid', expense_id=? WHERE id=?",
+                    "UPDATE sales_commissions SET status='paid', expense_id=?"
+                        . ($this->hasColumn('last_error') ? ', last_error=NULL' : '')
+                        . ' WHERE id=?',
                     [$expenseId, $row['id']]
                 );
 
@@ -787,6 +1004,15 @@ class CommissionService
                     $this->db->rollBack();
                 }
                 error_log('Commission settle accounting #' . $row['id'] . ': ' . $e->getMessage());
+                if ($ownTx && $this->hasColumn('last_error')) {
+                    try {
+                        $this->query(
+                            'UPDATE sales_commissions SET last_error=? WHERE id=?',
+                            [mb_substr($e->getMessage(), 0, 255), $row['id']]
+                        );
+                    } catch (\Throwable $ignored) {
+                    }
+                }
                 throw $e;
             }
         }
@@ -794,18 +1020,35 @@ class CommissionService
         return $settled;
     }
 
+    /** Fecha contable de la comisión: la del pago (pasarela / abono) o la de la venta. */
+    private function accrualDate(array $row): string
+    {
+        $stored = (string)($row['accrual_date'] ?? '');
+        if ($stored !== '' && strtotime($stored)) {
+            return date('Y-m-d', strtotime($stored));
+        }
+        if (!empty($row['sale_payment_id'])) {
+            $pay = $this->query(
+                'SELECT payment_date FROM sale_payments WHERE id=?',
+                [(int)$row['sale_payment_id']]
+            )->fetch();
+            if ($pay) {
+                return self::paymentDate($pay);
+            }
+        }
+        $sale = $this->query('SELECT sale_date FROM sales WHERE id=?', [(int)$row['sale_id']])->fetch();
+        $ts = $sale ? strtotime((string)$sale['sale_date']) : false;
+        return $ts ? date('Y-m-d', $ts) : date('Y-m-d');
+    }
+
     private function postSellerExpense(
         AccountingService $accounting,
         int $expenseId,
         float $amount,
+        string $date,
         string $desc,
         bool $affectCash
     ): void {
-        // Usa cuenta 510508 específicamente
-        $expense = $this->query('SELECT * FROM expenses WHERE id=?', [$expenseId])->fetch();
-        if (!$expense) {
-            return;
-        }
         $cfg = $this->config();
         $credit = $affectCash
             ? $this->setting('cash_account', '110505')
@@ -814,36 +1057,57 @@ class CommissionService
             $expenseId,
             $cfg['seller_account'],
             $amount,
-            (string)$expense['expense_date'],
+            $date,
             $desc,
             $credit
         );
     }
 
     /**
-     * Comisión de pasarela: Dr gasto financiero / Cr bancos (retención del adquirente).
+     * Comisión de pasarela: Dr gasto financiero (+ IVA descontable + anticipos de retención)
+     * / Cr bancos por lo que el adquirente descontó del abono.
      */
     private function postGatewayExpense(
         AccountingService $accounting,
         int $expenseId,
-        float $amount,
+        array $row,
+        string $date,
         string $desc
     ): void {
-        $expense = $this->query('SELECT * FROM expenses WHERE id=?', [$expenseId])->fetch();
-        if (!$expense) {
-            return;
-        }
         $cfg = $this->config();
+        $commission = round((float)$row['amount'], 2);
+        $vat = round((float)($row['vat_amount'] ?? 0), 2);
+        $expenseDebit = $cfg['gateway_vat_deductible'] ? $commission : round($commission + $vat, 2);
+
+        $extra = [];
+        if ($cfg['gateway_vat_deductible'] && $vat > 0) {
+            $extra[] = [$cfg['gateway_vat_account'], $vat, 'IVA descontable comisión adquirente'];
+        }
+        foreach ([
+            ['withholding_renta', 'withholding_renta_account', 'Retención en la fuente (adquirente)'],
+            ['withholding_iva', 'withholding_iva_account', 'ReteIVA (adquirente)'],
+            ['withholding_ica', 'withholding_ica_account', 'ReteICA (adquirente)'],
+        ] as [$col, $accountKey, $label]) {
+            $value = round((float)($row[$col] ?? 0), 2);
+            if ($value > 0) {
+                $extra[] = [$cfg[$accountKey], $value, $label];
+            }
+        }
+
         $accounting->postCommissionExpense(
             $expenseId,
             $cfg['gateway_account'],
-            $amount,
-            (string)$expense['expense_date'],
+            $expenseDebit,
+            $date,
             $desc,
-            $this->setting('bank_account', '111005')
+            $accounting->collectionAccount((string)($row['payment_method'] ?? ''), $date),
+            $extra
         );
     }
 
+    /**
+     * Venta anulada: revierte el asiento y anula (sin borrar) el gasto de cada comisión.
+     */
     public function cancelForSale(int $saleId): int
     {
         $rows = $this->query(
@@ -859,20 +1123,166 @@ class CommissionService
                     $accounting->reverseSource('expense', $expenseId, 'Venta cancelada · comisión');
                 } catch (\Throwable $e) {
                     error_log('Commission reverse: ' . $e->getMessage());
+                    $accounting->enqueuePending(
+                        'reverse_source',
+                        'expense',
+                        $expenseId,
+                        $e->getMessage(),
+                        ['reason' => 'Venta cancelada · comisión']
+                    );
                 }
-                try {
-                    $this->query('DELETE FROM expenses WHERE id = ?', [$expenseId]);
-                } catch (\Throwable $e) {
-                    error_log('Commission expense delete: ' . $e->getMessage());
-                }
+                $this->softCancelExpense($expenseId);
             }
             $this->query(
-                "UPDATE sales_commissions SET status='cancelled', expense_id=NULL WHERE id=?",
+                "UPDATE sales_commissions SET status='cancelled' WHERE id=?",
                 [$row['id']]
             );
             $n++;
         }
         return $n;
+    }
+
+    private function softCancelExpense(int $expenseId): void
+    {
+        try {
+            $this->query(
+                "UPDATE expenses SET status = 'cancelled', cancelled_at = NOW()
+                 WHERE id = ? AND COALESCE(status, 'active') <> 'cancelled'",
+                [$expenseId]
+            );
+        } catch (\Throwable $e) {
+            try {
+                $this->query(
+                    "UPDATE expenses
+                     SET notes = CONCAT(IFNULL(notes,''), IF(notes IS NULL OR notes='', '', ' | '), '[ANULADO ', ?, ']')
+                     WHERE id = ?",
+                    [date('Y-m-d H:i'), $expenseId]
+                );
+            } catch (\Throwable $e2) {
+                error_log('Commission expense cancel #' . $expenseId . ': ' . $e2->getMessage());
+            }
+        }
+    }
+
+    /**
+     * Gasto de comisión anulado desde Gastos: la comisión queda cancelada
+     * (el asiento ya lo revierte Gastos).
+     */
+    public function cancelByExpense(int $expenseId, string $expenseNotes = ''): int
+    {
+        if ($expenseId <= 0) {
+            return 0;
+        }
+        $where = 'expense_id = ?';
+        $params = [$expenseId];
+        if (preg_match('/sales_commission:(\d+)/', $expenseNotes, $m)) {
+            $where = '(expense_id = ? OR id = ?)';
+            $params[] = (int)$m[1];
+        }
+        return $this->query(
+            "UPDATE sales_commissions SET status='cancelled'
+             WHERE {$where} AND status != 'cancelled'",
+            $params
+        )->rowCount();
+    }
+
+    /** Comisiones de pasarela pendientes (sin gasto/asiento) y último error registrado. */
+    public function pendingGatewaySummary(): array
+    {
+        $out = ['count' => 0, 'amount' => 0.0, 'last_error' => ''];
+        try {
+            $row = $this->query(
+                "SELECT COUNT(*) cnt, COALESCE(SUM(amount),0) amt FROM sales_commissions
+                 WHERE commission_kind='gateway' AND status='pending'"
+            )->fetch();
+            $out['count'] = (int)($row['cnt'] ?? 0);
+            $out['amount'] = (float)($row['amt'] ?? 0);
+            if ($out['count'] > 0 && $this->hasColumn('last_error')) {
+                $out['last_error'] = (string)($this->query(
+                    "SELECT last_error FROM sales_commissions
+                     WHERE commission_kind='gateway' AND status='pending' AND last_error IS NOT NULL
+                     ORDER BY id DESC LIMIT 1"
+                )->fetchColumn() ?: '');
+            }
+        } catch (\Throwable $e) {
+            // Tabla ausente.
+        }
+        return $out;
+    }
+
+    /**
+     * Reintenta generar gasto + asiento de comisiones de pasarela que quedaron pendientes.
+     *
+     * @return array{processed:int,settled:int,errors:int}
+     */
+    public function settlePendingGateway(int $limit = 100): array
+    {
+        $out = ['processed' => 0, 'settled' => 0, 'errors' => 0];
+        $ids = $this->query(
+            "SELECT id FROM sales_commissions
+             WHERE commission_kind='gateway' AND status='pending'
+             ORDER BY id LIMIT " . max(1, min(500, $limit))
+        )->fetchAll(\PDO::FETCH_COLUMN);
+        foreach ($ids as $id) {
+            $out['processed']++;
+            try {
+                $out['settled'] += $this->settle([(int)$id], false);
+            } catch (\Throwable $e) {
+                $out['errors']++;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Genera las comisiones de pasarela faltantes de pagos electrónicos del rango
+     * (ventas importadas, pagos previos a la configuración, fallos). No recrea las
+     * comisiones anuladas a mano.
+     *
+     * @return array{created:int,settled:int,retried:int,errors:int,remaining:bool}
+     */
+    public function backfillGateway(string $from, string $to, int $limit = 300): array
+    {
+        $out = ['created' => 0, 'settled' => 0, 'retried' => 0, 'errors' => 0, 'remaining' => false];
+        $methods = self::GATEWAY_METHODS;
+        $ph = implode(',', array_fill(0, count($methods), '?'));
+        $limit = max(1, min(1000, $limit));
+        $rows = $this->query(
+            "SELECT sp.id
+             FROM sale_payments sp
+             INNER JOIN sales s ON s.id = sp.sale_id AND COALESCE(s.status, '') <> 'cancelled'
+             LEFT JOIN sales_commissions c
+               ON c.sale_payment_id = sp.id AND c.commission_kind = 'gateway'
+             WHERE c.id IS NULL
+               AND sp.amount > 0
+               AND sp.payment_method IN ({$ph})
+               AND DATE(sp.payment_date) BETWEEN ? AND ?
+             ORDER BY sp.id
+             LIMIT " . ($limit + 1),
+            array_merge($methods, [$from, $to])
+        )->fetchAll(\PDO::FETCH_COLUMN);
+        if (count($rows) > $limit) {
+            $out['remaining'] = true;
+            $rows = array_slice($rows, 0, $limit);
+        }
+        foreach ($rows as $paymentId) {
+            try {
+                $row = $this->accrueGateway((int)$paymentId);
+                if ($row) {
+                    $out['created']++;
+                    if (($row['status'] ?? '') === 'paid') {
+                        $out['settled']++;
+                    }
+                }
+            } catch (\Throwable $e) {
+                $out['errors']++;
+                error_log('Commission backfill payment #' . $paymentId . ': ' . $e->getMessage());
+            }
+        }
+        $retry = $this->settlePendingGateway(100);
+        $out['retried'] = $retry['settled'];
+        $out['errors'] += $retry['errors'];
+        return $out;
     }
 
     /** @return array{rows:list,pending:float,paid:float,cancelled:float} */
@@ -892,12 +1302,15 @@ class CommissionService
             $where[] = 'c.user_id = ?';
             $params[] = (int)$filters['user_id'];
         }
+        $dateExpr = $this->hasColumn('accrual_date')
+            ? 'COALESCE(c.accrual_date, DATE(c.created_at))'
+            : 'DATE(c.created_at)';
         if (!empty($filters['from'])) {
-            $where[] = 'DATE(c.created_at) >= ?';
+            $where[] = "{$dateExpr} >= ?";
             $params[] = $filters['from'];
         }
         if (!empty($filters['to'])) {
-            $where[] = 'DATE(c.created_at) <= ?';
+            $where[] = "{$dateExpr} <= ?";
             $params[] = $filters['to'];
         }
         $sqlWhere = implode(' AND ', $where);
@@ -907,7 +1320,7 @@ class CommissionService
              LEFT JOIN sales s ON s.id = c.sale_id
              LEFT JOIN users u ON u.id = c.user_id
              WHERE {$sqlWhere}
-             ORDER BY c.id DESC
+             ORDER BY {$dateExpr} DESC, c.id DESC
              LIMIT " . (int)$limit,
             $params
         )->fetchAll();

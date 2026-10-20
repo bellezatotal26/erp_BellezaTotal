@@ -1013,7 +1013,7 @@ document.addEventListener('DOMContentLoaded', function() {
 /**
  * Desplegables con opción "Otro": pide valor, lo guarda permanente y lo selecciona.
  * Uso: <select data-custom-other="payment_method">…<option value="__other__">Otro</option>
- * Grupos: payment_method | customer_source | sale_cancel_reason | discount_percent | product_location | expense_category | loan_received_reason
+ * Grupos: payment_method | customer_source | sale_cancel_reason | discount_percent | product_location | expense_category | loan_received_reason | credit_term
  */
 window.SoftNovaCustomSelect = {
     otherValues: { __other__: true, other: true, Otro: true, otro: true },
@@ -1041,6 +1041,7 @@ window.SoftNovaCustomSelect = {
         if (group === 'product_location') return 'Nombre de la nueva ubicación (bodega, local, etc.):';
         if (group === 'expense_category') return 'Nombre del nuevo tipo de gasto (se guardará de forma permanente):';
         if (group === 'loan_received_reason') return 'Escriba el nuevo motivo (se agregará a la lista de «Nos prestan»):';
+        if (group === 'credit_term') return 'Número de días de plazo del crédito (ej. 45). Quedará guardado en la lista:';
         return 'Escriba la nueva opción:';
     },
 
@@ -1089,8 +1090,19 @@ window.SoftNovaCustomSelect = {
                 if (lbl.indexOf('administrativ') !== -1) adminGroup = og;
             });
         }
+        var termBefore = null;
+        if (group === 'credit_term') {
+            var newDays = parseInt(String(value).replace(/^net_/, ''), 10);
+            Array.prototype.forEach.call(select.options, function(o) {
+                if (termBefore || o === otherOpt) return;
+                var m = /^net_(\d+)$/.exec(o.value);
+                if (!m || parseInt(m[1], 10) > newDays) termBefore = o;
+            });
+        }
         if (adminGroup) {
             adminGroup.appendChild(opt);
+        } else if (termBefore) {
+            select.insertBefore(opt, termBefore);
         } else if (otherOpt) {
             select.insertBefore(opt, otherOpt);
         } else {

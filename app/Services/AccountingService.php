@@ -305,8 +305,6 @@ class AccountingService
             'financial_expense_account' => '530505',
             'payable_account' => '220505',
             'inventory_account' => '143501',
-            'dataphone_commission_rate' => '2.5',
-            'card_commission_rate' => '2.8',
             'purchase_credit_policy' => 'cxp', // cxp = pendiente/parcial → Proveedores 220505
             'inventory_adjustment_account' => '519595',
             'opening_inventory_equity_account' => '310505',
@@ -324,7 +322,7 @@ class AccountingService
         $notes = [
             'Compras pagadas: crédito a caja/banco según medio de pago.',
             'Compras pendientes o parciales: crédito a CxP proveedores (220505); los abonos posteriores la liquidan desde Compras.',
-            'Comisiones datáfono/tarjeta: gasto a 530505 (financial_expense_account).',
+            'Comisiones datáfono (costo fijo + % débito/crédito) y link de pago: gasto a 530505 contra bancos 111005, en la fecha del pago. Si se configuran: IVA de la comisión a 240802 y retenciones del adquirente a 135515 / 135517 / 135518.',
             'Ajustes y mermas de inventario: gasto a 519595; el inventario inicial se acredita a 310505.',
             'Arqueo de caja: faltantes a 539595 y sobrantes a 429595.',
         ];
@@ -338,8 +336,6 @@ class AccountingService
                 'financial_expense_account' => $this->setting('financial_expense_account', '530505'),
                 'payable_account' => $this->setting('payable_account', '220505'),
                 'purchase_credit_policy' => $this->setting('purchase_credit_policy', 'cxp'),
-                'dataphone_commission_rate' => $this->setting('dataphone_commission_rate', '2.5'),
-                'card_commission_rate' => $this->setting('card_commission_rate', '2.8'),
             ],
         ];
     }
@@ -360,7 +356,11 @@ class AccountingService
             $sales = $this->query(
                 "SELECT sp.payment_method,
                         COUNT(DISTINCT sp.sale_id) cnt,
-                        COALESCE(SUM(sp.amount), 0) total
+                        COUNT(*) tx,
+                        COALESCE(SUM(sp.amount), 0) total,
+                        COALESCE(SUM(CASE WHEN s.total > 0
+                            THEN sp.amount * LEAST(1, GREATEST(0, COALESCE(s.tax, 0) / s.total))
+                            ELSE 0 END), 0) vat_part
                  FROM sale_payments sp
                  INNER JOIN sales s ON s.id = sp.sale_id
                  WHERE COALESCE(s.status, '') <> 'cancelled'
@@ -373,7 +373,8 @@ class AccountingService
             $sales = $this->query(
                 "SELECT payment_method,
                         COUNT(*) cnt,
-                        COALESCE(SUM(total), 0) total
+                        COALESCE(SUM(total), 0) total,
+                        COALESCE(SUM(tax), 0) vat_part
                  FROM sales
                  WHERE COALESCE(status, '') <> 'cancelled'
                    AND payment_method IN ({$placeholders})
@@ -383,25 +384,53 @@ class AccountingService
             )->fetchAll();
         }
 
+        // Datáfono = débito + crédito (y legado card/dataphone): fijo por transacción + % por tipo.
+        $commissions = new CommissionService($this->db);
+        $commCfg = $commissions->config();
+        $fixedFee = (float)($commCfg['dataphone_fixed_fee'] ?? 0);
+        $vatRate = (float)($commCfg['gateway_vat_rate'] ?? 0);
+        $vatDeductible = !empty($commCfg['gateway_vat_deductible']);
         $salesTotal = 0.0;
         $dataphoneSales = 0.0;
+        $dataphoneTx = 0;
         $cardSales = 0.0;
+        $expectedDataphone = 0.0;
+        $expectedCard = 0.0;
+        $expectedWithholdings = 0.0;
         foreach ($sales as $row) {
             $amt = (float)$row['total'];
+            $tx = (int)($row['tx'] ?? $row['cnt'] ?? 0);
+            $vatPart = min($amt, max(0.0, (float)($row['vat_part'] ?? 0)));
             $salesTotal += $amt;
             $m = (string)$row['payment_method'];
-            if ($m === 'dataphone') {
+            $pctPart = round($amt * $commissions->gatewayRate($m) / 100, 2);
+            $commission = 0.0;
+            if (CommissionService::isDataphoneMethod($m)) {
                 $dataphoneSales += $amt;
-            } elseif (in_array($m, ['debit_card', 'credit_card', 'card', 'payment_link'], true)) {
+                $dataphoneTx += $tx;
+                $commission = $pctPart + round($fixedFee * $tx, 2);
+                $expectedDataphone += $commission;
+            } elseif ($m === 'payment_link') {
                 $cardSales += $amt;
+                $commission = $pctPart;
+                $expectedCard += $commission;
+            }
+            if ($commission > 0) {
+                $net = $amt - $vatPart;
+                $expectedWithholdings += $net * (float)$commCfg['withholding_renta_rate'] / 100
+                    + $vatPart * (float)$commCfg['withholding_iva_rate'] / 100
+                    + $net * (float)$commCfg['withholding_ica_rate'] / 1000;
             }
         }
-
-        $rateDataphone = (float)$this->setting('dataphone_commission_rate', '2.5');
-        $rateCard = (float)$this->setting('card_commission_rate', '2.8');
-        $expectedDataphone = round($dataphoneSales * $rateDataphone / 100, 2);
-        $expectedCard = round($cardSales * $rateCard / 100, 2);
-        $expected = round($expectedDataphone + $expectedCard, 2);
+        $expectedDataphone = round($expectedDataphone, 2);
+        $expectedCard = round($expectedCard, 2);
+        $expectedCommission = round($expectedDataphone + $expectedCard, 2);
+        $expectedVat = round($expectedCommission * $vatRate / 100, 2);
+        $expectedWithholdings = round($expectedWithholdings, 2);
+        // Lo comparable con Gastos: comisión (+ IVA si no es descontable, va al gasto).
+        $expected = $vatDeductible ? $expectedCommission : round($expectedCommission + $expectedVat, 2);
+        $rateDataphone = $commissions->gatewayRate('debit_card');
+        $rateCard = $commissions->gatewayRate('payment_link');
 
         $expenses = $this->query(
             "SELECT COALESCE(category,'general') category,
@@ -410,7 +439,7 @@ class AccountingService
              FROM expenses
              WHERE expense_date BETWEEN ? AND ?
                AND COALESCE(status, 'active') <> 'cancelled'
-               AND category IN ('dataphone_commission','card_commission','payment_link_commission','financial','bank_fee')
+               AND category IN ('dataphone_commission','card_commission','payment_link_commission')
              GROUP BY COALESCE(category,'general')",
             [$from, $to]
         )->fetchAll();
@@ -432,11 +461,17 @@ class AccountingService
             'sales_by_method' => $sales,
             'sales_total' => $salesTotal,
             'dataphone_sales' => $dataphoneSales,
+            'dataphone_tx' => $dataphoneTx,
+            'dataphone_fixed_fee' => $fixedFee,
             'card_sales' => $cardSales,
             'rate_dataphone' => $rateDataphone,
             'rate_card' => $rateCard,
             'expected_dataphone' => $expectedDataphone,
             'expected_card' => $expectedCard,
+            'expected_commission' => $expectedCommission,
+            'expected_vat' => $expectedVat,
+            'vat_deductible' => $vatDeductible,
+            'expected_withholdings' => $expectedWithholdings,
             'expected_total' => $expected,
             'recorded_expenses' => $expenses,
             'recorded_total' => $recorded,
@@ -444,7 +479,7 @@ class AccountingService
             'gap' => $gap,
             'suggest_amount' => max(0, $gap),
             'suggest_category' => 'dataphone_commission',
-            'suggest_description' => 'Comisión datáfono/tarjetas ' . $from . ' a ' . $to,
+            'suggest_description' => 'Comisión datáfono/link de pago ' . $from . ' a ' . $to,
         ];
     }
 
@@ -509,8 +544,19 @@ class AccountingService
         if ($code === '' || $name === '' || !in_array($type, $allowedTypes, true)) {
             throw new \InvalidArgumentException('Datos de cuenta inválidos');
         }
-        if (!in_array($nature, ['debit', 'credit'], true)) {
+        $natureGiven = in_array($nature, ['debit', 'credit'], true);
+        if (!$natureGiven) {
             $nature = in_array($type, ['asset', 'expense'], true) ? 'debit' : 'credit';
+        }
+        $status = ($data['status'] ?? 'active') === 'inactive' ? 'inactive' : 'active';
+        $acceptsEntries = !empty($data['accepts_entries']);
+
+        $duplicate = $this->query(
+            "SELECT id FROM accounting_accounts WHERE code = ? AND id <> ? LIMIT 1",
+            [$code, $id]
+        )->fetchColumn();
+        if ($duplicate) {
+            throw new \InvalidArgumentException('Ya existe una cuenta con el código ' . $code);
         }
 
         if ($id > 0) {
@@ -526,10 +572,70 @@ class AccountingService
                 $code = $existing['code'];
                 $type = $existing['account_type'];
                 $nature = $existing['nature'];
-                if (($data['status'] ?? 'active') === 'inactive') {
+                if ($status === 'inactive') {
                     throw new \InvalidArgumentException('No se puede desactivar una cuenta de sistema');
                 }
+                if (!$acceptsEntries) {
+                    throw new \InvalidArgumentException(
+                        'Una cuenta de sistema debe recibir movimientos: las ventas, compras y gastos la usan.'
+                    );
+                }
             }
+
+            $existingCode = (string)$existing['code'];
+            $usedBy = $this->query(
+                "SELECT setting_key FROM accounting_settings
+                 WHERE setting_value = ? AND setting_key LIKE '%account%'
+                 ORDER BY setting_key",
+                [$existingCode]
+            )->fetchAll(\PDO::FETCH_COLUMN);
+            $usedLabel = implode(', ', array_slice($usedBy, 0, 4)) . (count($usedBy) > 4 ? '…' : '');
+            if ($usedBy) {
+                if ($code !== $existingCode) {
+                    throw new \InvalidArgumentException(
+                        'No se puede cambiar el código: la cuenta ' . $existingCode
+                        . ' está configurada en los parámetros contables (' . $usedLabel . ').'
+                    );
+                }
+                if ($status === 'inactive' || !$acceptsEntries) {
+                    throw new \InvalidArgumentException(
+                        'La cuenta ' . $existingCode . ' está configurada en los parámetros contables ('
+                        . $usedLabel . '). Si la desactiva o le quita movimientos, las operaciones no se podrán contabilizar.'
+                    );
+                }
+            }
+
+            $movements = $this->query(
+                "SELECT COUNT(*) cnt, COALESCE(SUM(l.debit - l.credit), 0) balance
+                 FROM accounting_lines l
+                 JOIN accounting_entries e ON e.id = l.entry_id
+                 WHERE l.account_id = ? AND e.status IN ('posted','reversed')",
+                [$id]
+            )->fetch() ?: ['cnt' => 0, 'balance' => 0];
+            if ((int)$movements['cnt'] > 0) {
+                if (!$natureGiven) {
+                    $nature = (string)$existing['nature'];
+                }
+                if ($type !== (string)$existing['account_type'] || $nature !== (string)$existing['nature']) {
+                    throw new \InvalidArgumentException(
+                        'La cuenta ' . $existingCode . ' ya tiene movimientos: no se puede cambiar su tipo ni su naturaleza '
+                        . '(reclasificaría la historia en los estados financieros). Cree una cuenta nueva y traslade el saldo con un comprobante.'
+                    );
+                }
+                if ($code !== $existingCode) {
+                    throw new \InvalidArgumentException(
+                        'La cuenta ' . $existingCode . ' ya tiene movimientos: no se puede cambiar su código.'
+                    );
+                }
+                $balance = round((float)$movements['balance'], 2);
+                if ($status === 'inactive' && abs($balance) >= 0.01) {
+                    throw new \InvalidArgumentException(
+                        'La cuenta ' . $existingCode . ' tiene saldo (' . number_format($balance, 2, ',', '.')
+                        . '). Traslade el saldo a otra cuenta antes de desactivarla.'
+                    );
+                }
+            }
+
             $this->query(
                 "UPDATE accounting_accounts
                  SET code = ?, name = ?, account_type = ?, nature = ?,
@@ -537,8 +643,8 @@ class AccountingService
                  WHERE id = ?",
                 [
                     $code, $name, $type, $nature,
-                    !empty($data['accepts_entries']) ? 1 : 0,
-                    ($data['status'] ?? 'active') === 'inactive' ? 'inactive' : 'active',
+                    $acceptsEntries ? 1 : 0,
+                    $status,
                     $id,
                 ]
             );
@@ -551,8 +657,8 @@ class AccountingService
              VALUES (?, ?, ?, ?, ?, ?)",
             [
                 $code, $name, $type, $nature,
-                !empty($data['accepts_entries']) ? 1 : 0,
-                ($data['status'] ?? 'active') === 'inactive' ? 'inactive' : 'active',
+                $acceptsEntries ? 1 : 0,
+                $status,
             ]
         );
         return (int)$this->db->lastInsertId();
@@ -897,12 +1003,13 @@ class AccountingService
             throw new \RuntimeException('Abono no encontrado');
         }
 
+        $paymentDate = date('Y-m-d', strtotime($payment['payment_date']));
         return $this->postEntry(
-            date('Y-m-d', strtotime($payment['payment_date'])),
+            $paymentDate,
             'Abono venta ' . $payment['invoice_number'],
             [
                 $this->line(
-                    $this->paymentAccount((string)$payment['payment_method']),
+                    $this->collectionAccount((string)$payment['payment_method'], $paymentDate),
                     (float)$payment['amount'],
                     0,
                     'Ingreso de abono'
@@ -1052,6 +1159,9 @@ class AccountingService
     /**
      * Gasto de comisión (vendedor o pasarela) con cuentas específicas.
      * Crédito típico: CxP (vendedor) o bancos (pasarela / retención del adquirente).
+     *
+     * @param list<array{0:string,1:float,2:string}> $extraDebits [cuenta, valor, descripción]
+     *        (IVA descontable, anticipos de retención); se suman al crédito.
      */
     public function postCommissionExpense(
         int $expenseId,
@@ -1059,15 +1169,25 @@ class AccountingService
         float $amount,
         string $date,
         string $description,
-        string $creditAccountCode
+        string $creditAccountCode,
+        array $extraDebits = []
     ): int {
+        $lines = [$this->line($expenseAccountCode, $amount, 0, 'Comisión sobre ventas')];
+        $credit = round($amount, 2);
+        foreach ($extraDebits as [$code, $value, $label]) {
+            $value = round((float)$value, 2);
+            if ($value <= 0) {
+                continue;
+            }
+            $lines[] = $this->line((string)$code, $value, 0, (string)$label);
+            $credit = round($credit + $value, 2);
+        }
+        $lines[] = $this->line($creditAccountCode, 0, $credit, 'Comisión por pagar / banco');
+
         return $this->postEntry(
             $date,
             $description,
-            [
-                $this->line($expenseAccountCode, $amount, 0, 'Comisión sobre ventas'),
-                $this->line($creditAccountCode, 0, $amount, 'Comisión por pagar / banco'),
-            ],
+            $lines,
             'expense',
             $expenseId,
             'created'
@@ -1078,19 +1198,20 @@ class AccountingService
      * Asiento detallado de nómina: sueldos + aportes patronales/parafiscales
      * contra CxP de seguridad social y banco/caja (neto).
      */
-    public function postPayrollRun(int $runId, bool $payNow = true): int
+    /**
+     * Totales contables de una liquidación (misma base del asiento).
+     * company_cost = todo lo que va al gasto: devengados + comisiones + provisiones + aportes.
+     *
+     * @return array<string,float>
+     */
+    public function payrollRunTotals(int $runId): array
     {
-        (new PayrollService($this->db))->params();
-
-        $run = $this->query('SELECT * FROM payroll_runs WHERE id = ?', [$runId])->fetch();
-        if (!$run || ($run['status'] ?? '') === 'cancelled') {
-            throw new \RuntimeException('Liquidación inválida');
-        }
         $sum = $this->query(
             "SELECT
                 COALESCE(SUM(salary_base + transport_aid + COALESCE(prima,0)
                     + COALESCE(incapacity_pay,0) + other_earnings),0) labor,
-                COALESCE(SUM(COALESCE(cesantias,0) + COALESCE(cesantias_interest,0)),0) cesantias,
+                COALESCE(SUM(COALESCE(cesantias,0)),0) cesantias,
+                COALESCE(SUM(COALESCE(cesantias_interest,0)),0) cesantias_interest,
                 COALESCE(SUM(COALESCE(commission_amount,0)),0) commission,
                 COALESCE(SUM(COALESCE(vacation_provision,0)),0) vacation,
                 COALESCE(SUM(health_employee),0) health_emp,
@@ -1106,24 +1227,77 @@ class AccountingService
             [$runId]
         )->fetch() ?: [];
 
-        $labor = round((float)$sum['labor'], 2);
-        $cesantias = round((float)$sum['cesantias'], 2);
-        $commission = round((float)($sum['commission'] ?? 0), 2);
-        $vacation = round((float)($sum['vacation'] ?? 0), 2);
-        $healthEmp = round((float)$sum['health_emp'], 2);
-        $pensionEmp = round((float)$sum['pension_emp'], 2);
-        $healthEr = round((float)$sum['health_er'], 2);
-        $pensionEr = round((float)$sum['pension_er'], 2);
-        $arl = round((float)$sum['arl'], 2);
-        $caja = round((float)$sum['caja'], 2);
-        $sena = round((float)$sum['sena'], 2);
-        $icbf = round((float)$sum['icbf'], 2);
-        $net = round((float)$sum['net'], 2);
-        $employerCost = round($healthEr + $pensionEr + $arl + $caja + $sena + $icbf, 2);
+        $out = [];
+        foreach (['labor', 'cesantias', 'cesantias_interest', 'commission', 'vacation', 'health_emp', 'pension_emp',
+            'health_er', 'pension_er', 'arl', 'caja', 'sena', 'icbf', 'net'] as $k) {
+            $out[$k] = round((float)($sum[$k] ?? 0), 2);
+        }
+        $out['employer_cost'] = round(
+            $out['health_er'] + $out['pension_er'] + $out['arl'] + $out['caja'] + $out['sena'] + $out['icbf'],
+            2
+        );
+        $out['company_cost'] = round(
+            $out['labor'] + $out['commission'] + $out['cesantias'] + $out['cesantias_interest']
+                + $out['vacation'] + $out['employer_cost'],
+            2
+        );
+        return $out;
+    }
 
-        if ($labor <= 0 && $employerCost <= 0 && $cesantias <= 0 && $commission <= 0 && $vacation <= 0) {
+    /**
+     * Fecha de causación de la nómina: el pago si cae dentro del mes liquidado;
+     * si no, el último día de ese mes (el costo queda en su periodo).
+     */
+    public static function payrollAccrualDate(array $run): string
+    {
+        $year = (int)($run['period_year'] ?? 0);
+        $month = (int)($run['period_month'] ?? 0);
+        $payDate = (string)($run['pay_date'] ?? '');
+        if ($year < 2000 || $month < 1 || $month > 12) {
+            return $payDate !== '' ? $payDate : date('Y-m-d');
+        }
+        $periodStart = sprintf('%04d-%02d-01', $year, $month);
+        $periodEnd = date('Y-m-t', strtotime($periodStart));
+        if ($payDate >= $periodStart && $payDate <= $periodEnd) {
+            return $payDate;
+        }
+        return $periodEnd;
+    }
+
+    public function postPayrollRun(int $runId, bool $payNow = true): int
+    {
+        (new PayrollService($this->db))->params();
+
+        $run = $this->query('SELECT * FROM payroll_runs WHERE id = ?', [$runId])->fetch();
+        if (!$run || ($run['status'] ?? '') === 'cancelled') {
+            throw new \RuntimeException('Liquidación inválida');
+        }
+        $t = $this->payrollRunTotals($runId);
+
+        $labor = $t['labor'];
+        $cesantias = $t['cesantias'];
+        $cesInterest = $t['cesantias_interest'];
+        $commission = $t['commission'];
+        $vacation = $t['vacation'];
+        $healthEmp = $t['health_emp'];
+        $pensionEmp = $t['pension_emp'];
+        $healthEr = $t['health_er'];
+        $pensionEr = $t['pension_er'];
+        $arl = $t['arl'];
+        $caja = $t['caja'];
+        $sena = $t['sena'];
+        $icbf = $t['icbf'];
+        $net = $t['net'];
+        $employerCost = $t['employer_cost'];
+
+        if ($labor <= 0 && $employerCost <= 0 && $cesantias <= 0 && $cesInterest <= 0 && $commission <= 0 && $vacation <= 0) {
             throw new \RuntimeException('Liquidación sin montos contables');
         }
+
+        $accrualDate = self::payrollAccrualDate($run);
+        $payDate = (string)$run['pay_date'];
+        // Pagada después del cierre del mes: se causa contra salarios por pagar y el pago va en su fecha.
+        $splitPayment = $payNow && $payDate > $accrualDate;
 
         $lines = [];
         if ($labor > 0) {
@@ -1148,6 +1322,14 @@ class AccountingService
                 $cesantias,
                 0,
                 'Provisión cesantías ' . $run['run_number']
+            );
+        }
+        if ($cesInterest > 0) {
+            $lines[] = $this->line(
+                $this->setting('payroll_expense_account', '510503'),
+                $cesInterest,
+                0,
+                'Provisión intereses cesantías ' . $run['run_number']
             );
         }
         if ($vacation > 0) {
@@ -1195,6 +1377,14 @@ class AccountingService
                 'Cesantías por pagar'
             );
         }
+        if ($cesInterest > 0) {
+            $lines[] = $this->line(
+                $this->setting('cesantias_interest_payable_account', '261010'),
+                0,
+                $cesInterest,
+                'Intereses cesantías por pagar'
+            );
+        }
         if ($vacation > 0) {
             $lines[] = $this->line(
                 $this->setting('vacation_payable_account', '261015'),
@@ -1203,24 +1393,162 @@ class AccountingService
                 'Vacaciones consolidadas'
             );
         }
+        $method = (string)($run['payment_method'] ?? 'transfer');
+        $paidInEntry = $payNow && !$splitPayment;
         if ($net > 0) {
-            $creditNet = $this->payrollNetCreditAccount((string)($run['payment_method'] ?? 'transfer'), $payNow);
+            $creditNet = $this->payrollNetCreditAccount($method, $paidInEntry);
             $lines[] = $this->line(
                 $creditNet,
                 0,
                 $net,
-                $payNow ? 'Neto nómina (no descuenta cajón POS)' : 'Salarios por pagar'
+                $paidInEntry ? 'Neto nómina (no descuenta cajón POS)' : 'Salarios por pagar'
             );
         }
 
+        $ownTx = !$this->db->inTransaction();
+        if ($ownTx) {
+            $this->db->beginTransaction();
+        }
+        try {
+            $entryId = $this->postEntry(
+                $accrualDate,
+                'Nómina ' . $run['run_number'] . ' · ' . $run['period_label'],
+                $lines,
+                'payroll',
+                $runId,
+                'created'
+            );
+            if ($splitPayment && $net > 0) {
+                $this->postEntry(
+                    $payDate,
+                    'Pago nómina ' . $run['run_number'] . ' · ' . $run['period_label'],
+                    [
+                        $this->line($this->setting('payroll_payable_account', '250505'), $net, 0, 'Pago salarios por pagar'),
+                        $this->line($this->payrollPaymentAccount($method), 0, $net, 'Neto nómina (no descuenta cajón POS)'),
+                    ],
+                    'payroll',
+                    $runId,
+                    'payment'
+                );
+            }
+            if ($ownTx) {
+                $this->db->commit();
+            }
+            return $entryId;
+        } catch (\Throwable $e) {
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * Revierte todos los asientos de una liquidación (causación y pago separado).
+     *
+     * @return list<int> ids de las reversiones
+     */
+    public function reversePayrollRun(int $runId, string $reason): array
+    {
+        $ids = [];
+        for ($i = 0; $i < 5; $i++) {
+            $rev = $this->reverseSource('payroll', $runId, $reason);
+            if ($rev === null) {
+                break;
+            }
+            $ids[] = $rev;
+        }
+        return $ids;
+    }
+
+    /**
+     * Pago de pasivos laborales (aportes PILA, parafiscales, cesantías, intereses, vacaciones, salarios por pagar).
+     * Débito a cada pasivo contra banco o caja de nómina. No genera gasto: el costo ya se causó en la nómina.
+     */
+    public function postPayrollLiabilityPayment(int $paymentId): int
+    {
+        (new PayrollService($this->db))->params();
+
+        $payment = $this->query(
+            'SELECT * FROM payroll_liability_payments WHERE id = ?',
+            [$paymentId]
+        )->fetch();
+        if (!$payment || ($payment['status'] ?? '') === 'cancelled') {
+            throw new \RuntimeException('Pago de nómina inválido');
+        }
+        $rows = $this->query(
+            'SELECT * FROM payroll_liability_payment_lines WHERE payment_id = ? ORDER BY id',
+            [$paymentId]
+        )->fetchAll();
+
+        $lines = [];
+        $total = 0.0;
+        $concepts = PayrollService::LIABILITY_CONCEPTS;
+        foreach ($rows as $row) {
+            $amount = round((float)$row['amount'], 2);
+            if ($amount <= 0) {
+                continue;
+            }
+            $label = $concepts[(string)$row['concept']]['label'] ?? (string)$row['concept'];
+            $lines[] = $this->line((string)$row['account_code'], $amount, 0, 'Pago ' . $label);
+            $total += $amount;
+        }
+        $total = round($total, 2);
+        if ($total <= 0) {
+            throw new \RuntimeException('El pago no tiene valores');
+        }
+        $lines[] = $this->line(
+            $this->payrollPaymentAccount((string)($payment['payment_method'] ?? 'transfer')),
+            0,
+            $total,
+            'Pago nómina (no descuenta cajón POS)'
+        );
+
+        $ref = trim((string)($payment['reference'] ?? ''));
         return $this->postEntry(
-            $run['pay_date'],
-            'Nómina ' . $run['run_number'] . ' · ' . $run['period_label'],
+            (string)$payment['payment_date'],
+            'Pago ' . (PayrollService::LIABILITY_KINDS[(string)($payment['kind'] ?? '')] ?? 'nómina')
+                . ($ref !== '' ? ' · ' . $ref : ''),
             $lines,
-            'payroll',
-            $runId,
+            'payroll_payment',
+            $paymentId,
             'created'
         );
+    }
+
+    /**
+     * Saldo actual (naturaleza crédito) de cuentas de pasivo laboral.
+     *
+     * @param list<string> $codes
+     * @return array<string,float>
+     */
+    public function liabilityBalances(array $codes, ?string $asOf = null): array
+    {
+        $codes = array_values(array_unique(array_filter(array_map('strval', $codes))));
+        if (!$codes) {
+            return [];
+        }
+        $params = $codes;
+        $dateSql = '';
+        if ($asOf !== null && $asOf !== '') {
+            $dateSql = ' AND e.entry_date <= ?';
+            $params[] = $asOf;
+        }
+        $rows = $this->query(
+            "SELECT a.code, COALESCE(SUM(l.credit - l.debit), 0) bal
+             FROM accounting_accounts a
+             LEFT JOIN accounting_lines l ON l.account_id = a.id
+             LEFT JOIN accounting_entries e ON e.id = l.entry_id
+             WHERE a.code IN (" . implode(',', array_fill(0, count($codes), '?')) . ")
+               AND (e.id IS NULL OR (e.status IN ('posted','reversed'){$dateSql}))
+             GROUP BY a.code",
+            $params
+        )->fetchAll(\PDO::FETCH_KEY_PAIR);
+        $out = [];
+        foreach ($codes as $code) {
+            $out[$code] = round((float)($rows[$code] ?? 0), 2);
+        }
+        return $out;
     }
 
     /**
@@ -1379,6 +1707,7 @@ class AccountingService
             'sale_credit_notes' => 0,
             'purchase_credit_notes' => 0,
             'pending_queue' => 0,
+            'commissions' => 0,
             'errors' => 0,
             'remaining' => 0,
             'done' => true,
@@ -1475,6 +1804,18 @@ class AccountingService
                     error_log('Accounting sync expense ' . $expense['id'] . ': ' . $e->getMessage());
                 }
                 $budget--;
+            }
+        }
+
+        // Comisiones de pasarela cuyo gasto/asiento falló al registrar el pago.
+        if ($budget > 0 && !$this->db->inTransaction()) {
+            try {
+                $retry = (new CommissionService($this->db))->settlePendingGateway(min(100, $budget));
+                $result['commissions'] = $retry['settled'];
+                $result['errors'] += $retry['errors'];
+                $budget -= $retry['processed'];
+            } catch (\Throwable $e) {
+                error_log('Accounting sync commissions: ' . $e->getMessage());
             }
         }
 
@@ -1677,6 +2018,10 @@ class AccountingService
                         $sourceId,
                         (string)($meta['reason'] ?? 'Reintento de reversión')
                     ),
+                    'void_purchase_order' => $this->voidPurchaseOrderEntry(
+                        $sourceId,
+                        (string)($meta['reason'] ?? 'Reintento de anulación de OC')
+                    ),
                     'reverse_sale_cascade' => $this->reverseSaleCascade(
                         $sourceId,
                         (string)($meta['reason'] ?? 'Reintento de reversión de venta')
@@ -1731,7 +2076,7 @@ class AccountingService
                                AND COALESCE(p.product_type, 'product') = 'product'
                           WHERE sm.accounting_entry_id IS NULL
                             AND COALESCE(sm.total_cost, 0) > 0
-                            AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return', 'loan_received', 'loan_received_return', 'status_change', 'consignment_in', 'consignment_return')
+                            AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'purchase_cancel', 'loan', 'loan_return', 'loan_received', 'loan_received_return', 'status_change', 'consignment_in', 'consignment_return')
                           ORDER BY sm.id",
                 'post' => fn(int $id): ?int => $this->postStockMovement($id),
             ],
@@ -1827,11 +2172,63 @@ class AccountingService
             }
         }
 
-        return $pendingSales + $pendingPayments + $pendingExpenses + $pendingOthers + $this->pendingQueueCount();
+        $pendingCommissions = 0;
+        try {
+            $pendingCommissions = (int)$this->query(
+                "SELECT COUNT(*) FROM sales_commissions
+                 WHERE commission_kind = 'gateway' AND status = 'pending'"
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            // Tabla de comisiones aún no creada.
+        }
+
+        return $pendingSales + $pendingPayments + $pendingExpenses + $pendingOthers
+            + $pendingCommissions + $this->pendingQueueCount();
     }
 
-    public function reverseSource(string $sourceType, int $sourceId, string $reason): ?int
+    /**
+     * Anulación de OC recibida (sin NC): reversa el asiento de compra con la misma fecha
+     * del original para que el par se cancele en el mismo periodo y no aparezca en el diario.
+     * Si ese periodo está cerrado, la reversión va al periodo abierto y sí queda visible.
+     */
+    public function voidPurchaseOrderEntry(int $orderId, string $reason): ?int
     {
+        $date = (string)$this->query(
+            "SELECT entry_date FROM accounting_entries
+             WHERE source_type = 'purchase_order' AND source_id = ? AND status = 'posted'
+               AND reversal_of_id IS NULL
+             ORDER BY id DESC LIMIT 1",
+            [$orderId]
+        )->fetchColumn();
+        if ($date === '') {
+            return null;
+        }
+        $date = substr($date, 0, 10);
+        if ($this->isPeriodClosed($date)) {
+            return $this->reverseSource('purchase_order', $orderId, $reason);
+        }
+        return $this->reverseSource('purchase_order', $orderId, $reason, $date, 'void_');
+    }
+
+    /** SQL: excluye del diario/mayor los pares asiento+anulación de OC del mismo día. */
+    private function voidedPairExclusionSql(string $alias): string
+    {
+        return "NOT EXISTS (
+                    SELECT 1 FROM accounting_entries vx
+                    JOIN accounting_entries ox ON ox.id = vx.reversal_of_id
+                    WHERE LEFT(vx.source_event, 5) = 'void_'
+                      AND vx.entry_date = ox.entry_date
+                      AND (vx.id = {$alias}.id OR ox.id = {$alias}.id)
+                )";
+    }
+
+    public function reverseSource(
+        string $sourceType,
+        int $sourceId,
+        string $reason,
+        ?string $preferredDate = null,
+        string $eventPrefix = 'reversal_'
+    ): ?int {
         // Solo asientos originales (no reversiones): evita doble reversión.
         $entry = $this->query(
             "SELECT * FROM accounting_entries
@@ -1864,7 +2261,7 @@ class AccountingService
             ];
         }
 
-        $postingDate = $this->resolvePostingDate(date('Y-m-d'), (string)$entry['entry_date']);
+        $postingDate = $this->resolvePostingDate($preferredDate ?? date('Y-m-d'), (string)$entry['entry_date']);
 
         $ownTx = !$this->db->inTransaction();
         if ($ownTx) {
@@ -1877,7 +2274,7 @@ class AccountingService
                 $lines,
                 $sourceType,
                 $sourceId,
-                'reversal_' . $entry['id'],
+                $eventPrefix . $entry['id'],
                 (int)$entry['id']
             );
             $this->query(
@@ -1896,6 +2293,100 @@ class AccountingService
         }
     }
 
+    /**
+     * Anula un comprobante manual con un asiento espejo (queda la traza de ambos).
+     * Los automáticos se anulan desde su documento origen (venta, gasto, compra...).
+     */
+    public function voidManualEntry(int $entryId, string $reason): int
+    {
+        $reason = trim($reason);
+        if (strlen($reason) < 5) {
+            throw new \InvalidArgumentException('Indique el motivo de la anulación (mínimo 5 caracteres)');
+        }
+        $entry = $this->query(
+            "SELECT * FROM accounting_entries WHERE id = ? LIMIT 1",
+            [$entryId]
+        )->fetch();
+        if (!$entry) {
+            throw new \InvalidArgumentException('Comprobante no encontrado');
+        }
+        if (!self::isManualEntry($entry)) {
+            throw new \InvalidArgumentException(
+                'Solo se pueden anular comprobantes manuales. Los automáticos se anulan desde su documento (venta, gasto, compra…).'
+            );
+        }
+        if (!empty($entry['reversal_of_id'])) {
+            throw new \InvalidArgumentException('Este comprobante ya es una anulación');
+        }
+        if (($entry['status'] ?? '') !== 'posted') {
+            throw new \InvalidArgumentException('El comprobante ya fue anulado');
+        }
+
+        $rows = $this->query(
+            "SELECT l.*, a.code account_code
+             FROM accounting_lines l
+             JOIN accounting_accounts a ON a.id = l.account_id
+             WHERE l.entry_id = ? ORDER BY l.id",
+            [$entryId]
+        )->fetchAll();
+        $lines = [];
+        foreach ($rows as $row) {
+            $lines[] = [
+                'account_code' => $row['account_code'],
+                'debit' => (float)$row['credit'],
+                'credit' => (float)$row['debit'],
+                'description' => $row['description'] ?: $reason,
+                'third_party_type' => $row['third_party_type'],
+                'third_party_id' => $row['third_party_id'],
+                'third_party_name' => $row['third_party_name'],
+            ];
+        }
+
+        $postingDate = $this->resolvePostingDate((string)$entry['entry_date'], date('Y-m-d'));
+
+        $ownTx = !$this->db->inTransaction();
+        if ($ownTx) {
+            $this->db->beginTransaction();
+        }
+        try {
+            $locked = $this->query(
+                "SELECT status FROM accounting_entries WHERE id = ? FOR UPDATE",
+                [$entryId]
+            )->fetchColumn();
+            if ($locked !== 'posted') {
+                throw new \InvalidArgumentException('El comprobante ya fue anulado');
+            }
+            $reversalId = $this->postEntry(
+                $postingDate,
+                'Anulación ' . $entry['entry_number'] . ': ' . $reason,
+                $lines,
+                'manual',
+                $entryId,
+                'reversal_' . $entryId,
+                $entryId
+            );
+            $this->query(
+                "UPDATE accounting_entries SET status = 'reversed' WHERE id = ?",
+                [$entryId]
+            );
+            if ($ownTx) {
+                $this->db->commit();
+            }
+            return $reversalId;
+        } catch (\Throwable $e) {
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
+    }
+
+    public static function isManualEntry(array $entry): bool
+    {
+        $type = (string)($entry['source_type'] ?? '');
+        return ($type === 'manual' || $type === '') && empty($entry['source_id']);
+    }
+
     public function entries(string $from, string $to, int $limit = 200): array
     {
         return $this->query(
@@ -1905,6 +2396,7 @@ class AccountingService
              LEFT JOIN accounting_lines l ON l.entry_id = e.id
              LEFT JOIN users u ON u.id = e.created_by
              WHERE e.entry_date BETWEEN ? AND ?
+               AND " . $this->voidedPairExclusionSql('e') . "
              GROUP BY e.id
              ORDER BY e.entry_date DESC, e.id DESC
              LIMIT " . max(1, min(500, $limit)),
@@ -1929,6 +2421,22 @@ class AccountingService
             [$id]
         )->fetchAll();
         $entry['source_document'] = $this->sourceDocumentForEntry($entry);
+        $entry['is_manual'] = self::isManualEntry($entry);
+        $entry['reversed_by'] = null;
+        if (($entry['status'] ?? '') === 'reversed') {
+            $entry['reversed_by'] = $this->query(
+                "SELECT id, entry_number, entry_date, description FROM accounting_entries
+                 WHERE reversal_of_id = ? ORDER BY id DESC LIMIT 1",
+                [$id]
+            )->fetch() ?: null;
+        }
+        $entry['reversal_of'] = null;
+        if (!empty($entry['reversal_of_id'])) {
+            $entry['reversal_of'] = $this->query(
+                "SELECT id, entry_number, entry_date FROM accounting_entries WHERE id = ? LIMIT 1",
+                [(int)$entry['reversal_of_id']]
+            )->fetch() ?: null;
+        }
         return $entry;
     }
 
@@ -2740,13 +3248,324 @@ class AccountingService
     }
 
     /**
+     * Libro mayor de síntesis (partida doble): saldo inicial, debe, haber y saldo final
+     * por cuenta / grupo PUC. Alimenta auditoría y estados financieros.
+     *
+     * @param array{account_type?:string,q?:string,include_zero?:bool,mode?:string} $options
+     *        mode: subaccounts (detalle) | accounts (4 dígitos) | groups (2) | classes (1)
+     * @return array{rows:list<array<string,mixed>>,totals:array,balanced:array,from:string,to:string,mode:string}
+     */
+    public function generalLedger(string $from, string $to, array $options = []): array
+    {
+        $mode = strtolower(trim((string)($options['mode'] ?? 'subaccounts')));
+        if (!in_array($mode, ['subaccounts', 'accounts', 'groups', 'classes'], true)) {
+            $mode = 'subaccounts';
+        }
+        $base = $this->trialBalance($from, $to, [
+            'account_type' => (string)($options['account_type'] ?? ''),
+            'q' => (string)($options['q'] ?? ''),
+            'include_zero' => !empty($options['include_zero']),
+        ]);
+
+        if ($mode === 'subaccounts') {
+            $base['mode'] = 'subaccounts';
+            $base['mode_label'] = 'Por subcuenta (detalle)';
+            return $base;
+        }
+
+        $prefixLen = match ($mode) {
+            'classes' => 1,
+            'groups' => 2,
+            default => 4,
+        };
+        $modeLabel = match ($mode) {
+            'classes' => 'Por clase (1 dígito)',
+            'groups' => 'Por grupo (2 dígitos)',
+            default => 'Por cuenta (4 dígitos)',
+        };
+
+        $buckets = [];
+        foreach ($base['rows'] as $row) {
+            $code = preg_replace('/\D+/', '', (string)($row['code'] ?? '')) ?: (string)($row['code'] ?? '');
+            $key = substr($code, 0, $prefixLen);
+            if ($key === '') {
+                $key = (string)($row['code'] ?? '?');
+            }
+            if (!isset($buckets[$key])) {
+                $buckets[$key] = [
+                    'id' => 0,
+                    'code' => $key,
+                    'name' => $this->pucGroupLabel($key, $mode, (string)($row['name'] ?? '')),
+                    'account_type' => (string)($row['account_type'] ?? ''),
+                    'account_type_label' => (string)($row['account_type_label'] ?? ''),
+                    'nature' => (string)($row['nature'] ?? 'debit'),
+                    'nature_label' => (string)($row['nature_label'] ?? 'Débito'),
+                    'opening_balance' => 0.0,
+                    'debit' => 0.0,
+                    'credit' => 0.0,
+                    'closing_balance' => 0.0,
+                    'opening_debit' => 0.0,
+                    'opening_credit' => 0.0,
+                    'closing_debit' => 0.0,
+                    'closing_credit' => 0.0,
+                    'accounts_count' => 0,
+                    'is_group' => true,
+                ];
+            }
+            $buckets[$key]['opening_balance'] = round($buckets[$key]['opening_balance'] + (float)$row['opening_balance'], 2);
+            $buckets[$key]['debit'] = round($buckets[$key]['debit'] + (float)$row['debit'], 2);
+            $buckets[$key]['credit'] = round($buckets[$key]['credit'] + (float)$row['credit'], 2);
+            $buckets[$key]['closing_balance'] = round($buckets[$key]['closing_balance'] + (float)$row['closing_balance'], 2);
+            $buckets[$key]['opening_debit'] = round($buckets[$key]['opening_debit'] + (float)$row['opening_debit'], 2);
+            $buckets[$key]['opening_credit'] = round($buckets[$key]['opening_credit'] + (float)$row['opening_credit'], 2);
+            $buckets[$key]['closing_debit'] = round($buckets[$key]['closing_debit'] + (float)$row['closing_debit'], 2);
+            $buckets[$key]['closing_credit'] = round($buckets[$key]['closing_credit'] + (float)$row['closing_credit'], 2);
+            $buckets[$key]['accounts_count']++;
+        }
+        ksort($buckets, SORT_STRING);
+
+        return [
+            'rows' => array_values($buckets),
+            'totals' => $base['totals'],
+            'balanced' => $base['balanced'],
+            'from' => $from,
+            'to' => $to,
+            'mode' => $mode,
+            'mode_label' => $modeLabel,
+        ];
+    }
+
+    private function pucGroupLabel(string $key, string $mode, string $fallbackName): string
+    {
+        if ($mode === 'classes') {
+            return match ($key) {
+                '1' => 'Activo',
+                '2' => 'Pasivo',
+                '3' => 'Patrimonio',
+                '4' => 'Ingresos',
+                '5' => 'Gastos',
+                '6' => 'Costos de ventas',
+                '7' => 'Costos de producción / operación',
+                '8' => 'Cuentas de orden deudoras',
+                '9' => 'Cuentas de orden acreedoras',
+                default => 'Clase ' . $key,
+            };
+        }
+        if ($mode === 'groups') {
+            return 'Grupo ' . $key;
+        }
+        if ($fallbackName !== '' && strlen($key) >= 4) {
+            return 'Cuenta ' . $key;
+        }
+        return $fallbackName !== '' ? $fallbackName : ('Cuenta ' . $key);
+    }
+
+    /**
+     * Libro documental de ventas / ingresos del periodo (facturas + NC).
+     * No incluye retenciones de adquirente (van al libro de retenciones).
+     *
+     * @return array<string,mixed>
+     */
+    public function salesIncomeBook(string $from, string $to): array
+    {
+        $rows = [];
+        $totals = [
+            'count' => 0,
+            'subtotal' => 0.0,
+            'discount' => 0.0,
+            'tax' => 0.0,
+            'delivery' => 0.0,
+            'total' => 0.0,
+            'credit_notes_count' => 0,
+            'credit_notes_total' => 0.0,
+            'net_income' => 0.0,
+        ];
+
+        try {
+            $sales = $this->query(
+                "SELECT s.id, s.invoice_number, s.sale_date, s.subtotal, s.discount, s.tax,
+                        COALESCE(s.delivery_fee, 0) AS delivery_fee, s.total,
+                        s.payment_method, s.payment_status, s.status, s.notes,
+                        COALESCE(c.name, 'Público general') AS customer_name,
+                        COALESCE(NULLIF(TRIM(c.document_number), ''), '') AS customer_document,
+                        COALESCE(e.entry_number, '') AS entry_number,
+                        e.id AS entry_id
+                 FROM sales s
+                 LEFT JOIN customers c ON c.id = s.customer_id
+                 LEFT JOIN accounting_entries e ON e.source_type = 'sale' AND e.source_id = s.id
+                      AND e.status IN ('posted','reversed')
+                 WHERE DATE(s.sale_date) BETWEEN ? AND ?
+                   AND COALESCE(s.status, '') <> 'cancelled'
+                 ORDER BY s.sale_date ASC, s.id ASC",
+                [$from, $to]
+            )->fetchAll() ?: [];
+        } catch (\Throwable $e) {
+            $sales = [];
+        }
+
+        foreach ($sales as $s) {
+            $sub = round((float)($s['subtotal'] ?? 0), 2);
+            $disc = round((float)($s['discount'] ?? 0), 2);
+            $tax = round((float)($s['tax'] ?? 0), 2);
+            $del = round((float)($s['delivery_fee'] ?? 0), 2);
+            $tot = round((float)($s['total'] ?? 0), 2);
+            $rows[] = [
+                'kind' => 'sale',
+                'kind_label' => 'Venta',
+                'id' => (int)$s['id'],
+                'number' => (string)($s['invoice_number'] ?? ''),
+                'date' => (string)($s['sale_date'] ?? ''),
+                'customer_name' => (string)($s['customer_name'] ?? ''),
+                'customer_document' => (string)($s['customer_document'] ?? ''),
+                'payment_method' => (string)($s['payment_method'] ?? ''),
+                'payment_status' => (string)($s['payment_status'] ?? ''),
+                'subtotal' => $sub,
+                'discount' => $disc,
+                'tax' => $tax,
+                'delivery' => $del,
+                'total' => $tot,
+                'sign' => 1,
+                'entry_number' => (string)($s['entry_number'] ?? ''),
+                'entry_id' => (int)($s['entry_id'] ?? 0),
+                'notes' => SalesDocumentService::displayNotes((string)($s['notes'] ?? '')),
+            ];
+            $totals['count']++;
+            $totals['subtotal'] += $sub;
+            $totals['discount'] += $disc;
+            $totals['tax'] += $tax;
+            $totals['delivery'] += $del;
+            $totals['total'] += $tot;
+        }
+
+        try {
+            $notes = $this->query(
+                "SELECT cn.id, cn.credit_number, cn.credit_date, cn.subtotal, cn.tax, cn.total,
+                        cn.status, s.invoice_number AS sale_invoice,
+                        COALESCE(c.name, 'Público general') AS customer_name,
+                        COALESCE(NULLIF(TRIM(c.document_number), ''), '') AS customer_document,
+                        COALESCE(e.entry_number, '') AS entry_number,
+                        e.id AS entry_id
+                 FROM sale_credit_notes cn
+                 LEFT JOIN sales s ON s.id = cn.sale_id
+                 LEFT JOIN customers c ON c.id = s.customer_id
+                 LEFT JOIN accounting_entries e ON e.source_type = 'sale_credit_note' AND e.source_id = cn.id
+                      AND e.status IN ('posted','reversed')
+                 WHERE cn.status = 'posted'
+                   AND DATE(cn.credit_date) BETWEEN ? AND ?
+                 ORDER BY cn.credit_date ASC, cn.id ASC",
+                [$from, $to]
+            )->fetchAll() ?: [];
+        } catch (\Throwable $e) {
+            $notes = [];
+        }
+
+        foreach ($notes as $n) {
+            $sub = round((float)($n['subtotal'] ?? 0), 2);
+            $tax = round((float)($n['tax'] ?? 0), 2);
+            $tot = round((float)($n['total'] ?? 0), 2);
+            $rows[] = [
+                'kind' => 'credit_note',
+                'kind_label' => 'NC venta',
+                'id' => (int)$n['id'],
+                'number' => (string)($n['credit_number'] ?? ''),
+                'date' => (string)($n['credit_date'] ?? ''),
+                'customer_name' => (string)($n['customer_name'] ?? ''),
+                'customer_document' => (string)($n['customer_document'] ?? ''),
+                'payment_method' => '',
+                'payment_status' => '',
+                'subtotal' => -$sub,
+                'discount' => 0.0,
+                'tax' => -$tax,
+                'delivery' => 0.0,
+                'total' => -$tot,
+                'sign' => -1,
+                'entry_number' => (string)($n['entry_number'] ?? ''),
+                'entry_id' => (int)($n['entry_id'] ?? 0),
+                'notes' => 'Ref. ' . (string)($n['sale_invoice'] ?? ''),
+            ];
+            $totals['credit_notes_count']++;
+            $totals['credit_notes_total'] += $tot;
+            $totals['subtotal'] -= $sub;
+            $totals['tax'] -= $tax;
+            $totals['total'] -= $tot;
+        }
+
+        usort($rows, static function ($a, $b) {
+            $da = (string)($a['date'] ?? '');
+            $db = (string)($b['date'] ?? '');
+            return strcmp($da, $db) ?: ((int)($a['id'] ?? 0) <=> (int)($b['id'] ?? 0));
+        });
+
+        foreach ($totals as $k => $v) {
+            if (is_float($v) || (is_numeric($v) && $k !== 'count' && $k !== 'credit_notes_count')) {
+                $totals[$k] = round((float)$v, 2);
+            }
+        }
+        $totals['net_income'] = round((float)$totals['total'], 2);
+
+        $salesAccount = $this->setting('sales_account', '413501');
+        $returnsAccount = $this->setting('sales_returns_account', '417501');
+        $ledgerSales = 0.0;
+        $ledgerReturns = 0.0;
+        try {
+            $led = $this->query(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN a.code = ? THEN l.credit - l.debit ELSE 0 END), 0) sales_net,
+                    COALESCE(SUM(CASE WHEN a.code = ? THEN l.debit - l.credit ELSE 0 END), 0) returns_net
+                 FROM accounting_lines l
+                 INNER JOIN accounting_entries e ON e.id = l.entry_id
+                 INNER JOIN accounting_accounts a ON a.id = l.account_id
+                 WHERE e.entry_date BETWEEN ? AND ?
+                   AND e.status IN ('posted','reversed')
+                   AND a.code IN (?, ?)",
+                [$salesAccount, $returnsAccount, $from, $to, $salesAccount, $returnsAccount]
+            )->fetch() ?: [];
+            $ledgerSales = round((float)($led['sales_net'] ?? 0), 2);
+            $ledgerReturns = round((float)($led['returns_net'] ?? 0), 2);
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        $docBase = round((float)$totals['subtotal'] - (float)$totals['discount'] + (float)$totals['delivery'], 2);
+        $ledgerNet = round($ledgerSales - $ledgerReturns, 2);
+        $warnings = [];
+        if (abs($docBase - $ledgerNet) >= 1.0 && ($totals['count'] > 0 || abs($ledgerNet) >= 0.01)) {
+            $warnings[] = 'La base documental neta (' . number_format($docBase, 2, ',', '.')
+                . ') difiere del mayor de ingresos (' . number_format($ledgerNet, 2, ',', '.')
+                . '). Revise asientos pendientes o cuentas de ingreso.';
+        }
+
+        return [
+            'from' => $from,
+            'to' => $to,
+            'rows' => $rows,
+            'totals' => $totals,
+            'accounts' => [
+                'sales' => $salesAccount,
+                'returns' => $returnsAccount,
+            ],
+            'ledger' => [
+                'sales_net' => $ledgerSales,
+                'returns_net' => $ledgerReturns,
+                'net' => $ledgerNet,
+            ],
+            'warnings' => $warnings,
+        ];
+    }
+
+    /**
      * Mayor de una cuenta en un rango.
      * Incluye saldo de apertura (movimientos anteriores a $from) para que la columna Saldo sea usable.
      *
      * @return array{opening_balance:float,rows:list<array<string,mixed>>}
      */
-    public function ledger(int $accountId, string $from, string $to): array
+    public function ledger(int $accountId, string $from, string $to, string $q = ''): array
     {
+        $account = $this->query(
+            "SELECT id, code, name, account_type, nature, status, accepts_entries
+             FROM accounting_accounts WHERE id = ? LIMIT 1",
+            [$accountId]
+        )->fetch() ?: null;
         $opening = 0.0;
         try {
             $opening = (float)$this->query(
@@ -2762,20 +3581,250 @@ class AccountingService
             $opening = 0.0;
         }
 
+        // Totales del periodo siempre completos (sin filtro de texto) para que el saldo final sea real.
+        $period = $this->query(
+            "SELECT COALESCE(SUM(l.debit), 0) debit, COALESCE(SUM(l.credit), 0) credit
+             FROM accounting_lines l
+             JOIN accounting_entries e ON e.id = l.entry_id
+             WHERE l.account_id = ? AND e.entry_date BETWEEN ? AND ?
+               AND e.status IN ('posted','reversed')
+               AND " . $this->voidedPairExclusionSql('e'),
+            [$accountId, $from, $to]
+        )->fetch() ?: ['debit' => 0, 'credit' => 0];
+
+        $params = [$accountId, $from, $to];
+        $qSql = '';
+        $q = trim($q);
+        if ($q !== '') {
+            $qSql = " AND (l.description LIKE ? OR e.description LIKE ? OR l.third_party_name LIKE ? OR e.entry_number LIKE ?)";
+            $like = '%' . $q . '%';
+            array_push($params, $like, $like, $like, $like);
+        }
+
         $rows = $this->query(
             "SELECT e.id entry_id, e.entry_number, e.entry_date, e.description entry_description,
+                    e.source_type, e.source_id, e.status entry_status, e.reversal_of_id,
                     l.description, l.debit, l.credit, l.third_party_name
              FROM accounting_lines l
              JOIN accounting_entries e ON e.id = l.entry_id
              WHERE l.account_id = ? AND e.entry_date BETWEEN ? AND ?
                AND e.status IN ('posted','reversed')
+               AND " . $this->voidedPairExclusionSql('e') . $qSql . "
              ORDER BY e.entry_date, e.id, l.id",
-            [$accountId, $from, $to]
+            $params
         )->fetchAll();
 
+        $opening = round($opening, 2);
+        $debit = round((float)$period['debit'], 2);
+        $credit = round((float)$period['credit'], 2);
+
         return [
-            'opening_balance' => round($opening, 2),
+            'account' => $account,
+            'opening_balance' => $opening,
+            'period_debit' => $debit,
+            'period_credit' => $credit,
+            'closing_balance' => round($opening + $debit - $credit, 2),
+            'filtered' => $q !== '',
             'rows' => $rows ?: [],
+        ];
+    }
+
+    /** Etiqueta en español del origen de un comprobante. */
+    public static function sourceLabel(?string $sourceType): string
+    {
+        return match ((string)$sourceType) {
+            '', 'manual' => 'Manual',
+            'sale' => 'Venta',
+            'sale_payment' => 'Abono de cliente',
+            'sale_credit_note' => 'NC de venta',
+            'expense' => 'Gasto',
+            'payroll' => 'Nómina',
+            'payroll_payment' => 'Pago de nómina',
+            'bank_posting' => 'Bancos (extracto)',
+            'bold_settlement' => 'Liquidación Bold',
+            'purchase', 'purchase_order' => 'Compra',
+            'purchase_credit_note' => 'NC de compra',
+            'purchase_cancel', 'purchase_order_cancel' => 'Anulación de compra',
+            'supplier_payment' => 'Pago a proveedor',
+            'stock_movement' => 'Inventario',
+            'cash_movement' => 'Movimiento de caja',
+            'cash_session' => 'Cierre de caja',
+            'consignment_settlement', 'consignment_in', 'consignment_return' => 'Consignación',
+            'loan', 'loan_return', 'loan_received', 'loan_received_return', 'loan_received_settle' => 'Préstamo',
+            default => (string)$sourceType,
+        };
+    }
+
+    /**
+     * Retenciones que nos practican (anticipos de impuestos, activo 1355):
+     * saldos del libro, de dónde vienen y cuánto debería haber según las comisiones de pasarela.
+     *
+     * @return array<string,mixed>
+     */
+    public function withholdingSummary(string $from, string $to): array
+    {
+        $defs = [
+            'renta' => ['label' => 'Retención en la fuente', 'key' => 'gateway_withholding_renta_account', 'default' => '135515', 'rate_key' => 'gateway_withholding_renta_rate', 'rate_unit' => '%', 'column' => 'withholding_renta'],
+            'iva' => ['label' => 'ReteIVA', 'key' => 'gateway_withholding_iva_account', 'default' => '135517', 'rate_key' => 'gateway_withholding_iva_rate', 'rate_unit' => '%', 'column' => 'withholding_iva'],
+            'ica' => ['label' => 'ReteICA', 'key' => 'gateway_withholding_ica_account', 'default' => '135518', 'rate_key' => 'gateway_withholding_ica_rate', 'rate_unit' => '‰', 'column' => 'withholding_ica'],
+        ];
+
+        $expected = [];
+        $pending = [];
+        $commissionsAvailable = true;
+        try {
+            $paid = $this->query(
+                "SELECT COALESCE(SUM(withholding_renta),0) renta, COALESCE(SUM(withholding_iva),0) iva,
+                        COALESCE(SUM(withholding_ica),0) ica, COUNT(*) cnt
+                 FROM sales_commissions
+                 WHERE commission_kind = 'gateway' AND status = 'paid' AND expense_id IS NOT NULL
+                   AND COALESCE(accrual_date, DATE(created_at)) BETWEEN ? AND ?",
+                [$from, $to]
+            )->fetch() ?: [];
+            $pend = $this->query(
+                "SELECT COALESCE(SUM(withholding_renta),0) renta, COALESCE(SUM(withholding_iva),0) iva,
+                        COALESCE(SUM(withholding_ica),0) ica, COUNT(*) cnt
+                 FROM sales_commissions
+                 WHERE commission_kind = 'gateway' AND status = 'pending'
+                   AND COALESCE(accrual_date, DATE(created_at)) BETWEEN ? AND ?",
+                [$from, $to]
+            )->fetch() ?: [];
+            foreach (array_keys($defs) as $k) {
+                $expected[$k] = round((float)($paid[$k] ?? 0), 2);
+                $pending[$k] = round((float)($pend[$k] ?? 0), 2);
+            }
+            $paidCount = (int)($paid['cnt'] ?? 0);
+            $pendingCount = (int)($pend['cnt'] ?? 0);
+        } catch (\Throwable $e) {
+            $commissionsAvailable = false;
+            $paidCount = 0;
+            $pendingCount = 0;
+        }
+
+        $gatewayPayments = 0;
+        $gatewayAmount = 0.0;
+        try {
+            $methods = CommissionService::GATEWAY_METHODS;
+            $ph = implode(',', array_fill(0, count($methods), '?'));
+            $gp = $this->query(
+                "SELECT COUNT(*) cnt, COALESCE(SUM(sp.amount), 0) total
+                 FROM sale_payments sp
+                 JOIN sales s ON s.id = sp.sale_id AND COALESCE(s.status, '') <> 'cancelled'
+                 WHERE sp.amount > 0
+                   AND sp.payment_method IN ({$ph})
+                   AND DATE(sp.payment_date) BETWEEN ? AND ?",
+                array_merge($methods, [$from, $to])
+            )->fetch() ?: [];
+            $gatewayPayments = (int)($gp['cnt'] ?? 0);
+            $gatewayAmount = round((float)($gp['total'] ?? 0), 2);
+        } catch (\Throwable $e) {
+            $gatewayPayments = 0;
+        }
+
+        $rows = [];
+        foreach ($defs as $k => $def) {
+            $code = $this->setting($def['key'], $def['default']);
+            $account = $this->query(
+                "SELECT id, code, name FROM accounting_accounts WHERE code = ? LIMIT 1",
+                [$code]
+            )->fetch() ?: null;
+            $row = [
+                'key' => $k,
+                'label' => $def['label'],
+                'code' => $code,
+                'account_id' => $account ? (int)$account['id'] : 0,
+                'account_name' => $account['name'] ?? '',
+                'exists' => (bool)$account,
+                'rate' => (float)$this->setting($def['rate_key'], '0'),
+                'rate_unit' => $def['rate_unit'],
+                'opening' => 0.0, 'debit' => 0.0, 'credit' => 0.0, 'closing' => 0.0,
+                'by_source' => [],
+                'expected_commissions' => $expected[$k] ?? 0.0,
+                'pending_commissions' => $pending[$k] ?? 0.0,
+                'commission_ledger' => 0.0,
+            ];
+            if ($account) {
+                $bal = $this->query(
+                    "SELECT
+                        COALESCE(SUM(CASE WHEN e.entry_date < ? THEN l.debit - l.credit ELSE 0 END), 0) opening,
+                        COALESCE(SUM(CASE WHEN e.entry_date BETWEEN ? AND ? THEN l.debit ELSE 0 END), 0) debit,
+                        COALESCE(SUM(CASE WHEN e.entry_date BETWEEN ? AND ? THEN l.credit ELSE 0 END), 0) credit
+                     FROM accounting_lines l
+                     JOIN accounting_entries e ON e.id = l.entry_id
+                     WHERE l.account_id = ? AND e.status IN ('posted','reversed')",
+                    [$from, $from, $to, $from, $to, (int)$account['id']]
+                )->fetch() ?: [];
+                $row['opening'] = round((float)($bal['opening'] ?? 0), 2);
+                $row['debit'] = round((float)($bal['debit'] ?? 0), 2);
+                $row['credit'] = round((float)($bal['credit'] ?? 0), 2);
+                $row['closing'] = round($row['opening'] + $row['debit'] - $row['credit'], 2);
+
+                $sources = $this->query(
+                    "SELECT COALESCE(e.source_type, 'manual') source_type,
+                            COUNT(DISTINCT e.id) entries,
+                            COALESCE(SUM(l.debit - l.credit), 0) net
+                     FROM accounting_lines l
+                     JOIN accounting_entries e ON e.id = l.entry_id
+                     WHERE l.account_id = ? AND e.entry_date BETWEEN ? AND ?
+                       AND e.status IN ('posted','reversed')
+                     GROUP BY COALESCE(e.source_type, 'manual')
+                     ORDER BY net DESC",
+                    [(int)$account['id'], $from, $to]
+                )->fetchAll();
+                foreach ($sources as $s) {
+                    $row['by_source'][] = [
+                        'label' => self::sourceLabel($s['source_type']),
+                        'entries' => (int)$s['entries'],
+                        'net' => round((float)$s['net'], 2),
+                    ];
+                }
+
+                if ($commissionsAvailable) {
+                    try {
+                        $row['commission_ledger'] = round((float)$this->query(
+                            "SELECT COALESCE(SUM(l.debit - l.credit), 0)
+                             FROM accounting_lines l
+                             JOIN accounting_entries e ON e.id = l.entry_id
+                             WHERE l.account_id = ? AND e.entry_date BETWEEN ? AND ?
+                               AND e.status IN ('posted','reversed')
+                               AND e.source_type = 'expense'
+                               AND e.source_id IN (
+                                   SELECT expense_id FROM sales_commissions
+                                   WHERE commission_kind = 'gateway' AND expense_id IS NOT NULL
+                               )",
+                            [(int)$account['id'], $from, $to]
+                        )->fetchColumn(), 2);
+                    } catch (\Throwable $e) {
+                        $row['commission_ledger'] = 0.0;
+                    }
+                }
+            }
+            $rows[] = $row;
+        }
+
+        $expenseCategories = [];
+        try {
+            $codes = array_map(static fn($r) => $r['code'], $rows);
+            $in = implode(',', array_fill(0, count($codes), '?'));
+            $expenseCategories = $this->query(
+                "SELECT code, name, account_code FROM expense_categories
+                 WHERE account_code IN ({$in}) AND status = 'active'",
+                $codes
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $expenseCategories = [];
+        }
+
+        return [
+            'from' => $from,
+            'to' => $to,
+            'rows' => $rows,
+            'commissions_available' => $commissionsAvailable,
+            'paid_commissions' => $paidCount,
+            'pending_commissions' => $pendingCount,
+            'gateway_payments' => $gatewayPayments,
+            'gateway_amount' => $gatewayAmount,
+            'expense_categories' => $expenseCategories,
         ];
     }
 
@@ -2794,11 +3843,17 @@ class AccountingService
             'revenue' => 'revenue',
             'expense' => 'expenses',
         ];
+        // Resultado acumulado antes de "from" (aún sin asiento de cierre): sin él el
+        // balance a la fecha "to" no cuadra cuando el rango no arranca en el inicio.
+        $priorProfit = 0.0;
         foreach ($rows as $row) {
             $type = $row['account_type'];
             $key = $typeKeyMap[$type] ?? null;
             if ($key === null) {
                 continue;
+            }
+            if (in_array($type, ['revenue', 'expense'], true)) {
+                $priorProfit -= (float)($row['opening_balance'] ?? 0);
             }
             // P&L: movimiento del periodo. Balance: saldo acumulado a la fecha "to".
             if (in_array($type, ['revenue', 'expense'], true)) {
@@ -2817,6 +3872,11 @@ class AccountingService
             $result['totals'][$key] += $displayBalance;
         }
         $result['profit'] = $result['totals']['revenue'] - $result['totals']['expenses'];
+        $result['prior_profit'] = round($priorProfit, 2);
+        $result['totals']['equity_with_results'] = round(
+            $result['totals']['equity'] + $result['prior_profit'] + $result['profit'],
+            2
+        );
         return $result;
     }
 
@@ -2849,6 +3909,20 @@ class AccountingService
              LEFT JOIN users u ON u.id = p.closed_by
              ORDER BY p.year DESC, p.month DESC"
         )->fetchAll();
+    }
+
+    /**
+     * Para comprobantes digitados por el usuario: no se reubican de mes como los automáticos.
+     */
+    public function assertPeriodOpen(string $date): void
+    {
+        if ($this->isPeriodClosed($date)) {
+            $ts = strtotime($date) ?: time();
+            throw new \InvalidArgumentException(
+                'El periodo ' . date('m/Y', $ts) . ' está cerrado. Use una fecha de un periodo abierto '
+                . 'o reabra el periodo en Contabilidad → Periodos.'
+            );
+        }
     }
 
     private function isPeriodClosed(string $date): bool
@@ -2960,13 +4034,54 @@ class AccountingService
         if (!$paid) {
             return $this->setting('payroll_payable_account', '250505');
         }
+        return $this->payrollPaymentAccount($method);
+    }
+
+    /**
+     * Cuenta de salida de pagos de nómina: banco para medios electrónicos;
+     * efectivo contra la caja de nómina (110510), nunca el cajón POS.
+     */
+    public function payrollPaymentAccount(string $method): string
+    {
         $method = strtolower(trim($method));
         $electronic = ['transfer', 'card', 'debit_card', 'credit_card', 'dataphone', 'payment_link', 'nequi', 'daviplata', 'breb'];
         if (in_array($method, $electronic, true)) {
             return $this->setting('bank_account', '111005');
         }
-        // Efectivo u otros: contabiliza contra CxP nómina (pago fuera del cajón físico).
-        return $this->setting('payroll_payable_account', '250505');
+        $cashAccount = $this->setting('payroll_cash_account', '110510');
+        if ($cashAccount === $this->setting('cash_account', '110505')) {
+            $cashAccount = '110510';
+        }
+        return $cashAccount;
+    }
+
+    /**
+     * Cuenta donde entra el cobro de una venta según el medio de pago (Bancos → Cuentas):
+     * banco por entidad, billetera o pasarela por liquidar (Bold). Sin asignación, o con fecha
+     * anterior a «collection_accounts_since», se usa la regla general de paymentAccount().
+     * Los egresos (gastos, compras, nómina) no usan esta asignación.
+     */
+    public function collectionAccount(string $method, ?string $date = null): string
+    {
+        $default = $this->paymentAccount($method);
+        $code = PaymentMethodCatalog::normalize($method);
+        if ($code === 'cash' || $code === 'mixed') {
+            return $default;
+        }
+        $mapped = $this->setting('collection_account_' . $code, '');
+        if ($mapped === '') {
+            return $default;
+        }
+        $since = $this->setting('collection_accounts_since', '');
+        if ($since !== '' && $date !== null && $date < $since) {
+            return $default;
+        }
+        $usable = $this->query(
+            "SELECT 1 FROM accounting_accounts
+             WHERE code = ? AND status = 'active' AND accepts_entries = 1 LIMIT 1",
+            [$mapped]
+        )->fetchColumn();
+        return $usable ? $mapped : $default;
     }
 
     private function paymentAccount(string $method): string
@@ -3053,13 +4168,31 @@ class AccountingService
             $label .= ' / Factura ' . $order['invoice_number'];
         }
 
+        // Líneas sin producto (facturadas sin inventario: muestras, compra externa) van a gasto, no a 1435.
+        $nonStock = 0.0;
+        foreach ($order['items'] ?? [] as $item) {
+            if (empty($item['product_id'])) {
+                $nonStock += (float)($item['subtotal'] ?? 0);
+            }
+        }
+        $nonStock = round(min(max(0.0, $subtotal), max(0.0, $nonStock)), 2);
+        $stockSubtotal = round($subtotal - $nonStock, 2);
+
         $lines = [];
-        if ($subtotal > 0) {
+        if ($stockSubtotal > 0) {
             $lines[] = $this->line(
                 $this->setting('inventory_account', '143501'),
-                $subtotal,
+                $stockSubtotal,
                 0,
                 'Entrada mercancía ' . $label
+            );
+        }
+        if ($nonStock > 0) {
+            $lines[] = $this->line(
+                $this->setting('purchase_non_stock_account', '519595'),
+                $nonStock,
+                0,
+                'Compra sin inventario (muestras / externa) ' . $label
             );
         }
         if ($tax > 0) {
@@ -3603,11 +4736,12 @@ class AccountingService
 
         $referenceType = (string)($movement['reference_type'] ?? '');
         if (in_array($referenceType, [
-            'sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note',
+            'sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'purchase_cancel',
             'loan', 'loan_return', 'loan_received', 'loan_received_return', 'status_change',
             'consignment_in', 'consignment_return',
         ], true)) {
             // sale/return/NCV: asiento de venta. purchase_order / NCC: asiento propio.
+            // purchase_cancel: lo cubre el reverso del asiento de la OC.
             // loan / consignación / status_change: sin capitalizar inventario propio.
             return null;
         }
@@ -3918,10 +5052,12 @@ class AccountingService
                 : ' · Efectivo fuera del cajón';
         }
 
+        // Dcto. pronto pago obtenido al pagar: baja la CxP sin salir de caja/bancos.
+        $discountAmount = round((float)($payment['discount_amount'] ?? 0), 2);
         $lines = [
             $this->line(
                 $this->setting('payable_account', '220505'),
-                $amount,
+                round($amount + $discountAmount, 2),
                 0,
                 'Abono cuenta por pagar ' . $label,
                 'supplier',
@@ -3938,6 +5074,17 @@ class AccountingService
                 $supplierName
             ),
         ];
+        if ($discountAmount > 0.009) {
+            $lines[] = $this->line(
+                $this->setting('purchase_discount_account', '421040'),
+                0,
+                $discountAmount,
+                'Descuento pronto pago ' . $label,
+                'supplier',
+                $payment['supplier_id'] ?? null,
+                $supplierName
+            );
+        }
 
         $entryId = $this->postEntry(
             $date,

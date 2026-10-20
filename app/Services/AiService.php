@@ -449,8 +449,8 @@ class AiService
         $rawText = mb_substr($rawText, 0, 12000);
 
         $instruccion = <<<'PROMPT'
-Eres un extractor de datos de facturas de compra. Recibirás el texto de una factura
-y devolverás EXCLUSIVAMENTE un objeto JSON válido, sin explicaciones ni bloques de código.
+Eres un extractor de datos de facturas de compra (Colombia / distribuidores belleza y consumo).
+Devuelve EXCLUSIVAMENTE un objeto JSON válido, sin markdown ni explicaciones.
 
 Estructura exacta:
 {
@@ -463,28 +463,30 @@ Estructura exacta:
   "total": 0,
   "items": [
     {
-      "supplier_sku": "SKU, ID o codigo interno del proveedor (NO el EAN)",
-      "barcode": "codigo de barras EAN/UPC/GTIN o vacio",
+      "supplier_sku": "SKU o ID interno del proveedor (NO el EAN)",
+      "barcode": "EAN/UPC/GTIN o vacio",
       "description": "nombre del producto",
       "quantity": 0,
       "unit_cost": 0,
       "tax_rate": 0,
       "discount_pct": 0,
       "line_total": 0,
-      "lot_code": "codigo de lote o vacio",
+      "lot_code": "lote o vacio",
       "expiry_date": "YYYY-MM-DD o vacio"
     }
   ]
 }
 
-Reglas: usa punto decimal; no inventes datos ausentes (deja vacío o 0);
-separa SIEMPRE barcode/EAN de supplier_sku/ID.
-Si el texto trae "ID: 048391 / EAN: 7702113048391", supplier_sku=048391 y barcode=7702113048391.
-No uses como cantidad los números del nombre (ej. 5.0, 6.35, 60 gr); la cantidad es CANT./unidades facturadas.
-Si hay BONIF y CANT=0, quantity = BONIF y unit_cost=0, line_total=0 (bonificación/regalo).
-Si hay CANT>0 y BONIF>0, genera DOS items: uno con quantity=CANT y precios de la factura, y otro con quantity=BONIF, unit_cost=0, line_total=0 (mismo barcode/sku/nombre).
-Las bonificaciones (costo 0) SÍ deben listarse: entran al inventario con el mismo SKU/EAN.
-si el texto no es una factura devuelve {"items": []}.
+Reglas estrictas:
+1) Punto decimal. No inventes datos: vacío o 0.
+2) Separar códigos: "ID: 048391 / EAN: 7702113048391" → supplier_sku=048391, barcode=7702113048391.
+   EAN suele tener 8–14 dígitos; SKU es el código corto del proveedor.
+3) quantity = unidades facturadas (columna CANT/Cantidad/Und). NUNCA uses ml, gr, oz, %, ni tamaños del nombre (ej. "60 ml", "5.0").
+4) Bonificaciones: BONIF con CANT=0 → un ítem quantity=BONIF, unit_cost=0, line_total=0.
+   CANT>0 y BONIF>0 → DOS ítems (cobrado + regalo) mismo sku/barcode/nombre.
+5) Incluye TODAS las líneas de producto. Omite flete, publicidad, redondeo, anticipos y textos legales.
+6) tax_rate por línea si aparece (19, 5, 0). Totales de cabecera = sumas de la factura.
+7) Si no es factura de compra → {"items": []}.
 PROMPT;
 
         try {
@@ -540,9 +542,8 @@ PROMPT;
         $parts = [[
             'type' => 'text',
             'text' => <<<'PROMPT'
-Eres un extractor de datos de facturas de compra. Analiza la(s) imagen(es) de la factura
-(puede ser un escaneo o foto) y devuelve EXCLUSIVAMENTE un objeto JSON válido,
-sin explicaciones ni bloques de código.
+Eres un extractor de facturas de compra (Colombia / belleza y consumo) desde foto o escaneo.
+Devuelve EXCLUSIVAMENTE JSON válido, sin markdown ni texto extra.
 
 Estructura exacta:
 {
@@ -555,24 +556,24 @@ Estructura exacta:
   "total": 0,
   "items": [
     {
-      "supplier_sku": "SKU, ID o codigo interno del proveedor (NO el EAN)",
-      "barcode": "codigo de barras EAN/UPC/GTIN o vacio",
+      "supplier_sku": "SKU o ID interno (NO el EAN)",
+      "barcode": "EAN/UPC/GTIN o vacio",
       "description": "nombre del producto",
       "quantity": 0,
       "unit_cost": 0,
       "tax_rate": 0,
       "discount_pct": 0,
       "line_total": 0,
-      "lot_code": "codigo de lote o vacio",
+      "lot_code": "lote o vacio",
       "expiry_date": "YYYY-MM-DD o vacio"
     }
   ]
 }
 
-Reglas: usa punto decimal; no inventes datos ausentes (deja vacío o 0);
-separa SIEMPRE barcode/EAN de supplier_sku/ID (formato frecuente: "ID: 048391 / EAN: 7702113048391");
-no uses como cantidad los números del nombre del producto; incluye todas las líneas visibles;
-si no es una factura devuelve {"items": []}.
+Reglas: punto decimal; no inventar; separar ID/SKU de EAN;
+quantity = columna CANT/unidades (nunca ml/gr del nombre);
+BONIF → ítem(s) a costo 0; incluir todas las líneas de producto;
+omitir flete/publicidad/legales; si no es factura → {"items": []}.
 PROMPT
         ]];
 

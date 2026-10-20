@@ -262,7 +262,6 @@ class OfflineSaleSyncService
                     'unit_price' => isset($item['unit_price']) ? (float)$item['unit_price'] : 0.0,
                     'product_name' => (string)($item['product_name'] ?? 'Combo'),
                     'price_manual' => '1',
-                    'tax_rate' => $item['tax_rate'] ?? null,
                     'components' => array_values($components),
                     'components_json' => json_encode(array_values($components), JSON_UNESCAPED_UNICODE),
                 ];
@@ -321,6 +320,74 @@ class OfflineSaleSyncService
             'payment_splits' => SalePaymentSplitter::extractFromArray($raw),
             'cash_received' => isset($raw['cash_received']) ? \SoftNova\Core\parse_money($raw['cash_received']) : null,
             'cash_change' => isset($raw['cash_change']) ? \SoftNova\Core\parse_money($raw['cash_change']) : null,
+            'offline_at' => $this->parseOfflineAt((string)($raw['offline_at'] ?? '')),
+        ];
+    }
+
+    /**
+     * Hora en que el POS encoló la venta (reloj del navegador), en hora de negocio.
+     * Solo se usa para etiquetar el movimiento de caja; se descarta si es absurda.
+     */
+    private function parseOfflineAt(string $raw): ?string
+    {
+        $raw = trim($raw);
+        if ($raw === '' || strlen($raw) > 40) {
+            return null;
+        }
+        try {
+            $tz = new \DateTimeZone(\SoftNova\Core\BusinessTimezone::resolve($this->db));
+            $at = (new \DateTimeImmutable($raw))->setTimezone($tz);
+            $now = new \DateTimeImmutable('now', $tz);
+        } catch (\Throwable $e) {
+            return null;
+        }
+        if ($at > $now->modify('+10 minutes') || $at < $now->modify('-60 days')) {
+            return null;
+        }
+        return $at->format('Y-m-d H:i:s');
+    }
+
+    /**
+     * Si la venta se hizo con otra caja (ya cerrada) y el efectivo entra a la actual,
+     * devuelve la etiqueta para que el cierre lo muestre; '' si es la misma caja.
+     *
+     * @return array{label:string,note:string}
+     */
+    private function lateOfflineCashTag(?string $offlineAt): array
+    {
+        $none = ['label' => '', 'note' => ''];
+        if ($offlineAt === null) {
+            return $none;
+        }
+        try {
+            $current = $this->cash->getOpenSession();
+            if (!$current) {
+                return $none;
+            }
+            $cur = $this->query(
+                "SELECT id, opening_date FROM cash_sessions WHERE id = ? LIMIT 1",
+                [(int)$current['id']]
+            )->fetch();
+            if (!$cur || (string)$cur['opening_date'] <= $offlineAt) {
+                return $none;
+            }
+            $orig = $this->query(
+                "SELECT id FROM cash_sessions
+                 WHERE id <> ? AND opening_date <= ?
+                   AND (closing_date IS NULL OR closing_date >= ?)
+                 ORDER BY id DESC LIMIT 1",
+                [(int)$cur['id'], $offlineAt, $offlineAt]
+            )->fetch();
+        } catch (\Throwable $e) {
+            return $none;
+        }
+        $when = date('d/m/Y H:i', strtotime($offlineAt));
+        $origin = $orig
+            ? 'caja #' . (int)$orig['id'] . ' cerrada'
+            : 'sin caja abierta en ese momento';
+        return [
+            'label' => ' · venta offline del ' . $when . ' (' . $origin . ')',
+            'note' => 'Efectivo sumado a la caja #' . (int)$cur['id'] . '; venta offline del ' . $when . ' (' . $origin . ')',
         ];
     }
 
@@ -498,7 +565,8 @@ class OfflineSaleSyncService
                         'stock_conflicts' => [],
                     ];
                 }
-                $postedTax = isset($item['tax_rate']) ? round((float)$item['tax_rate'], 2) : $taxRateCombo;
+                // IVA del combo = mayor tasa de sus componentes según catálogo; nunca la del navegador.
+                $postedTax = round($taxRateCombo, 2);
                 $comboValidExtra[] = [
                     'product_id' => null,
                     'product_name' => $comboName,
@@ -785,7 +853,7 @@ class OfflineSaleSyncService
         $paymentType = (string)$payload['payment_type'];
         $paymentMethod = (string)$payload['payment_method'];
         $paymentTerms = (string)$payload['payment_terms'];
-        if (!isset(SalesDocumentService::paymentTerms()[$paymentTerms])) {
+        if (!SalesDocumentService::isValidTerms($paymentTerms)) {
             $paymentTerms = $paymentType === 'credit' ? 'net_30' : 'cash';
         }
 
@@ -1175,6 +1243,7 @@ class OfflineSaleSyncService
             error_log('Comisiones venta offline ' . $saleId . ': ' . $e->getMessage());
         }
 
+        $lateCashNote = '';
         if ($cashAmount > 0.009) {
             try {
                 $label = ($paymentType === 'credit' && $paymentStatus !== 'paid')
@@ -1183,8 +1252,16 @@ class OfflineSaleSyncService
                 if ($paymentMethod === 'mixed') {
                     $label .= ' (efectivo mixto)';
                 }
+                $lateTag = $this->lateOfflineCashTag($payload['offline_at'] ?? null);
+                $label .= $lateTag['label'];
                 if (!$this->cash->registerIncome($cashAmount, $label, 'sale', $saleId)) {
                     error_log('Caja: venta offline ' . $saleId . ' sin movimiento de ingreso');
+                } elseif ($lateTag['note'] !== '') {
+                    $lateCashNote = $lateTag['note'];
+                    $this->query(
+                        "UPDATE sales SET notes = CONCAT(IFNULL(notes, ''), ?) WHERE id = ?",
+                        [' · ' . $lateCashNote, $saleId]
+                    );
                 }
             } catch (\Throwable $e) {
                 error_log('Caja venta offline ' . $saleId . ': ' . $e->getMessage());
@@ -1224,7 +1301,8 @@ class OfflineSaleSyncService
             (new TenantAuditService($this->db))->log(
                 'create',
                 'ventas',
-                'Venta offline sincronizada: ' . $invoiceNumber . ' total=' . $total,
+                'Venta offline sincronizada: ' . $invoiceNumber . ' total=' . $total
+                    . ($lateCashNote !== '' ? ' · ' . $lateCashNote : ''),
                 'sale',
                 $saleId
             );
@@ -1234,7 +1312,8 @@ class OfflineSaleSyncService
 
         return [
             'status' => 'ok',
-            'message' => 'Venta sincronizada: ' . $invoiceNumber,
+            'message' => 'Venta sincronizada: ' . $invoiceNumber
+                . ($lateCashNote !== '' ? '. ' . $lateCashNote : ''),
             'client_sale_uuid' => $uuid,
             'sale_id' => $saleId,
             'invoice_number' => $invoiceNumber,

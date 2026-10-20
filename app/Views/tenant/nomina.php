@@ -120,6 +120,8 @@ $hasOvertimeSchedules = (bool)array_filter($schedules, static fn ($s) => (float)
 .nm-modal-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
 .nm-modal-grid .full{grid-column:1/-1}
 .nm-check{display:flex;align-items:center;gap:8px;font-size:13px}
+.nm-void-form{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0}
+.nm-void-form .form-control{width:auto;min-width:150px;max-width:260px}
 </style>
 
 <div class="stats-grid">
@@ -133,6 +135,7 @@ $hasOvertimeSchedules = (bool)array_filter($schedules, static fn ($s) => (float)
     <a class="<?php echo $tab === 'employees' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=employees">Empleados</a>
     <a class="<?php echo $tab === 'schedules' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=schedules">Horarios <span class="nm-count"><?php echo count($schedules); ?></span></a>
     <a class="<?php echo in_array($tab, ['runs', 'run_detail'], true) ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=runs">Liquidaciones</a>
+    <a class="<?php echo $tab === 'payments' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=payments">Pagos de nómina</a>
     <a class="<?php echo $tab === 'params' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=params">Parámetros</a>
 </nav>
 
@@ -380,6 +383,8 @@ $runExportQs = $runExportQs !== '' ? '&' . $runExportQs : '';
 $run = $detail['run'];
 $items = $detail['items'];
 $accountingEntry = $accountingEntry ?? null;
+$paymentEntry = $paymentEntry ?? null;
+$accrualDate = \SoftNova\Services\AccountingService::payrollAccrualDate($run);
 
 $sumCols = ['salary_base', 'transport_aid', 'other_earnings', 'incapacity_pay', 'prima', 'commission_amount',
     'health_employee', 'pension_employee', 'other_deductions',
@@ -431,7 +436,7 @@ $costParts = [
 ];
 $runStatusInfo = [
     'draft' => ['Borrador', 'warn', 'Puede ajustar incapacidades y horas extras antes de contabilizar.'],
-    'paid' => ['Pagada', 'ok', 'Contabilizada y marcada como pagada.'],
+    'paid' => ['Pagada', 'ok', 'Contabilizada y marcada como pagada. El gasto quedó en Gastos por el costo total de la empresa y solo se corrige desde aquí con «Anular pago».'],
     'posted' => ['Contabilizada', 'ok', 'Asiento contable generado.'],
     'cancelled' => ['Cancelada', 'off', 'Esta liquidación no se contabiliza. Puede crear una nueva para el mismo periodo.'],
 ];
@@ -499,6 +504,9 @@ $includes = [
                     <span class="nm-status <?php echo $stTone; ?>"><?php echo htmlspecialchars($stName); ?></span></h3>
                 <div class="nm-run-meta">
                     <span class="nm-pill">Pago: <b><?php echo date('d/m/Y', strtotime($run['pay_date'])); ?></b></span>
+                    <?php if ($accrualDate !== (string)$run['pay_date']): ?>
+                        <span class="nm-pill">Causación: <b><?php echo date('d/m/Y', strtotime($accrualDate)); ?></b> <?php echo nmTip('El pago cae fuera del mes liquidado: el costo se registra el último día del mes y el pago en su fecha (salarios por pagar 250505).'); ?></span>
+                    <?php endif; ?>
                     <span class="nm-pill"><b><?php echo (int)$run['days_worked']; ?></b> días</span>
                     <span class="nm-pill"><b><?php echo count($items); ?></b> empleado(s)</span>
                     <span class="nm-pill"><?php echo htmlspecialchars(\SoftNova\Core\payment_method_label((string)($run['payment_method'] ?? ''))); ?></span>
@@ -512,6 +520,11 @@ $includes = [
                 <?php if (!empty($accountingEntry['id'])): ?>
                     <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$accountingEntry['id']; ?>">
                         Asiento <?php echo htmlspecialchars((string)($accountingEntry['entry_number'] ?? '')); ?>
+                    </a>
+                <?php endif; ?>
+                <?php if (!empty($paymentEntry['id'])): ?>
+                    <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$paymentEntry['id']; ?>" title="Asiento del pago (fecha de pago)">
+                        Pago <?php echo htmlspecialchars((string)($paymentEntry['entry_number'] ?? '')); ?>
                     </a>
                 <?php endif; ?>
             </div>
@@ -570,12 +583,20 @@ $includes = [
                 <form method="POST" action="<?php echo $base; ?>?action=pay_run" data-ajax="true" style="display:inline;">
                     <?php echo \SoftNova\Core\csrf_field(); ?>
                     <input type="hidden" name="id" value="<?php echo (int)$run['id']; ?>">
-                    <button class="btn btn-primary" type="submit" onclick="return confirm('¿Contabilizar nómina y marcar como pagada? No descuenta el cajón de caja.')">Contabilizar y pagar</button>
+                    <button class="btn btn-primary" type="submit" onclick="return confirm('¿Contabilizar nómina y marcar como pagada?\n\nSe registra el gasto por el costo total de la empresa (<?php echo htmlspecialchars(fmtN($companyCost, $currency), ENT_QUOTES); ?>) con fecha <?php echo date('d/m/Y', strtotime($accrualDate)); ?>. No descuenta el cajón de caja.')">Contabilizar y pagar</button>
                 </form>
                 <form method="POST" action="<?php echo $base; ?>?action=cancel_run" data-ajax="true" style="display:inline;">
                     <?php echo \SoftNova\Core\csrf_field(); ?>
                     <input type="hidden" name="id" value="<?php echo (int)$run['id']; ?>">
                     <button class="btn btn-danger" type="submit" onclick="return confirm('¿Cancelar liquidación?')">Cancelar</button>
+                </form>
+        <?php endif; ?>
+        <?php if (in_array(($run['status'] ?? ''), ['paid', 'posted'], true) && $canDelete): ?>
+                <form method="POST" action="<?php echo $base; ?>?action=cancel_paid_run" data-ajax="true" class="nm-void-form">
+                    <?php echo \SoftNova\Core\csrf_field(); ?>
+                    <input type="hidden" name="id" value="<?php echo (int)$run['id']; ?>">
+                    <input type="text" name="reason" class="form-control" required minlength="5" maxlength="200" placeholder="Motivo de la anulación (obligatorio)">
+                    <button class="btn btn-danger" type="submit" data-confirm="¿Anular el pago de esta nómina? Se revierten sus asientos contables, se anula el gasto en Gastos y la liquidación vuelve a borrador para corregirla. Si ya registró pagos de seguridad social de este periodo, revíselos en «Pagos de nómina».">Anular pago</button>
                 </form>
         <?php endif; ?>
         </div>
@@ -691,6 +712,171 @@ $includes = [
     </div>
 </div>
 
+<?php elseif ($tab === 'payments'): ?>
+<?php
+$liabilities = $liabilities ?? [];
+$liabilityPayments = $liabilityPayments ?? [];
+$conceptDefs = \SoftNova\Services\PayrollService::LIABILITY_CONCEPTS;
+$kindLabels = ['pila' => 'Seguridad social y parafiscales (PILA)', 'benefits' => 'Prestaciones y salarios por pagar'];
+$moneyPlain = static function (float $v): string {
+    $v = round($v, 2);
+    return abs($v - round($v)) < 0.005
+        ? number_format($v, 0, ',', '.')
+        : number_format($v, 2, ',', '.');
+};
+$byKind = ['pila' => [], 'benefits' => []];
+foreach ($liabilities as $li) {
+    $byKind[$li['kind']][] = $li;
+}
+?>
+<style>
+.nm-liab-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;margin-bottom:16px}
+.nm-liab-row{display:grid;grid-template-columns:1fr auto 170px;gap:10px;align-items:center;padding:7px 0;border-bottom:1px dashed var(--color-border);font-size:13px}
+.nm-liab-row .acc{font-size:11px;color:var(--color-text-secondary)}
+.nm-liab-row .bal{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.nm-liab-row .bal.neg{color:var(--dmc-B45309, #B45309)}
+.nm-liab-row .bal.zero{color:var(--color-text-secondary)}
+.nm-liab-foot{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}
+.nm-liab-total{display:flex;justify-content:space-between;align-items:center;margin-top:10px;font-weight:700}
+.nm-liab-lines{margin:0;padding-left:16px;font-size:12px}
+@media (max-width:560px){.nm-liab-grid{grid-template-columns:1fr}.nm-liab-row{grid-template-columns:1fr 130px}.nm-liab-row .bal{grid-column:1/-1;text-align:left}}
+</style>
+<div class="nm-run-banner" style="margin:0 0 16px;">
+    Aquí se registran los pagos de lo que la nómina dejó <strong>por pagar</strong>: planilla PILA (salud, pensión, ARL, caja, SENA, ICBF),
+    consignación de cesantías, intereses, vacaciones pagadas y salarios pendientes.
+    El pago <strong>no genera gasto</strong> (el costo ya se registró al liquidar la nómina): solo baja el pasivo contra banco o caja de nómina.
+    No registre estos pagos en Gastos porque el costo quedaría duplicado.
+</div>
+<div class="nm-liab-grid">
+<?php foreach (['pila', 'benefits'] as $kindKey): ?>
+    <div class="card neumorphic" style="margin:0;">
+        <div class="card-header"><h3><?php echo htmlspecialchars($kindLabels[$kindKey]); ?></h3></div>
+        <div class="card-body">
+        <form method="POST" action="<?php echo $base; ?>?action=save_liability_payment" data-ajax="true" class="js-liab-form">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="kind" value="<?php echo $kindKey; ?>">
+            <div class="nm-liab-row" style="font-size:11px;text-transform:uppercase;color:var(--color-text-secondary);border-bottom-style:solid;">
+                <span>Concepto</span><span class="bal">Saldo por pagar</span><span>Valor a pagar</span>
+            </div>
+            <?php foreach ($byKind[$kindKey] as $li):
+                $bal = (float)$li['balance'];
+                $balClass = $bal < -0.004 ? 'neg' : (abs($bal) < 0.005 ? 'zero' : ''); ?>
+                <div class="nm-liab-row">
+                    <span><?php echo htmlspecialchars($li['label']); ?><br><span class="acc">Cuenta <?php echo htmlspecialchars($li['account']); ?></span></span>
+                    <span class="bal <?php echo $balClass; ?>" title="<?php echo $bal < -0.004 ? 'Saldo a favor: se ha pagado más de lo causado' : ''; ?>"><?php echo fmtN($bal, $currency); ?></span>
+                    <span>
+                        <?php if ($canEdit): ?>
+                        <input type="text" inputmode="decimal" class="form-control money-input js-liab-amount" data-money="1"
+                               name="amounts[<?php echo htmlspecialchars($li['concept']); ?>]"
+                               data-balance="<?php echo htmlspecialchars($moneyPlain(max(0, $bal))); ?>" placeholder="0">
+                        <?php endif; ?>
+                    </span>
+                </div>
+            <?php endforeach; ?>
+            <?php if ($canEdit): ?>
+            <div class="nm-liab-total"><span>Total a pagar</span><span class="js-liab-total">0</span></div>
+            <div class="nm-liab-foot">
+                <div class="form-group" style="margin:0;"><label>Fecha de pago</label><input class="form-control" type="date" name="payment_date" value="<?php echo date('Y-m-d'); ?>" max="<?php echo date('Y-m-d'); ?>" required></div>
+                <div class="form-group" style="margin:0;"><label>Medio de pago</label><select class="form-control" name="payment_method"><?php echo \SoftNova\Core\payment_method_options('transfer'); ?></select></div>
+                <div class="form-group" style="margin:0;"><label>Referencia</label><input class="form-control" name="reference" maxlength="120" placeholder="<?php echo $kindKey === 'pila' ? 'Nº planilla PILA' : 'Fondo / soporte'; ?>"></div>
+            </div>
+            <div class="form-group" style="margin:10px 0 0;"><label>Notas</label><input class="form-control" name="notes" maxlength="255"></div>
+            <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;flex-wrap:wrap;">
+                <button type="button" class="btn btn-secondary js-liab-fill" title="Llena cada concepto con su saldo por pagar">Usar saldos</button>
+                <button type="submit" class="btn btn-primary" data-confirm="¿Registrar este pago? Se contabiliza contra banco (medios electrónicos) o caja de nómina 110510 (efectivo). No descuenta el cajón POS.">Registrar pago</button>
+            </div>
+            <?php endif; ?>
+        </form>
+        </div>
+    </div>
+<?php endforeach; ?>
+</div>
+
+<div class="card neumorphic">
+    <div class="card-header"><h3>Historial de pagos de nómina</h3></div>
+    <div class="card-body"><div class="table-container"><table>
+        <thead><tr><th>Fecha</th><th>Tipo</th><th>Conceptos</th><th>Total</th><th>Medio</th><th>Referencia</th><th>Asiento</th><th>Estado</th><?php if ($canDelete): ?><th></th><?php endif; ?></tr></thead>
+        <tbody>
+        <?php if (!$liabilityPayments): ?>
+            <tr><td colspan="<?php echo $canDelete ? 9 : 8; ?>" class="dashboard-empty">Aún no hay pagos registrados.</td></tr>
+        <?php endif; ?>
+        <?php foreach ($liabilityPayments as $p):
+            $isCancelled = ($p['status'] ?? '') === 'cancelled'; ?>
+            <tr style="<?php echo $isCancelled ? 'opacity:.6;' : ''; ?>">
+                <td><?php echo date('d/m/Y', strtotime((string)$p['payment_date'])); ?></td>
+                <td><?php echo htmlspecialchars($p['kind'] === 'pila' ? 'PILA' : 'Prestaciones'); ?></td>
+                <td><ul class="nm-liab-lines">
+                    <?php foreach ($p['lines'] as $pl): ?>
+                        <li><?php echo htmlspecialchars($conceptDefs[$pl['concept']]['label'] ?? $pl['concept']); ?>: <?php echo fmtN((float)$pl['amount'], $currency); ?></li>
+                    <?php endforeach; ?>
+                </ul></td>
+                <td><strong><?php echo fmtN((float)$p['total'], $currency); ?></strong></td>
+                <td><?php echo htmlspecialchars(\SoftNova\Core\payment_method_label((string)($p['payment_method'] ?? ''))); ?></td>
+                <td><?php echo htmlspecialchars((string)($p['reference'] ?? '')); ?></td>
+                <td>
+                    <?php if (!empty($p['entry_id'])): ?>
+                        <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$p['entry_id']; ?>"><?php echo htmlspecialchars((string)($p['entry_number'] ?? 'Ver')); ?></a>
+                    <?php else: ?>—<?php endif; ?>
+                </td>
+                <td>
+                    <?php if ($isCancelled): ?>
+                        <span class="badge" title="<?php echo htmlspecialchars((string)($p['cancel_reason'] ?? '')); ?>">Anulado</span>
+                    <?php else: ?>
+                        <span class="badge badge-success">Registrado</span>
+                    <?php endif; ?>
+                </td>
+                <?php if ($canDelete): ?>
+                <td>
+                    <?php if (!$isCancelled): ?>
+                    <form method="POST" action="<?php echo $base; ?>?action=cancel_liability_payment" data-ajax="true" class="nm-void-form">
+                        <?php echo \SoftNova\Core\csrf_field(); ?>
+                        <input type="hidden" name="id" value="<?php echo (int)$p['id']; ?>">
+                        <input type="text" name="reason" class="form-control" required minlength="5" maxlength="200" placeholder="Motivo">
+                        <button type="submit" class="btn btn-sm btn-danger" data-confirm="¿Anular este pago? Se revierte el asiento y el saldo vuelve a quedar por pagar.">Anular</button>
+                    </form>
+                    <?php endif; ?>
+                </td>
+                <?php endif; ?>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table></div></div>
+</div>
+<script>
+(function () {
+    function parseAmt(v) {
+        if (window.SeriMoney && typeof SeriMoney.parse === 'function') return SeriMoney.parse(v) || 0;
+        var s = String(v || '').replace(/\s/g, '');
+        if (s.indexOf(',') > -1) s = s.replace(/\./g, '').replace(',', '.');
+        else if ((s.match(/\./g) || []).length > 1 || /\.\d{3}$/.test(s)) s = s.replace(/\./g, '');
+        var n = parseFloat(s);
+        return isNaN(n) ? 0 : n;
+    }
+    function fmt(n) {
+        return n.toLocaleString('es-CO', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+    }
+    document.querySelectorAll('.js-liab-form').forEach(function (form) {
+        var totalEl = form.querySelector('.js-liab-total');
+        function recalc() {
+            var t = 0;
+            form.querySelectorAll('.js-liab-amount').forEach(function (inp) { t += parseAmt(inp.value); });
+            if (totalEl) totalEl.textContent = fmt(Math.round(t * 100) / 100);
+        }
+        form.addEventListener('input', recalc);
+        form.addEventListener('change', recalc);
+        var fill = form.querySelector('.js-liab-fill');
+        if (fill) fill.addEventListener('click', function () {
+            form.querySelectorAll('.js-liab-amount').forEach(function (inp) {
+                var b = inp.getAttribute('data-balance') || '';
+                inp.value = (b === '0' || b === '') ? '' : b;
+            });
+            recalc();
+        });
+        recalc();
+    });
+})();
+</script>
+
 <?php elseif ($tab === 'params'): ?>
 <?php
 $paramGroups = [
@@ -722,11 +908,12 @@ $paramGroups = [
     ['title' => 'Incapacidades', 'desc' => 'Pago de días de incapacidad por enfermedad general.', 'acc' => '#06B6D4', 'preview' => null, 'fields' => [
         ['incapacity_rate', '% desde el día 3', 'pct', 'Los días 1 y 2 los paga el empleador al 100%. Desde el día 3 se paga este porcentaje (EPS: 66,67%). La incapacidad laboral (ARL) siempre se paga al 100%.'],
     ]],
-    ['title' => 'Provisiones', 'desc' => 'Prestaciones sociales como % mensual del salario. Se aplican según las casillas de la nueva liquidación.', 'acc' => '#0EA5E9', 'preview' => 'prov', 'fields' => [
-        ['cesantias_rate', 'Cesantías', 'pct', 'Provisión mensual de cesantías sobre el salario: 8,33% (un mes de salario por año). Se contabiliza en 261005 y no suma al neto a pagar.'],
+    ['title' => 'Provisiones', 'desc' => 'Prestaciones sociales como % mensual. Cesantías y prima se calculan sobre salario + auxilio de transporte (si aplica); vacaciones solo sobre el salario. Se aplican según las casillas de la nueva liquidación.', 'acc' => '#0EA5E9', 'preview' => 'prov', 'fields' => [
+        ['cesantias_rate', 'Cesantías', 'pct', 'Provisión mensual de cesantías sobre salario + auxilio de transporte: 8,33% (un mes por año). Se contabiliza en 261005 y no suma al neto a pagar.'],
         ['cesantias_interest_rate', 'Intereses s/ cesantías', 'pct', 'Porcentaje ANUAL sobre las cesantías: 12%. Cada mes se provisiona la doceava parte (≈1% de las cesantías).'],
-        ['prima_rate', 'Prima de servicios', 'pct', 'Equivalente mensual de la prima: 8,33%. Cuando la liquidación incluye prima (junio y diciembre) se paga este % × 6 meses (medio salario) y sí suma al neto.'],
-        ['vacation_rate', 'Vacaciones', 'pct', 'Provisión mensual de vacaciones: 4,17% (15 días hábiles por año). Se contabiliza en 510539 contra 261015 y no suma al neto a pagar.'],
+        ['prima_rate', 'Prima de servicios', 'pct', 'Equivalente mensual de la prima: 8,33% sobre salario + auxilio de transporte. Cuando la liquidación incluye prima (junio y diciembre) se paga este % × 6 meses (medio mes) y sí suma al neto.'],
+        ['vacation_rate', 'Vacaciones', 'pct', 'Provisión mensual de vacaciones: 4,17% (15 días hábiles por año), solo sobre el salario. Se contabiliza en 510539 contra 261015 y no suma al neto a pagar.'],
+        ['prestaciones_include_transport', 'Auxilio de transporte en base de cesantías y prima', 'toggle', 'Por ley (Ley 1 de 1963, art. 7) el auxilio de transporte se suma a la base de cesantías, intereses y prima de quienes lo reciben (salario hasta 2 SMMLV y casilla activa en el empleado). Se suma el auxilio mensual completo. Desmarque solo si su contador lo indica.'],
     ]],
     ['title' => 'Horas extras y recargos', 'desc' => 'Porcentaje adicional sobre el valor hora ordinario.', 'acc' => '#EC4899', 'preview' => 'ot', 'wide' => true, 'fields' => [
         ['overtime_day_rate', 'HE diurna (HED)', 'pct', 'Hora extra diurna: hora ordinaria + 25%.'],
@@ -767,6 +954,16 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
                 </div>
                 <div class="nm-fields">
                     <?php foreach ($g['fields'] as [$key, $label, $kind, $tipText]): ?>
+                        <?php if ($kind === 'toggle'): ?>
+                        <div class="nm-field" style="grid-column:1/-1;">
+                            <input type="hidden" name="<?php echo $key; ?>" value="0">
+                            <label class="nm-check" for="p_<?php echo $key; ?>">
+                                <input type="checkbox" id="p_<?php echo $key; ?>" name="<?php echo $key; ?>" value="1" data-toggle-param
+                                       <?php echo !empty((float)($params[$key] ?? 0)) ? 'checked' : ''; ?> <?php echo $canEdit ? '' : 'disabled'; ?>>
+                                <?php echo htmlspecialchars($label); ?><?php echo nmTip($tipText); ?>
+                            </label>
+                        </div>
+                        <?php continue; endif; ?>
                         <?php
                         $isDecimalRate = in_array($key, $decimalRates, true);
                         $step = match ($kind) { 'money' => '1', 'hour' => '1', 'h' => '0.5', default => ($key === 'arl_employer_rate' ? '0.001' : ($isDecimalRate ? '0.01' : '1')) };
@@ -850,7 +1047,7 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
     <?php endif; ?>
 </form>
 <p class="nm-footnote">
-    Prima ≈ medio salario por semestre. Cesantías = provisión mensual salario/12 + interés (asiento a 261005, no se pagan en el neto).
+    Prima ≈ medio mes (salario + auxilio de transporte) por semestre. Cesantías = provisión mensual (salario + auxilio)/12 + interés (asiento a 261005, no se pagan en el neto).
     HE, RNO y dominicales cotizan a salud y pensión. Cuentas: salud (237005), pensión (238030), ARL, caja, SENA, ICBF, cesantías (261005).
     Verifique los valores con su contador antes de liquidar.
 </p>
@@ -954,8 +1151,8 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
                 <div class="form-group"><label>Fecha de pago</label><input class="form-control" type="date" name="pay_date" value="<?php echo date('Y-m-d'); ?>" required></div>
                 <div class="form-group"><label>Días trabajados <?php echo nmTip('Días del periodo (base 30). Las incapacidades se descuentan después en el detalle.'); ?></label><input class="form-control" type="number" min="1" max="31" name="days_worked" value="30"></div>
                 <div class="form-group full"><label>Medio de pago</label><select class="form-control" name="payment_method"><?php echo \SoftNova\Core\payment_method_options('transfer'); ?></select></div>
-                <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="include_prima" value="1" <?php echo in_array((int)date('n'), [6, 12], true) ? 'checked' : ''; ?>> Incluir prima de servicios <?php echo nmTip('Paga la prima del semestre: salario × % de Parámetros → Provisiones × 6 meses (8,33% = medio salario). Se paga normalmente en junio y diciembre.'); ?></label></div>
-                <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="include_cesantias" value="1"> Incluir cesantías e intereses <?php echo nmTip('Provisión mensual según Parámetros → Provisiones (cesantías % del salario + intereses anuales ÷ 12). Se registra en contabilidad y no suma al neto a pagar.'); ?></label></div>
+                <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="include_prima" value="1" <?php echo in_array((int)date('n'), [6, 12], true) ? 'checked' : ''; ?>> Incluir prima de servicios <?php echo nmTip('Paga la prima del semestre: (salario + auxilio de transporte si aplica) × % de Parámetros → Provisiones × 6 meses (8,33% = medio mes). Se paga normalmente en junio y diciembre.'); ?></label></div>
+                <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="include_cesantias" value="1"> Incluir cesantías e intereses <?php echo nmTip('Provisión mensual según Parámetros → Provisiones (cesantías % de salario + auxilio de transporte si aplica, + intereses anuales ÷ 12). Se registra en contabilidad y no suma al neto a pagar.'); ?></label></div>
                 <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="include_vacaciones" value="1"> Incluir provisión de vacaciones <?php echo nmTip('Provisión mensual: salario × % de vacaciones de Parámetros → Provisiones. Se contabiliza (510539 / 261015) y no suma al neto a pagar.'); ?></label></div>
                 <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="include_parafiscales" value="1" checked> Parafiscales (caja, SENA, ICBF) <?php echo nmTip('Calcula los % de Parámetros → Parafiscales. La ARL se calcula siempre.'); ?></label></div>
                 <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="schedule_rno" value="1" <?php echo $hasNightSchedules ? 'checked' : ''; ?>> Precargar recargo nocturno según horario <?php echo nmTip('Para empleados con horario asignado, llena las horas RNO del periodo (horas nocturnas semanales × días ÷ 7). Puede ajustarlas luego en el detalle.'); ?></label></div>
@@ -1099,11 +1296,14 @@ function nmRenderPreviews() {
     if ((b = box('para'))) b.innerHTML = '<span class="nm-pill">Parafiscales: <b>' + nmFmtPct(para) + '</b></span>'
         + '<span class="nm-pill">Costo empresa total: <b>' + nmFmtPct(er + para) + '</b></span>';
     if ((b = box('prov'))) {
-        var ces = smmlv * nmParamVal('cesantias_rate') / 100;
+        var auxToggle = document.getElementById('p_prestaciones_include_transport');
+        var auxOn = auxToggle ? auxToggle.checked : !!Number(NM.params.prestaciones_include_transport || 0);
+        var prestBase = smmlv + (auxOn ? nmParamVal('transport_aid') : 0);
+        var ces = prestBase * nmParamVal('cesantias_rate') / 100;
         var cesInt = ces * nmParamVal('cesantias_interest_rate') / 100 / 12;
-        var primaM = smmlv * nmParamVal('prima_rate') / 100;
+        var primaM = prestBase * nmParamVal('prima_rate') / 100;
         var vac = smmlv * nmParamVal('vacation_rate') / 100;
-        b.innerHTML = '<span style="align-self:center;">Por mes con SMMLV:</span>'
+        b.innerHTML = '<span style="align-self:center;">Por mes con SMMLV' + (auxOn ? ' + auxilio' : '') + ':</span>'
             + '<span class="nm-pill">Cesantías <b>' + nmFmtMoney(ces) + '</b></span>'
             + '<span class="nm-pill">Intereses <b>' + nmFmtMoney(cesInt) + '</b></span>'
             + '<span class="nm-pill">Prima <b>' + nmFmtMoney(primaM) + '</b> (semestre ' + nmFmtMoney(primaM * 6) + ')</span>'
@@ -1147,7 +1347,7 @@ function nmSuggestParams() {
 }
 document.addEventListener('input', function (e) {
     if (e.target && e.target.hasAttribute && e.target.hasAttribute('data-param')) { e.target.classList.remove('nm-changed'); nmRenderPreviews(); }
-    else if (e.target && e.target.hasAttribute && e.target.hasAttribute('data-commission')) { nmRenderPreviews(); }
+    else if (e.target && e.target.hasAttribute && (e.target.hasAttribute('data-commission') || e.target.hasAttribute('data-toggle-param'))) { nmRenderPreviews(); }
 });
 nmRenderPreviews();
 

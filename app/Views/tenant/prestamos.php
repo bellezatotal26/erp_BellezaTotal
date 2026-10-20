@@ -4,6 +4,12 @@ $title = 'Préstamos - ' . ($tenantName ?? 'Sistema');
 $pageTitle = 'Préstamos de productos';
 $loans = $loans ?? [];
 $receivedLoans = $receivedLoans ?? [];
+$loansTotal = (int)($loansTotal ?? 0);
+$movements = $movements ?? ['rows' => [], 'total' => 0];
+$tab = ($tab ?? 'loans') === 'traza' ? 'traza' : 'loans';
+$filters = $filters ?? ['q' => '', 'type' => '', 'status' => 'pending', 'reason' => '', 'person' => '', 'from' => '', 'to' => ''];
+$filterOptions = $filterOptions ?? ['reasons' => [], 'people' => []];
+$loanSummary = $loanSummary ?? ['out_count' => 0, 'out_units' => 0, 'in_count' => 0, 'in_units' => 0, 'aged_count' => 0];
 $stockAlert = $stockAlert ?? ['count' => 0, 'debts' => [], 'summary_lines' => [], 'negative_count' => 0];
 $products = $products ?? [];
 $canCreate = $canCreate ?? false;
@@ -12,13 +18,44 @@ $loanReasonsHtml = $loanReasonsHtml ?? '';
 $receivedReasonsHtml = $receivedReasonsHtml ?? '';
 $base = $viewInstance->route('app/prestamos');
 $searchUrl = $base . '?action=searchProducts';
+
+$statusExplicit = isset($_GET['status']) && (string)$_GET['status'] !== '';
+$hasFilters = $statusExplicit;
+foreach (['q', 'type', 'reason', 'person', 'from', 'to'] as $fk) {
+    if ((string)($filters[$fk] ?? '') !== '') {
+        $hasFilters = true;
+    }
+}
+$tabUrl = static function (string $target) use ($filters, $statusExplicit, $base): string {
+    $qs = [];
+    if ($target === 'traza') {
+        $qs['tab'] = 'traza';
+    }
+    foreach (['q', 'type', 'reason', 'person', 'from', 'to'] as $fk) {
+        if ((string)($filters[$fk] ?? '') !== '') {
+            $qs[$fk] = $filters[$fk];
+        }
+    }
+    if ($statusExplicit) {
+        $qs['status'] = $filters['status'];
+    }
+    return $base . ($qs ? '?' . http_build_query($qs) : '');
+};
+$fmtDate = static function ($value, bool $withTime = true): string {
+    $ts = strtotime((string)$value);
+    if (!$ts) {
+        return '—';
+    }
+    return date($withTime ? 'd/m/Y H:i' : 'd/m/Y', $ts);
+};
 ?>
 <?php echo flashMessage(); ?>
 
 <div style="display:flex;gap:12px;margin-bottom:18px;flex-wrap:wrap;align-items:center;">
     <p style="margin:0;flex:1;min-width:220px;color:var(--color-text-secondary);font-size:13px;">
         <strong>Salida:</strong> nosotros prestamos (no es venta). <strong>Recibido:</strong> nos prestan mercancía
-        (entra al inventario como <em>Prestado</em>; no es consignación). Todo queda en Trazabilidad.
+        (entra al inventario como <em>Prestado</em>; no es consignación). Cada préstamo tiene un número
+        <strong>PR-</strong> y su historial completo en <strong>Trazabilidad</strong>.
     </p>
     <?php if ($canCreate): ?>
     <button type="button" class="btn btn-primary neumorphic-btn" onclick="openLoanModal()">+ Salida por préstamo</button>
@@ -32,7 +69,7 @@ $searchUrl = $base . '?action=searchProducts';
     <strong>Atención inventario:</strong>
     <?php echo (int)($stockAlert['negative_count'] ?? 0); ?> producto(s) en stock negativo ·
     <?php echo (int)($stockAlert['loan_count'] ?? 0); ?> préstamo(s) de salida ·
-    <?php echo (int)($stockAlert['loan_received_count'] ?? count($receivedLoans)); ?> nos prestaron ·
+    <?php echo (int)($stockAlert['loan_received_count'] ?? 0); ?> nos prestaron ·
     <?php echo (int)($stockAlert['sale_debt_count'] ?? 0); ?> venta(s) sin stock.
     <ul>
         <?php foreach (array_slice($stockAlert['summary_lines'] ?? [], 0, 12) as $line): ?>
@@ -44,12 +81,18 @@ $searchUrl = $base . '?action=searchProducts';
 
 <div class="stats-grid" style="margin-bottom:18px;">
     <div class="stat-card neumorphic">
-        <h4>Préstamos (salida)</h4>
-        <div class="stat-value"><?php echo count($loans); ?></div>
+        <h4>Prestamos (pendientes)</h4>
+        <div class="stat-value"><?php echo (int)$loanSummary['out_count']; ?></div>
+        <small style="color:var(--color-text-secondary);"><?php echo (int)$loanSummary['out_units']; ?> uds por recibir</small>
     </div>
     <div class="stat-card neumorphic">
         <h4>Nos prestaron (pendientes)</h4>
-        <div class="stat-value" style="color:var(--dmc-0369A1, #0369A1);"><?php echo count($receivedLoans); ?></div>
+        <div class="stat-value" style="color:var(--dmc-0369A1, #0369A1);"><?php echo (int)$loanSummary['in_count']; ?></div>
+        <small style="color:var(--color-text-secondary);"><?php echo (int)$loanSummary['in_units']; ?> uds por devolver</small>
+    </div>
+    <div class="stat-card neumorphic">
+        <h4>Más de <?php echo \SoftNova\Services\LoanTraceService::AGING_DAYS; ?> días abiertos</h4>
+        <div class="stat-value" style="color:var(--dmc-B45309, #B45309);"><?php echo (int)$loanSummary['aged_count']; ?></div>
     </div>
     <div class="stat-card neumorphic">
         <h4>Stock negativo</h4>
@@ -61,112 +104,377 @@ $searchUrl = $base . '?action=searchProducts';
     </div>
 </div>
 
-<div class="card neumorphic">
-    <div class="card-header"><h3>Préstamos pendientes de devolución</h3></div>
+<form method="GET" action="<?php echo $base; ?>" class="card neumorphic loan-filters" style="margin-bottom:14px;">
+    <?php if ($tab === 'traza'): ?><input type="hidden" name="tab" value="traza"><?php endif; ?>
+    <div class="card-body" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+        <div class="form-group" style="margin:0;flex:1;min-width:220px;">
+            <label style="font-size:12px;">Buscar</label>
+            <input type="text" name="q" value="<?php echo htmlspecialchars($filters['q']); ?>" class="form-control"
+                   placeholder="Producto, SKU, EAN, persona, nota o N.º PR-…">
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Tipo</label>
+            <select name="type" class="form-control" style="width:auto;">
+                <option value="">Todos</option>
+                <option value="loan" <?php echo $filters['type'] === 'loan' ? 'selected' : ''; ?>>Prestamos (salida)</option>
+                <option value="loan_received" <?php echo $filters['type'] === 'loan_received' ? 'selected' : ''; ?>>Nos prestaron</option>
+            </select>
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Estado</label>
+            <select name="status" class="form-control" style="width:auto;">
+                <option value="pending" <?php echo $filters['status'] === 'pending' ? 'selected' : ''; ?>>Pendientes</option>
+                <option value="partial" <?php echo $filters['status'] === 'partial' ? 'selected' : ''; ?>>Con devolución parcial</option>
+                <option value="closed" <?php echo $filters['status'] === 'closed' ? 'selected' : ''; ?>>Cerrados</option>
+                <option value="all" <?php echo $filters['status'] === 'all' ? 'selected' : ''; ?>>Todos</option>
+            </select>
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Motivo</label>
+            <select name="reason" class="form-control" style="width:auto;max-width:200px;">
+                <option value="">Todos</option>
+                <?php foreach ($filterOptions['reasons'] as $rv => $rl): ?>
+                    <option value="<?php echo htmlspecialchars((string)$rv); ?>" <?php echo $filters['reason'] === (string)$rv ? 'selected' : ''; ?>><?php echo htmlspecialchars((string)$rl); ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group" style="margin:0;min-width:160px;">
+            <label style="font-size:12px;">Persona / empresa</label>
+            <input type="text" name="person" list="loanPeopleList" value="<?php echo htmlspecialchars($filters['person']); ?>" class="form-control" placeholder="Todas">
+            <datalist id="loanPeopleList">
+                <?php foreach ($filterOptions['people'] as $person): ?>
+                    <option value="<?php echo htmlspecialchars((string)$person); ?>"></option>
+                <?php endforeach; ?>
+            </datalist>
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;"><?php echo $tab === 'traza' ? 'Movimiento desde' : 'Prestado desde'; ?></label>
+            <input type="date" name="from" value="<?php echo htmlspecialchars($filters['from']); ?>" class="form-control">
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label style="font-size:12px;">Hasta</label>
+            <input type="date" name="to" value="<?php echo htmlspecialchars($filters['to']); ?>" class="form-control">
+        </div>
+        <div style="display:flex;gap:6px;">
+            <button type="submit" class="btn btn-primary">Filtrar</button>
+            <?php if ($hasFilters): ?>
+            <a href="<?php echo $base . ($tab === 'traza' ? '?tab=traza' : ''); ?>" class="btn btn-secondary">Limpiar</a>
+            <?php endif; ?>
+        </div>
+    </div>
+</form>
+
+<div class="loan-tabs" style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+    <a href="<?php echo htmlspecialchars($tabUrl('loans')); ?>" class="btn <?php echo $tab === 'loans' ? 'btn-primary' : 'btn-secondary'; ?>">Préstamos</a>
+    <a href="<?php echo htmlspecialchars($tabUrl('traza')); ?>" class="btn <?php echo $tab === 'traza' ? 'btn-primary' : 'btn-secondary'; ?>">Trazabilidad (movimientos)</a>
+</div>
+
+<?php if ($tab === 'loans'): ?>
+<p style="margin:0 0 10px;font-size:13px;color:var(--color-text-secondary);">
+    <?php
+    $shown = count($loans) + count($receivedLoans);
+    echo $shown . ' préstamo(s)';
+    if ($loansTotal > $shown) {
+        echo ' de ' . $loansTotal . ' (afine el filtro para ver el resto)';
+    }
+    ?>
+    · Use <strong>Historial</strong> para ver cada salida, ingreso y devolución del préstamo.
+</p>
+<?php
+$loanSections = [
+    [
+        'source' => 'loan',
+        'id' => 'prestamos-salida',
+        'title' => 'Préstamos de salida (nosotros prestamos)',
+        'rows' => $loans,
+        'person' => 'A quién',
+        'empty' => 'No hay préstamos de salida con este filtro.',
+    ],
+    [
+        'source' => 'loan_received',
+        'id' => 'prestamos-recibidos',
+        'title' => 'Préstamos recibidos (nos prestaron)',
+        'rows' => $receivedLoans,
+        'person' => 'Quién nos prestó',
+        'empty' => 'No hay préstamos recibidos con este filtro.',
+    ],
+];
+foreach ($loanSections as $section):
+    if ($filters['type'] !== '' && $filters['type'] !== $section['source']) {
+        continue;
+    }
+?>
+<div class="card neumorphic" id="<?php echo $section['id']; ?>" style="margin-bottom:18px;">
+    <div class="card-header"><h3><?php echo htmlspecialchars($section['title']); ?> <span style="font-weight:400;font-size:13px;color:var(--color-text-secondary);">(<?php echo count($section['rows']); ?>)</span></h3></div>
     <div class="card-body">
-        <?php if (empty($loans)): ?>
-            <p style="text-align:center;color:var(--color-text-secondary);padding:24px;">No hay préstamos abiertos.</p>
+        <?php if (empty($section['rows'])): ?>
+            <p style="text-align:center;color:var(--color-text-secondary);padding:24px;"><?php echo htmlspecialchars($section['empty']); ?></p>
         <?php else: ?>
         <div class="table-container">
             <table>
                 <thead>
                     <tr>
-                        <th>Fecha</th>
+                        <th>N.º / Fecha</th>
                         <th>Producto</th>
-                        <th>Stock actual</th>
-                        <th>Pendiente</th>
+                        <th style="min-width:150px;">Avance</th>
+                        <th>Estado</th>
                         <th>Motivo</th>
-                        <th>A quién</th>
+                        <th><?php echo htmlspecialchars($section['person']); ?></th>
                         <th>Nota</th>
-                        <?php if ($canEdit): ?><th></th><?php endif; ?>
+                        <th></th>
                     </tr>
                 </thead>
                 <tbody>
-                <?php foreach ($loans as $loan): ?>
+                <?php foreach ($section['rows'] as $loan):
+                    $owed = (int)$loan['qty_owed'];
+                    $pct = $owed > 0 ? min(100, (int)round(((int)$loan['qty_returned'] / $owed) * 100)) : 0;
+                    $prodName = (string)($loan['product_name'] ?? '');
+                ?>
                     <tr>
-                        <td><?php echo !empty($loan['created_at']) ? date('d/m/Y H:i', strtotime((string)$loan['created_at'])) : '—'; ?></td>
+                        <td style="white-space:nowrap;">
+                            <a href="javascript:void(0)" onclick="openLoanHistory(<?php echo (int)$loan['id']; ?>)" style="font-weight:700;"><?php echo htmlspecialchars((string)$loan['code']); ?></a>
+                            <div style="font-size:12px;color:var(--color-text-secondary);"><?php echo $fmtDate($loan['created_at'] ?? ''); ?></div>
+                            <?php if (!empty($loan['created_by_name'])): ?>
+                                <div style="font-size:11px;color:var(--color-text-secondary);">por <?php echo htmlspecialchars((string)$loan['created_by_name']); ?></div>
+                            <?php endif; ?>
+                        </td>
                         <td>
-                            <strong><?php echo htmlspecialchars((string)($loan['product_name'] ?? '')); ?></strong>
+                            <strong><?php echo htmlspecialchars($prodName); ?></strong>
                             <?php if (!empty($loan['product_code'])): ?>
                                 <div style="font-size:12px;color:var(--color-text-secondary);"><?php echo htmlspecialchars((string)$loan['product_code']); ?></div>
                             <?php endif; ?>
+                            <div style="font-size:12px;">Stock actual:
+                                <strong style="color:<?php echo ((int)($loan['product_stock'] ?? 0) < 0) ? '#DC2626' : 'inherit'; ?>;"><?php echo (int)($loan['product_stock'] ?? 0); ?></strong>
+                            </div>
                         </td>
-                        <td style="font-weight:600;color:<?php echo ((int)($loan['product_stock'] ?? 0) < 0) ? '#DC2626' : 'inherit'; ?>;">
-                            <?php echo (int)($loan['product_stock'] ?? 0); ?>
+                        <td>
+                            <div style="font-size:12px;margin-bottom:4px;">
+                                Prestado <strong><?php echo $owed; ?></strong> ·
+                                Devuelto <strong><?php echo (int)$loan['qty_returned']; ?></strong> ·
+                                Pendiente <strong><?php echo (int)$loan['qty_remaining']; ?></strong>
+                            </div>
+                            <div class="loan-progress" title="<?php echo $pct; ?>% devuelto"><span style="width:<?php echo $pct; ?>%;"></span></div>
                         </td>
-                        <td><span class="badge badge-warning"><?php echo (int)$loan['qty_remaining']; ?> / <?php echo (int)$loan['qty_owed']; ?></span></td>
+                        <td style="white-space:nowrap;">
+                            <span class="badge badge-<?php echo htmlspecialchars((string)$loan['status_badge']); ?>"><?php echo htmlspecialchars((string)$loan['status_label']); ?></span>
+                            <div style="font-size:12px;margin-top:4px;color:<?php echo !empty($loan['is_aged']) ? 'var(--dmc-DC2626, #DC2626)' : 'var(--color-text-secondary)'; ?>;">
+                                <?php
+                                $days = (int)$loan['days_open'];
+                                $daysTxt = $days === 0 ? 'hoy' : ($days === 1 ? '1 día' : $days . ' días');
+                                echo !empty($loan['is_open']) ? ('Abierto ' . $daysTxt) : ('Cerrado en ' . $daysTxt);
+                                ?>
+                            </div>
+                        </td>
                         <td><?php echo htmlspecialchars((string)($loan['reason_label'] ?? $loan['reason'] ?? '')); ?></td>
-                        <td><?php echo htmlspecialchars((string)($loan['borrower'] ?? '—')); ?></td>
+                        <td><?php echo htmlspecialchars((string)($loan['borrower'] ?? '') !== '' ? (string)$loan['borrower'] : '—'); ?></td>
                         <td style="max-width:220px;font-size:13px;"><?php echo htmlspecialchars((string)($loan['note'] ?? '')); ?></td>
-                        <?php if ($canEdit): ?>
-                        <td class="table-actions">
-                            <button type="button" class="btn btn-sm btn-success"
-                                onclick="openReturnModal(<?php echo (int)$loan['id']; ?>, <?php echo (int)$loan['qty_remaining']; ?>, <?php echo htmlspecialchars(json_encode((string)($loan['product_name'] ?? ''), JSON_UNESCAPED_UNICODE), ENT_QUOTES); ?>, <?php echo (int)($loan['product_id'] ?? 0); ?>)">
-                                Devolver
-                            </button>
+                        <td class="table-actions" style="white-space:nowrap;">
+                            <button type="button" class="btn btn-sm btn-secondary" onclick="openLoanHistory(<?php echo (int)$loan['id']; ?>)">Historial</button>
+                            <?php if ($canEdit && !empty($loan['is_open'])): ?>
+                                <?php if ($section['source'] === 'loan'): ?>
+                                <button type="button" class="btn btn-sm btn-success"
+                                    onclick="openReturnModal(<?php echo (int)$loan['id']; ?>, <?php echo (int)$loan['qty_remaining']; ?>, <?php echo htmlspecialchars(json_encode($prodName, JSON_UNESCAPED_UNICODE), ENT_QUOTES); ?>, <?php echo (int)($loan['product_id'] ?? 0); ?>)">
+                                    Devolver
+                                </button>
+                                <?php else: ?>
+                                <button type="button" class="btn btn-sm btn-success"
+                                    onclick="openReturnReceivedModal(<?php echo (int)$loan['id']; ?>, <?php echo (int)$loan['qty_remaining']; ?>, <?php echo (int)($loan['product_stock'] ?? 0); ?>, <?php echo htmlspecialchars(json_encode($prodName, JSON_UNESCAPED_UNICODE), ENT_QUOTES); ?>)">
+                                    Devolver
+                                </button>
+                                <?php endif; ?>
+                            <?php endif; ?>
                         </td>
-                        <?php endif; ?>
                     </tr>
                 <?php endforeach; ?>
                 </tbody>
             </table>
         </div>
         <?php endif; ?>
+    </div>
+</div>
+<?php endforeach; ?>
+<?php else: ?>
+<div class="card neumorphic" id="prestamos-trazabilidad" style="margin-bottom:18px;">
+    <div class="card-header">
+        <h3>Trazabilidad de préstamos
+            <span style="font-weight:400;font-size:13px;color:var(--color-text-secondary);">
+                (<?php echo count($movements['rows']); ?><?php echo (int)$movements['total'] > count($movements['rows']) ? ' de ' . (int)$movements['total'] : ''; ?> movimientos)
+            </span>
+        </h3>
+    </div>
+    <div class="card-body">
+        <p style="margin:0 0 10px;font-size:13px;color:var(--color-text-secondary);">
+            Cada fila es un movimiento real de inventario: la salida o ingreso del préstamo, cada devolución
+            (incluso con otro producto) y los cierres sin devolución física. Pulse el N.º PR- para ver el expediente completo.
+        </p>
+        <?php if (empty($movements['rows'])): ?>
+            <p style="text-align:center;color:var(--color-text-secondary);padding:24px;">No hay movimientos de préstamos con este filtro.</p>
+        <?php else: ?>
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Fecha</th>
+                        <th>Préstamo</th>
+                        <th>Movimiento</th>
+                        <th>Producto</th>
+                        <th>Cantidad</th>
+                        <th>Stock después</th>
+                        <th>Persona / empresa</th>
+                        <th>Usuario</th>
+                        <th>Detalle</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($movements['rows'] as $mv):
+                    $notes = (string)($mv['notes'] ?? '');
+                ?>
+                    <tr>
+                        <td style="white-space:nowrap;"><?php echo $fmtDate($mv['created_at'] ?? ''); ?></td>
+                        <td style="white-space:nowrap;">
+                            <a href="javascript:void(0)" onclick="openLoanHistory(<?php echo (int)$mv['debt_id']; ?>)" style="font-weight:700;"><?php echo htmlspecialchars((string)$mv['loan_code']); ?></a>
+                            <div style="font-size:11px;color:var(--color-text-secondary);"><?php echo $mv['source'] === 'loan_received' ? 'Nos prestaron' : 'Prestamos'; ?></div>
+                        </td>
+                        <td><span class="badge badge-<?php echo htmlspecialchars((string)$mv['movement_badge']); ?>"><?php echo htmlspecialchars((string)$mv['movement_label']); ?></span></td>
+                        <td>
+                            <strong><?php echo htmlspecialchars((string)($mv['product_name'] ?? '')); ?></strong>
+                            <?php if (!empty($mv['product_code'])): ?>
+                                <div style="font-size:12px;color:var(--color-text-secondary);"><?php echo htmlspecialchars((string)$mv['product_code']); ?></div>
+                            <?php endif; ?>
+                            <?php if (!empty($mv['substitution'])): ?>
+                                <div style="font-size:12px;color:var(--dmc-B45309, #B45309);">En lugar de: <?php echo htmlspecialchars((string)($mv['loan_product_name'] ?? '')); ?></div>
+                            <?php endif; ?>
+                        </td>
+                        <td style="font-weight:700;white-space:nowrap;"><?php echo htmlspecialchars((string)$mv['qty_signed']); ?></td>
+                        <td><?php echo $mv['stock_after'] !== null ? (int)$mv['stock_after'] : '—'; ?></td>
+                        <td><?php echo htmlspecialchars((string)($mv['borrower'] ?? '') !== '' ? (string)$mv['borrower'] : '—'); ?></td>
+                        <td><?php echo htmlspecialchars((string)($mv['user_name'] ?? '') !== '' ? (string)$mv['user_name'] : '—'); ?></td>
+                        <td style="max-width:280px;font-size:12px;color:var(--color-text-secondary);" title="<?php echo htmlspecialchars($notes); ?>">
+                            <?php echo htmlspecialchars(mb_strlen($notes) > 120 ? mb_substr($notes, 0, 120) . '…' : $notes); ?>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php endif; ?>
+    </div>
+</div>
+<?php endif; ?>
+
+<div id="loanHistoryModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:760px;">
+        <div class="modal-header">
+            <h3 id="loanHistoryTitle">Historial del préstamo</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('loanHistoryModal').style.display='none'">&times;</button>
+        </div>
+        <div class="modal-body" id="loanHistoryBody"></div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="document.getElementById('loanHistoryModal').style.display='none'">Cerrar</button>
+        </div>
     </div>
 </div>
 
-<div class="card neumorphic" id="prestamos-recibidos" style="margin-top:18px;">
-    <div class="card-header"><h3>Préstamos recibidos (nos prestaron · pendiente devolver)</h3></div>
-    <div class="card-body">
-        <?php if (empty($receivedLoans)): ?>
-            <p style="text-align:center;color:var(--color-text-secondary);padding:24px;">No hay préstamos recibidos abiertos.</p>
-        <?php else: ?>
-        <div class="table-container">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Fecha</th>
-                        <th>Producto</th>
-                        <th>Stock actual</th>
-                        <th>Pendiente</th>
-                        <th>Motivo</th>
-                        <th>Quién nos prestó</th>
-                        <th>Nota</th>
-                        <?php if ($canEdit): ?><th></th><?php endif; ?>
-                    </tr>
-                </thead>
-                <tbody>
-                <?php foreach ($receivedLoans as $loan): ?>
-                    <tr>
-                        <td><?php echo !empty($loan['created_at']) ? date('d/m/Y H:i', strtotime((string)$loan['created_at'])) : '—'; ?></td>
-                        <td>
-                            <strong><?php echo htmlspecialchars((string)($loan['product_name'] ?? '')); ?></strong>
-                            <?php if (!empty($loan['product_code'])): ?>
-                                <div style="font-size:12px;color:var(--color-text-secondary);"><?php echo htmlspecialchars((string)$loan['product_code']); ?></div>
-                            <?php endif; ?>
-                            <div><span class="badge badge-info">Prestado</span></div>
-                        </td>
-                        <td style="font-weight:600;"><?php echo (int)($loan['product_stock'] ?? 0); ?></td>
-                        <td><span class="badge badge-warning"><?php echo (int)$loan['qty_remaining']; ?> / <?php echo (int)$loan['qty_owed']; ?></span></td>
-                        <td><?php echo htmlspecialchars((string)($loan['reason_label'] ?? $loan['reason'] ?? '')); ?></td>
-                        <td><?php echo htmlspecialchars((string)($loan['borrower'] ?? '—')); ?></td>
-                        <td style="max-width:220px;font-size:13px;"><?php echo htmlspecialchars((string)($loan['note'] ?? '')); ?></td>
-                        <?php if ($canEdit): ?>
-                        <td class="table-actions">
-                            <button type="button" class="btn btn-sm btn-success"
-                                onclick="openReturnReceivedModal(<?php echo (int)$loan['id']; ?>, <?php echo (int)$loan['qty_remaining']; ?>, <?php echo (int)($loan['product_stock'] ?? 0); ?>, <?php echo htmlspecialchars(json_encode((string)($loan['product_name'] ?? ''), JSON_UNESCAPED_UNICODE), ENT_QUOTES); ?>)">
-                                Devolver
-                            </button>
-                        </td>
-                        <?php endif; ?>
-                    </tr>
-                <?php endforeach; ?>
-                </tbody>
-            </table>
-        </div>
-        <?php endif; ?>
-    </div>
-</div>
+<style>
+.loan-progress { height: 6px; background: var(--color-border, #e2e8f0); border-radius: 4px; overflow: hidden; }
+.loan-progress > span { display: block; height: 100%; background: #16A34A; }
+.loan-timeline { list-style: none; margin: 0; padding: 0; }
+.loan-timeline li { position: relative; padding: 0 0 14px 22px; border-left: 2px solid var(--color-border, #e2e8f0); margin-left: 6px; }
+.loan-timeline li:last-child { border-left-color: transparent; }
+.loan-timeline li::before { content: ''; position: absolute; left: -7px; top: 2px; width: 12px; height: 12px; border-radius: 50%; background: var(--color-primary, #0369A1); }
+.loan-timeline li.tl-out::before { background: #D97706; }
+.loan-timeline li.tl-in::before { background: #16A34A; }
+.loan-timeline li.tl-settle::before { background: #64748B; }
+.loan-history-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px 16px; margin-bottom: 14px; font-size: 13px; }
+.loan-history-grid span { display: block; font-size: 11px; color: var(--color-text-secondary); text-transform: uppercase; letter-spacing: .03em; }
+</style>
+
+<script>
+window.PRESTAMOS_HISTORY_URL = <?php echo json_encode($base . '?action=history&id='); ?>;
+
+function loanEsc(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function loanFmtDate(v) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(String(v || ''));
+    return m ? (m[3] + '/' + m[2] + '/' + m[1] + ' ' + m[4] + ':' + m[5]) : '—';
+}
+
+function openLoanHistory(id) {
+    var modal = document.getElementById('loanHistoryModal');
+    var body = document.getElementById('loanHistoryBody');
+    var title = document.getElementById('loanHistoryTitle');
+    if (!modal || !body) return;
+    title.textContent = 'Historial del préstamo';
+    body.innerHTML = '<p style="text-align:center;padding:20px;color:var(--color-text-secondary);">Cargando…</p>';
+    modal.style.display = 'flex';
+    fetch(window.PRESTAMOS_HISTORY_URL + encodeURIComponent(id), {
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' }
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+        if (!d || !d.success || !d.loan) {
+            body.innerHTML = '<p style="color:#DC2626;">' + loanEsc((d && d.message) || 'No se pudo cargar el historial') + '</p>';
+            return;
+        }
+        var l = d.loan;
+        var received = l.source === 'loan_received';
+        title.textContent = l.code + ' · ' + (received ? 'Nos prestaron' : 'Prestamos');
+        var owed = parseInt(l.qty_owed, 10) || 0;
+        var ret = parseInt(l.qty_returned, 10) || 0;
+        var pct = owed > 0 ? Math.min(100, Math.round(ret / owed * 100)) : 0;
+        var html = '<div class="loan-history-grid">'
+            + '<div><span>Producto</span><strong>' + loanEsc(l.product_name) + '</strong>'
+            + (l.product_code ? '<div style="font-size:12px;color:var(--color-text-secondary);">' + loanEsc(l.product_code) + '</div>' : '') + '</div>'
+            + '<div><span>' + (received ? 'Quién nos prestó' : 'A quién') + '</span>' + loanEsc(l.borrower || '—') + '</div>'
+            + '<div><span>Motivo</span>' + loanEsc(l.reason_label || l.reason || '—') + '</div>'
+            + '<div><span>Fecha del préstamo</span>' + loanFmtDate(l.created_at)
+            + (l.created_by_name ? '<div style="font-size:12px;color:var(--color-text-secondary);">por ' + loanEsc(l.created_by_name) + '</div>' : '') + '</div>'
+            + '<div><span>Estado</span><span class="badge badge-' + loanEsc(l.status_badge) + '" style="display:inline-block;text-transform:none;font-size:12px;letter-spacing:0;">' + loanEsc(l.status_label) + '</span></div>'
+            + '<div><span>Stock actual del producto</span>' + loanEsc(l.product_stock) + '</div>'
+            + '</div>';
+        if (l.note) {
+            html += '<p style="font-size:13px;margin:0 0 12px;"><strong>Nota:</strong> ' + loanEsc(l.note) + '</p>';
+        }
+        html += '<div style="font-size:13px;margin-bottom:4px;">Prestado <strong>' + owed + '</strong> · Devuelto <strong>' + ret
+            + '</strong> · Pendiente <strong>' + loanEsc(l.qty_remaining) + '</strong></div>'
+            + '<div class="loan-progress" style="margin-bottom:16px;"><span style="width:' + pct + '%;"></span></div>';
+
+        var movs = d.movements || [];
+        if (!movs.length) {
+            html += '<p style="color:var(--color-text-secondary);">Sin movimientos de inventario registrados para este préstamo (registro antiguo).</p>';
+        } else {
+            html += '<h4 style="margin:0 0 10px;">Línea de tiempo</h4><ul class="loan-timeline">';
+            movs.forEach(function (m) {
+                var ref = String(m.reference_type || '');
+                var cls = ref === 'loan_received_settle' ? 'tl-settle'
+                    : ((ref === 'loan' || ref === 'loan_received_return') ? 'tl-out' : 'tl-in');
+                html += '<li class="' + cls + '">'
+                    + '<div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;">'
+                    + '<strong>' + loanEsc(m.movement_label) + ' · ' + loanEsc(m.qty_signed) + '</strong>'
+                    + '<span style="font-size:12px;color:var(--color-text-secondary);">' + loanFmtDate(m.created_at)
+                    + (m.user_name ? ' · ' + loanEsc(m.user_name) : '') + '</span></div>'
+                    + '<div style="font-size:13px;">' + loanEsc(m.product_name || '')
+                    + (m.product_code ? ' <span style="color:var(--color-text-secondary);">(' + loanEsc(m.product_code) + ')</span>' : '')
+                    + (m.stock_after != null ? ' · stock después: <strong>' + loanEsc(m.stock_after) + '</strong>' : '')
+                    + '</div>'
+                    + (m.substitution ? '<div style="font-size:12px;color:var(--dmc-B45309, #B45309);">Devolvieron otro producto en lugar de ' + loanEsc(m.loan_product_name || '') + '</div>' : '')
+                    + (m.notes ? '<div style="font-size:12px;color:var(--color-text-secondary);margin-top:2px;">' + loanEsc(m.notes) + '</div>' : '')
+                    + '</li>';
+            });
+            html += '</ul>';
+        }
+        body.innerHTML = html;
+    })
+    .catch(function () {
+        body.innerHTML = '<p style="color:#DC2626;">Error de conexión al cargar el historial.</p>';
+    });
+}
+</script>
 
 <?php if ($canCreate || $canEdit): ?>
 <?php if ($canCreate): ?>

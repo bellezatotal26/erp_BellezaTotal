@@ -371,6 +371,137 @@ function openAddLotForProduct(id, prefill) {
 
 window.openAddLotForProduct = openAddLotForProduct;
 
+function productCostSummaryHtml(cs, p, moneyVal) {
+    if (!cs) return '';
+    var current = parseFloat(cs.avg_cost) || 0;
+    var avg = parseFloat(cs.purchase_avg) || 0;
+    function cell(label, value, sub, tip) {
+        return '<div style="background:var(--bg-input);border-radius:8px;padding:8px 10px;"' + (tip ? ' title="' + esc(tip) + '"' : '') + '>' +
+            '<div style="font-size:11px;color:var(--color-text-secondary);text-transform:uppercase;letter-spacing:.3px;">' + label + '</div>' +
+            '<div style="font-size:15px;font-weight:700;">' + value + '</div>' +
+            (sub ? '<div style="font-size:11px;color:var(--color-text-secondary);">' + sub + '</div>' : '') +
+            '</div>';
+    }
+    function vsAvg(v) {
+        v = parseFloat(v) || 0;
+        if (!(avg > 0) || !(v > 0)) return '';
+        var pct = ((v - avg) / avg) * 100;
+        if (Math.abs(pct) < 0.05) return 'igual al promedio';
+        var color = pct > 0 ? 'var(--dmc-DC2626, #DC2626)' : 'var(--dmc-047857, #047857)';
+        return '<span style="color:' + color + ';font-weight:600;">' + (pct > 0 ? '+' : '') + pct.toFixed(1) + '%</span> vs promedio';
+    }
+    var h = '<h4 style="margin:0 0 8px;">Costos</h4>';
+    h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:14px;">';
+    var curCmp = vsAvg(current);
+    h += cell('Precio de costo vigente', moneyVal(current),
+        'Valor inventario: ' + moneyVal(cs.stock_value) + (curCmp ? '<br>' + curCmp : ''),
+        'P. Compra actual del producto: base de la utilidad y del valor del inventario.');
+    if (cs.purchase_avg != null) {
+        h += cell('Costo promedio compras', moneyVal(cs.purchase_avg),
+            cs.purchase_count + ' compra(s) · ' + cs.purchase_units + ' ud(s)<br>Mín ' + moneyVal(cs.purchase_min) + ' · Máx ' + moneyVal(cs.purchase_max),
+            'Promedio de todas las compras ingresadas, ponderado por cantidad (excluye OC anuladas).');
+    }
+    if (cs.last_cost != null) {
+        var lastSub = (cs.last_cost_date ? esc(String(cs.last_cost_date).substr(0, 10)) : '') +
+            (cs.last_cost_ref ? ' · ' + esc(cs.last_cost_ref) : '');
+        var cmp = vsAvg(cs.last_cost);
+        h += cell('Último costo de compra', moneyVal(cs.last_cost), lastSub + (cmp ? '<br>' + cmp : ''),
+            'Costo unitario con el que entró la última compra al inventario.');
+    } else {
+        h += cell('Último costo de compra', '—', 'Sin compras registradas', '');
+    }
+    if (cs.purchase_avg_90 != null) {
+        h += cell('Prom. compras 90 días', moneyVal(cs.purchase_avg_90),
+            cs.purchase_units_90 + ' ud(s) · ' + vsAvg(cs.purchase_avg_90),
+            'Promedio de las compras de los últimos 90 días, ponderado por cantidad.');
+    }
+    h += '</div>';
+    return h;
+}
+
+/** Historial del precio de costo: gráfica (más antiguo → reciente) + tabla. */
+function productCostHistoryHtml(rows, moneyVal) {
+    rows = rows || [];
+    var h = '<h4 style="margin:0 0 8px;">Historial de costos (' + rows.length + ')</h4>';
+    if (!rows.length) {
+        return h + '<p style="text-align:center;color:var(--color-text-secondary);margin:0 0 14px;">Sin compras ni cambios de costo registrados</p>';
+    }
+    function costOf(r) {
+        var n = r.new_cost != null ? parseFloat(r.new_cost) : NaN;
+        if (isFinite(n) && n > 0) return n;
+        var u = parseFloat(r.unit_cost_in);
+        return isFinite(u) && u > 0 ? u : 0;
+    }
+    var pts = rows.slice().reverse().filter(function(r) { return costOf(r) > 0; });
+    var sum = 0;
+    pts.forEach(function(r) { sum += costOf(r); });
+    var avg = pts.length ? sum / pts.length : 0;
+
+    if (pts.length >= 2) {
+        var W = 600, H = 130, padL = 8, padR = 8, padT = 14, padB = 18;
+        var vals = pts.map(costOf);
+        var min = Math.min.apply(null, vals), max = Math.max.apply(null, vals);
+        if (max - min < 0.01) { max += 1; min = Math.max(0, min - 1); }
+        var x = function(i) { return padL + (i * (W - padL - padR) / (pts.length - 1)); };
+        var y = function(v) { return padT + (H - padT - padB) * (1 - (v - min) / (max - min)); };
+        var path = vals.map(function(v, i) { return (i ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1); }).join(' ');
+        var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="width:100%;height:130px;display:block;">';
+        svg += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + y(avg).toFixed(1) + '" y2="' + y(avg).toFixed(1) + '" stroke="#F59E0B" stroke-dasharray="5 4" stroke-width="1.5"/>';
+        svg += '<path d="' + path + '" fill="none" stroke="#7C3AED" stroke-width="2.2" vector-effect="non-scaling-stroke"/>';
+        vals.forEach(function(v, i) {
+            var r = pts[i];
+            svg += '<circle cx="' + x(i).toFixed(1) + '" cy="' + y(v).toFixed(1) + '" r="3.5" fill="' + (r.source === 'manual' ? '#DC2626' : '#7C3AED') + '">' +
+                '<title>' + esc(String(r.date || '').substr(0, 10)) + ' · ' + esc(invFmtMoney(v)) + (r.ref ? ' · ' + esc(r.ref) : '') + '</title></circle>';
+        });
+        svg += '</svg>';
+        h += '<div style="background:var(--bg-input);border-radius:8px;padding:8px 10px;margin-bottom:8px;">' + svg +
+            '<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:11px;color:var(--color-text-secondary);">' +
+            '<span>' + esc(String(pts[0].date || '').substr(0, 10)) + '</span>' +
+            '<span><b style="color:#7C3AED;">━</b> Precio de costo · <b style="color:#F59E0B;">┅</b> Promedio ' + moneyVal(avg) +
+            ' · Mín ' + moneyVal(Math.min.apply(null, vals)) + ' · Máx ' + moneyVal(Math.max.apply(null, vals)) + '</span>' +
+            '<span>' + esc(String(pts[pts.length - 1].date || '').substr(0, 10)) + '</span></div></div>';
+    } else {
+        h += '<p style="margin:0 0 8px;font-size:13px;">Promedio: <strong>' + moneyVal(avg) + '</strong></p>';
+    }
+
+    var srcLabel = { purchase: 'Compra', manual: 'Edición manual', entry: 'Entrada' };
+    h += '<div style="max-height:260px;overflow:auto;margin-bottom:14px;"><table><thead><tr>' +
+        '<th>Fecha</th><th>Origen</th><th>Cant</th><th title="Costo unitario con el que entró la mercancía">Costo entrada</th>' +
+        '<th title="Precio de costo del producto antes → después">Precio de costo</th><th>Var.</th></tr></thead><tbody>';
+    rows.forEach(function(r) {
+        var origin = (srcLabel[r.source] || r.source || '—');
+        if (r.ref) origin += '<div style="font-size:11px;color:var(--color-text-secondary);">' + esc(r.ref) + '</div>';
+        if (r.supplier) origin += '<div style="font-size:11px;color:var(--color-text-secondary);">' + esc(r.supplier) + '</div>';
+        if (r.user) origin += '<div style="font-size:11px;color:var(--color-text-secondary);">' + esc(r.user) + '</div>';
+        var oldC = r.old_cost != null ? parseFloat(r.old_cost) : null;
+        var newC = r.new_cost != null ? parseFloat(r.new_cost) : null;
+        var change = '—';
+        if (newC != null) {
+            change = (oldC != null ? moneyVal(oldC) + ' → ' : '') + '<strong>' + moneyVal(newC) + '</strong>';
+        } else if (!Number(r.logged)) {
+            change = '<span style="color:var(--color-text-secondary);" title="Compra anterior al registro de historial">No registrado</span>';
+        }
+        var varCell = '';
+        if (oldC != null && newC != null && oldC > 0) {
+            var pct = ((newC - oldC) / oldC) * 100;
+            if (Math.abs(pct) >= 0.05) {
+                varCell = '<span style="color:' + (pct > 0 ? 'var(--dmc-DC2626, #DC2626)' : 'var(--dmc-047857, #047857)') + ';font-weight:600;">' +
+                    (pct > 0 ? '+' : '') + pct.toFixed(1) + '%</span>';
+            } else {
+                varCell = '<span style="color:var(--color-text-secondary);">0%</span>';
+            }
+        }
+        h += '<tr><td style="white-space:nowrap;font-size:12px;">' + esc(String(r.date || '').substr(0, 10)) + '</td>' +
+            '<td style="font-size:12px;">' + origin + '</td>' +
+            '<td>' + (r.qty != null ? r.qty : '—') + '</td>' +
+            '<td>' + (r.unit_cost_in != null ? moneyVal(r.unit_cost_in) : '—') + '</td>' +
+            '<td style="white-space:nowrap;">' + change + '</td>' +
+            '<td>' + varCell + '</td></tr>';
+    });
+    h += '</tbody></table></div>';
+    return h;
+}
+
 function viewDetail(id) {
     fetch(window.invRouteDetail + '&id=' + id, {
         headers: { 'X-Requested-With': 'XMLHttpRequest' }
@@ -388,13 +519,17 @@ function viewDetail(id) {
         h += '<div><strong>EAN:</strong> ' + esc(p.barcode || '-') + '</div>';
         h += '<div><strong>Categoría:</strong> ' + esc(p.category_name || '-') + '</div>';
         h += '<div><strong>Ubicación:</strong> ' + esc(p.location || '-') + '</div>';
-        h += '<div><strong>P. Compra:</strong> ' + moneyVal(p.purchase_price) + '</div>';
+        h += '<div title="Precio de costo vigente del producto (se actualiza con cada compra o edición; ver Historial de costos)"><strong>P. Compra:</strong> ' + moneyVal(p.purchase_price) + '</div>';
         h += '<div><strong>P. Venta:</strong> ' + moneyVal(p.sale_price) + '</div>';
         h += '<div style="grid-column:1/-1;"><strong>Utilidad / ganancia:</strong> ' + marginLine(p.purchase_price, p.sale_price) + '</div>';
         h += '<div><strong>Stock:</strong> ' + (isSvc ? 'N/A' : p.stock) + '</div>';
         h += '<div><strong>Creado:</strong> ' + (p.created_at || '').substr(0, 10) + '</div>';
         h += '<div><strong>Última Venta:</strong> ' + ((p.last_sale_date || '').substr(0, 10) || 'Nunca') + '</div>';
         h += '</div>';
+        if (!isSvc) {
+            h += productCostSummaryHtml(d.cost_summary, p, moneyVal);
+            h += productCostHistoryHtml(d.cost_history, moneyVal);
+        }
         h += '<p style="margin:0 0 12px;padding:8px 10px;background:var(--bg-input);border-radius:8px;font-size:13px;white-space:pre-wrap;"><strong>Descripción:</strong> ' + esc(p.description || '—') + '</p>';
         if (p.notes) {
             h += '<p style="margin:0 0 12px;padding:8px 10px;background:var(--bg-input);border-radius:8px;font-size:13px;"><strong>Notas:</strong> ' + esc(p.notes) + '</p>';
@@ -464,7 +599,10 @@ function viewDetail(id) {
         if (!purchases.length) {
             h += '<p style="text-align:center;color:var(--color-text-secondary);">Sin compras ni facturas de proveedor vinculadas</p>';
         } else {
-            h += '<table><thead><tr><th>OC / Factura</th><th>Proveedor</th><th>Fecha</th><th>Cant</th><th>Costo</th><th>Estado</th></tr></thead><tbody>';
+            h += '<table><thead><tr><th>OC / Factura</th><th>Proveedor</th><th>Fecha</th><th>Cant</th>' +
+                '<th title="Costo unitario de la factura (contabilidad)">Costo factura</th>' +
+                '<th title="Costo con el que entró al inventario (promedio). Vacío = igual al costo factura">Costo inv.</th>' +
+                '<th>Estado</th></tr></thead><tbody>';
             purchases.forEach(function(x) {
                 var oc = String(x.order_number || ('#' + (x.purchase_order_id || '')));
                 var inv = String(x.invoice_number || '').trim();
@@ -474,6 +612,10 @@ function viewDetail(id) {
                 h += '<td style="font-size:12px;">' + esc(when || '—') + '</td>';
                 h += '<td>' + (x.received_qty != null && x.received_qty !== '' ? x.received_qty : (x.quantity || 0)) + '</td>';
                 h += '<td>' + moneyVal(x.unit_cost) + '</td>';
+                var invC = parseFloat(x.inventory_cost) || 0;
+                h += '<td>' + (invC > 0 && Math.abs(invC - (parseFloat(x.unit_cost) || 0)) > 0.009
+                    ? '<strong style="color:#7C3AED;">' + moneyVal(invC) + '</strong>'
+                    : '<span style="color:var(--color-text-secondary);">= factura</span>') + '</td>';
                 h += '<td><span class="badge badge-secondary">' + esc(String(x.status || '').toUpperCase()) + '</span></td></tr>';
             });
             h += '</tbody></table>';

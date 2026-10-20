@@ -73,6 +73,10 @@ class TenantComprasController extends TenantController
             $this->pay();
             return;
         }
+        if ($action === 'purchase_limit' && $this->request->method() === 'POST') {
+            $this->savePurchaseLimit();
+            return;
+        }
         if ($action === 'review_notes' && $this->request->method() === 'POST') {
             TenantMiddleware::authorize('compras', 'edit');
             $this->saveReviewNotes();
@@ -129,6 +133,10 @@ class TenantComprasController extends TenantController
         }
         if ($action === 'invoice_preview' && $this->request->method() === 'GET') {
             $this->invoicePreview();
+            return;
+        }
+        if (($action === 'invoice_export_xlsx' || $action === 'invoice_export_csv') && $this->request->method() === 'GET') {
+            $this->invoiceExportXlsx();
             return;
         }
         if ($action === 'open_orders_match' && $this->request->method() === 'GET') {
@@ -233,7 +241,7 @@ class TenantComprasController extends TenantController
             }
             $status = 'open';
         }
-        $listFilters = $this->compraListFilters();
+        $listFilters = $this->compraListFilters('ordenes');
         $per = $this->resolvePerPage();
         $total = $this->purchasing->countOrders($status, $due, $listFilters);
         $pagination = $this->paginate($total, $per['perPage']);
@@ -282,10 +290,19 @@ class TenantComprasController extends TenantController
                 'status' => $status !== '' ? $status : null,
                 'per_page' => $per['perPage'] !== 20 ? (string)$per['perPage'] : null,
             ]),
+            'sortFilters' => [
+                'sort' => (string)($listFilters['sort'] ?? ''),
+                'dir' => (string)($listFilters['dir'] ?? 'desc'),
+                'query' => $this->compraListQuery($listFilters, [
+                    'status' => $status !== '' ? $status : null,
+                    'per_page' => $per['perPage'] !== 20 ? (string)$per['perPage'] : null,
+                ]),
+            ],
             'openTotal' => $openTotal,
             'openCount' => $openCount,
             'monthReceived' => $monthReceived,
             'payableTotal' => $this->purchasing->payableTotal(),
+            'purchaseBudget' => $this->purchaseBudgetStatus(),
             'payableOrders' => [],
             'pendingInvoices' => $this->invoiceImports()->pendingImports(20),
             'aiInvoiceReady' => (new \SoftNova\Services\AiService($this->db))->isConfigured(),
@@ -306,7 +323,7 @@ class TenantComprasController extends TenantController
             $payment = '';
         }
 
-        $listFilters = $this->compraListFilters();
+        $listFilters = $this->compraListFilters('facturas');
         $per = $this->resolvePerPage();
         $total = $this->purchasing->countInvoices($payment, $due, $listFilters);
         $pagination = $this->paginate($total, $per['perPage']);
@@ -370,6 +387,16 @@ class TenantComprasController extends TenantController
                 'due' => $due !== '' ? $due : null,
                 'per_page' => $per['perPage'] !== 20 ? (string)$per['perPage'] : null,
             ]),
+            'sortFilters' => [
+                'sort' => (string)($listFilters['sort'] ?? ''),
+                'dir' => (string)($listFilters['dir'] ?? 'desc'),
+                'query' => $this->compraListQuery($listFilters, [
+                    'action' => 'facturas',
+                    'payment' => $payment !== '' ? $payment : null,
+                    'due' => $due !== '' ? $due : null,
+                    'per_page' => $per['perPage'] !== 20 ? (string)$per['perPage'] : null,
+                ]),
+            ],
             'openTotal' => $openTotal,
             'openCount' => $openCount,
             'monthReceived' => $monthReceived,
@@ -377,6 +404,7 @@ class TenantComprasController extends TenantController
             'invoiceQuick' => $this->purchasing->invoiceQuickSummary($listFilters),
             'invoiceFiltered' => $this->purchasing->invoiceSummary($payment, $due, $listFilters),
             'payableTotal' => $this->purchasing->payableTotal(),
+            'purchaseBudget' => $this->purchaseBudgetStatus(),
             'payableOrders' => $this->purchasing->payableOrders(50, in_array($due, ['overdue', 'due_today', 'due_soon'], true) ? $due : ''),
             'pendingInvoices' => $this->invoiceImports()->pendingImports(20),
             'aiInvoiceReady' => (new \SoftNova\Services\AiService($this->db))->isConfigured(),
@@ -929,6 +957,9 @@ class TenantComprasController extends TenantController
             $resultado['received_items'],
             $resultado['created_products']
         );
+        if (!empty($resultado['bill_only'])) {
+            $mensaje .= sprintf(', %d facturada(s) sin ingresar a inventario', (int)$resultado['bill_only']);
+        }
         if ($resultado['skipped'] > 0) {
             $mensaje .= sprintf(', %d omitida(s)', $resultado['skipped']);
         }
@@ -1358,6 +1389,138 @@ class TenantComprasController extends TenantController
         }
     }
 
+    /**
+     * Excel (.xlsx) de líneas de una factura leída (pendiente) para revisión externa.
+     * Columnas de montos van con formato moneda de celda (no texto).
+     */
+    private function invoiceExportXlsx(): void
+    {
+        $importId = (int)$this->request->get('import_id', $this->request->get('id', 0));
+        $data = $this->invoiceImports()->get($importId);
+        if (!$data) {
+            $this->respond(false, 'Factura leída no encontrada', '/app/compras?action=facturas');
+            return;
+        }
+
+        $import = $data['import'];
+        $status = (string)($import['status'] ?? '');
+        if ($status !== 'pending' && $status !== 'processing') {
+            $this->respond(false, 'Solo se pueden exportar facturas pendientes de confirmar', '/app/compras?action=facturas');
+            return;
+        }
+
+        $actionLabels = [
+            'add_stock' => 'Ingresar',
+            'create_product' => 'Crear producto',
+            'skip' => 'Omitir',
+        ];
+
+        $money = static fn (float $n): array => ['v' => round($n, 2), 't' => 'currency'];
+        $rows = [];
+        $linesSum = 0.0;
+        foreach ($data['items'] as $it) {
+            $lineTotal = (float)($it['line_total'] ?? 0);
+            $linesSum += $lineTotal;
+            $unitCost = (float)($it['unit_cost'] ?? 0);
+            $invCost = $it['inventory_cost'] ?? null;
+            $salePrice = $it['sale_price'] ?? null;
+            $matched = trim((string)($it['matched_product_name'] ?? ''));
+            if ($matched !== '' && !empty($it['matched_product_code'])) {
+                $matched .= ' [' . (string)$it['matched_product_code'] . ']';
+            }
+            $rowAction = (string)($it['row_action'] ?? 'add_stock');
+            $isBonus = $unitCost <= 0.009 && $lineTotal <= 0.009
+                && stripos((string)($it['description'] ?? ''), 'bonific') !== false;
+
+            $rows[] = [
+                (int)($it['line_no'] ?? 0),
+                (string)($it['supplier_sku'] ?? ''),
+                (string)($it['barcode'] ?? ''),
+                (string)($it['description'] ?? ''),
+                $matched,
+                $actionLabels[$rowAction] ?? $rowAction,
+                $isBonus ? 1 : 0,
+                ['v' => (float)($it['quantity'] ?? 0), 't' => 'qty'],
+                $money($unitCost),
+                ['v' => (float)($it['tax_rate'] ?? 0), 't' => 'number'],
+                ['v' => (float)($it['discount_pct'] ?? 0), 't' => 'number'],
+                (string)($it['lot_code'] ?? ''),
+                (string)($it['expiry_date'] ?? ''),
+                ($invCost !== null && $invCost !== '') ? $money((float)$invCost) : null,
+                ($salePrice !== null && $salePrice !== '') ? $money((float)$salePrice) : null,
+                $money($lineTotal),
+            ];
+        }
+
+        $subtotal = (float)($import['subtotal'] ?? 0);
+        $taxTotal = (float)($import['tax_total'] ?? 0);
+        if (isset($import['tax_override_amount']) && $import['tax_override_amount'] !== null && $import['tax_override_amount'] !== '') {
+            $taxTotal = (float)$import['tax_override_amount'];
+        }
+        $disc = \SoftNova\Services\PurchasingService::resolvePurchaseDiscounts(
+            $subtotal,
+            $taxTotal,
+            (float)($import['early_payment_discount_pct'] ?? 0),
+            (float)($import['commercial_discount_pct'] ?? 0),
+            (float)($import['commercial_discount_amount'] ?? 0)
+        );
+        $commercialAmt = (float)$disc['commercial_amount'];
+        $subAfterDisc = max(0.0, round($subtotal - $commercialAmt, 2));
+
+        $blank = array_fill(0, 16, null);
+        $sumRow = static function (string $label, mixed $value) use ($blank): array {
+            $row = $blank;
+            $row[14] = $label;
+            $row[15] = $value;
+            return $row;
+        };
+
+        $rows[] = $blank;
+        $head = $blank;
+        $head[3] = 'RESUMEN FACTURA';
+        $head[14] = 'Etiqueta';
+        $head[15] = 'Valor';
+        $rows[] = $head;
+        $rows[] = $sumRow('Factura', (string)($import['invoice_number'] ?? ''));
+        $rows[] = $sumRow('Proveedor', (string)($import['supplier_name'] ?? ''));
+        $rows[] = $sumRow('Fecha', (string)($import['invoice_date'] ?? ''));
+        $rows[] = $sumRow('Origen', strtoupper((string)($import['source'] ?? '')));
+        $rows[] = $sumRow('Suma líneas', $money($linesSum));
+        $rows[] = $sumRow('Total bruto', $money((float)$disc['gross']));
+        $rows[] = $sumRow('Desc. comercial', $money(-1 * $commercialAmt));
+        $rows[] = $sumRow('Sub total', $money($subAfterDisc));
+        $rows[] = $sumRow('IVA', $money($taxTotal));
+        $rows[] = $sumRow('Valor neto', $money((float)$disc['total']));
+
+        $invNo = preg_replace('/[^A-Za-z0-9_-]+/', '_', (string)($import['invoice_number'] ?? 'sin_numero')) ?: 'sin_numero';
+        $headers = [
+            'Linea', 'Referencia', 'EAN', 'Descripcion', 'Producto_catalogo', 'Accion', 'Bonif',
+            'Cantidad', 'Costo_factura', 'IVA_pct', 'Dcto_pct', 'Lote', 'Vencimiento',
+            'Costo_inventario', 'Precio_venta', 'Total_linea',
+        ];
+        // 14 = Precio_venta en líneas (tipo por celda) y etiqueta en resumen (texto).
+        $columnTypes = [
+            0 => 'number',
+            7 => 'qty',
+            8 => 'currency',
+            9 => 'number',
+            10 => 'number',
+            13 => 'currency',
+            15 => 'currency',
+        ];
+
+        try {
+            \SoftNova\Services\SimpleXlsxWriter::download(
+                'factura_pendiente_' . $invNo . '_' . $importId . '_' . date('Ymd_His') . '.xlsx',
+                $headers,
+                $rows,
+                $columnTypes
+            );
+        } catch (\Throwable $e) {
+            $this->respond(false, $this->clientErrorMessage($e, 'No se pudo generar el Excel'), '/app/compras?action=facturas');
+        }
+    }
+
     private function detail(): void
     {
         $orderId = (int)$this->request->get('id', 0);
@@ -1407,6 +1570,7 @@ class TenantComprasController extends TenantController
         }
 
         try {
+            $this->purchasing->assertCashDrawerForReversal($orderId);
             $result = $this->purchasing->createCreditNote(
                 $orderId,
                 $lines,
@@ -1502,7 +1666,14 @@ class TenantComprasController extends TenantController
     }
 
     /** @return array{q:string,supplier_id:int,from:string,to:string} */
-    private function compraListFilters(): array
+    /**
+     * @param 'facturas'|'ordenes' $panel
+     * @return array{
+     *   q:string,supplier_id:int,from:string,to:string,
+     *   sort:string,dir:string,orderSql:string
+     * }
+     */
+    private function compraListFilters(string $panel = 'ordenes'): array
     {
         $q = trim((string)$this->request->get('q', ''));
         $from = trim((string)$this->request->get('from', ''));
@@ -1514,11 +1685,51 @@ class TenantComprasController extends TenantController
         if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $to)) {
             $to = '';
         }
+
+        $sortable = $panel === 'facturas'
+            ? [
+                'invoice' => 'po.invoice_number',
+                'order' => 'po.order_number',
+                'date' => 'COALESCE(po.invoice_date, po.warehouse_date, po.order_date)',
+                'due' => 'po.due_date',
+                'supplier' => 's.name',
+                'total' => 'po.total',
+                'discount' => 'CASE
+                    WHEN COALESCE(po.commercial_discount_amount, 0) > 0.009 THEN po.commercial_discount_amount
+                    WHEN COALESCE(po.commercial_discount_pct, 0) > 0.009 THEN ROUND(COALESCE(po.subtotal, 0) * po.commercial_discount_pct / 100, 2)
+                    ELSE 0 END',
+                'credit' => 'COALESCE(po.credit_total, 0)',
+                'net' => '(po.total - COALESCE(po.credit_total, 0))',
+                'paid' => 'COALESCE(po.paid_total, 0)',
+                'balance' => 'GREATEST(po.total - COALESCE(po.paid_total, 0) - COALESCE(po.credit_total, 0), 0)',
+                'payment' => 'po.payment_mode',
+            ]
+            : [
+                'order' => 'po.order_number',
+                'date' => 'po.order_date',
+                'expected' => 'po.expected_date',
+                'supplier' => 's.name',
+                'total' => 'po.total',
+                'status' => 'po.status',
+            ];
+
+        $sort = (string)$this->request->get('sort', '');
+        $dir = strtolower((string)$this->request->get('dir', 'desc')) === 'asc' ? 'asc' : 'desc';
+        $orderSql = '';
+        if ($sort !== '' && isset($sortable[$sort])) {
+            $orderSql = $sortable[$sort] . ' ' . strtoupper($dir);
+        } else {
+            $sort = '';
+        }
+
         return [
             'q' => $q,
             'supplier_id' => $supplierId > 0 ? $supplierId : 0,
             'from' => $from,
             'to' => $to,
+            'sort' => $sort,
+            'dir' => $dir,
+            'orderSql' => $orderSql,
         ];
     }
 
@@ -1530,6 +1741,8 @@ class TenantComprasController extends TenantController
             'from' => ($listFilters['from'] ?? '') !== '' ? $listFilters['from'] : null,
             'to' => ($listFilters['to'] ?? '') !== '' ? $listFilters['to'] : null,
             'supplier_id' => !empty($listFilters['supplier_id']) ? (string)$listFilters['supplier_id'] : null,
+            'sort' => ($listFilters['sort'] ?? '') !== '' ? $listFilters['sort'] : null,
+            'dir' => ($listFilters['sort'] ?? '') !== '' ? ($listFilters['dir'] ?? null) : null,
         ], $extra), static fn($v) => $v !== null && $v !== '');
     }
 
@@ -1544,7 +1757,7 @@ class TenantComprasController extends TenantController
             $panel = 'ordenes';
         }
 
-        $listFilters = $this->compraListFilters();
+        $listFilters = $this->compraListFilters($panel === 'facturas' ? 'facturas' : 'ordenes');
         $limit = 20000;
 
         if ($panel === 'facturas') {
@@ -1574,6 +1787,11 @@ class TenantComprasController extends TenantController
                 $overdueDays = (!$isCancelled && $mode === 'payable' && $balance > 0.009 && !empty($o['due_date']) && $daysOver !== null && $daysOver > 0)
                     ? (string)$daysOver
                     : '';
+                $discAmt = round((float)($o['commercial_discount_amount'] ?? 0), 2);
+                $discPct = (float)($o['commercial_discount_pct'] ?? 0);
+                if ($discAmt <= 0.009 && $discPct > 0.009) {
+                    $discAmt = round((float)($o['subtotal'] ?? 0) * $discPct / 100, 2);
+                }
                 $csvRows[] = [
                     (string)($o['invoice_number'] ?? ''),
                     (string)($o['order_number'] ?? ''),
@@ -1582,6 +1800,7 @@ class TenantComprasController extends TenantController
                     $overdueDays,
                     (string)($o['supplier_name'] ?? ''),
                     number_format($total, 2, '.', ''),
+                    number_format($discAmt, 2, '.', ''),
                     number_format($paid, 2, '.', ''),
                     number_format($credit, 2, '.', ''),
                     number_format($balance, 2, '.', ''),
@@ -1596,7 +1815,7 @@ class TenantComprasController extends TenantController
             }
             $this->exportCsv(
                 'compras_facturas_' . ($payment === 'unpaid' ? 'por_pagar_' : '') . date('Ymd_His') . '.csv',
-                ['Factura', 'OC', 'Fecha', 'Vence', 'Días vencida', 'Proveedor', 'Total', 'Abonado', 'NC', 'Saldo', 'Estado pago', 'Modo pago'],
+                ['Factura', 'OC', 'Fecha', 'Vence', 'Días vencida', 'Proveedor', 'Total', 'Dcto comercial', 'Abonado', 'NC', 'Saldo', 'Estado pago', 'Modo pago'],
                 $csvRows
             );
             return;
@@ -1686,6 +1905,55 @@ class TenantComprasController extends TenantController
     /**
      * Observaciones internas de factura/OC (review_notes).
      */
+    private function purchaseBudgetStatus(): ?array
+    {
+        try {
+            return (new \SoftNova\Services\PurchaseBudgetService($this->db))->status(
+                (string)$this->request->get('pb_from', ''),
+                (string)$this->request->get('pb_to', '')
+            );
+        } catch (\Throwable $e) {
+            error_log('Semáforo compras: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    /** Límite mensual de compras (semáforo): solo Administrador o Gerencia. */
+    private function savePurchaseLimit(): void
+    {
+        $back = $this->request->post('return', '') === 'facturas' ? '/app/compras?action=facturas' : '/app/compras';
+        $rangeQs = http_build_query(array_filter([
+            'pb_from' => (string)$this->request->post('pb_from', ''),
+            'pb_to' => (string)$this->request->post('pb_to', ''),
+        ], static fn($v) => preg_match('/^\d{4}-\d{2}-\d{2}$/', $v) === 1));
+        if ($rangeQs !== '') {
+            $back .= (str_contains($back, '?') ? '&' : '?') . $rangeQs;
+        }
+        if (!$this->validateCsrfOrFail($back)) {
+            return;
+        }
+        if (!TenantMiddleware::isManagement()) {
+            $this->respond(false, 'Solo el administrador o gerencia pueden cambiar el límite de compras', $back);
+            return;
+        }
+        $raw = trim((string)$this->request->post('limit', ''));
+        if ($raw !== '' && !is_numeric($raw)) {
+            $this->respond(false, 'Monto límite inválido', $back);
+            return;
+        }
+        $limit = $raw === '' ? 0.0 : (float)$raw;
+        $warnPct = (int)$this->request->post('warn_pct', \SoftNova\Services\PurchaseBudgetService::DEFAULT_WARN_PCT);
+        try {
+            (new \SoftNova\Services\PurchaseBudgetService($this->db))->save($limit, $warnPct);
+            $msg = $limit > 0
+                ? 'Límite mensual de compras actualizado a ' . $this->formatMoney($limit)
+                : 'Límite mensual de compras desactivado';
+            $this->respond(true, $msg, $back);
+        } catch (\Throwable $e) {
+            $this->respond(false, $this->clientErrorMessage($e, 'No se pudo guardar el límite'), $back);
+        }
+    }
+
     private function saveReviewNotes(): void
     {
         if (!$this->validateCsrfOrFail('/app/compras?action=facturas')) {
@@ -1719,6 +1987,9 @@ class TenantComprasController extends TenantController
 
         $orderId = (int)$this->request->post('id', 0);
         $amount = \SoftNova\Core\parse_money($this->request->post('amount', '0'));
+        $invoiceValue = \SoftNova\Core\parse_money($this->request->post('invoice_value', '0'));
+        $discountPct = max(0.0, min(100.0, (float)str_replace(',', '.', (string)$this->request->post('discount_pct', '0'))));
+        $discountAmount = \SoftNova\Core\parse_money($this->request->post('discount_amount', '0'));
         $paymentDate = trim((string)$this->request->post('payment_date', date('Y-m-d')));
         $method = trim((string)$this->request->post('payment_method', 'cash'));
         $reference = trim((string)$this->request->post('reference', ''));
@@ -1750,6 +2021,9 @@ class TenantComprasController extends TenantController
                 [
                     'cash_from_drawer' => $cashFromDrawer,
                     'cash_source_note' => $cashSourceNote,
+                    'invoice_value' => $invoiceValue,
+                    'discount_pct' => $discountPct,
+                    'discount_amount' => $discountAmount,
                 ]
             );
 
@@ -1770,6 +2044,9 @@ class TenantComprasController extends TenantController
             $cashNote = $this->purchasing->syncCashForSupplierPayment((int)$result['payment_id']);
 
             $message = 'Abono registrado por ' . $this->formatMoney($amount) . '. ';
+            if (($result['discount_amount'] ?? 0) > 0.009) {
+                $message .= 'Dcto. pronto pago aplicado: ' . $this->formatMoney((float)$result['discount_amount']) . '. ';
+            }
             $message .= $result['balance'] <= 0.009
                 ? 'La orden queda pagada en su totalidad.'
                 : 'Saldo pendiente: ' . $this->formatMoney($result['balance']) . '.';
@@ -1931,6 +2208,13 @@ class TenantComprasController extends TenantController
         }
         try {
             $orderId = (int)$this->request->post('id', 0);
+            if ((string)$this->request->post('payment_mode', 'payable') === 'cash'
+                && !(new \SoftNova\Services\CashService($this->db))->getOpenSession()
+            ) {
+                throw new \RuntimeException(
+                    'Para pagar en efectivo desde el cajón debe haber una caja abierta. Abra la caja o elija otra forma de pago.'
+                );
+            }
             $this->purchasing->applyInvoiceMeta($orderId, [
                 'due_date' => trim((string)$this->request->post('due_date', '')),
                 'invoice_date' => trim((string)$this->request->post('invoice_date', '')),
@@ -2031,6 +2315,7 @@ class TenantComprasController extends TenantController
         $orderId = (int)$this->request->post('id', 0);
         $reason = trim((string)$this->request->post('reason', ''));
         try {
+            $this->purchasing->assertCashDrawerForReversal($orderId);
             $result = $this->purchasing->voidReceivedOrder($orderId, $reason);
 
             // Reverso contable/caja de abonos que se cancelaron al anular.
@@ -2065,7 +2350,25 @@ class TenantComprasController extends TenantController
             }
 
             $accountingOk = true;
-            if (!empty($result['credit_note_id'])) {
+            $cashNote = '';
+            if (!empty($result['direct'])) {
+                $voidReason = 'Anulación OC ' . ($result['order_number'] ?? '') . ': '
+                    . ($reason !== '' ? $reason : 'Error de recepción');
+                try {
+                    $this->accounting->voidPurchaseOrderEntry($orderId, $voidReason);
+                } catch (\Throwable $e) {
+                    $accountingOk = false;
+                    $this->accounting->enqueuePending(
+                        'void_purchase_order',
+                        'purchase_order',
+                        $orderId,
+                        $e->getMessage(),
+                        ['reason' => $voidReason]
+                    );
+                    error_log('Contabilidad anulación OC ' . $orderId . ': ' . $e->getMessage());
+                }
+                $cashNote = $this->purchasing->syncCashForVoidedOrder($orderId);
+            } elseif (!empty($result['credit_note_id'])) {
                 try {
                     $this->accounting->postPurchaseCreditNote((int)$result['credit_note_id']);
                 } catch (\Throwable $e) {
@@ -2078,18 +2381,27 @@ class TenantComprasController extends TenantController
                     );
                     error_log('Contabilidad anulación OC/NC ' . $result['credit_note_id'] . ': ' . $e->getMessage());
                 }
-                $this->purchasing->syncCashForCreditNote((int)$result['credit_note_id']);
+                $cashNote = $this->purchasing->syncCashForCreditNote((int)$result['credit_note_id']);
             }
 
-            $msg = !empty($result['already_credited'])
-                ? ('OC ' . ($result['order_number'] ?? '') . ' marcada como anulada (ya estaba totalmente acreditada).')
-                : ('OC ' . ($result['order_number'] ?? '') . ' anulada. NC '
+            if (!empty($result['direct'])) {
+                $msg = 'OC ' . ($result['order_number'] ?? '') . ' anulada por '
+                    . $this->formatMoney((float)($result['total'] ?? 0))
+                    . '. Inventario y contabilidad revertidos.';
+            } elseif (!empty($result['already_credited'])) {
+                $msg = 'OC ' . ($result['order_number'] ?? '') . ' marcada como anulada (ya estaba totalmente acreditada).';
+            } else {
+                $msg = 'OC ' . ($result['order_number'] ?? '') . ' anulada. Ya tenía notas crédito: el resto se acreditó con NC '
                     . ($result['credit_number'] ?? '') . ' por '
                     . $this->formatMoney((float)($result['total'] ?? 0))
-                    . '. Inventario y CxP/caja revertidos.');
+                    . '. Inventario y CxP/caja revertidos.';
+            }
             $revCount = count($result['reversed_payments'] ?? []);
             if ($revCount > 0) {
                 $msg .= ' Se revirtieron ' . $revCount . ' abono(s).';
+            }
+            if ($cashNote !== '') {
+                $msg .= ' ' . $cashNote;
             }
             if (!$accountingOk || $accountingIssues !== []) {
                 $msg .= ' Asiento pendiente: use «Sincronizar» en Contabilidad.';

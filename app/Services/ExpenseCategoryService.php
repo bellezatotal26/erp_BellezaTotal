@@ -31,6 +31,12 @@ class ExpenseCategoryService
         'other_operational', 'other_administrative', 'other_financial', 'other_management',
     ];
 
+    /** Gasto generado por el módulo Nómina (costo total de la liquidación). */
+    public const PAYROLL_CODE = 'payroll';
+
+    /** Categorías de sistema: las crea otro módulo; no se eligen ni editan desde Gastos. */
+    public const SYSTEM_CODES = [self::PAYROLL_CODE];
+
     /** Códigos del catálogo base operativo (gastos generales de caja). */
     public const CORE_OPERATIONAL_CODES = [
         'papeleria', 'alimentos', 'transport', 'maintenance',
@@ -614,9 +620,44 @@ class ExpenseCategoryService
     private function excludePlaceholdersSql(string $alias = ''): string
     {
         $prefix = $alias !== '' ? "{$alias}." : '';
-        $codes = self::PLACEHOLDER_CODES;
+        $codes = array_merge(self::PLACEHOLDER_CODES, self::SYSTEM_CODES);
         $quoted = implode(',', array_map(fn ($c) => $this->db->quote($c), $codes));
         return "{$prefix}code NOT IN ($quoted)";
+    }
+
+    public static function isSystemCategory(?array $category): bool
+    {
+        return $category !== null
+            && in_array(strtolower(trim((string)($category['code'] ?? ''))), self::SYSTEM_CODES, true);
+    }
+
+    /** Id de una categoría de sistema; la crea si falta (Nómina → administrativo, 510503). */
+    public function systemCategoryId(string $code): int
+    {
+        if (!in_array($code, self::SYSTEM_CODES, true)) {
+            return 0;
+        }
+        try {
+            $id = (int)$this->query(
+                'SELECT id FROM expense_categories WHERE code = ? LIMIT 1',
+                [$code]
+            )->fetchColumn();
+            if ($id > 0) {
+                return $id;
+            }
+            $this->query(
+                "INSERT IGNORE INTO expense_categories (code, name, kind, account_code, sort_order, status)
+                 VALUES (?, 'Nómina (liquidaciones)', 'administrative', '510503', 900, 'active')",
+                [$code]
+            );
+            return (int)$this->query(
+                'SELECT id FROM expense_categories WHERE code = ? LIMIT 1',
+                [$code]
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            error_log('ExpenseCategoryService::systemCategoryId: ' . $e->getMessage());
+            return 0;
+        }
     }
 
     public function listActive(?string $kind = null): array
@@ -764,6 +805,9 @@ class ExpenseCategoryService
             "SELECT * FROM expense_categories WHERE id = ? AND status = 'active'",
             [$id]
         )->fetch();
+        if ($row && self::isSystemCategory($row)) {
+            return null;
+        }
         return $row ?: null;
     }
 
@@ -801,7 +845,7 @@ class ExpenseCategoryService
         $existing = $this->query(
             "SELECT id, name, code, kind, status, account_code FROM expense_categories
              WHERE LOWER(name) = LOWER(?)
-               AND code NOT IN ('other_operational','other_administrative')
+               AND code NOT IN ('other_operational','other_administrative','payroll')
              ORDER BY status = 'active' DESC, id DESC
              LIMIT 1",
             [$name]

@@ -13,35 +13,36 @@ class TenantAiController extends TenantController
     public function index(): void
     {
         $ai = new AiService($this->db);
-        $modules = [];
-        if (\SoftNova\Core\is_standalone()) {
-            $modules = ['ventas','inventario','prestamos','clientes','caja','cotizaciones','gastos','contabilidad','nomina','reportes','compras'];
-        } else {
-            $tenantId = (int)($_SESSION['tenant_id'] ?? 0);
-            if ($tenantId > 0) {
-                try {
-                    $plan = \SoftNova\Core\Database::getInstance()->query(
-                        "SELECT sp.modules
-                         FROM tenants t
-                         JOIN subscription_plans sp ON t.subscription_plan_id = sp.id
-                         WHERE t.id = ? LIMIT 1",
-                        [$tenantId]
-                    )->fetch();
-                    $decoded = json_decode((string)($plan['modules'] ?? '[]'), true);
-                    if (is_array($decoded)) {
-                        $modules = array_values(array_filter($decoded, 'is_string'));
-                    }
-                } catch (\Throwable $e) {
-                    $modules = [];
-                }
-            }
-        }
-
         $this->view('tenant.ai', $this->tenantViewData([
             'aiConfigured' => $ai->isConfigured(),
-            'aiPersonality' => \SoftNova\Core\ai_personality($modules),
+            'aiPersonality' => \SoftNova\Core\ai_personality($this->activeModules()),
             'conversations' => $ai->conversations($this->currentUserId()),
         ]));
+    }
+
+    /** @return list<string> */
+    private function activeModules(): array
+    {
+        if (\SoftNova\Core\is_standalone()) {
+            return ['ventas','inventario','prestamos','clientes','caja','cotizaciones','gastos','contabilidad','nomina','reportes','compras'];
+        }
+        $tenantId = (int)($_SESSION['tenant_id'] ?? 0);
+        if ($tenantId <= 0) {
+            return [];
+        }
+        try {
+            $plan = \SoftNova\Core\Database::getInstance()->query(
+                "SELECT sp.modules
+                 FROM tenants t
+                 JOIN subscription_plans sp ON t.subscription_plan_id = sp.id
+                 WHERE t.id = ? LIMIT 1",
+                [$tenantId]
+            )->fetch();
+            $decoded = json_decode((string)($plan['modules'] ?? '[]'), true);
+            return is_array($decoded) ? array_values(array_filter($decoded, 'is_string')) : [];
+        } catch (\Throwable $e) {
+            return [];
+        }
     }
 
     public function chat(): void
@@ -108,6 +109,18 @@ class TenantAiController extends TenantController
         $ai = new AiService($this->db);
         $action = (string)$this->request->get('action', 'list');
         $userId = $this->currentUserId();
+
+        if ($action === 'widget') {
+            $personality = \SoftNova\Core\ai_personality($this->activeModules());
+            $this->json([
+                'success' => true,
+                'name' => (string)($personality['name'] ?? 'Seri'),
+                'welcome' => (string)($personality['welcome'] ?? 'Hola, soy Seri. ¿En qué te ayudo?'),
+                'suggestions' => array_values($personality['suggestions'] ?? []),
+                'configured' => $ai->isConfigured(),
+            ]);
+            return;
+        }
 
         if ($action === 'load') {
             $conversationId = (int)$this->request->get('id', 0);

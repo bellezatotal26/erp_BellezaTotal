@@ -49,6 +49,8 @@
     <title><?php echo htmlspecialchars($title ?? 'Seri ERP'); ?></title>
     <?php echo \SoftNova\Core\og_meta_tags($title ?? null); ?>
     <link rel="stylesheet" href="<?php echo $viewInstance->asset('css/style.css'); ?>">
+    <link rel="stylesheet" href="<?php echo $viewInstance->asset('css/ai-widget.css'); ?>">
+    <meta name="ai-widget-url" content="<?php echo htmlspecialchars($viewInstance->route('app/ia')); ?>">
     <meta name="barcode-lookup-url" content="<?php echo htmlspecialchars($viewInstance->route('app/dashboard') . '?action=lookup_barcode'); ?>">
     <meta name="custom-option-url" content="<?php echo htmlspecialchars($viewInstance->route('app/dashboard') . '?action=save_custom_option'); ?>">
     <?php
@@ -675,6 +677,7 @@
     <script src="<?php echo $viewInstance->asset('js/money-input.js'); ?>"></script>
     <script src="<?php echo $viewInstance->asset('js/app.js'); ?>"></script>
     <script src="<?php echo $viewInstance->asset('js/pos-offline.js'); ?>"></script>
+    <script src="<?php echo $viewInstance->asset('js/ai-widget.js'); ?>"></script>
     <script>
     if (window.SeriCsrf && typeof SeriCsrf.startKeepAlive === 'function') {
         SeriCsrf.startKeepAlive();

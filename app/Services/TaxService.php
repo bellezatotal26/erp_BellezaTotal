@@ -568,6 +568,36 @@ class TaxService
             }
         }
 
+        // IVA que cobra el adquirente sobre la comisión de datáfono / link de pago:
+        // solo va a la cuenta descontable si el parámetro está activo (si no, es mayor gasto).
+        $gatewayTax = 0.0;
+        $gatewayDeductible = true;
+        try {
+            $st = $db->prepare(
+                "SELECT setting_value FROM accounting_settings WHERE setting_key = 'gateway_vat_deductible' LIMIT 1"
+            );
+            $st->execute();
+            $raw = $st->fetchColumn();
+            $gatewayDeductible = $raw === false || (string)$raw === '1';
+        } catch (\Throwable $e) {
+            $gatewayDeductible = true;
+        }
+        if ($gatewayDeductible) {
+            try {
+                $st = $db->prepare(
+                    "SELECT COALESCE(SUM(vat_amount), 0) FROM sales_commissions
+                     WHERE commission_kind = 'gateway'
+                       AND status = 'paid'
+                       AND expense_id IS NOT NULL
+                       AND COALESCE(accrual_date, DATE(created_at)) BETWEEN ? AND ?"
+                );
+                $st->execute([$from, $to]);
+                $gatewayTax = (float)$st->fetchColumn();
+            } catch (\Throwable $e) {
+                $gatewayTax = 0.0;
+            }
+        }
+
         try {
             $st = $db->prepare(
                 "SELECT COALESCE(si.tax_rate, 0) rate,
@@ -614,7 +644,8 @@ class TaxService
         }
 
         $netGeneratedDocs = round($salesTax - $salesCnTax, 2);
-        $netDeductibleDocs = round($purchaseTax - $purchaseCnTax, 2);
+        $netPurchaseDocs = round($purchaseTax - $purchaseCnTax, 2);
+        $netDeductibleDocs = round($netPurchaseDocs + $gatewayTax, 2);
 
         return [
             'from' => $from,
@@ -629,7 +660,10 @@ class TaxService
                 'sales_net' => $netGeneratedDocs,
                 'purchases_tax' => round($purchaseTax, 2),
                 'purchases_credit_tax' => round($purchaseCnTax, 2),
-                'purchases_net' => $netDeductibleDocs,
+                'purchases_net' => $netPurchaseDocs,
+                'gateway_commission_tax' => round($gatewayTax, 2),
+                'gateway_vat_deductible' => $gatewayDeductible,
+                'deductible_net' => $netDeductibleDocs,
                 'balance_to_pay' => round($netGeneratedDocs - $netDeductibleDocs, 2),
             ],
             'ledger' => [
@@ -656,7 +690,7 @@ class TaxService
             $w[] = 'IVA generado en documentos vs libro contable difiere más de $1. Revise sync/asientos pendientes.';
         }
         if (abs($docDed - $ledDed) > 1.0) {
-            $w[] = 'IVA descontable en compras vs libro contable difiere más de $1.';
+            $w[] = 'IVA descontable en documentos (compras + comisiones de pasarela) vs libro contable difiere más de $1.';
         }
         return $w;
     }

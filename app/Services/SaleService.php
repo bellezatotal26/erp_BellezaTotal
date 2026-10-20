@@ -127,6 +127,29 @@ class SaleService
                 throw new \RuntimeException('La venta ya está cancelada');
             }
 
+            // H1: cancelar venta en efectivo sin caja abierta descuadra libros vs cajón.
+            if ($this->cash->saleAffectsCashDrawer($saleId, $sale)) {
+                $this->cash->assertOpenSessionForCash('cancelar una venta cobrada en efectivo');
+            }
+
+            // Evitar doble reingreso de stock si ya hubo NC posted.
+            try {
+                $ncCount = (int)$this->query(
+                    "SELECT COUNT(*) FROM sale_credit_notes
+                     WHERE sale_id = ? AND status = 'posted'",
+                    [$saleId]
+                )->fetchColumn();
+                if ($ncCount > 0) {
+                    throw new \RuntimeException(
+                        'Esta venta tiene nota(s) de crédito. No se puede cancelar: use NC para devoluciones o anule la NC primero.'
+                    );
+                }
+            } catch (\RuntimeException $e) {
+                throw $e;
+            } catch (\Throwable $e) {
+                // Tabla NC aún no creada en instalaciones viejas.
+            }
+
             // Anular deudas de sobreventa antes de devolver stock (evitar cubrir otras deudas).
             try {
                 (new ConsignmentService($this->db, $this->stock))->assertSaleCancellable($saleId);

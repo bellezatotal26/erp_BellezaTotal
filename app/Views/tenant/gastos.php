@@ -27,6 +27,11 @@ $currency = $currency ?? ['symbol' => '$', 'decimals' => 2, 'decimal' => ',', 't
 $pagination = $pagination ?? null;
 $perPageOptions = $perPageOptions ?? [20, 50, 100, 200];
 $listQuery = $listQuery ?? [];
+$sortFilters = $sortFilters ?? [
+    'sort' => '',
+    'dir' => 'desc',
+    'query' => $listQuery,
+];
 $paymentMethods = $paymentMethods ?? \SoftNova\Services\PaymentMethodCatalog::all();
 
 function fmtG(float $a, array $c): string
@@ -58,6 +63,10 @@ $gastosBase = $viewInstance->route('app/gastos');
 </div>
 
 <form method="GET" action="<?php echo $gastosBase; ?>" class="inv-filters-form" style="margin-bottom:16px;">
+    <?php if (!empty($sortFilters['sort'])): ?>
+        <input type="hidden" name="sort" value="<?php echo htmlspecialchars((string)$sortFilters['sort']); ?>">
+        <input type="hidden" name="dir" value="<?php echo htmlspecialchars((string)($sortFilters['dir'] ?? 'desc')); ?>">
+    <?php endif; ?>
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
         <div class="form-group" style="margin:0;flex:1;min-width:200px;">
             <label style="font-size:12px;">Buscar</label>
@@ -134,11 +143,25 @@ $gastosBase = $viewInstance->route('app/gastos');
             </p>
         <?php else: ?>
             <div class="table-container"><table>
-                <thead><tr><th>Fecha</th><th>Usuario</th><th>Descripcion</th><th>Categoria</th><th>Proveedor</th><th>Monto</th><th>Metodo</th><th>Soporte</th><th>Contabilidad</th><?php if ($canEditExpense || $canDeleteExpense): ?><th>Acciones</th><?php endif; ?></tr></thead>
+                <thead><tr>
+                    <th><?php $viewInstance->partial('sortable_th', ['label' => 'Fecha', 'column' => 'date', 'filters' => $sortFilters, 'baseUrl' => $gastosBase]); ?></th>
+                    <th><?php $viewInstance->partial('sortable_th', ['label' => 'Usuario', 'column' => 'user', 'filters' => $sortFilters, 'baseUrl' => $gastosBase]); ?></th>
+                    <th><?php $viewInstance->partial('sortable_th', ['label' => 'Descripcion', 'column' => 'description', 'filters' => $sortFilters, 'baseUrl' => $gastosBase]); ?></th>
+                    <th><?php $viewInstance->partial('sortable_th', ['label' => 'Categoria', 'column' => 'category', 'filters' => $sortFilters, 'baseUrl' => $gastosBase]); ?></th>
+                    <th><?php $viewInstance->partial('sortable_th', ['label' => 'Proveedor', 'column' => 'supplier', 'filters' => $sortFilters, 'baseUrl' => $gastosBase]); ?></th>
+                    <th><?php $viewInstance->partial('sortable_th', ['label' => 'Monto', 'column' => 'amount', 'filters' => $sortFilters, 'baseUrl' => $gastosBase]); ?></th>
+                    <th><?php $viewInstance->partial('sortable_th', ['label' => 'Metodo', 'column' => 'method', 'filters' => $sortFilters, 'baseUrl' => $gastosBase]); ?></th>
+                    <th>Soporte</th>
+                    <th><?php $viewInstance->partial('sortable_th', ['label' => 'Contabilidad', 'column' => 'entry', 'filters' => $sortFilters, 'baseUrl' => $gastosBase]); ?></th>
+                    <?php if ($canEditExpense || $canDeleteExpense): ?><th>Acciones</th><?php endif; ?>
+                </tr></thead>
                 <tbody>
                 <?php foreach ($expenses as $exp): ?>
                     <?php
                     $catLabel = $exp['category_label'] ?? ($exp['category'] ?? '');
+                    if (!empty($exp['is_payroll']) && empty($exp['category_label'])) {
+                        $catLabel = 'Nómina (liquidaciones)';
+                    }
                     $ck = (string)($exp['category_kind'] ?? '');
                         $kindBadge = match ($ck) {
                             'operational' => 'badge-success',
@@ -176,7 +199,15 @@ $gastosBase = $viewInstance->route('app/gastos');
                             <?php endif; ?>
                         </td>
                         <td>
-                            <?php if (!empty($exp['accounting_entry_id'])): ?>
+                            <?php if (!empty($exp['is_payroll'])): ?>
+                                <?php if (!empty($exp['payroll_run_id'])): ?>
+                                <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/nomina'); ?>?tab=runs&amp;action=run_detail&amp;id=<?php echo (int)$exp['payroll_run_id']; ?>" title="Asiento de nómina: se gestiona desde el módulo Nómina">Nómina</a>
+                                <?php else: ?>
+                                <span style="font-size:12px;color:var(--color-text-secondary);">Asiento de nómina</span>
+                                <?php endif; ?>
+                            <?php elseif (!empty($exp['is_bank'])): ?>
+                                <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/bancos'); ?>?tab=<?php echo str_starts_with(ltrim((string)($exp['notes'] ?? '')), 'bold_settlement:') ? 'bold' : 'conciliacion'; ?>" title="Asiento del módulo Bancos: se gestiona desde Bancos">Bancos</a>
+                            <?php elseif (!empty($exp['accounting_entry_id'])): ?>
                                 <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$exp['accounting_entry_id']; ?>" title="Ver comprobante contable">
                                     <?php echo htmlspecialchars((string)($exp['accounting_entry_number'] ?? 'Ver')); ?>
                                 </a>
@@ -186,6 +217,11 @@ $gastosBase = $viewInstance->route('app/gastos');
                         </td>
                         <?php if ($canEditExpense || $canDeleteExpense): ?>
                         <td class="table-actions">
+                            <?php if (!empty($exp['is_payroll'])): ?>
+                                <span style="font-size:12px;color:var(--color-text-secondary);" title="Para corregirlo use Nómina → Liquidaciones → «Anular pago»">Se gestiona en Nómina</span>
+                            <?php elseif (!empty($exp['is_bank'])): ?>
+                                <span style="font-size:12px;color:var(--color-text-secondary);" title="Para corregirlo anule el registro en Bancos">Se gestiona en Bancos</span>
+                            <?php else: ?>
                             <?php if ($canEditExpense && empty($exp['accounting_entry_id'])): ?>
                                 <button type="button" class="btn btn-sm btn-secondary" title="Editar"
                                     onclick='openEditExpense(<?php echo json_encode([
@@ -208,6 +244,7 @@ $gastosBase = $viewInstance->route('app/gastos');
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
                                 </button>
                             </form>
+                            <?php endif; ?>
                             <?php endif; ?>
                         </td>
                         <?php endif; ?>
@@ -394,5 +431,26 @@ function openEditExpense(row) {
     if (payEl) payEl.addEventListener('change', syncCashExplanation);
     if (catEl) catEl.addEventListener('change', syncCashExplanation);
     syncCashExplanation();
+
+    // Aportes y prestaciones ya se causan en Nómina: registrarlos aquí duplica el costo.
+    var payrollRe = /(n[oó]mina|pila|seguridad\s+social|parafiscal|aportes?\s+(salud|pensi[oó]n|eps|arl)|\beps\b|\barl\b|caja\s+de\s+compensaci[oó]n|\bsena\b|\bicbf\b|cesant[ií]as|prima\s+de\s+servicios|vacaciones|salarios?)/i;
+    form.addEventListener('submit', function (e) {
+        var descEl = form.querySelector('[name="description"]');
+        var text = descEl ? String(descEl.value || '') : '';
+        if (!payrollRe.test(text) || form.dataset.payrollWarned === '1') return;
+        var ok = window.confirm(
+            'Parece un pago de nómina, seguridad social o prestaciones.\n\n'
+            + 'Esos costos ya se registran al liquidar la nómina. Si lo carga aquí como gasto, el costo queda DUPLICADO.\n\n'
+            + 'Use Nómina → Pagos de nómina para registrar el pago.\n\n'
+            + '¿Registrarlo de todos modos como gasto?'
+        );
+        if (!ok) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return;
+        }
+        form.dataset.payrollWarned = '1';
+        setTimeout(function () { form.dataset.payrollWarned = ''; }, 3000);
+    }, true);
 })();
 </script>

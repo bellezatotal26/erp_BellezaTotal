@@ -253,6 +253,7 @@
             notes: String(src.notes || ''),
             cash_received: src.cash_received != null ? String(src.cash_received) : '',
             cash_change: src.cash_change != null ? String(src.cash_change) : '',
+            offline_at: String(src.offline_at || ''),
             offline_sync: '1',
             items: items,
             payment_splits: splits
@@ -427,6 +428,9 @@
             clean.notes = (clean.notes ? clean.notes + ' | ' : '') + 'Offline';
         }
         clean.offline_sync = '1';
+        if (!clean.offline_at) {
+            clean.offline_at = new Date().toISOString();
+        }
 
         var q = loadQueue();
         var exists = q.some(function (e) {
@@ -819,8 +823,10 @@
     }
 
     function payloadForBatch(entry) {
-        return normalizePayload(Object.assign({}, entry.payload || {}, {
-            client_sale_uuid: entry.client_sale_uuid || (entry.payload && entry.payload.client_sale_uuid) || ''
+        var src = entry.payload || {};
+        return normalizePayload(Object.assign({}, src, {
+            client_sale_uuid: entry.client_sale_uuid || src.client_sale_uuid || '',
+            offline_at: src.offline_at || entry.at || ''
         }));
     }
 

@@ -278,10 +278,16 @@ if (!function_exists('rptChartTypeSelect')) {
     <div class="card neumorphic">
         <div class="card-header"><h3>Conciliación datáfono</h3></div>
         <div class="card-body">
-            <div class="rpt-row muted"><span>Ventas datáfono</span><strong><?php echo fmtR((float)$dataphoneRecon['dataphone_sales'], $currency); ?></strong></div>
-            <div class="rpt-row muted"><span>Ventas tarjeta / link</span><strong><?php echo fmtR((float)$dataphoneRecon['card_sales'], $currency); ?></strong></div>
-            <div class="rpt-row muted"><span>Comisión esperada</span><strong><?php echo fmtR((float)$dataphoneRecon['expected_total'], $currency); ?></strong></div>
-            <div class="rpt-row muted"><span>Gastos registrados</span><span><?php echo fmtR((float)$dataphoneRecon['recorded_total'], $currency); ?></span></div>
+            <div class="rpt-row muted"><span>Ventas datáfono (débito / crédito)<?php if ((int)($dataphoneRecon['dataphone_tx'] ?? 0) > 0): ?> · <?php echo (int)$dataphoneRecon['dataphone_tx']; ?> transacciones<?php endif; ?></span><strong><?php echo fmtR((float)$dataphoneRecon['dataphone_sales'], $currency); ?></strong></div>
+            <div class="rpt-row muted"><span>Ventas link de pago</span><strong><?php echo fmtR((float)$dataphoneRecon['card_sales'], $currency); ?></strong></div>
+            <div class="rpt-row muted"><span>Comisión esperada<?php if (empty($dataphoneRecon['vat_deductible']) && (float)($dataphoneRecon['expected_vat'] ?? 0) > 0): ?> (incluye IVA no descontable)<?php endif; ?></span><strong><?php echo fmtR((float)$dataphoneRecon['expected_total'], $currency); ?></strong></div>
+            <?php if (!empty($dataphoneRecon['vat_deductible']) && (float)($dataphoneRecon['expected_vat'] ?? 0) > 0): ?>
+            <div class="rpt-row muted"><span>IVA descontable sobre comisiones (240802)</span><span><?php echo fmtR((float)$dataphoneRecon['expected_vat'], $currency); ?></span></div>
+            <?php endif; ?>
+            <?php if ((float)($dataphoneRecon['expected_withholdings'] ?? 0) > 0): ?>
+            <div class="rpt-row muted"><span>Retenciones del adquirente (anticipo de impuestos)</span><span><?php echo fmtR((float)$dataphoneRecon['expected_withholdings'], $currency); ?></span></div>
+            <?php endif; ?>
+            <div class="rpt-row muted"><span>Gastos de comisión registrados</span><span><?php echo fmtR((float)$dataphoneRecon['recorded_total'], $currency); ?></span></div>
             <div class="rpt-row rpt-row-total">
                 <strong>Brecha</strong>
                 <strong style="color:<?php echo (float)$dataphoneRecon['gap'] > 0.01 ? '#DC2626' : '#10B981'; ?>;">
@@ -290,8 +296,8 @@ if (!function_exists('rptChartTypeSelect')) {
             </div>
             <?php if ((float)$dataphoneRecon['suggest_amount'] > 0.01): ?>
                 <a class="btn btn-sm btn-primary" style="margin-top:10px;"
-                   href="<?php echo $viewInstance->route('app/gastos'); ?>?suggest=1&amp;amount=<?php echo urlencode((string)$dataphoneRecon['suggest_amount']); ?>&amp;category=<?php echo urlencode((string)$dataphoneRecon['suggest_category']); ?>&amp;description=<?php echo urlencode((string)$dataphoneRecon['suggest_description']); ?>">
-                    Registrar comisión sugerida
+                   href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=commissions&amp;from=<?php echo urlencode((string)($dataphoneRecon['from'] ?? '')); ?>&amp;to=<?php echo urlencode((string)($dataphoneRecon['to'] ?? '')); ?>">
+                    Revisar / recalcular comisiones del periodo
                 </a>
             <?php endif; ?>
         </div>

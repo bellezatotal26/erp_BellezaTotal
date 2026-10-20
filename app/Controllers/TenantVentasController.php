@@ -112,7 +112,8 @@ class TenantVentasController extends TenantController
             return;
         }
         if ($action === 'credit_note' && $this->request->method() === 'POST') {
-            TenantMiddleware::authorize('ventas', 'create');
+            // H4: emitir NC exige el mismo nivel que cancelar (delete), no solo create.
+            TenantMiddleware::authorize('ventas', 'delete');
             $this->creditNote();
             return;
         }
@@ -141,22 +142,60 @@ class TenantVentasController extends TenantController
         )->fetch()['c'];
         $pagination = $this->paginate($total);
         
-        $sales = $this->query(
-            "SELECT s.*, c.name as customer_name, u.name as user_name,
-                    COALESCE(p.paid_amount, 0) as paid_amount
-             FROM sales s
-             LEFT JOIN customers c ON s.customer_id = c.id
-             LEFT JOIN users u ON s.user_id = u.id
-             LEFT JOIN (
-                SELECT sale_id, COALESCE(SUM(amount), 0) as paid_amount
-                FROM sale_payments
-                GROUP BY sale_id
-             ) p ON p.sale_id = s.id
-             WHERE {$whereSql}
-             ORDER BY {$filters['orderSql']}, s.id DESC
-             LIMIT {$pagination['perPage']} OFFSET {$pagination['offset']}",
-            $params
-        )->fetchAll();
+        try {
+            (new \SoftNova\Services\SalesCreditNoteService($this->db))->ensureSchema();
+        } catch (\Throwable $e) {
+        }
+        try {
+            $sales = $this->query(
+                "SELECT s.*, c.name as customer_name, u.name as user_name,
+                        COALESCE(p.paid_amount, 0) as paid_amount,
+                        COALESCE(cn.credit_note_total, 0) AS credit_note_total,
+                        COALESCE(cn.credit_notes_count, 0) AS credit_notes_count,
+                        cn.credit_note_numbers
+                 FROM sales s
+                 LEFT JOIN customers c ON s.customer_id = c.id
+                 LEFT JOIN users u ON s.user_id = u.id
+                 LEFT JOIN (
+                    SELECT sale_id, COALESCE(SUM(amount), 0) as paid_amount
+                    FROM sale_payments
+                    GROUP BY sale_id
+                 ) p ON p.sale_id = s.id
+                 LEFT JOIN (
+                    SELECT sale_id,
+                           SUM(total) AS credit_note_total,
+                           COUNT(*) AS credit_notes_count,
+                           GROUP_CONCAT(credit_number ORDER BY id SEPARATOR ', ') AS credit_note_numbers
+                    FROM sale_credit_notes
+                    WHERE status = 'posted'
+                    GROUP BY sale_id
+                 ) cn ON cn.sale_id = s.id
+                 WHERE {$whereSql}
+                 ORDER BY {$filters['orderSql']}, s.id DESC
+                 LIMIT {$pagination['perPage']} OFFSET {$pagination['offset']}",
+                $params
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $sales = $this->query(
+                "SELECT s.*, c.name as customer_name, u.name as user_name,
+                        COALESCE(p.paid_amount, 0) as paid_amount,
+                        0 AS credit_note_total,
+                        0 AS credit_notes_count,
+                        NULL AS credit_note_numbers
+                 FROM sales s
+                 LEFT JOIN customers c ON s.customer_id = c.id
+                 LEFT JOIN users u ON s.user_id = u.id
+                 LEFT JOIN (
+                    SELECT sale_id, COALESCE(SUM(amount), 0) as paid_amount
+                    FROM sale_payments
+                    GROUP BY sale_id
+                 ) p ON p.sale_id = s.id
+                 WHERE {$whereSql}
+                 ORDER BY {$filters['orderSql']}, s.id DESC
+                 LIMIT {$pagination['perPage']} OFFSET {$pagination['offset']}",
+                $params
+            )->fetchAll();
+        }
         
         [$sumFrom, $sumTo] = $this->salesSummaryRange();
         $salesSummary = \SoftNova\Services\SalesPeriodSummary::build($this->db, $sumFrom, $sumTo);
@@ -868,7 +907,7 @@ class TenantVentasController extends TenantController
             $documentType = 'invoice';
         }
         $paymentTerms = (string)$this->request->post('payment_terms', $paymentType === 'credit' ? 'net_30' : 'cash');
-        if (!isset(\SoftNova\Services\SalesDocumentService::paymentTerms()[$paymentTerms])) {
+        if (!\SoftNova\Services\SalesDocumentService::isValidTerms($paymentTerms)) {
             $paymentTerms = $paymentType === 'credit' ? 'net_30' : 'cash';
         }
         $saleDate = trim((string)$this->request->post('sale_date', date('Y-m-d')));
@@ -1197,9 +1236,8 @@ class TenantVentasController extends TenantController
                     );
                     return;
                 }
-                $postedTax = array_key_exists('tax_rate', $item)
-                    ? round((float)$item['tax_rate'], 2)
-                    : $taxRateCombo;
+                // IVA del combo = mayor tasa de sus componentes según catálogo; nunca la del navegador.
+                $postedTax = round($taxRateCombo, 2);
                 $lineSub = round($comboPrice * $packs, 2);
                 $subtotal += $lineSub;
                 $validItems[] = [
@@ -1489,13 +1527,12 @@ class TenantVentasController extends TenantController
             $cashChange = null;
         }
 
-        // Efectivo requiere caja abierta (igual que sync offline) para no descuadrar arqueo.
+        // Efectivo requiere caja abierta (igual que cancel/NC y sync offline).
         if ((float)($payPlan['cash_total'] ?? 0) > 0.009) {
-            $openCash = $this->query(
-                "SELECT id FROM cash_sessions WHERE status = 'open' ORDER BY id DESC LIMIT 1"
-            )->fetch();
-            if (!$openCash) {
-                $this->respond(false, 'Debe abrir caja para registrar cobros en efectivo', '/app/ventas');
+            try {
+                $this->cash->assertOpenSessionForCash('registrar una venta cobrada en efectivo');
+            } catch (\RuntimeException $e) {
+                $this->respond(false, $e->getMessage(), '/app/ventas');
                 return;
             }
         }
@@ -1756,6 +1793,7 @@ class TenantVentasController extends TenantController
             }
 
             // Solo el efectivo del mixto (o del pago único) entra a la caja física.
+            // Ya se exigió caja abierta antes de crear la venta; required=true evita éxito silencioso.
             $cashWarn = '';
             if ($cashAmount > 0.009) {
                 $label = ($paymentType === 'credit' && $paymentStatus !== 'paid')
@@ -1764,9 +1802,11 @@ class TenantVentasController extends TenantController
                 if ($paymentMethod === 'mixed') {
                     $label .= ' (efectivo mixto)';
                 }
-                if (!$this->cash->registerIncome($cashAmount, $label, 'sale', $saleId)) {
-                    error_log('Caja: venta ' . $saleId . ' sin movimiento de ingreso');
-                    $cashWarn = ' La venta quedó registrada, pero el efectivo no entró a caja: revise la sesión abierta.';
+                try {
+                    $this->cash->registerIncome($cashAmount, $label, 'sale', $saleId, true);
+                } catch (\RuntimeException $e) {
+                    error_log('Caja: venta ' . $saleId . ' sin movimiento de ingreso: ' . $e->getMessage());
+                    $cashWarn = ' ' . $e->getMessage();
                 }
             }
 
@@ -1876,6 +1916,16 @@ class TenantVentasController extends TenantController
             $this->respond(false, 'El monto debe ser mayor a cero', '/app/ventas');
             return;
         }
+
+        // Abono en efectivo: exigir caja abierta antes de grabar (evita descuadre cajón vs libros).
+        if (\SoftNova\Services\PaymentMethodCatalog::affectsCash($method)) {
+            try {
+                $this->cash->assertOpenSessionForCash('registrar un abono en efectivo');
+            } catch (\RuntimeException $e) {
+                $this->respond(false, $e->getMessage(), '/app/ventas');
+                return;
+            }
+        }
         
         try {
             $this->db->beginTransaction();
@@ -1893,37 +1943,43 @@ class TenantVentasController extends TenantController
                 $this->respond(false, 'Venta no encontrada, cancelada o ya esta pagada', '/app/ventas');
                 return;
             }
-            
-            $alreadyPaid = (float)$this->query(
-                "SELECT COALESCE(SUM(amount), 0) as t FROM sale_payments WHERE sale_id = ?",
-                [$saleId]
-            )->fetch()['t'];
-            $balance = max(0, round((float)$sale['total'] - $alreadyPaid, 2));
-            
-            if ($balance <= 0) {
+
+            // Saldo = total − NC posted − pagos (misma regla que syncReceivable).
+            $ncSvc = new \SoftNova\Services\SalesCreditNoteService($this->db);
+            $balances = $ncSvc->saleBalances($saleId);
+            $alreadyPaid = (float)$balances['paid'];
+            $netTotal = (float)$balances['net_total'];
+            $balance = (float)$balances['balance'];
+
+            if ($balance <= 0.009) {
                 $this->db->rollBack();
+                // Mantener estado coherente si quedó pagada por NC.
+                try {
+                    $ncSvc->syncReceivable($saleId);
+                } catch (\Throwable $e) {
+                }
                 $this->respond(false, 'Esta venta ya no tiene saldo pendiente', '/app/ventas');
                 return;
             }
-            
+
             if ($amount > $balance + 0.009) {
                 $this->db->rollBack();
                 $this->respond(false, 'El abono no puede superar el saldo pendiente (' . $this->formatMoney($balance) . ')', '/app/ventas');
                 return;
             }
-            
+
             $amount = min($amount, $balance);
-            
+
             $this->query(
                 "INSERT INTO sale_payments (sale_id, amount, payment_date, payment_method, notes, user_id)
                  VALUES (?, ?, NOW(), ?, ?, ?)",
                 [$saleId, $amount, $method, $notes, $_SESSION['tenant_user_id']]
             );
             $paymentId = (int)$this->db->lastInsertId();
-            
+
             $totalPaid = round($alreadyPaid + $amount, 2);
-            $remaining = round((float)$sale['total'] - $totalPaid, 2);
-            
+            $remaining = round($netTotal - $totalPaid, 2);
+
             if ($remaining <= 0.009) {
                 $this->query(
                     "UPDATE sales SET payment_status = 'paid', status = 'completed'
@@ -1963,9 +2019,15 @@ class TenantVentasController extends TenantController
 
             // Solo el efectivo entra a la caja física (evita descuadre con contabilidad).
             if (\SoftNova\Services\PaymentMethodCatalog::affectsCash($method)) {
-                $this->cash->registerIncome($amount, 'Abono: ' . $sale['invoice_number'], 'sale_payment', $paymentId);
+                $this->cash->registerIncome(
+                    $amount,
+                    'Abono: ' . $sale['invoice_number'],
+                    'sale_payment',
+                    $paymentId,
+                    true
+                );
             }
-            $this->receivables->applyPayment($saleId, $totalPaid, (float)$sale['total']);
+            $this->receivables->applyPayment($saleId, min($totalPaid, $netTotal), $netTotal);
 
             (new \SoftNova\Services\TenantAuditService($this->db))->log(
                 'payment',
@@ -2143,6 +2205,16 @@ class TenantVentasController extends TenantController
 
         $newMethod = $plan['method'];
         $newCash = (float)$plan['cash_total'];
+
+        // Si el ajuste mueve efectivo del cajón, exigir caja abierta.
+        if (abs(round($newCash - $oldCash, 2)) > 0.009) {
+            try {
+                $this->cash->assertOpenSessionForCash('cambiar el medio de pago cuando hay efectivo involucrado');
+            } catch (\RuntimeException $e) {
+                $this->respond(false, $e->getMessage(), $redirect);
+                return;
+            }
+        }
 
         // Reversar asientos de los pagos viejos ANTES de reemplazar filas.
         // Si falla, no se toca la venta (evita doble asiento).

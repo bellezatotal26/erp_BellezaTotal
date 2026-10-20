@@ -189,6 +189,8 @@ class Router
         $this->post('/app/gastos', 'TenantGastosController', 'index');
         $this->get('/app/contabilidad', 'TenantContabilidadController', 'index');
         $this->post('/app/contabilidad', 'TenantContabilidadController', 'index');
+        $this->get('/app/bancos', 'TenantBancosController', 'index');
+        $this->post('/app/bancos', 'TenantBancosController', 'index');
         $this->get('/app/nomina', 'TenantNominaController', 'index');
         $this->post('/app/nomina', 'TenantNominaController', 'index');
 

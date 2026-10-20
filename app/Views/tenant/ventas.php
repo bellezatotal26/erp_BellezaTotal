@@ -393,25 +393,64 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
                     <th><?php $viewInstance->partial('sortable_th', ['label'=>'Total','column'=>'total','filters'=>$filters,'baseUrl'=>$ventasBase]); ?></th>
                     <th><?php $viewInstance->partial('sortable_th', ['label'=>'Pagado','column'=>'paid','filters'=>$filters,'baseUrl'=>$ventasBase]); ?></th>
                     <th><?php $viewInstance->partial('sortable_th', ['label'=>'Pago','column'=>'method','filters'=>$filters,'baseUrl'=>$ventasBase]); ?></th>
+                    <th>NC</th>
                     <th><?php $viewInstance->partial('sortable_th', ['label'=>'Estado','column'=>'status','filters'=>$filters,'baseUrl'=>$ventasBase]); ?></th>
                     <th>Acciones</th>
                 </tr></thead>
                 <tbody>
                 <?php foreach ($sales as $sale): ?>
-                    <tr>
-                        <td><strong><?php echo htmlspecialchars($sale['invoice_number']); ?></strong></td>
+                    <?php
+                    $ncTot = round((float)($sale['credit_note_total'] ?? 0), 2);
+                    $saleTot = round((float)($sale['total'] ?? 0), 2);
+                    $ncFull = $ncTot > 0.009 && $ncTot >= ($saleTot - 0.02);
+                    $ncTip = trim((string)($sale['credit_note_numbers'] ?? ''));
+                    if ($ncTip === '' && $ncTot > 0.009) {
+                        $ncTip = 'Nota(s) de crédito';
+                    }
+                    $saleObs = \SoftNova\Services\SalesDocumentService::displayNotes((string)($sale['notes'] ?? ''));
+                    ?>
+                    <tr<?php echo $ncFull ? ' style="opacity:0.85;"' : ''; ?>>
+                        <td>
+                            <strong><?php echo htmlspecialchars($sale['invoice_number']); ?></strong>
+                            <?php if ($ncFull): ?>
+                                <div><span class="badge badge-warning" title="<?php echo htmlspecialchars($ncTip); ?>">Devuelta</span></div>
+                            <?php elseif ($ncTot > 0.009): ?>
+                                <div><span class="badge badge-info" title="<?php echo htmlspecialchars($ncTip); ?>">Con NC</span></div>
+                            <?php endif; ?>
+                            <?php if ($saleObs !== ''): ?>
+                                <div style="font-size:11px;color:var(--color-text-secondary);margin-top:2px;max-width:220px;" title="<?php echo htmlspecialchars($saleObs); ?>">
+                                    <?php echo htmlspecialchars(mb_strlen($saleObs) > 80 ? mb_substr($saleObs, 0, 77) . '…' : $saleObs); ?>
+                                </div>
+                            <?php endif; ?>
+                        </td>
                         <td><?php echo htmlspecialchars($sale['customer_name'] ?? 'General'); ?></td>
                         <td><?php echo date('d/m/Y H:i', strtotime($sale['sale_date'])); ?></td>
-                        <td style="font-weight:600;"><?php echo fmtV($sale['total'], $currency); ?></td>
-                        <td><?php echo $sale['payment_status'] === 'paid' ? fmtV($sale['total'], $currency) : fmtV($sale['paid_amount'] ?? 0, $currency); ?></td>
+                        <td style="font-weight:600;">
+                            <?php echo fmtV($saleTot, $currency); ?>
+                            <?php if ($ncTot > 0.009): ?>
+                                <div style="font-size:11px;color:var(--color-text-secondary);">Neto <?php echo fmtV(max(0, $saleTot - $ncTot), $currency); ?></div>
+                            <?php endif; ?>
+                        </td>
+                        <td><?php echo $sale['payment_status'] === 'paid' ? fmtV($saleTot, $currency) : fmtV($sale['paid_amount'] ?? 0, $currency); ?></td>
                         <td>
                             <span class="badge <?php echo $sale['payment_method'] === 'cash' ? 'badge-success' : (in_array($sale['payment_method'], ['mixed','card','dataphone','payment_link','transfer','debit_card','credit_card','nequi'], true) ? 'badge-info' : 'badge-warning'); ?>">
                                 <?php echo htmlspecialchars(\SoftNova\Services\PaymentMethodCatalog::label((string)$sale['payment_method'])); ?>
                             </span>
                         </td>
                         <td>
+                            <?php if ($ncTot > 0.009): ?>
+                                <span class="badge badge-warning" title="<?php echo htmlspecialchars($ncTip); ?>">
+                                    NC <?php echo fmtV($ncTot, $currency); ?>
+                                </span>
+                            <?php else: ?>
+                                —
+                            <?php endif; ?>
+                        </td>
+                        <td>
                             <?php if (($sale['status'] ?? '') === 'cancelled'): ?>
                                 <span class="badge badge-danger">Cancelado</span>
+                            <?php elseif ($ncFull): ?>
+                                <span class="badge badge-warning">Devuelta</span>
                             <?php elseif ($sale['payment_status'] === 'paid'): ?>
                                 <span class="badge badge-success">Pagado</span>
                             <?php elseif ($sale['payment_status'] === 'partial'): ?>
@@ -431,12 +470,12 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
                                     Pago
                                 </button>
                             <?php endif; ?>
-                            <?php if ($canCreateSale && ($sale['status'] ?? '') !== 'cancelled'): ?>
+                            <?php if ($canDeleteSale && ($sale['status'] ?? '') !== 'cancelled'): ?>
                                 <button type="button" class="btn btn-sm btn-warning" title="Nota de crédito / devolución"
                                     onclick="openSaleCreditNoteModal(<?php echo (int)$sale['id']; ?>)">NC</button>
                             <?php endif; ?>
                             <?php if (in_array($sale['payment_status'], ['pending', 'partial'])): ?>
-                                <button onclick="openPaymentModal(<?php echo $sale['id']; ?>,<?php echo $sale['total']; ?>,<?php echo ($sale['paid_amount'] ?? 0); ?>)" class="btn btn-sm btn-success" title="Registrar abono"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></button>
+                                <button onclick="openPaymentModal(<?php echo (int)$sale['id']; ?>,<?php echo (float)$sale['total']; ?>,<?php echo (float)($sale['paid_amount'] ?? 0); ?>,<?php echo (float)($sale['credit_note_total'] ?? 0); ?>)" class="btn btn-sm btn-success" title="Registrar abono"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></button>
                             <?php endif; ?>
                             <?php if ($canDeleteSale && $sale['status'] !== 'cancelled'): ?>
                                 <button type="button" class="btn btn-sm btn-danger" title="Eliminar venta"
@@ -686,7 +725,7 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="sale_id" id="paySaleId">
             <p id="payInfo" style="margin-bottom:10px;"></p>
-            <div class="form-group"><label>Monto * <span class="field-tip" data-tip="Cantidad que el cliente abona ahora. No puede superar el saldo pendiente.">?</span></label><input type="text" name="amount" id="payAmount" class="form-control money-input" data-money="1" inputmode="decimal" required placeholder="0"></div>
+            <div class="form-group"><label>Monto * <span class="field-tip" data-tip="Cantidad que el cliente abona ahora. No puede superar el saldo pendiente (total − notas de crédito − abonos previos).">?</span></label><input type="text" name="amount" id="payAmount" class="form-control money-input" data-money="1" inputmode="decimal" required placeholder="0"></div>
             <div class="form-group"><label>Método <span class="field-tip" data-tip="Medio de pago de este abono.">?</span></label><select name="payment_method" class="form-control" data-custom-other="payment_method"><?php echo \SoftNova\Services\PaymentMethodCatalog::optionsHtml('cash', true, \SoftNova\Core\TenantMiddleware::getDb()); ?></select></div>
             <div class="form-group"><label>Notas <span class="field-tip" data-tip="Referencia del abono (número de transferencia, recibo, etc.).">?</span></label><input type="text" name="notes" class="form-control" placeholder="Abono"></div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('paymentModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-success">Registrar Abono</button></div>
@@ -799,7 +838,8 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
     </div>
 </div>
 
-<!-- Modal Nota de crédito venta -->
+<?php if ($canDeleteSale): ?>
+<!-- Modal Nota de crédito venta (requiere ventas.delete) -->
 <div id="saleCreditNoteModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:720px;max-height:90vh;overflow-y:auto;">
         <div class="modal-header">
@@ -871,6 +911,7 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
         </form>
     </div>
 </div>
+<?php endif; ?>
 
 <script>
     window.invRouteVentasDetail = '<?php echo $viewInstance->route('app/ventas'); ?>?action=detail';

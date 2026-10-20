@@ -823,6 +823,18 @@ class PurchaseInvoiceImportService
                 isset($item['sale_price']) && (float)$item['sale_price'] > 0 ? round((float)$item['sale_price'], 2) : null,
                 $autoMatch ? (int)($match['confidence'] ?? 0) : 0,
             ]);
+
+            $costoInventario = round(max(0, (float)($item['inventory_cost'] ?? 0)), 2);
+            if ($costoInventario > 0.009) {
+                try {
+                    $this->query(
+                        "UPDATE purchase_invoice_import_items SET inventory_cost = ? WHERE id = ? AND import_id = ?",
+                        [$costoInventario, (int)$this->db->lastInsertId(), $importId]
+                    );
+                } catch (\Throwable $e) {
+                    // Columna aún no migrada: el usuario puede digitarlo en la revisión.
+                }
+            }
         }
     }
 
@@ -1488,6 +1500,12 @@ class PurchaseInvoiceImportService
             $taxRate = 0.0;
         }
 
+        $invCostRaw = $this->csvValue($campos, $mapa, 'inventory_cost');
+        $invCost = $this->toNumber($invCostRaw);
+        if ($invCost <= 0 || $invCost >= 1.0e11 || $this->looksLikeBarcode($invCostRaw)) {
+            $invCost = 0.0;
+        }
+
         $fila = [
             'raw_line' => implode($separador, $campos),
             'supplier_sku' => $sku,
@@ -1502,6 +1520,7 @@ class PurchaseInvoiceImportService
             'lot_code' => $this->csvValue($campos, $mapa, 'lot_code'),
             'expiry_date' => $this->normalizeDate($this->csvValue($campos, $mapa, 'expiry_date')),
             'sale_price' => $this->toNumber($this->csvValue($campos, $mapa, 'sale_price')),
+            'inventory_cost' => $invCost,
             '_fields' => $campos,
         ];
         return $this->normalizeInvoiceLineAmounts($fila);
@@ -1665,7 +1684,7 @@ class PurchaseInvoiceImportService
                 'cantbonif', 'qtybonus', 'freeqty', 'bonificados',
             ],
             'unit_cost' => [
-                'costo_unitario', 'precio_unitario', 'valor_unitario', 'vr_unitario',
+                'costo_factura', 'costofactura', 'costo_unitario', 'precio_unitario', 'valor_unitario', 'vr_unitario',
                 'valorunitario', 'vrunitario', 'costounitario', 'preciounitario',
                 'unit_cost', 'unitprice', 'unit_price', 'punit', 'vu', 'vunitario', 'costo',
                 'precio', 'price', 'pricenet', 'netprice', 'unitcost',
@@ -1683,6 +1702,7 @@ class PurchaseInvoiceImportService
             'lot_code' => ['lote', 'lot', 'lot_code', 'codigo_lote'],
             'expiry_date' => ['vencimiento', 'vence', 'expiry', 'expiry_date', 'fecha_vencimiento', 'caducidad'],
             'sale_price' => ['precio_venta', 'pvp', 'sale_price', 'precioventa'],
+            'inventory_cost' => ['costo_inventario', 'costoinventario', 'inventory_cost', 'costo_inv', 'costoinv'],
         ];
 
         // Emparejar por longitud de alias (exacto primero) para que "valortotal"
@@ -1719,6 +1739,9 @@ class PurchaseInvoiceImportService
                         continue;
                     }
                     if ($clave === 'unit_cost' && (str_contains($normalizado, 'total') || str_contains($normalizado, 'importe'))) {
+                        continue;
+                    }
+                    if ($clave === 'unit_cost' && str_contains($normalizado, 'inventario')) {
                         continue;
                     }
                     if ($clave === 'line_total' && (str_contains($normalizado, 'unit') || str_contains($normalizado, 'unitario'))) {
@@ -2342,7 +2365,8 @@ class PurchaseInvoiceImportService
 
         $items = $this->query(
             "SELECT it.*, p.name matched_product_name, p.code matched_product_code,
-                    p.stock matched_stock, p.sale_price matched_sale_price, p.track_lots matched_track_lots
+                    p.stock matched_stock, p.sale_price matched_sale_price, p.track_lots matched_track_lots,
+                    p.purchase_price matched_purchase_price
              FROM purchase_invoice_import_items it
              LEFT JOIN products p ON p.id = it.matched_product_id
              WHERE it.import_id = ?
@@ -2454,6 +2478,22 @@ class PurchaseInvoiceImportService
                 $itemId,
                 $importId,
             ]);
+
+            if (array_key_exists('inventory_cost', $row)) {
+                $rawInv = trim((string)$row['inventory_cost']);
+                $invCost = $rawInv !== '' ? round(max(0, $this->toNumber($rawInv)), 2) : null;
+                if ($invCost !== null && $invCost <= 0.009) {
+                    $invCost = null;
+                }
+                try {
+                    $this->query(
+                        "UPDATE purchase_invoice_import_items SET inventory_cost = ? WHERE id = ? AND import_id = ?",
+                        [$invCost, $itemId, $importId]
+                    );
+                } catch (\Throwable $e) {
+                    // Columna aún no migrada.
+                }
+            }
         }
 
         $this->refreshTotals($importId);
@@ -2827,7 +2867,7 @@ class PurchaseInvoiceImportService
         // (la factura puede ser parcial). Solo se completan qty/costo de coincidencias.
         $invoiceHasLines = false;
         foreach ($data['items'] as $it) {
-            if (($it['row_action'] ?? '') !== 'skip') {
+            if (($it['row_action'] ?? '') !== 'skip' || ($it['match_type'] ?? '') !== 'purchase_order') {
                 $invoiceHasLines = true;
                 break;
             }
@@ -3487,7 +3527,7 @@ class PurchaseInvoiceImportService
     /**
      * @param array<string,mixed> $data
      * @param array<string,mixed> $import
-     * @return array{order_id:int,created_products:int,received_items:int,skipped:int,cash_note?:string,oc_kept_open?:bool,oc_remaining_qty?:int,source_order_id?:int}
+     * @return array{order_id:int,created_products:int,received_items:int,skipped:int,bill_only:int,cash_note?:string,oc_kept_open?:bool,oc_remaining_qty?:int,source_order_id?:int}
      */
     private function confirmBuildOrder(
         int $importId,
@@ -3516,8 +3556,12 @@ class PurchaseInvoiceImportService
         }
         $catalogDefaultTax = TaxService::defaultRate($this->db);
 
+        $sinInventario = 0;
         foreach ($data['items'] as $item) {
-            if (($item['row_action'] ?? '') === 'skip') {
+            // Omitir en línea solo-OC = pendiente de recepción parcial (no está en la factura).
+            // Omitir en línea de factura = se factura (total/CxP) pero no entra a inventario ni crea producto.
+            $billOnly = ($item['row_action'] ?? '') === 'skip';
+            if ($billOnly && ($item['match_type'] ?? '') === 'purchase_order') {
                 $omitidos++;
                 continue;
             }
@@ -3538,6 +3582,18 @@ class PurchaseInvoiceImportService
             if ($cantidad <= 0) {
                 $sinCantidad++;
                 $omitidos++;
+                continue;
+            }
+
+            if ($billOnly) {
+                $lineaSinStock = $this->buildBillOnlyLine($item, $cantidadFloat, $vatInCost, $isCustomVat);
+                if ($lineaSinStock === null) {
+                    $sinCantidad++;
+                    $omitidos++;
+                    continue;
+                }
+                $lineas[] = $lineaSinStock;
+                $sinInventario++;
                 continue;
             }
 
@@ -3570,11 +3626,15 @@ class PurchaseInvoiceImportService
                 ? $catalogDefaultTax
                 : TaxService::normalizeRate((float)($item['tax_rate'] ?? 0));
 
+            // Costo factura → OC / CxP / asiento. Costo inventario → kardex y promedio del producto.
+            $costoInventario = round(max(0, (float)($item['inventory_cost'] ?? 0)), 2);
+
             $lineas[] = [
                 'product_id' => $productoId,
                 'product_name' => (string)$item['description'],
                 'quantity' => $cantidad,
                 'unit_cost' => $costo,
+                'inventory_cost' => $costoInventario > 0.009 ? $costoInventario : null,
                 'tax_rate' => $lineTax,
                 'catalog_tax_rate' => $catalogTax,
                 'vat_in_cost' => $vatInCost,
@@ -3614,7 +3674,7 @@ class PurchaseInvoiceImportService
             throw new \RuntimeException(
                 'No hay líneas válidas para ingresar al inventario.'
                 . $detalle
-                . ' En Revisar, complete Cant. y Costo u. (o Total) en cada línea antes de confirmar.'
+                . ' En Revisar, complete Cant. y Costo factura (o Total) en cada línea antes de confirmar.'
             );
         }
 
@@ -3712,7 +3772,7 @@ class PurchaseInvoiceImportService
                 );
                 $sourceRemain = $purchasing->deductOpenOrderQuantities(
                     $linkedOrderId,
-                    $lineas,
+                    array_values(array_filter($lineas, static fn($ln) => empty($ln['no_stock']))),
                     'Recepción parcial por factura importada #' . $importId
                 );
             } else {
@@ -3831,7 +3891,7 @@ class PurchaseInvoiceImportService
 
         // El ingreso usa WAC; si el precio de la factura cambió respecto al catálogo,
         // el costo de compra del inventario debe quedar en el de la factura confirmada.
-        $this->applyInvoiceCostsToCatalog($lineas);
+        $this->applyInvoiceCostsToCatalog($lineas, $orderId);
 
         $accountingOk = true;
         try {
@@ -3881,8 +3941,9 @@ class PurchaseInvoiceImportService
         return [
             'order_id' => $orderId,
             'created_products' => $creados,
-            'received_items' => count($lineas),
+            'received_items' => count($lineas) - $sinInventario,
             'skipped' => $omitidos,
+            'bill_only' => $sinInventario,
             'cash_note' => $cashNote,
             'accounting_ok' => $accountingOk,
             'accounting_note' => $accountingOk
@@ -3906,13 +3967,76 @@ class PurchaseInvoiceImportService
      *
      * @param array<int,array<string,mixed>> $lineas
      */
-    private function applyInvoiceCostsToCatalog(array $lineas): void
+    /**
+     * Línea facturada sin inventario (muestra, compra externa): entra a la OC sin producto,
+     * así la recepción no mueve stock pero el total, el IVA y la CxP sí la incluyen.
+     *
+     * @param array<string,mixed> $item línea ya normalizada (quantity/unit_cost/tax_rate/discount_pct/line_total)
+     * @return array<string,mixed>|null null si la línea no tiene valor que facturar
+     */
+    private function buildBillOnlyLine(array $item, float $cantidadFloat, bool $vatInCost, bool $isCustomVat): ?array
+    {
+        $descuento = max(0.0, min(100.0, (float)($item['discount_pct'] ?? 0)));
+        $taxRate = ($vatInCost || $isCustomVat) ? 0.0 : max(0.0, (float)($item['tax_rate'] ?? 0));
+        $base = round($cantidadFloat * max(0.0, (float)($item['unit_cost'] ?? 0)) * (1 - $descuento / 100), 2);
+        $lineTotal = (float)($item['line_total'] ?? 0);
+        if ($base <= 0.009 && $lineTotal > 0) {
+            $base = $taxRate > 0.009 ? round($lineTotal / (1 + $taxRate / 100), 2) : round($lineTotal, 2);
+        }
+        if ($base <= 0.009) {
+            return null;
+        }
+
+        // Cantidad entera si el costo cuadra exacto; si no, 1 × base para no alterar el total facturado.
+        $cantidad = (int)round($cantidadFloat);
+        $costo = $base;
+        if ($cantidad >= 1 && abs($cantidadFloat - $cantidad) < 0.0005) {
+            $costo = round($base / $cantidad, 2);
+            if (abs(round($costo * $cantidad, 2) - $base) > 0.009) {
+                $cantidad = 1;
+                $costo = $base;
+            }
+        } else {
+            $cantidad = 1;
+        }
+
+        $name = trim((string)($item['description'] ?? ''));
+        if ($name === '') {
+            $name = trim((string)($item['matched_product_name'] ?? ''));
+        }
+        $name = '[Sin inventario] ' . ($name !== '' ? $name : 'Ítem facturado');
+        $name = function_exists('mb_substr') ? mb_substr($name, 0, 255) : substr($name, 0, 255);
+
+        return [
+            'product_id' => null,
+            'product_name' => $name,
+            'quantity' => $cantidad,
+            'unit_cost' => $costo,
+            'tax_rate' => $taxRate,
+            'catalog_tax_rate' => 0.0,
+            'vat_in_cost' => $vatInCost,
+            'lot_code' => '',
+            'expiry_date' => null,
+            'barcode' => null,
+            'product_code' => substr(trim((string)($item['supplier_sku'] ?? '')), 0, 255) ?: null,
+            'no_stock' => true,
+        ];
+    }
+
+    private function applyInvoiceCostsToCatalog(array $lineas, int $orderId = 0): void
     {
         foreach ($lineas as $ln) {
             $pid = (int)($ln['product_id'] ?? 0);
             $cost = round((float)($ln['unit_cost'] ?? 0), 2);
             if ($pid <= 0) {
                 continue;
+            }
+            $prevCost = null;
+            try {
+                $prevRow = $this->query("SELECT purchase_price FROM products WHERE id = ? LIMIT 1", [$pid])->fetch();
+                $prevCost = $prevRow ? round((float)$prevRow['purchase_price'], 2) : null;
+            } catch (\Throwable $e) {
+                $prevCost = null;
             }
             $vatInCost = !empty($ln['vat_in_cost']);
             $catalogTax = isset($ln['catalog_tax_rate'])
@@ -3926,6 +4050,11 @@ class PurchaseInvoiceImportService
             } elseif (!$vatInCost && $catalogTax > 0.009 && $cost > 0) {
                 $purchasePrice = round($cost * (1 + $catalogTax / 100), 2);
             }
+            // «Costo inventario» de la revisión fija el precio de costo del producto.
+            $inventoryCost = round(max(0, (float)($ln['inventory_cost'] ?? 0)), 2);
+            if ($inventoryCost > 0.009) {
+                $purchasePrice = $inventoryCost;
+            }
             if ($purchasePrice > 0) {
                 $this->query(
                     "UPDATE products
@@ -3933,6 +4062,9 @@ class PurchaseInvoiceImportService
                      WHERE id = ? AND COALESCE(product_type, 'product') = 'product'",
                     [$purchasePrice, $catalogTax, $pid]
                 );
+                if ($orderId > 0) {
+                    ProductCostHistory::setPurchaseResult($this->db, $pid, $orderId, $prevCost, $purchasePrice);
+                }
             } else {
                 $this->query(
                     "UPDATE products
@@ -3972,6 +4104,10 @@ class PurchaseInvoiceImportService
         $purchasePrice = $vatInCost || $taxRate <= 0.009
             ? $costo
             : round($costo * (1 + $taxRate / 100), 2);
+        $costoInventario = round(max(0, (float)($item['inventory_cost'] ?? 0)), 2);
+        if ($costoInventario > 0.009) {
+            $purchasePrice = $costoInventario;
+        }
         $precioVenta = !empty($item['sale_price']) && (float)$item['sale_price'] > 0
             ? round((float)$item['sale_price'], 2)
             : round($purchasePrice * (1 + $this->defaultMarginPct() / 100), 2);
@@ -4138,6 +4274,7 @@ class PurchaseInvoiceImportService
         $gift['line_total'] = 0.0;
         $gift['tax_rate'] = 0.0;
         $gift['discount_pct'] = 0.0;
+        unset($gift['inventory_cost']);
         $gift['raw_line'] = trim((string)($fila['raw_line'] ?? '') . ' [Bonificación]');
         return [$fila, $gift];
     }
@@ -5046,19 +5183,19 @@ class PurchaseInvoiceImportService
                             it.line_total / NULLIF(1 + (it.tax_rate / 100), 0)
                         , 2))
                         FROM purchase_invoice_import_items it
-                        WHERE it.import_id = i.id AND it.row_action <> 'skip'
+                        WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
                      ), 0),
                      i.tax_total = COALESCE((
                         SELECT SUM(ROUND(
                             it.line_total - (it.line_total / NULLIF(1 + (it.tax_rate / 100), 0))
                         , 2))
                         FROM purchase_invoice_import_items it
-                        WHERE it.import_id = i.id AND it.row_action <> 'skip'
+                        WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
                      ), 0),
                      i.total = COALESCE((
                         SELECT SUM(it.line_total)
                         FROM purchase_invoice_import_items it
-                        WHERE it.import_id = i.id AND it.row_action <> 'skip'
+                        WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
                      ), 0)
                  WHERE i.id = ?",
                 [$importId]
@@ -5074,14 +5211,14 @@ class PurchaseInvoiceImportService
                  SET i.subtotal = COALESCE((
                         SELECT SUM(ROUND(it.quantity * it.unit_cost * (1 - it.discount_pct / 100), 2))
                         FROM purchase_invoice_import_items it
-                        WHERE it.import_id = i.id AND it.row_action <> 'skip'
+                        WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
                      ), 0),
                      i.tax_total = ?,
                      i.total = ROUND(
                         COALESCE((
                             SELECT SUM(ROUND(it.quantity * it.unit_cost * (1 - it.discount_pct / 100), 2))
                             FROM purchase_invoice_import_items it
-                            WHERE it.import_id = i.id AND it.row_action <> 'skip'
+                            WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
                          ), 0) + ?, 2)
                  WHERE i.id = ?",
                 [$override, $override, $importId]
@@ -5095,17 +5232,17 @@ class PurchaseInvoiceImportService
              SET i.subtotal = COALESCE((
                     SELECT SUM(ROUND(it.quantity * it.unit_cost * (1 - it.discount_pct / 100), 2))
                     FROM purchase_invoice_import_items it
-                    WHERE it.import_id = i.id AND it.row_action <> 'skip'
+                    WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
                  ), 0),
                  i.tax_total = COALESCE((
                     SELECT SUM(ROUND(it.quantity * it.unit_cost * (1 - it.discount_pct / 100) * (it.tax_rate / 100), 2))
                     FROM purchase_invoice_import_items it
-                    WHERE it.import_id = i.id AND it.row_action <> 'skip'
+                    WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
                  ), 0),
                  i.total = COALESCE((
                     SELECT SUM(it.line_total)
                     FROM purchase_invoice_import_items it
-                    WHERE it.import_id = i.id AND it.row_action <> 'skip'
+                    WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
                  ), 0)
              WHERE i.id = ?",
             [$importId]

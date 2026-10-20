@@ -9,7 +9,7 @@ $totals = $totals ?? ['incomes'=>0,'expenses'=>0,'balance'=>0];
 $historySessions = $historySessions ?? [];
 $currency = $currency ?? ['symbol'=>'$','name'=>'Peso','decimals'=>0];
 $isPosRole = $isPosRole ?? \SoftNova\Core\TenantMiddleware::isPosRole();
-$isAdminViewer = $isAdminViewer ?? (\SoftNova\Core\TenantMiddleware::getRole() === 'admin');
+$isAdminViewer = $isAdminViewer ?? \SoftNova\Core\TenantMiddleware::isManagement();
 $openSessionsCount = (int)($openSessionsCount ?? ($openSession ? 1 : 0));
 $stockAlert = $stockAlert ?? ['count' => 0, 'negative_count' => 0, 'loan_count' => 0, 'loan_received_count' => 0, 'sale_debt_count' => 0, 'summary_lines' => []];
 $needBarcode = true;
@@ -170,7 +170,11 @@ if (!$isPosRole) {
     <?php if (!empty($canLoanFromCaja)): ?>
     <button type="button" class="btn btn-secondary neumorphic-btn" onclick="openCajaLoanModal()" title="Registrar salida por préstamo">+ Préstamo</button>
     <?php endif; ?>
-    <?php if (!$isPosRole || \SoftNova\Core\TenantMiddleware::canDo('edit', 'caja')): ?>
+    <?php if (empty($canManageCashSession)): ?>
+    <span class="badge badge-info" style="font-size:12px;" title="Solo quien abrió la caja, el administrador o Gerencia pueden cerrarla">
+        Cierre: <?php echo htmlspecialchars((string)$openSession['user_name']); ?>
+    </span>
+    <?php elseif (!$isPosRole || \SoftNova\Core\TenantMiddleware::canDo('edit', 'caja')): ?>
     <button type="button" onclick="openCloseCashModal()" class="btn btn-danger"
             data-balance="<?php echo htmlspecialchars((string)round((float)($totals['expected_cash'] ?? $totals['balance'] ?? 0), 2)); ?>"
             data-opening="<?php echo htmlspecialchars(fmt($openSession['opening_amount'], $currency)); ?>"
@@ -357,13 +361,20 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                 </div>
                 <div class="form-group" id="posTermsGroup" style="margin:0;min-width:120px;display:none;">
                     <label style="font-size:12px;">Plazo</label>
-                    <select id="posPaymentTerms" class="form-control">
-                        <option value="net_15">15 días</option>
-                        <option value="net_30" selected>30 días</option>
-                        <option value="net_60">60 días</option>
-                        <option value="net_90">90 días</option>
-                        <option value="net_120">120 días</option>
-                        <option value="overdue">Vencido</option>
+                    <select id="posPaymentTerms" class="form-control" data-custom-other="credit_term">
+                        <?php
+                        try {
+                            echo (new \SoftNova\Services\CustomOptionService(\SoftNova\Core\TenantMiddleware::getDb()))
+                                ->optionsHtml(\SoftNova\Services\CustomOptionService::GROUP_CREDIT_TERM, 'net_30', true);
+                        } catch (\Throwable $e) {
+                            echo '<option value="net_15">15 días</option>'
+                                . '<option value="net_30" selected>30 días</option>'
+                                . '<option value="net_60">60 días</option>'
+                                . '<option value="net_90">90 días</option>'
+                                . '<option value="net_120">120 días</option>'
+                                . '<option value="overdue">Vencido</option>';
+                        }
+                        ?>
                     </select>
                 </div>
                 <div class="form-group" id="posInitialGroup" style="margin:0;min-width:110px;display:none;">
@@ -386,6 +397,10 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                 </label>
                 <button type="button" class="btn btn-success" id="posConfirmPay" disabled>Cobrar ahora</button>
                 <button type="button" class="btn btn-secondary" id="posCancelPay">Cancelar</button>
+            </div>
+            <div class="form-group" style="margin:8px 0 0;width:100%;">
+                <label style="font-size:12px;" for="posSaleNotes">Observación / nota <span class="field-tip" data-tip="Queda guardada en la venta y aparece en Ventas y en el reporte de cierre de caja.">?</span></label>
+                <input type="text" id="posSaleNotes" class="form-control" maxlength="255" placeholder="Ej: mesa 3, entrega mañana, referencia…" autocomplete="off">
             </div>
             <div id="posMixedPayWrap" class="pos-mixed-wrap" style="display:none;">
                 <div id="posMixedRows" class="pos-mixed-rows"></div>
@@ -624,19 +639,44 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
         <?php else: ?>
             <div class="table-container"><table>
                 <thead><tr>
-                    <th>Factura</th><th>Cliente</th><?php if ($isAdminViewer): ?><th>Usuario</th><?php endif; ?><th>Fecha</th><th>Total</th><th>Pagado</th><th>Pago</th><th>NC</th><th>Estado</th><th>Acciones</th>
+                    <th>Factura</th><th>Cliente</th><th>Usuario</th><th>Fecha</th><th>Total</th><th>Pagado</th><th>Pago</th><th>NC</th><th>Estado</th><th>Acciones</th>
                 </tr></thead>
                 <tbody>
                 <?php foreach ($todaySales as $sale): ?>
-                    <tr>
-                        <td><strong><?php echo htmlspecialchars($sale['invoice_number']); ?></strong></td>
+                    <?php
+                    $cajaNcTot = round((float)($sale['credit_note_total'] ?? 0), 2);
+                    $cajaSaleTot = round((float)($sale['total'] ?? 0), 2);
+                    $cajaNcFull = $cajaNcTot > 0.009 && $cajaNcTot >= ($cajaSaleTot - 0.02);
+                    $cajaNcTip = trim((string)($sale['credit_note_numbers'] ?? ''));
+                    if ($cajaNcTip === '' && $cajaNcTot > 0.009) {
+                        $cajaNcTip = 'Nota(s) de crédito';
+                    }
+                    $cajaSaleObs = \SoftNova\Services\SalesDocumentService::displayNotes((string)($sale['notes'] ?? ''));
+                    ?>
+                    <tr<?php echo $cajaNcFull ? ' style="opacity:0.85;"' : ''; ?>>
+                        <td>
+                            <strong><?php echo htmlspecialchars($sale['invoice_number']); ?></strong>
+                            <?php if ($cajaNcFull): ?>
+                                <div><span class="badge badge-warning" title="<?php echo htmlspecialchars($cajaNcTip); ?>">Devuelta</span></div>
+                            <?php elseif ($cajaNcTot > 0.009): ?>
+                                <div><span class="badge badge-info" title="<?php echo htmlspecialchars($cajaNcTip); ?>">Con NC</span></div>
+                            <?php endif; ?>
+                            <?php if ($cajaSaleObs !== ''): ?>
+                                <div style="font-size:11px;color:var(--color-text-secondary);margin-top:2px;max-width:200px;" title="<?php echo htmlspecialchars($cajaSaleObs); ?>">
+                                    <?php echo htmlspecialchars(mb_strlen($cajaSaleObs) > 70 ? mb_substr($cajaSaleObs, 0, 67) . '…' : $cajaSaleObs); ?>
+                                </div>
+                            <?php endif; ?>
+                        </td>
                         <td><?php echo htmlspecialchars($sale['customer_name'] ?? 'Cliente Final'); ?></td>
-                        <?php if ($isAdminViewer): ?>
                         <td><?php echo htmlspecialchars((string)($sale['user_name'] ?? '—')); ?></td>
-                        <?php endif; ?>
                         <td><?php echo date('d/m/Y H:i', strtotime($sale['sale_date'])); ?></td>
-                        <td style="font-weight:600;"><?php echo fmt((float)$sale['total'], $currency); ?></td>
-                        <td><?php echo ($sale['payment_status'] ?? '') === 'paid' ? fmt((float)$sale['total'], $currency) : fmt((float)($sale['paid_amount'] ?? 0), $currency); ?></td>
+                        <td style="font-weight:600;">
+                            <?php echo fmt($cajaSaleTot, $currency); ?>
+                            <?php if ($cajaNcTot > 0.009): ?>
+                                <div style="font-size:11px;color:var(--color-text-secondary);">Neto <?php echo fmt(max(0, $cajaSaleTot - $cajaNcTot), $currency); ?></div>
+                            <?php endif; ?>
+                        </td>
+                        <td><?php echo ($sale['payment_status'] ?? '') === 'paid' ? fmt($cajaSaleTot, $currency) : fmt((float)($sale['paid_amount'] ?? 0), $currency); ?></td>
                         <td>
                             <span class="badge <?php
                                 $pm = (string)($sale['payment_method'] ?? '');
@@ -646,12 +686,12 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                             </span>
                         </td>
                         <td>
-                            <?php if ((float)($sale['credit_note_total'] ?? 0) > 0.009): ?>
-                                <span class="badge badge-warning" title="<?php echo htmlspecialchars((string)($sale['credit_note_numbers'] ?? 'Nota crédito')); ?>">
-                                    NC <?php echo fmt((float)$sale['credit_note_total'], $currency); ?>
+                            <?php if ($cajaNcTot > 0.009): ?>
+                                <span class="badge badge-warning" title="<?php echo htmlspecialchars($cajaNcTip); ?>">
+                                    NC <?php echo fmt($cajaNcTot, $currency); ?>
                                 </span>
-                                <?php if (!empty($sale['credit_note_numbers'])): ?>
-                                    <div style="font-size:11px;color:var(--color-text-secondary);"><?php echo htmlspecialchars((string)$sale['credit_note_numbers']); ?></div>
+                                <?php if ($cajaNcTip !== ''): ?>
+                                    <div style="font-size:11px;color:var(--color-text-secondary);"><?php echo htmlspecialchars($cajaNcTip); ?></div>
                                 <?php endif; ?>
                             <?php else: ?>
                                 <span style="color:var(--color-text-secondary);">—</span>
@@ -660,6 +700,8 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                         <td>
                             <?php if (($sale['status'] ?? '') === 'cancelled'): ?>
                                 <span class="badge badge-danger">Cancelado</span>
+                            <?php elseif ($cajaNcFull): ?>
+                                <span class="badge badge-warning">Devuelta</span>
                             <?php elseif (($sale['payment_status'] ?? '') === 'paid'): ?>
                                 <span class="badge badge-success">Pagado</span>
                             <?php elseif (($sale['payment_status'] ?? '') === 'partial'): ?>
@@ -680,7 +722,7 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                                 </button>
                             <?php endif; ?>
                             <?php if (in_array($sale['payment_status'] ?? '', ['pending', 'partial'], true) && ($sale['status'] ?? '') !== 'cancelled'): ?>
-                                <button type="button" onclick="openPaymentModal(<?php echo (int)$sale['id']; ?>,<?php echo (float)$sale['total']; ?>,<?php echo (float)($sale['paid_amount'] ?? 0); ?>)" class="btn btn-sm btn-success" title="Registrar abono"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></button>
+                                <button type="button" onclick="openPaymentModal(<?php echo (int)$sale['id']; ?>,<?php echo (float)$sale['total']; ?>,<?php echo (float)($sale['paid_amount'] ?? 0); ?>,<?php echo (float)($sale['credit_note_total'] ?? 0); ?>)" class="btn btn-sm btn-success" title="Registrar abono"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></button>
                             <?php endif; ?>
                             <?php if ($canDeleteSale && ($sale['status'] ?? '') !== 'cancelled'): ?>
                                 <button type="button" class="btn btn-sm btn-danger" title="Eliminar venta"
@@ -742,7 +784,13 @@ foreach ($payBreakDashboard as $pbRow) {
     <p style="margin:12px 0 0;font-size:12px;color:var(--color-text-secondary);">
         En cajón = base <?php echo fmt((float)$openSession['opening_amount'], $currency); ?>
         + efectivo ventas <?php echo fmt((float)($totals['cash_sales'] ?? 0), $currency); ?>
+        <?php if ((float)($totals['other_cash_incomes'] ?? 0) > 0.009): ?>
+        + otros ingresos <?php echo fmt((float)$totals['other_cash_incomes'], $currency); ?>
+        <?php endif; ?>
         − egresos <?php echo fmt((float)$totals['expenses'], $currency); ?>
+        <?php if ((float)($totals['purchases_cash'] ?? 0) > 0.009): ?>
+        (incluye compras OC/proveedores <?php echo fmt((float)$totals['purchases_cash'], $currency); ?>)
+        <?php endif; ?>
         → <strong style="color:#10B981;"><?php echo fmt((float)$totals['expected_cash'], $currency); ?></strong>
         — los demás medios no van al cajón físico.
     </p>
@@ -2016,7 +2064,10 @@ $cajaBase = $viewInstance->route('app/caja');
             var pays = d.payments || [];
             var canMargin = !!d.can_view_margin;
             var enCajaHint = (dr.expenses || 0) > 0.009
-                ? 'Base de caja + efectivo de ventas − gastos'
+                ? 'Base de caja + efectivo de ventas − '
+                    + (((dr.purchases || 0) > 0.009 || (dr.nc_cash_refunds || 0) > 0.009)
+                        ? 'compras, NC y gastos'
+                        : 'gastos')
                 : 'Base de caja + efectivo de ventas';
 
             var kpi = function(label, value, bg, extra) {
@@ -2046,10 +2097,37 @@ $cajaBase = $viewInstance->route('app/caja');
             if ((sa.discount || 0) > 0.009) {
                 accountHtml += row('Descuentos', 'i', cajaEsc(sa.discount_fmt), '', 'color:var(--dmc-B45309, #B45309);');
             }
-            if ((dr.other_cash || 0) > 0.009) {
-                accountHtml += row('Otros ingresos efectivo', '+', cajaEsc(dr.other_cash_fmt), '', 'color:var(--dmc-059669, #059669);');
+            var refunds = dr.refunds || 0;
+            var purchases = dr.purchases || 0;
+            var ncCash = dr.nc_cash_refunds || 0;
+            if (refunds > 0.009) {
+                accountHtml += row('Reintegro compras anuladas', '+', cajaEsc(dr.refunds_fmt), '', 'color:var(--dmc-059669, #059669);');
             }
-            accountHtml += row('Gastos efectivo (cajón)', '-', cajaEsc(dr.expenses_fmt), '', 'color:var(--dmc-DC2626, #DC2626);');
+            if ((dr.other_cash || 0) - refunds > 0.009) {
+                accountHtml += row('Otros ingresos efectivo', '+', cajaEsc(refunds > 0.009 ? dr.other_cash_net_fmt : dr.other_cash_fmt), '', 'color:var(--dmc-059669, #059669);');
+            }
+            if (purchases > 0.009) {
+                accountHtml += row('Compras a proveedores (OC / abonos efectivo)', '-', cajaEsc(dr.purchases_fmt), '', 'color:var(--dmc-DC2626, #DC2626);');
+            }
+            if (ncCash > 0.009 || (sa.nc_count || 0) > 0) {
+                var ncLabel = 'Reembolsos NC venta'
+                    + ((sa.nc_count || 0) > 0 ? ' (' + sa.nc_count + ')' : '');
+                if (sa.nc_numbers) {
+                    ncLabel += '<br><span style="font-weight:500;font-size:10px;opacity:.85;">' + cajaEsc(sa.nc_numbers) + '</span>';
+                }
+                if ((sa.nc_total || 0) > 0.009 && Math.abs((sa.nc_total || 0) - ncCash) > 0.02) {
+                    ncLabel += '<br><span style="font-weight:500;font-size:10px;opacity:.85;">Total NC documental '
+                        + cajaEsc(sa.nc_total_fmt) + '</span>';
+                }
+                accountHtml += row(ncLabel, '-', cajaEsc(dr.nc_cash_refunds_fmt || '0'), '#FFF7ED', 'color:#C2410C;');
+            }
+            accountHtml += row(
+                'Gastos efectivo (cajón)',
+                '-',
+                cajaEsc((purchases > 0.009 || ncCash > 0.009) ? dr.other_expenses_fmt : dr.expenses_fmt),
+                '',
+                'color:var(--dmc-DC2626, #DC2626);'
+            );
             accountHtml += row(
                 '= En caja (esperado)<br><span style="font-weight:500;font-size:10px;opacity:.9;">' + cajaEsc(enCajaHint) + '</span>',
                 '=',
@@ -2088,9 +2166,40 @@ $cajaBase = $viewInstance->route('app/caja');
                     + 'Utilidad = facturado − costo (sin restar egresos de caja).</p></div>';
             }
 
+            var byUser = d.by_user || [];
+            var movs = d.movements || [];
+            var userHtml = '';
+            if (byUser.length) {
+                userHtml = '<div style="border:1px solid var(--color-border,#e5e7eb);border-radius:8px;overflow:hidden;margin-bottom:14px;">'
+                    + '<div style="padding:8px 10px;background:var(--bg-body,#f8fafc);font-weight:700;font-size:13px;">Por usuario (caja única)</div>';
+                byUser.forEach(function(u) {
+                    userHtml += '<div style="display:flex;justify-content:space-between;gap:8px;padding:7px 10px;border-bottom:1px solid var(--color-border,#e5e7eb);font-size:12px;">'
+                        + '<span><strong>' + cajaEsc(u.user_name) + '</strong> · ' + (u.count || 0) + ' mov.</span>'
+                        + '<span style="text-align:right;">+ ' + cajaEsc(u.incomes_fmt) + ' · − ' + cajaEsc(u.expenses_fmt)
+                        + '<br><strong>Neto ' + cajaEsc(u.net_fmt) + '</strong></span></div>';
+                });
+                userHtml += '</div>';
+            }
+            var movHtml = '';
+            if (movs.length) {
+                movHtml = '<div style="border:1px solid var(--color-border,#e5e7eb);border-radius:8px;overflow:hidden;margin-bottom:14px;">'
+                    + '<div style="padding:8px 10px;background:var(--bg-body,#f8fafc);font-weight:700;font-size:13px;">Movimientos — quién hizo qué</div>'
+                    + '<div style="max-height:320px;overflow:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;">'
+                    + '<thead><tr><th style="text-align:left;padding:6px 8px;">Hora</th><th style="text-align:left;padding:6px 8px;">Usuario</th><th style="text-align:left;padding:6px 8px;">Tipo</th><th style="text-align:left;padding:6px 8px;">Descripción</th><th style="text-align:right;padding:6px 8px;">Monto</th></tr></thead><tbody>';
+                movs.forEach(function(m) {
+                    movHtml += '<tr style="border-top:1px solid var(--color-border,#e5e7eb);">'
+                        + '<td style="padding:5px 8px;">' + cajaEsc(m.time) + '</td>'
+                        + '<td style="padding:5px 8px;"><strong>' + cajaEsc(m.user_name) + '</strong></td>'
+                        + '<td style="padding:5px 8px;">' + cajaEsc(m.type_label) + '</td>'
+                        + '<td style="padding:5px 8px;">' + cajaEsc(m.description) + '</td>'
+                        + '<td style="padding:5px 8px;text-align:right;"><strong>' + cajaEsc(m.amount_fmt) + '</strong></td></tr>';
+                });
+                movHtml += '</tbody></table></div></div>';
+            }
+
             if (body) {
                 body.innerHTML = '<p style="margin:0 0 12px;font-size:13px;color:var(--color-text-secondary);">'
-                    + cajaEsc(d.user_name) + ' · ' + cajaEsc(d.opening_date) + ' → ' + cajaEsc(d.closing_date) + '</p>'
+                    + 'Abierta por ' + cajaEsc(d.user_name) + ' · ' + cajaEsc(d.opening_date) + ' → ' + cajaEsc(d.closing_date) + '</p>'
                     + kpi('FACTURADO + BASE', cajaEsc(sa.ventas_totales_con_base_fmt || sa.total_fmt), '#2563EB',
                         ' <span style="font-weight:500;font-size:11px;opacity:.9;">ventas del día + apertura</span>')
                     + marginToggle
@@ -2102,7 +2211,9 @@ $cajaBase = $viewInstance->route('app/caja');
                     + '. El facturado no incluye facturas viejas cobradas hoy; esos abonos sí entran en Σ medios.</p>'
                     + '<div style="border:1px solid var(--color-border,#e5e7eb);border-radius:8px;overflow:hidden;margin-bottom:14px;">'
                     + '<div style="padding:8px 10px;background:var(--bg-body,#f8fafc);font-weight:700;font-size:13px;">Cuentas del día</div>'
-                    + accountHtml + '</div>';
+                    + accountHtml + '</div>'
+                    + userHtml
+                    + movHtml;
             }
         })
         .catch(function() {

@@ -6,6 +6,7 @@ use SoftNova\Core\TenantController;
 use SoftNova\Core\TenantMiddleware;
 use SoftNova\Services\AccountingService;
 use SoftNova\Services\Integrations\IntegrationManager;
+use SoftNova\Services\PaymentMethodCatalog;
 
 class TenantContabilidadController extends TenantController
 {
@@ -26,9 +27,10 @@ class TenantContabilidadController extends TenantController
             $redirect = match ($action) {
                 'save-integration', 'set-active-provider' => '/app/contabilidad?tab=integrations',
                 'save-account' => '/app/contabilidad?tab=accounts',
-                'save-commission-rates', 'save-commission-config', 'save-user-commission', 'settle-commissions' => '/app/contabilidad?tab=commissions',
+                'save-commission-rates', 'save-commission-config', 'save-user-commission', 'settle-commissions',
+                'recalc-commissions' => '/app/contabilidad?tab=commissions',
                 'period' => '/app/contabilidad?tab=periods',
-                'manual-entry' => '/app/contabilidad?tab=entries',
+                'manual-entry', 'void-entry' => '/app/contabilidad?tab=entries',
                 default => '/app/contabilidad',
             };
             if ($action === 'save-catalog-integration') {
@@ -44,11 +46,13 @@ class TenantContabilidadController extends TenantController
             }
             match ($action) {
                 'manual-entry' => $this->createManualEntry(),
+                'void-entry' => $this->voidManualEntry(),
                 'save-account' => $this->saveAccount(),
                 'save-commission-rates' => $this->saveCommissionRates(),
                 'save-commission-config' => $this->saveCommissionConfig(),
                 'save-user-commission' => $this->saveUserCommission(),
                 'settle-commissions' => $this->settleCommissions(),
+                'recalc-commissions' => $this->recalcCommissions(),
                 'period' => $this->updatePeriod(),
                 'sync' => $this->syncOperations(),
                 'save-integration' => $this->saveIntegration(),
@@ -155,17 +159,22 @@ class TenantContabilidadController extends TenantController
         $needsRecon = $tab === 'dashboard';
         $needsAccountAudit = in_array($tab, ['dashboard', 'accounts'], true);
         $needsEntries = in_array($tab, ['dashboard', 'entries'], true);
-        $needsLedger = $tab === 'ledger' && $accountId > 0;
+        $needsLedgerDetail = $tab === 'ledger' && $accountId > 0;
         $needsPeriods = in_array($tab, ['dashboard', 'periods'], true);
 
         $trialAccountType = trim((string)$this->request->get('account_type', ''));
         $trialQ = trim((string)$this->request->get('q', ''));
         $trialIncludeZero = (string)$this->request->get('include_zero', '') === '1';
+        $ledgerMode = trim((string)$this->request->get('ledger_mode', 'subaccounts'));
+        if (!in_array($ledgerMode, ['subaccounts', 'accounts', 'groups', 'classes'], true)) {
+            $ledgerMode = 'subaccounts';
+        }
         $balanceYear = (int)$this->request->get('year', 0);
         if ($balanceYear < 2000 || $balanceYear > 2100) {
             $balanceYear = (int)substr($from, 0, 4);
         }
-        $monthlyBalance = $tab === 'trial'
+        $trialView = (string)$this->request->get('view', '') === 'accounts' ? 'accounts' : 'operational';
+        $monthlyBalance = $tab === 'trial' && $trialView === 'operational'
             ? $this->accounting->monthlyOperationalBalance($balanceYear)
             : [
                 'year' => $balanceYear,
@@ -173,8 +182,13 @@ class TenantContabilidadController extends TenantController
                 'totals' => [],
                 'chart' => [],
             ];
-        $trialReport = $needsStatements
-            ? $this->accounting->trialBalance($from, $to, [
+        $accountsTrial = $tab === 'trial' && $trialView === 'accounts';
+        $trialReport = ($needsStatements || $accountsTrial)
+            ? $this->accounting->trialBalance($from, $to, $accountsTrial ? [
+                'account_type' => $trialAccountType,
+                'q' => $trialQ,
+                'include_zero' => $trialIncludeZero,
+            ] : [
                 'account_type' => '',
                 'q' => '',
                 'include_zero' => false,
@@ -198,11 +212,52 @@ class TenantContabilidadController extends TenantController
             'totals' => ['assets' => 0, 'liabilities' => 0, 'equity' => 0, 'revenue' => 0, 'expenses' => 0],
             'profit' => 0,
         ];
-        $ledgerReport = $needsLedger
-            ? $this->accounting->ledger($accountId, $from, $to)
+        $ledgerQ = trim((string)$this->request->get('lq', ''));
+        $generalLedger = $tab === 'ledger' && !$needsLedgerDetail
+            ? $this->accounting->generalLedger($from, $to, [
+                'account_type' => $trialAccountType,
+                'q' => $trialQ,
+                'include_zero' => $trialIncludeZero,
+                'mode' => $ledgerMode,
+            ])
+            : [
+                'rows' => [],
+                'totals' => [],
+                'balanced' => ['opening' => true, 'period' => true, 'closing' => true],
+                'from' => $from,
+                'to' => $to,
+                'mode' => $ledgerMode,
+                'mode_label' => '',
+            ];
+        $ledgerReport = $needsLedgerDetail
+            ? $this->accounting->ledger($accountId, $from, $to, $ledgerQ)
             : ['opening_balance' => 0.0, 'rows' => []];
         $ledger = $ledgerReport['rows'] ?? [];
         $ledgerOpening = (float)($ledgerReport['opening_balance'] ?? 0);
+        $withholdings = null;
+        if ($tab === 'withholdings') {
+            try {
+                $withholdings = $this->accounting->withholdingSummary($from, $to);
+            } catch (\Throwable $e) {
+                $withholdings = null;
+            }
+        }
+        $salesBook = null;
+        if ($tab === 'sales-book') {
+            try {
+                $salesBook = $this->accounting->salesIncomeBook($from, $to);
+            } catch (\Throwable $e) {
+                $salesBook = [
+                    'from' => $from,
+                    'to' => $to,
+                    'rows' => [],
+                    'totals' => [],
+                    'ledger' => [],
+                    'accounts' => ['sales' => '413501', 'returns' => '417501'],
+                    'warnings' => ['No se pudo calcular el libro de ventas: ' . $e->getMessage()],
+                ];
+            }
+        }
         $accountAudit = $needsAccountAudit ? $this->accounting->auditCriticalAccounts() : [];
         $reconciliation = $needsRecon ? $this->accounting->subledgerReconciliation() : [];
         $pendingQueue = $needsRecon ? $this->accounting->pendingQueueCount() : 0;
@@ -214,9 +269,11 @@ class TenantContabilidadController extends TenantController
         $commissionCfg = [];
         $commissionList = ['rows' => [], 'pending' => 0, 'paid' => 0, 'cancelled' => 0];
         $commissionUsers = [];
+        $commissionPending = ['count' => 0, 'amount' => 0.0, 'last_error' => ''];
         if ($tab === 'commissions') {
             $comm = new \SoftNova\Services\CommissionService($this->db);
             $commissionCfg = $comm->config();
+            $commissionPending = $comm->pendingGatewaySummary();
             $commissionUsers = $comm->userRates();
             $commissionList = $comm->list([
                 'from' => $from,
@@ -253,12 +310,19 @@ class TenantContabilidadController extends TenantController
             'trialReport' => $trialReport,
             'monthlyBalance' => $monthlyBalance,
             'balanceYear' => $balanceYear,
+            'trialView' => $trialView,
             'trialAccountType' => $trialAccountType,
             'trialQ' => $trialQ,
             'trialIncludeZero' => $trialIncludeZero,
             'statements' => $statements,
             'ledger' => $ledger,
             'ledgerOpening' => $ledgerOpening,
+            'ledgerReport' => $ledgerReport,
+            'ledgerQ' => $ledgerQ,
+            'ledgerMode' => $ledgerMode,
+            'generalLedger' => $generalLedger,
+            'withholdings' => $withholdings,
+            'salesBook' => $salesBook,
             'selectedAccountId' => $accountId,
             'periods' => $needsPeriods ? $this->accounting->periods() : [],
             'integrationStatuses' => $integrations->statuses(),
@@ -274,6 +338,7 @@ class TenantContabilidadController extends TenantController
             'pendingQueue' => $pendingQueue,
             'commissionCfg' => $commissionCfg,
             'commissionList' => $commissionList,
+            'commissionPending' => $commissionPending,
             'commissionUsers' => $commissionUsers,
             'vatBook' => $vatBook,
         ]));
@@ -330,11 +395,14 @@ class TenantContabilidadController extends TenantController
                 'seller_trigger' => $cfg['seller_trigger'],
                 'seller_auto_expense' => $cfg['seller_auto_expense'],
                 'gateway_auto' => $cfg['gateway_auto'],
-                'dataphone_rate' => $this->request->post('dataphone_commission_rate', $cfg['dataphone_rate']),
-                'card_rate' => $this->request->post('card_commission_rate', $cfg['card_rate']),
+                'dataphone_fixed_fee' => $cfg['dataphone_fixed_fee'],
                 'payment_link_rate' => $cfg['payment_link_rate'],
                 'debit_card_rate' => $cfg['debit_card_rate'],
                 'credit_card_rate' => $cfg['credit_card_rate'],
+                'credit_over_60_rate' => $cfg['credit_over_60_rate'],
+                'credit_over_60_days' => $cfg['credit_over_60_days'],
+                'credit_surcharge_tiers' => $cfg['credit_surcharge_tiers'],
+                'quantity_discount_tiers' => $cfg['quantity_discount_tiers'],
             ]);
             $this->respond(true, 'Tasas de pasarela actualizadas. Ver panel Comisiones para el resto.', '/app/contabilidad?tab=commissions');
         } catch (\Throwable $e) {
@@ -354,8 +422,7 @@ class TenantContabilidadController extends TenantController
                 'seller_trigger' => $this->request->post('seller_trigger', 'on_payment'),
                 'seller_auto_expense' => $this->request->post('seller_auto_expense', '0') === '1',
                 'gateway_auto' => $this->request->post('gateway_auto', '0') === '1',
-                'dataphone_rate' => $this->request->post('dataphone_rate', '2.5'),
-                'card_rate' => $this->request->post('card_rate', '2.8'),
+                'dataphone_fixed_fee' => $this->request->post('dataphone_fixed_fee', '0'),
                 'payment_link_rate' => $this->request->post('payment_link_rate', '2.5'),
                 'debit_card_rate' => $this->request->post('debit_card_rate', '1.5'),
                 'credit_card_rate' => $this->request->post('credit_card_rate', '2.8'),
@@ -365,6 +432,11 @@ class TenantContabilidadController extends TenantController
                 'credit_tier_rates' => $this->request->post('credit_tier_rates', []),
                 'qty_discount_qty' => $this->request->post('qty_discount_qty', []),
                 'qty_discount_rates' => $this->request->post('qty_discount_rates', []),
+                'gateway_vat_rate' => $this->request->post('gateway_vat_rate', '0'),
+                'gateway_vat_deductible' => $this->request->post('gateway_vat_deductible', '0') === '1',
+                'gateway_withholding_renta_rate' => $this->request->post('gateway_withholding_renta_rate', '0'),
+                'gateway_withholding_iva_rate' => $this->request->post('gateway_withholding_iva_rate', '0'),
+                'gateway_withholding_ica_rate' => $this->request->post('gateway_withholding_ica_rate', '0'),
             ]);
             $this->respond(true, 'Parámetros de comisiones guardados', '/app/contabilidad?tab=commissions');
         } catch (\Throwable $e) {
@@ -400,6 +472,39 @@ class TenantContabilidadController extends TenantController
             $this->respond(true, $n . ' comisión(es) liquidada(s)', '/app/contabilidad?tab=commissions');
         } catch (\Throwable $e) {
             $this->respond(false, $e->getMessage(), '/app/contabilidad?tab=commissions');
+        }
+    }
+
+    private function recalcCommissions(): void
+    {
+        TenantMiddleware::authorize('contabilidad', 'edit');
+        $from = $this->validDate((string)$this->request->post('from', date('Y-m-01')), date('Y-m-01'));
+        $to = $this->validDate((string)$this->request->post('to', date('Y-m-d')), date('Y-m-d'));
+        if ($from > $to) {
+            [$from, $to] = [$to, $from];
+        }
+        $back = '/app/contabilidad?tab=commissions&from=' . urlencode($from) . '&to=' . urlencode($to);
+        try {
+            $r = (new \SoftNova\Services\CommissionService($this->db))->backfillGateway($from, $to);
+            $parts = [];
+            if ($r['created'] > 0) {
+                $parts[] = $r['created'] . ' comisión(es) nuevas (' . $r['settled'] . ' con gasto y asiento)';
+            }
+            if ($r['retried'] > 0) {
+                $parts[] = $r['retried'] . ' pendiente(s) contabilizada(s)';
+            }
+            $message = $parts
+                ? 'Recalculo ' . $from . ' a ' . $to . ': ' . implode(', ', $parts)
+                : 'No había pagos con datáfono / link de pago sin comisión en el periodo';
+            if ($r['remaining']) {
+                $message .= '. Quedan más pagos: vuelve a ejecutar';
+            }
+            if ($r['errors'] > 0) {
+                $message .= '. ' . $r['errors'] . ' no se pudieron contabilizar (ver aviso en el panel)';
+            }
+            $this->respond($r['errors'] === 0, $message, $back);
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), $back);
         }
     }
 
@@ -487,7 +592,7 @@ class TenantContabilidadController extends TenantController
         $lineDescriptions = $this->request->post('line_description', []);
 
         if ($description === '' || !is_array($accountCodes)) {
-            $this->respond(false, 'Descripción y líneas contables son obligatorias', '/app/contabilidad');
+            $this->respond(false, 'Descripción y líneas contables son obligatorias', '/app/contabilidad?tab=entries');
             return;
         }
 
@@ -508,6 +613,7 @@ class TenantContabilidadController extends TenantController
         }
 
         try {
+            $this->accounting->assertPeriodOpen($date);
             $this->db->beginTransaction();
             $id = $this->accounting->postEntry($date, $description, $lines, 'manual', null, null);
             $this->db->commit();
@@ -516,6 +622,21 @@ class TenantContabilidadController extends TenantController
             if ($this->db->inTransaction()) {
                 $this->db->rollBack();
             }
+            $this->respond(false, $e->getMessage(), '/app/contabilidad?tab=entries');
+        }
+    }
+
+    private function voidManualEntry(): void
+    {
+        TenantMiddleware::authorize('contabilidad', 'delete');
+        $entryId = (int)$this->request->post('entry_id', 0);
+        try {
+            $reversalId = $this->accounting->voidManualEntry(
+                $entryId,
+                (string)$this->request->post('reason', '')
+            );
+            $this->respond(true, 'Comprobante anulado con asiento de reversión', '/app/contabilidad?tab=entries&entry_id=' . $reversalId);
+        } catch (\Throwable $e) {
             $this->respond(false, $e->getMessage(), '/app/contabilidad?tab=entries');
         }
     }
@@ -567,6 +688,7 @@ class TenantContabilidadController extends TenantController
             'sales' => 'ventas',
             'payments' => 'abonos de clientes',
             'expenses' => 'gastos',
+            'commissions' => 'comisiones de datáfono / link de pago',
             'purchases' => 'compras',
             'stock' => 'movimientos de inventario',
             'supplier_payments' => 'abonos a proveedores',
@@ -600,6 +722,10 @@ class TenantContabilidadController extends TenantController
             $this->json(['success' => false, 'message' => 'Comprobante no encontrado']);
             return;
         }
+        $entry['can_void'] = !empty($entry['is_manual'])
+            && ($entry['status'] ?? '') === 'posted'
+            && empty($entry['reversal_of_id'])
+            && TenantMiddleware::canDo('delete', 'contabilidad');
         $this->json(['success' => true, 'entry' => $entry]);
     }
 
@@ -665,6 +791,145 @@ class TenantContabilidadController extends TenantController
             return;
         }
 
+        if ($report === 'ledger' || $report === 'general-ledger') {
+            if ($from > $to) {
+                [$from, $to] = [$to, $from];
+            }
+            $accountId = (int)$this->request->get('account_id', 0);
+            if ($accountId <= 0 || $report === 'general-ledger') {
+                $mode = trim((string)$this->request->get('ledger_mode', 'subaccounts'));
+                $data = $this->accounting->generalLedger($from, $to, [
+                    'account_type' => trim((string)$this->request->get('account_type', '')),
+                    'q' => trim((string)$this->request->get('q', '')),
+                    'include_zero' => (string)$this->request->get('include_zero', '') === '1',
+                    'mode' => $mode,
+                ]);
+                $rows = [];
+                foreach ($data['rows'] as $row) {
+                    $rows[] = [
+                        $row['code'] ?? '',
+                        $row['name'] ?? '',
+                        $row['account_type_label'] ?? $row['account_type'] ?? '',
+                        $row['opening_debit'] ?? 0,
+                        $row['opening_credit'] ?? 0,
+                        $row['debit'] ?? 0,
+                        $row['credit'] ?? 0,
+                        $row['closing_debit'] ?? 0,
+                        $row['closing_credit'] ?? 0,
+                    ];
+                }
+                $t = $data['totals'] ?? [];
+                $rows[] = [
+                    '', 'TOTALES', '',
+                    $t['opening_debit'] ?? 0, $t['opening_credit'] ?? 0,
+                    $t['debit'] ?? 0, $t['credit'] ?? 0,
+                    $t['closing_debit'] ?? 0, $t['closing_credit'] ?? 0,
+                ];
+                $this->exportCsv(
+                    'libro_mayor_sintesis_' . $from . '_' . $to . '.csv',
+                    ['Código', 'Cuenta', 'Tipo', 'Si Debe', 'Si Haber', 'Debe', 'Haber', 'Sf Debe', 'Sf Haber'],
+                    $rows
+                );
+                return;
+            }
+            $data = $this->accounting->ledger($accountId, $from, $to, trim((string)$this->request->get('lq', '')));
+            $account = $data['account'] ?? null;
+            if (!$account) {
+                $this->respond(false, 'Seleccione una cuenta para exportar el libro mayor', '/app/contabilidad?tab=ledger');
+                return;
+            }
+            $sign = ($account['nature'] ?? 'debit') === 'credit' ? -1 : 1;
+            $running = (float)$data['opening_balance'];
+            $rows = [['', '', 'Saldo inicial', '', '', '', '', round($running * $sign, 2)]];
+            foreach ($data['rows'] as $line) {
+                $running += (float)$line['debit'] - (float)$line['credit'];
+                $rows[] = [
+                    $line['entry_date'],
+                    $line['entry_number'],
+                    $line['description'] ?: $line['entry_description'],
+                    AccountingService::sourceLabel($line['source_type'] ?? null),
+                    $line['third_party_name'] ?? '',
+                    $line['debit'],
+                    $line['credit'],
+                    $data['filtered'] ? '' : round($running * $sign, 2),
+                ];
+            }
+            $rows[] = [
+                '', '', 'Totales del periodo', '', '',
+                $data['period_debit'], $data['period_credit'],
+                round((float)$data['closing_balance'] * $sign, 2),
+            ];
+            $this->exportCsv(
+                'libro_mayor_' . $account['code'] . '_' . $from . '_' . $to . '.csv',
+                ['Fecha', 'Comprobante', 'Concepto', 'Origen', 'Tercero', 'Debe', 'Haber',
+                    'Saldo (' . ($sign < 0 ? 'naturaleza crédito' : 'naturaleza débito') . ')'],
+                $rows
+            );
+            return;
+        }
+
+        if ($report === 'withholdings') {
+            $wh = $this->accounting->withholdingSummary($from, $to);
+            $rows = [];
+            foreach (($wh['rows'] ?? []) as $w) {
+                $rows[] = [
+                    $w['label'] ?? '',
+                    $w['code'] ?? '',
+                    $w['rate'] ?? 0,
+                    $w['rate_unit'] ?? '',
+                    $w['opening'] ?? 0,
+                    $w['debit'] ?? 0,
+                    $w['credit'] ?? 0,
+                    $w['closing'] ?? 0,
+                    $w['expected_commissions'] ?? 0,
+                    $w['pending_commissions'] ?? 0,
+                    $w['commission_ledger'] ?? 0,
+                ];
+            }
+            $this->exportCsv(
+                'libro_retenciones_' . $from . '_' . $to . '.csv',
+                ['Tipo', 'Cuenta', 'Tarifa', 'Unidad', 'Saldo inicial', 'Debe', 'Haber', 'Saldo final',
+                    'Esperado comisiones', 'Pendiente comisiones', 'Libro por comisiones'],
+                $rows
+            );
+            return;
+        }
+
+        if ($report === 'sales-book') {
+            $book = $this->accounting->salesIncomeBook($from, $to);
+            $rows = [];
+            foreach (($book['rows'] ?? []) as $r) {
+                $rows[] = [
+                    $r['kind_label'] ?? '',
+                    substr((string)($r['date'] ?? ''), 0, 10),
+                    $r['number'] ?? '',
+                    $r['customer_document'] ?? '',
+                    $r['customer_name'] ?? '',
+                    PaymentMethodCatalog::label((string)($r['payment_method'] ?? '')),
+                    $r['subtotal'] ?? 0,
+                    $r['discount'] ?? 0,
+                    $r['tax'] ?? 0,
+                    $r['delivery'] ?? 0,
+                    $r['total'] ?? 0,
+                    $r['entry_number'] ?? '',
+                    $r['notes'] ?? '',
+                ];
+            }
+            $t = $book['totals'] ?? [];
+            $rows[] = [
+                'TOTALES', '', '', '', '', '',
+                $t['subtotal'] ?? 0, $t['discount'] ?? 0, $t['tax'] ?? 0,
+                $t['delivery'] ?? 0, $t['total'] ?? 0, '', '',
+            ];
+            $this->exportCsv(
+                'libro_ventas_ingresos_' . $from . '_' . $to . '.csv',
+                ['Tipo', 'Fecha', 'Número', 'NIT/Doc', 'Cliente', 'Medio pago',
+                    'Subtotal', 'Descuento', 'IVA', 'Domicilio', 'Total', 'Asiento', 'Observación'],
+                $rows
+            );
+            return;
+        }
+
         if ($report === 'journal') {
             $rows = [];
             foreach ($this->accounting->entries($from, $to, 500) as $entry) {
@@ -695,7 +960,9 @@ class TenantContabilidadController extends TenantController
                 ['IVA generado neto (docs)', $docs['sales_net'] ?? 0],
                 ['Compras IVA', $docs['purchases_tax'] ?? 0],
                 ['NC compras IVA', $docs['purchases_credit_tax'] ?? 0],
-                ['IVA descontable neto (docs)', $docs['purchases_net'] ?? 0],
+                ['IVA compras neto (docs)', $docs['purchases_net'] ?? 0],
+                ['IVA comisiones pasarela (docs)', $docs['gateway_commission_tax'] ?? 0],
+                ['IVA descontable neto (docs)', $docs['deductible_net'] ?? ($docs['purchases_net'] ?? 0)],
                 ['Saldo a pagar (docs)', $docs['balance_to_pay'] ?? 0],
                 ['Libro 240801 neto', $led['generated_net'] ?? 0],
                 ['Libro 240802 neto', $led['deductible_net'] ?? 0],

@@ -490,13 +490,22 @@ function submitQuickCustomer(form) {
     return false;
 }
 
-function openPaymentModal(id, total, paid) {
+function openPaymentModal(id, total, paid, credited) {
     document.getElementById('paySaleId').value = id;
-    var bal = (total - paid);
+    var tot = Number(total) || 0;
+    var pay = Number(paid) || 0;
+    var nc = Number(credited) || 0;
+    var net = Math.max(0, tot - nc);
+    var bal = Math.max(0, net - pay);
     var payEl = document.getElementById('payAmount');
     payEl.value = window.SeriMoney ? SeriMoney.format(bal) : bal.toFixed(curDec);
     if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(payEl);
-    document.getElementById('payInfo').textContent = 'Total: ' + ventasFmtMoney(total) + ' | Pagado: ' + ventasFmtMoney(paid) + ' | Pendiente: ' + ventasFmtMoney(total - paid);
+    var info = 'Total: ' + ventasFmtMoney(tot);
+    if (nc > 0.009) {
+        info += ' | NC: ' + ventasFmtMoney(nc) + ' | Neto: ' + ventasFmtMoney(net);
+    }
+    info += ' | Pagado: ' + ventasFmtMoney(pay) + ' | Pendiente: ' + ventasFmtMoney(bal);
+    document.getElementById('payInfo').textContent = info;
     document.getElementById('paymentModal').style.display = 'flex';
 }
 
@@ -804,6 +813,18 @@ function viewDetail(id) {
         if (cashRecv > 0.009) {
             h += '<div><strong>Billete / recibido:</strong> ' + moneyVal(cashRecv) + '</div>';
             h += '<div><strong>Vueltas / cambio:</strong> ' + moneyVal(cashChange) + '</div>';
+        }
+        var saleNotes = String(s.notes || '').trim();
+        if (saleNotes) {
+            // Quitar metadatos de cobro/caja para mostrar solo la observación útil.
+            var noteParts = saleNotes.split(/\s*[·|]\s*/).map(function (p) { return p.trim(); }).filter(Boolean);
+            var noteKeep = noteParts.filter(function (p) {
+                return !/^(venta\s*r[aá]pida\s*desde\s*caja|offline|combo\s*:|mixto\s*:|recibido(?:\s+efectivo)?\s*:|cambio\s*:|vueltas\s*:|pago\s*mixto|domicilio\s*:|venta\s+al\s+por\s+mayor|descuento|recargo\s+cr[eé]dito|abono\s+inicial)/i.test(p)
+                    && !/^(medio|efectivo|transferencia|dat[aá]fono|tarjeta|nequi)\b/i.test(p)
+                    && !/^\d+[\d.,]*\s*$/.test(p);
+            });
+            var noteShow = noteKeep.join(' · ') || saleNotes;
+            h += '<div style="grid-column:1 / -1;"><strong>Observación:</strong> ' + esc(noteShow) + '</div>';
         }
         h += '</div>';
         if (d.items) {

@@ -15,6 +15,7 @@ $balanceYear = (int)($balanceYear ?? ($monthlyBalance['year'] ?? date('Y')));
 $trialAccountType = $trialAccountType ?? '';
 $trialQ = $trialQ ?? '';
 $trialIncludeZero = !empty($trialIncludeZero);
+$trialView = ($trialView ?? '') === 'accounts' ? 'accounts' : 'operational';
 $statements = $statements ?? [];
 $ledger = $ledger ?? [];
 $periods = $periods ?? [];
@@ -28,6 +29,7 @@ if (!isset($integrationStatuses[$selectedProvider])) {
 $canCreate = \SoftNova\Core\TenantMiddleware::canDo('create', 'contabilidad');
 $canEdit = \SoftNova\Core\TenantMiddleware::canDo('edit', 'contabilidad');
 $canExport = \SoftNova\Core\TenantMiddleware::canDo('export', 'contabilidad');
+$canDelete = \SoftNova\Core\TenantMiddleware::canDo('delete', 'contabilidad');
 
 $purchaseSummary = $purchaseSummary ?? ['cnt' => 0, 'total' => 0];
 $expenseByType = $expenseByType ?? [];
@@ -57,6 +59,8 @@ $tabs = [
     'gastos' => 'Gastos',
     'invoice-trace' => 'Trazabilidad facturas',
     'vat' => 'Libro IVA',
+    'sales-book' => 'Libro ventas / ingresos',
+    'withholdings' => 'Retenciones',
     'trace' => 'Inventario',
     'entries' => 'Libro diario',
     'ledger' => 'Libro mayor',
@@ -70,6 +74,10 @@ $tabs = [
 $invoiceTraceOrders = $invoiceTraceOrders ?? [];
 $invoiceTraceQ = $invoiceTraceQ ?? '';
 $vatBook = $vatBook ?? null;
+$salesBook = $salesBook ?? null;
+$generalLedger = $generalLedger ?? ['rows' => [], 'totals' => [], 'balanced' => [], 'mode' => 'subaccounts'];
+$ledgerMode = $ledgerMode ?? 'subaccounts';
+$withholdings = $withholdings ?? null;
 $statusLabelsPo = [
     'draft' => 'Borrador',
     'ordered' => 'Ordenada',
@@ -94,9 +102,9 @@ foreach ($accounts as $account) {
 <?php echo flashMessage(); ?>
 
 <div class="alert alert-info" style="margin-bottom:16px;">
-    <strong>Contabilidad nativa - Fase 1.</strong>
-    El catálogo y las reglas automáticas son una plantilla operativa. Antes de usar estos libros como información oficial,
-    un contador debe validar las cuentas, impuestos, retenciones y políticas aplicables a la empresa.
+    <strong>Contabilidad nativa.</strong>
+    Libro mayor = síntesis de partida doble; Retenciones (ReteFuente / ReteIVA / ReteICA) y Libro de ventas/ingresos son independientes.
+    Antes de usarlos como información oficial, un contador debe validar cuentas, impuestos y políticas de la empresa.
 </div>
 
 <div class="card neumorphic" style="margin-bottom:18px;">
@@ -118,21 +126,81 @@ foreach ($accounts as $account) {
               style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;">
             <input type="hidden" name="tab" value="<?php echo htmlspecialchars($tab); ?>">
             <?php if ($tab === 'ledger'): ?>
-                <div class="form-group" style="margin:0;min-width:280px;flex:1;">
-                    <label>Cuenta</label>
-                    <select name="account_id" class="form-control" required>
-                        <option value="">Seleccione una cuenta</option>
-                        <?php foreach ($accounts as $account): ?>
-                            <option value="<?php echo (int)$account['id']; ?>" <?php echo (int)$account['id'] === (int)$selectedAccountId ? 'selected' : ''; ?>>
-                                <?php echo htmlspecialchars($account['code'] . ' - ' . $account['name']); ?>
-                            </option>
+                <div class="form-group" style="margin:0;min-width:260px;flex:1;">
+                    <label>Cuenta (detalle opcional)</label>
+                    <select name="account_id" class="form-control">
+                        <option value="">Síntesis (todas las cuentas)</option>
+                        <?php foreach ($types as $typeKey => $typeLabel): ?>
+                            <optgroup label="<?php echo htmlspecialchars($typeLabel); ?>">
+                            <?php foreach ($accounts as $account): ?>
+                                <?php if (($account['account_type'] ?? '') !== $typeKey) { continue; } ?>
+                                <option value="<?php echo (int)$account['id']; ?>" <?php echo (int)$account['id'] === (int)$selectedAccountId ? 'selected' : ''; ?>>
+                                    <?php echo htmlspecialchars($account['code'] . ' - ' . $account['name'] . (($account['status'] ?? 'active') !== 'active' ? ' (inactiva)' : '')); ?>
+                                </option>
+                            <?php endforeach; ?>
+                            </optgroup>
                         <?php endforeach; ?>
                     </select>
                 </div>
+                <?php if ((int)$selectedAccountId <= 0): ?>
+                    <div class="form-group" style="margin:0;min-width:160px;">
+                        <label>Nivel de síntesis</label>
+                        <select name="ledger_mode" class="form-control">
+                            <option value="subaccounts" <?php echo $ledgerMode === 'subaccounts' ? 'selected' : ''; ?>>Subcuenta</option>
+                            <option value="accounts" <?php echo $ledgerMode === 'accounts' ? 'selected' : ''; ?>>Cuenta (4 dígitos)</option>
+                            <option value="groups" <?php echo $ledgerMode === 'groups' ? 'selected' : ''; ?>>Grupo (2 dígitos)</option>
+                            <option value="classes" <?php echo $ledgerMode === 'classes' ? 'selected' : ''; ?>>Clase (1 dígito)</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="margin:0;min-width:140px;">
+                        <label>Tipo</label>
+                        <select name="account_type" class="form-control">
+                            <option value="">Todas</option>
+                            <?php foreach ($types as $value => $label): ?>
+                                <option value="<?php echo $value; ?>" <?php echo $trialAccountType === $value ? 'selected' : ''; ?>><?php echo htmlspecialchars($label); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="form-group" style="margin:0;min-width:160px;flex:1;">
+                        <label>Buscar cuenta</label>
+                        <input class="form-control" type="search" name="q" value="<?php echo htmlspecialchars($trialQ); ?>" placeholder="Código o nombre">
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label style="display:flex;gap:6px;align-items:center;white-space:nowrap;">
+                            <input type="checkbox" name="include_zero" value="1" <?php echo $trialIncludeZero ? 'checked' : ''; ?>> Incluir ceros
+                        </label>
+                    </div>
+                <?php endif; ?>
             <?php endif; ?>
             <div class="form-group" style="margin:0;"><label>Desde</label><input class="form-control" type="date" name="from" value="<?php echo htmlspecialchars($dateFrom); ?>"></div>
             <div class="form-group" style="margin:0;"><label>Hasta</label><input class="form-control" type="date" name="to" value="<?php echo htmlspecialchars($dateTo); ?>"></div>
-            <?php if ($tab === 'trial'): ?>
+            <?php if ($tab === 'ledger' && (int)$selectedAccountId > 0): ?>
+                <div class="form-group" style="margin:0;min-width:180px;">
+                    <label>Buscar en movimientos</label>
+                    <input class="form-control" type="search" name="lq" value="<?php echo htmlspecialchars((string)($ledgerQ ?? '')); ?>" placeholder="Concepto, tercero o comprobante">
+                </div>
+            <?php endif; ?>
+            <?php if ($tab === 'trial' && $trialView === 'accounts'): ?>
+                <input type="hidden" name="view" value="accounts">
+                <div class="form-group" style="margin:0;min-width:150px;">
+                    <label>Tipo de cuenta</label>
+                    <select name="account_type" class="form-control">
+                        <option value="">Todas</option>
+                        <?php foreach ($types as $value => $label): ?>
+                            <option value="<?php echo $value; ?>" <?php echo $trialAccountType === $value ? 'selected' : ''; ?>><?php echo htmlspecialchars($label); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group" style="margin:0;min-width:200px;flex:1;">
+                    <label>Buscar cuenta</label>
+                    <input class="form-control" type="search" name="q" value="<?php echo htmlspecialchars($trialQ); ?>" placeholder="Código o nombre">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label style="display:flex;gap:6px;align-items:center;white-space:nowrap;">
+                        <input type="checkbox" name="include_zero" value="1" <?php echo $trialIncludeZero ? 'checked' : ''; ?>> Incluir cuentas en cero
+                    </label>
+                </div>
+            <?php elseif ($tab === 'trial'): ?>
                 <div class="form-group" style="margin:0;min-width:140px;">
                     <label>Año del Balance</label>
                     <select name="year" class="form-control" title="El Balance muestra los 12 meses de este año">
@@ -264,7 +332,7 @@ foreach ($accounts as $account) {
                 <td><?php echo htmlspecialchars((string)($entry['created_by_name'] ?? '—')); ?></td>
                 <td><?php echo acctFmt((float)$entry['total_debit'], $currency); ?></td>
                 <td><?php echo acctFmt((float)$entry['total_credit'], $currency); ?></td>
-                <td><span class="badge <?php echo $entry['status'] === 'posted' ? 'badge-success' : 'badge-warning'; ?>"><?php echo htmlspecialchars($entry['status']); ?></span></td>
+                <td><span class="badge <?php echo $entry['status'] === 'posted' ? 'badge-success' : 'badge-warning'; ?>"><?php echo htmlspecialchars(['posted' => 'Contabilizado', 'reversed' => 'Anulado', 'draft' => 'Borrador'][$entry['status']] ?? $entry['status']); ?></span></td>
                 <td><button type="button" class="btn btn-sm btn-info" onclick="showAccountingEntry(<?php echo (int)$entry['id']; ?>)">Ver detalle</button></td>
             </tr><?php endforeach; ?>
             </tbody>
@@ -272,47 +340,501 @@ foreach ($accounts as $account) {
     </div></div>
 
 <?php elseif ($tab === 'ledger'): ?>
-    <?php $ledgerOpening = (float)($ledgerOpening ?? 0); ?>
-    <div class="card neumorphic"><div class="card-header"><h3>Libro mayor</h3></div><div class="card-body">
-        <?php if (!$selectedAccountId): ?>
-            <p class="dashboard-empty">Seleccione una cuenta para consultar sus movimientos.</p>
-        <?php else: ?>
-            <?php $running = $ledgerOpening; ?>
-            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">
-                Periodo <?php echo htmlspecialchars($dateFrom); ?> → <?php echo htmlspecialchars($dateTo); ?>.
-                El saldo arrastra el saldo anterior a la fecha «Desde».
-            </p>
-            <div class="table-container"><table>
-                <thead><tr><th>Fecha</th><th>Comprobante</th><th>Concepto</th><th>Tercero</th><th>Debe</th><th>Haber</th><th>Saldo</th></tr></thead>
-                <tbody>
-                <tr style="background:var(--dmb-F8FAFC, #F8FAFC);font-weight:600;">
-                    <td colspan="4">Saldo inicial (antes de <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateFrom) ?: time())); ?>)</td>
-                    <td></td><td></td>
-                    <td><?php echo acctFmt($ledgerOpening, $currency); ?></td>
-                </tr>
-                <?php if (!$ledger): ?><tr><td colspan="7" class="dashboard-empty">Sin movimientos en el periodo</td></tr><?php endif; ?>
-                <?php foreach ($ledger as $line): $running += (float)$line['debit'] - (float)$line['credit']; ?><tr>
-                    <td><?php echo date('d/m/Y', strtotime($line['entry_date'])); ?></td>
-                    <td><button type="button" class="btn btn-sm btn-secondary" onclick="showAccountingEntry(<?php echo (int)$line['entry_id']; ?>)"><?php echo htmlspecialchars($line['entry_number']); ?></button></td>
-                    <td><?php echo htmlspecialchars($line['description'] ?: $line['entry_description']); ?></td>
-                    <td><?php echo htmlspecialchars($line['third_party_name'] ?: '-'); ?></td>
-                    <td><?php echo acctFmt((float)$line['debit'], $currency); ?></td>
-                    <td><?php echo acctFmt((float)$line['credit'], $currency); ?></td>
-                    <td><?php echo acctFmt($running, $currency); ?></td>
-                </tr><?php endforeach; ?>
-                <?php if ($ledger): ?>
-                <tr style="background:var(--dmb-F1F5F9, #F1F5F9);font-weight:700;">
-                    <td colspan="4">Saldo final del periodo</td>
-                    <td></td><td></td>
-                    <td><?php echo acctFmt($running, $currency); ?></td>
-                </tr>
+    <?php
+    $ledgerOpening = (float)($ledgerOpening ?? 0);
+    $lr = is_array($ledgerReport ?? null) ? $ledgerReport : [];
+    $ledgerAccount = $lr['account'] ?? null;
+    $ledgerSign = (($ledgerAccount['nature'] ?? 'debit') === 'credit') ? -1 : 1;
+    $ledgerFiltered = !empty($lr['filtered']);
+    $ledgerBase = $viewInstance->route('app/contabilidad');
+    $gl = is_array($generalLedger ?? null) ? $generalLedger : [];
+    $glRows = $gl['rows'] ?? [];
+    $glTot = $gl['totals'] ?? [];
+    $glBal = $gl['balanced'] ?? [];
+    $ledgerLink = static function (int $accountId) use ($ledgerBase, $dateFrom, $dateTo): string {
+        return $ledgerBase . '?tab=ledger&account_id=' . $accountId . '&from=' . urlencode($dateFrom) . '&to=' . urlencode($dateTo);
+    };
+    $trCell = static function ($v) use ($currency): string {
+        return abs((float)$v) < 0.009 ? '—' : acctFmt((float)$v, $currency);
+    };
+    ?>
+    <?php if (!$selectedAccountId || !$ledgerAccount): ?>
+        <div class="card neumorphic">
+            <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+                <div>
+                    <h3 style="margin:0;">Libro mayor — síntesis contable</h3>
+                    <p style="margin:4px 0 0;font-size:12px;color:var(--color-text-secondary);">
+                        Saldos iniciales, débitos, créditos y saldos finales por cuenta
+                        (<?php echo htmlspecialchars((string)($gl['mode_label'] ?? 'Por subcuenta')); ?>).
+                        Audita la partida doble y alimenta los estados financieros.
+                        Retenciones → <a href="<?php echo $ledgerBase; ?>?tab=withholdings&amp;from=<?php echo urlencode($dateFrom); ?>&amp;to=<?php echo urlencode($dateTo); ?>">pestaña Retenciones</a>.
+                    </p>
+                </div>
+                <?php if ($canExport): ?>
+                    <a class="btn btn-sm btn-secondary" href="<?php echo htmlspecialchars($ledgerBase . '?' . http_build_query([
+                        'action' => 'export', 'report' => 'general-ledger',
+                        'from' => $dateFrom, 'to' => $dateTo,
+                        'ledger_mode' => $ledgerMode,
+                        'account_type' => $trialAccountType,
+                        'q' => $trialQ,
+                        'include_zero' => $trialIncludeZero ? '1' : '',
+                    ])); ?>">Exportar CSV</a>
                 <?php endif; ?>
+            </div>
+            <div class="card-body">
+                <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+                    <?php
+                    $pill = static function (bool $ok, string $label): string {
+                        $cls = $ok ? 'badge-success' : 'badge-danger';
+                        $txt = $ok ? 'Cuadra' : 'Descuadre';
+                        return '<span class="badge ' . $cls . '">' . htmlspecialchars($label . ': ' . $txt) . '</span>';
+                    };
+                    echo $pill(!empty($glBal['opening']), 'Apertura');
+                    echo ' ';
+                    echo $pill(!empty($glBal['period']), 'Periodo');
+                    echo ' ';
+                    echo $pill(!empty($glBal['closing']), 'Cierre');
+                    ?>
+                </div>
+                <?php if (!$glRows): ?>
+                    <p class="dashboard-empty">Sin movimientos en el rango (o todas las cuentas en cero).</p>
+                <?php else: ?>
+                    <div class="table-container"><table class="trial-table">
+                        <thead><tr>
+                            <th>Código</th><th>Cuenta / grupo</th><th>Tipo</th>
+                            <th class="num">Si Debe</th><th class="num">Si Haber</th>
+                            <th class="num">Debe</th><th class="num">Haber</th>
+                            <th class="num">Sf Debe</th><th class="num">Sf Haber</th>
+                        </tr></thead>
+                        <tbody>
+                        <?php foreach ($glRows as $row): ?>
+                            <tr>
+                                <td>
+                                    <?php if (!empty($row['id'])): ?>
+                                        <a href="<?php echo $ledgerLink((int)$row['id']); ?>"><strong><?php echo htmlspecialchars((string)$row['code']); ?></strong></a>
+                                    <?php else: ?>
+                                        <strong><?php echo htmlspecialchars((string)$row['code']); ?></strong>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php echo htmlspecialchars((string)$row['name']); ?>
+                                    <?php if (!empty($row['accounts_count']) && (int)$row['accounts_count'] > 1): ?>
+                                        <div style="font-size:11px;color:var(--color-text-secondary);"><?php echo (int)$row['accounts_count']; ?> subcuentas</div>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?php echo htmlspecialchars((string)($row['account_type_label'] ?? '')); ?></td>
+                                <td class="num"><?php echo $trCell($row['opening_debit'] ?? 0); ?></td>
+                                <td class="num"><?php echo $trCell($row['opening_credit'] ?? 0); ?></td>
+                                <td class="num"><?php echo $trCell($row['debit'] ?? 0); ?></td>
+                                <td class="num"><?php echo $trCell($row['credit'] ?? 0); ?></td>
+                                <td class="num"><?php echo $trCell($row['closing_debit'] ?? 0); ?></td>
+                                <td class="num"><?php echo $trCell($row['closing_credit'] ?? 0); ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                        <tfoot>
+                        <tr class="trial-total">
+                            <td colspan="3">TOTALES (<?php echo count($glRows); ?> filas)</td>
+                            <td class="num"><?php echo acctFmt((float)($glTot['opening_debit'] ?? 0), $currency); ?></td>
+                            <td class="num"><?php echo acctFmt((float)($glTot['opening_credit'] ?? 0), $currency); ?></td>
+                            <td class="num"><?php echo acctFmt((float)($glTot['debit'] ?? 0), $currency); ?></td>
+                            <td class="num"><?php echo acctFmt((float)($glTot['credit'] ?? 0), $currency); ?></td>
+                            <td class="num"><?php echo acctFmt((float)($glTot['closing_debit'] ?? 0), $currency); ?></td>
+                            <td class="num"><?php echo acctFmt((float)($glTot['closing_credit'] ?? 0), $currency); ?></td>
+                        </tr>
+                        </tfoot>
+                    </table></div>
+                <?php endif; ?>
+            </div>
+        </div>
+    <?php else: ?>
+        <div class="card neumorphic">
+            <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+                <div>
+                    <h3 style="margin:0;">Libro mayor · <?php echo htmlspecialchars($ledgerAccount['code'] . ' ' . $ledgerAccount['name']); ?></h3>
+                    <p style="margin:4px 0 0;font-size:12px;">
+                        <a href="<?php echo $ledgerBase; ?>?tab=ledger&amp;from=<?php echo urlencode($dateFrom); ?>&amp;to=<?php echo urlencode($dateTo); ?>">← Volver a síntesis</a>
+                    </p>
+                </div>
+                <?php if ($canExport): ?>
+                    <a class="btn btn-sm btn-secondary" href="<?php echo htmlspecialchars($ledgerBase . '?' . http_build_query([
+                        'action' => 'export', 'report' => 'ledger', 'account_id' => (int)$ledgerAccount['id'],
+                        'from' => $dateFrom, 'to' => $dateTo, 'lq' => (string)($ledgerQ ?? ''),
+                    ])); ?>">Exportar CSV</a>
+                <?php endif; ?>
+            </div>
+            <div class="card-body">
+                <?php $running = $ledgerOpening; ?>
+                <div class="ledger-summary">
+                    <div><span>Saldo inicial</span><strong><?php echo acctFmt($ledgerOpening * $ledgerSign, $currency); ?></strong></div>
+                    <div><span>Debe del periodo</span><strong><?php echo acctFmt((float)($lr['period_debit'] ?? 0), $currency); ?></strong></div>
+                    <div><span>Haber del periodo</span><strong><?php echo acctFmt((float)($lr['period_credit'] ?? 0), $currency); ?></strong></div>
+                    <div><span>Saldo final</span><strong><?php echo acctFmt((float)($lr['closing_balance'] ?? 0) * $ledgerSign, $currency); ?></strong></div>
+                </div>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">
+                    Naturaleza <strong><?php echo $ledgerSign < 0 ? 'crédito' : 'débito'; ?></strong>
+                    (saldo = <?php echo $ledgerSign < 0 ? 'Haber − Debe' : 'Debe − Haber'; ?>).
+                    <?php if ($ledgerFiltered): ?>
+                        <br><strong>Búsqueda aplicada:</strong> totales de arriba son de toda la cuenta.
+                    <?php endif; ?>
+                    <?php
+                    $whCodesHint = ['135515', '135517', '135518'];
+                    if (in_array((string)$ledgerAccount['code'], $whCodesHint, true)):
+                    ?>
+                        <br>Esta es una cuenta de retención: vea la <a href="<?php echo $ledgerBase; ?>?tab=withholdings&amp;from=<?php echo urlencode($dateFrom); ?>&amp;to=<?php echo urlencode($dateTo); ?>">conciliación en Retenciones</a>.
+                    <?php endif; ?>
+                </p>
+                <div class="table-container"><table class="trial-table">
+                    <thead><tr><th>Fecha</th><th>Comprobante</th><th>Concepto</th><th>Origen</th><th>Tercero</th><th class="num">Debe</th><th class="num">Haber</th><th class="num">Saldo</th></tr></thead>
+                    <tbody>
+                    <tr style="background:var(--dmb-F8FAFC, #F8FAFC);font-weight:600;">
+                        <td colspan="5">Saldo inicial (antes de <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateFrom) ?: time())); ?>)</td>
+                        <td></td><td></td>
+                        <td class="num"><?php echo acctFmt($ledgerOpening * $ledgerSign, $currency); ?></td>
+                    </tr>
+                    <?php if (!$ledger): ?>
+                        <tr><td colspan="8" class="dashboard-empty">
+                            <?php echo $ledgerFiltered ? 'Ningún movimiento coincide con la búsqueda' : 'Sin movimientos en el periodo'; ?>
+                        </td></tr>
+                    <?php endif; ?>
+                    <?php foreach ($ledger as $line): $running += (float)$line['debit'] - (float)$line['credit']; ?><tr>
+                        <td><?php echo date('d/m/Y', strtotime($line['entry_date'])); ?></td>
+                        <td><button type="button" class="btn btn-sm btn-secondary" onclick="showAccountingEntry(<?php echo (int)$line['entry_id']; ?>)"><?php echo htmlspecialchars($line['entry_number']); ?></button></td>
+                        <td>
+                            <?php echo htmlspecialchars($line['description'] ?: $line['entry_description']); ?>
+                            <?php if (($line['entry_status'] ?? '') === 'reversed'): ?><span class="badge badge-warning">Anulado</span><?php endif; ?>
+                            <?php if (!empty($line['reversal_of_id'])): ?><span class="badge badge-info">Reversión</span><?php endif; ?>
+                        </td>
+                        <td><?php echo htmlspecialchars(\SoftNova\Services\AccountingService::sourceLabel($line['source_type'] ?? null)); ?></td>
+                        <td><?php echo htmlspecialchars($line['third_party_name'] ?: '-'); ?></td>
+                        <td class="num"><?php echo (float)$line['debit'] > 0 ? acctFmt((float)$line['debit'], $currency) : '—'; ?></td>
+                        <td class="num"><?php echo (float)$line['credit'] > 0 ? acctFmt((float)$line['credit'], $currency) : '—'; ?></td>
+                        <td class="num"><?php echo $ledgerFiltered ? '' : acctFmt($running * $ledgerSign, $currency); ?></td>
+                    </tr><?php endforeach; ?>
+                    </tbody>
+                    <tfoot>
+                    <tr class="trial-total">
+                        <td colspan="5">Totales del periodo y saldo final</td>
+                        <td class="num"><?php echo acctFmt((float)($lr['period_debit'] ?? 0), $currency); ?></td>
+                        <td class="num"><?php echo acctFmt((float)($lr['period_credit'] ?? 0), $currency); ?></td>
+                        <td class="num"><?php echo acctFmt((float)($lr['closing_balance'] ?? 0) * $ledgerSign, $currency); ?></td>
+                    </tr>
+                    </tfoot>
+                </table></div>
+            </div>
+        </div>
+    <?php endif; ?>
+
+<?php elseif ($tab === 'withholdings'): ?>
+    <?php
+    $wh = is_array($withholdings ?? null) ? $withholdings : null;
+    $whRows = $wh['rows'] ?? [];
+    $whBase = $viewInstance->route('app/contabilidad');
+    $ledgerLinkWh = static function (int $accountId) use ($whBase, $dateFrom, $dateTo): string {
+        return $whBase . '?tab=ledger&account_id=' . $accountId . '&from=' . urlencode($dateFrom) . '&to=' . urlencode($dateTo);
+    };
+    ?>
+    <div class="card neumorphic" style="margin-bottom:16px;">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+            <div>
+                <h3 style="margin:0;">Libro de retenciones (sufridas)</h3>
+                <p style="margin:4px 0 0;font-size:12px;color:var(--color-text-secondary);">
+                    ReteFuente, ReteIVA y ReteICA independientes del Libro mayor.
+                    Periodo <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateFrom) ?: time())); ?>
+                    → <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateTo) ?: time())); ?>.
+                </p>
+            </div>
+            <?php if ($canExport): ?>
+                <a class="btn btn-sm btn-secondary" href="<?php echo htmlspecialchars($whBase . '?' . http_build_query([
+                    'action' => 'export', 'report' => 'withholdings', 'from' => $dateFrom, 'to' => $dateTo,
+                ])); ?>">Exportar CSV</a>
+            <?php endif; ?>
+        </div>
+        <div class="card-body">
+            <?php if (!$whRows): ?>
+                <p class="dashboard-empty">No hay datos de retenciones para el periodo.</p>
+            <?php else: ?>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:16px;">
+                    <?php foreach ($whRows as $w): ?>
+                        <?php
+                        $gap = round((float)$w['commission_ledger'] - (float)$w['expected_commissions'], 2);
+                        if (!$w['exists']) {
+                            $stLabel = 'Cuenta no creada'; $stClass = 'badge-warning';
+                        } elseif (abs($gap) >= 1) {
+                            $stLabel = 'Diferencia ' . acctFmt($gap, $currency); $stClass = 'badge-danger';
+                        } elseif ((float)$w['pending_commissions'] > 0.009) {
+                            $stLabel = 'Pendiente ' . acctFmt((float)$w['pending_commissions'], $currency); $stClass = 'badge-warning';
+                        } elseif ((float)$w['rate'] <= 0) {
+                            $stLabel = 'Tarifa en 0'; $stClass = 'badge-info';
+                        } else {
+                            $stLabel = 'Cuadra'; $stClass = 'badge-success';
+                        }
+                        ?>
+                        <div style="border:1px solid var(--color-border,#e5e7eb);border-radius:10px;padding:14px;background:var(--bg-card,#fff);">
+                            <div style="display:flex;justify-content:space-between;gap:8px;align-items:start;">
+                                <div>
+                                    <strong style="font-size:15px;"><?php echo htmlspecialchars((string)$w['label']); ?></strong>
+                                    <div style="font-size:12px;color:var(--color-text-secondary);">
+                                        <?php if ((int)$w['account_id'] > 0): ?>
+                                            <a href="<?php echo $ledgerLinkWh((int)$w['account_id']); ?>"><?php echo htmlspecialchars((string)$w['code']); ?></a>
+                                        <?php else: ?>
+                                            <?php echo htmlspecialchars((string)$w['code']); ?>
+                                        <?php endif; ?>
+                                        · <?php echo number_format((float)$w['rate'], 2, ',', '.') . ' ' . htmlspecialchars((string)$w['rate_unit']); ?>
+                                    </div>
+                                </div>
+                                <span class="badge <?php echo $stClass; ?>"><?php echo htmlspecialchars($stLabel); ?></span>
+                            </div>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px;font-size:13px;">
+                                <div><span style="color:var(--color-text-secondary);">Saldo inicial</span><br><strong><?php echo acctFmt((float)$w['opening'], $currency); ?></strong></div>
+                                <div><span style="color:var(--color-text-secondary);">Saldo final</span><br><strong><?php echo acctFmt((float)$w['closing'], $currency); ?></strong></div>
+                                <div><span style="color:var(--color-text-secondary);">Debe</span><br><?php echo acctFmt((float)$w['debit'], $currency); ?></div>
+                                <div><span style="color:var(--color-text-secondary);">Haber</span><br><?php echo acctFmt((float)$w['credit'], $currency); ?></div>
+                                <div><span style="color:var(--color-text-secondary);">Esperado comisiones</span><br><?php echo acctFmt((float)$w['expected_commissions'], $currency); ?></div>
+                                <div><span style="color:var(--color-text-secondary);">En libro (pasarela)</span><br><?php echo acctFmt((float)$w['commission_ledger'], $currency); ?></div>
+                            </div>
+                            <?php if (!empty($w['by_source'])): ?>
+                                <div style="margin-top:10px;font-size:12px;color:var(--color-text-secondary);">
+                                    <?php foreach ($w['by_source'] as $i => $src): ?>
+                                        <?php echo $i ? ' · ' : ''; ?><?php echo htmlspecialchars((string)$src['label']); ?>: <?php echo acctFmt((float)$src['net'], $currency); ?>
+                                    <?php endforeach; ?>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+                <div class="ledger-note">
+                    <strong>Origen de las retenciones sufridas</strong>
+                    <ul>
+                        <li>
+                            Datáfono / link de pago: tarifas en
+                            <a href="<?php echo $whBase; ?>?tab=commissions">Comisiones</a>.
+                            Periodo: <?php echo (int)($wh['gateway_payments'] ?? 0); ?> pago(s)
+                            por <?php echo acctFmt((float)($wh['gateway_amount'] ?? 0), $currency); ?>;
+                            <?php echo (int)($wh['paid_commissions'] ?? 0); ?> comisión(es) contabilizada(s)
+                            <?php if ((int)($wh['pending_commissions'] ?? 0) > 0): ?>
+                                · <strong><?php echo (int)$wh['pending_commissions']; ?> pendiente(s)</strong>
+                            <?php endif; ?>.
+                        </li>
+                        <?php foreach (($wh['expense_categories'] ?? []) as $cat): ?>
+                            <li>Gastos «<?php echo htmlspecialchars((string)$cat['name']); ?>» → cuenta <?php echo htmlspecialchars((string)$cat['account_code']); ?>.</li>
+                        <?php endforeach; ?>
+                        <li>Retenciones por transferencia de clientes: comprobante manual (aún no automático).</li>
+                    </ul>
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+<?php elseif ($tab === 'sales-book'): ?>
+    <?php
+    $sb = is_array($salesBook ?? null) ? $salesBook : [];
+    $sbRows = $sb['rows'] ?? [];
+    $sbTot = $sb['totals'] ?? [];
+    $sbLed = $sb['ledger'] ?? [];
+    $sbAcc = $sb['accounts'] ?? ['sales' => '413501', 'returns' => '417501'];
+    $sbBase = $viewInstance->route('app/contabilidad');
+    ?>
+    <div class="card neumorphic" style="margin-bottom:16px;">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+            <div>
+                <h3 style="margin:0;">Libro de ventas / ingresos</h3>
+                <p style="margin:4px 0 0;font-size:12px;color:var(--color-text-secondary);">
+                    Documentos de venta y notas de crédito del periodo. Las retenciones de adquirente van en
+                    <a href="<?php echo $sbBase; ?>?tab=withholdings&amp;from=<?php echo urlencode($dateFrom); ?>&amp;to=<?php echo urlencode($dateTo); ?>">Retenciones</a>;
+                    el IVA en <a href="<?php echo $sbBase; ?>?tab=vat&amp;from=<?php echo urlencode($dateFrom); ?>&amp;to=<?php echo urlencode($dateTo); ?>">Libro IVA</a>.
+                </p>
+            </div>
+            <?php if ($canExport): ?>
+                <a class="btn btn-sm btn-secondary" href="<?php echo htmlspecialchars($sbBase . '?' . http_build_query([
+                    'action' => 'export', 'report' => 'sales-book', 'from' => $dateFrom, 'to' => $dateTo,
+                ])); ?>">Exportar CSV</a>
+            <?php endif; ?>
+        </div>
+        <div class="card-body">
+            <?php if (!empty($sb['warnings'])): ?>
+                <div class="alert alert-warning" style="margin-bottom:14px;">
+                    <?php foreach ($sb['warnings'] as $w): ?>
+                        <div><?php echo htmlspecialchars((string)$w); ?></div>
+                    <?php endforeach; ?>
+                </div>
+            <?php endif; ?>
+            <div class="ledger-summary" style="margin-bottom:14px;">
+                <div><span>Ventas</span><strong><?php echo (int)($sbTot['count'] ?? 0); ?></strong></div>
+                <div><span>NC</span><strong><?php echo (int)($sbTot['credit_notes_count'] ?? 0); ?></strong></div>
+                <div><span>Total documental</span><strong><?php echo acctFmt((float)($sbTot['total'] ?? 0), $currency); ?></strong></div>
+                <div><span>Mayor <?php echo htmlspecialchars((string)$sbAcc['sales']); ?> neto</span><strong><?php echo acctFmt((float)($sbLed['net'] ?? 0), $currency); ?></strong></div>
+            </div>
+            <div class="table-container" style="margin-bottom:14px;">
+                <table>
+                    <thead><tr><th>Resumen</th><th class="num">Monto</th></tr></thead>
+                    <tbody>
+                        <tr><td>Subtotal (neto de NC)</td><td class="num"><?php echo acctFmt((float)($sbTot['subtotal'] ?? 0), $currency); ?></td></tr>
+                        <tr><td>Descuentos</td><td class="num"><?php echo acctFmt((float)($sbTot['discount'] ?? 0), $currency); ?></td></tr>
+                        <tr><td>IVA</td><td class="num"><?php echo acctFmt((float)($sbTot['tax'] ?? 0), $currency); ?></td></tr>
+                        <tr><td>Domicilios</td><td class="num"><?php echo acctFmt((float)($sbTot['delivery'] ?? 0), $currency); ?></td></tr>
+                        <tr><td>NC ventas (valor absoluto)</td><td class="num"><?php echo acctFmt((float)($sbTot['credit_notes_total'] ?? 0), $currency); ?></td></tr>
+                        <tr><td><strong>Ingreso neto documental</strong></td><td class="num"><strong><?php echo acctFmt((float)($sbTot['net_income'] ?? 0), $currency); ?></strong></td></tr>
+                        <tr><td>Libro contable <?php echo htmlspecialchars((string)$sbAcc['sales']); ?> − <?php echo htmlspecialchars((string)$sbAcc['returns']); ?></td><td class="num"><?php echo acctFmt((float)($sbLed['net'] ?? 0), $currency); ?></td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <?php if (!$sbRows): ?>
+                <p class="dashboard-empty">Sin ventas ni NC en el periodo.</p>
+            <?php else: ?>
+                <div class="table-container"><table class="trial-table">
+                    <thead><tr>
+                        <th>Fecha</th><th>Tipo</th><th>Número</th><th>Cliente</th><th>Medio</th>
+                        <th class="num">Subtotal</th><th class="num">Dcto</th><th class="num">IVA</th><th class="num">Total</th><th>Asiento</th>
+                    </tr></thead>
+                    <tbody>
+                    <?php foreach ($sbRows as $r): ?>
+                        <tr<?php echo ($r['kind'] ?? '') === 'credit_note' ? ' style="background:#FFF7ED;"' : ''; ?>>
+                            <td><?php echo !empty($r['date']) ? date('d/m/Y', strtotime((string)$r['date']) ?: time()) : '—'; ?></td>
+                            <td><span class="badge <?php echo ($r['kind'] ?? '') === 'credit_note' ? 'badge-warning' : 'badge-success'; ?>"><?php echo htmlspecialchars((string)($r['kind_label'] ?? '')); ?></span></td>
+                            <td>
+                                <strong><?php echo htmlspecialchars((string)($r['number'] ?? '')); ?></strong>
+                                <?php if (!empty($r['notes'])): ?>
+                                    <div style="font-size:11px;color:var(--color-text-secondary);"><?php echo htmlspecialchars((string)$r['notes']); ?></div>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php echo htmlspecialchars((string)($r['customer_name'] ?? '')); ?>
+                                <?php if (!empty($r['customer_document'])): ?>
+                                    <div style="font-size:11px;color:var(--color-text-secondary);"><?php echo htmlspecialchars((string)$r['customer_document']); ?></div>
+                                <?php endif; ?>
+                            </td>
+                            <td><?php echo htmlspecialchars(($r['payment_method'] ?? '') !== '' ? \SoftNova\Services\PaymentMethodCatalog::label((string)$r['payment_method']) : '—'); ?></td>
+                            <td class="num"><?php echo acctFmt((float)($r['subtotal'] ?? 0), $currency); ?></td>
+                            <td class="num"><?php echo abs((float)($r['discount'] ?? 0)) > 0.009 ? acctFmt((float)$r['discount'], $currency) : '—'; ?></td>
+                            <td class="num"><?php echo acctFmt((float)($r['tax'] ?? 0), $currency); ?></td>
+                            <td class="num"><strong><?php echo acctFmt((float)($r['total'] ?? 0), $currency); ?></strong></td>
+                            <td>
+                                <?php if (!empty($r['entry_id'])): ?>
+                                    <button type="button" class="btn btn-sm btn-secondary" onclick="showAccountingEntry(<?php echo (int)$r['entry_id']; ?>)"><?php echo htmlspecialchars((string)($r['entry_number'] ?: ('#' . $r['entry_id']))); ?></button>
+                                <?php else: ?>
+                                    <span style="color:var(--color-text-secondary);">—</span>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                    <tfoot>
+                    <tr class="trial-total">
+                        <td colspan="5">TOTALES</td>
+                        <td class="num"><?php echo acctFmt((float)($sbTot['subtotal'] ?? 0), $currency); ?></td>
+                        <td class="num"><?php echo acctFmt((float)($sbTot['discount'] ?? 0), $currency); ?></td>
+                        <td class="num"><?php echo acctFmt((float)($sbTot['tax'] ?? 0), $currency); ?></td>
+                        <td class="num"><?php echo acctFmt((float)($sbTot['total'] ?? 0), $currency); ?></td>
+                        <td></td>
+                    </tr>
+                    </tfoot>
+                </table></div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+<?php elseif ($tab === 'trial' && $trialView === 'accounts'): ?>
+    <?php
+    $tr = is_array($trialReport) ? $trialReport : ['rows' => [], 'totals' => [], 'balanced' => []];
+    $trRows = $tr['rows'] ?? [];
+    $trTot = $tr['totals'] ?? [];
+    $trBal = $tr['balanced'] ?? [];
+    $trialBase = $viewInstance->route('app/contabilidad');
+    $trialExport = $trialBase . '?' . http_build_query([
+        'action' => 'export',
+        'report' => 'accounts-trial',
+        'from' => $dateFrom,
+        'to' => $dateTo,
+        'account_type' => $trialAccountType,
+        'q' => $trialQ,
+        'include_zero' => $trialIncludeZero ? '1' : '',
+    ]);
+    $trCell = static function ($v) use ($currency): string {
+        return abs((float)$v) < 0.009 ? '—' : acctFmt((float)$v, $currency);
+    };
+    ?>
+    <div class="trial-switch">
+        <a class="btn btn-sm btn-secondary" href="<?php echo $trialBase; ?>?tab=trial&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">Balance operativo</a>
+        <a class="btn btn-sm btn-primary" href="<?php echo $trialBase; ?>?tab=trial&view=accounts&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">Balance de comprobación (cuentas)</a>
+    </div>
+    <div class="card neumorphic">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+            <div>
+                <h3 style="margin:0;">Balance de comprobación</h3>
+                <div style="font-size:12px;color:var(--color-text-secondary);margin-top:4px;">
+                    <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateFrom) ?: time())); ?> → <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateTo) ?: time())); ?>
+                    · <?php echo (int)($trTot['accounts'] ?? 0); ?> cuenta(s).
+                    Saldo inicial = acumulado antes de «Desde»; saldo final = acumulado a «Hasta».
+                </div>
+            </div>
+            <?php if ($canExport): ?>
+                <a class="btn btn-sm btn-secondary" href="<?php echo htmlspecialchars($trialExport); ?>">Exportar CSV</a>
+            <?php endif; ?>
+        </div>
+        <div class="card-body">
+            <?php if ($trialAccountType === '' && $trialQ === ''): ?>
+                <div class="trial-checks">
+                    <?php foreach (['opening' => 'Saldo inicial', 'period' => 'Movimientos del periodo', 'closing' => 'Saldo final'] as $bk => $bl): ?>
+                        <?php $ok = !empty($trBal[$bk]); ?>
+                        <span class="badge <?php echo $ok ? 'badge-success' : 'badge-danger'; ?>"><?php echo $bl . ($ok ? ' cuadra' : ' NO cuadra'); ?></span>
+                    <?php endforeach; ?>
+                </div>
+            <?php else: ?>
+                <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">Con filtros aplicados los totales no tienen que cuadrar (solo se ve una parte del plan de cuentas).</p>
+            <?php endif; ?>
+            <div class="table-container"><table class="trial-table">
+                <thead>
+                    <tr>
+                        <th rowspan="2">Código</th><th rowspan="2">Cuenta</th><th rowspan="2">Tipo</th>
+                        <th colspan="2" class="trial-group">Saldo inicial</th>
+                        <th colspan="2" class="trial-group">Movimientos</th>
+                        <th colspan="2" class="trial-group">Saldo final</th>
+                    </tr>
+                    <tr>
+                        <th class="num">Debe</th><th class="num">Haber</th>
+                        <th class="num">Debe</th><th class="num">Haber</th>
+                        <th class="num">Debe</th><th class="num">Haber</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php if (!$trRows): ?><tr><td colspan="9" class="dashboard-empty">Sin cuentas con saldo o movimientos en el periodo</td></tr><?php endif; ?>
+                <?php foreach ($trRows as $row): ?>
+                    <tr>
+                        <td><a href="<?php echo $trialBase; ?>?tab=ledger&account_id=<?php echo (int)$row['id']; ?>&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>" title="Ver libro mayor"><strong><?php echo htmlspecialchars($row['code']); ?></strong></a></td>
+                        <td><?php echo htmlspecialchars($row['name']); ?></td>
+                        <td><?php echo htmlspecialchars($row['account_type_label'] ?? ''); ?></td>
+                        <td class="num"><?php echo $trCell($row['opening_debit'] ?? 0); ?></td>
+                        <td class="num"><?php echo $trCell($row['opening_credit'] ?? 0); ?></td>
+                        <td class="num"><?php echo $trCell($row['debit'] ?? 0); ?></td>
+                        <td class="num"><?php echo $trCell($row['credit'] ?? 0); ?></td>
+                        <td class="num"><?php echo $trCell($row['closing_debit'] ?? 0); ?></td>
+                        <td class="num"><?php echo $trCell($row['closing_credit'] ?? 0); ?></td>
+                    </tr>
+                <?php endforeach; ?>
                 </tbody>
+                <?php if ($trRows): ?>
+                <tfoot>
+                    <tr class="trial-total">
+                        <td colspan="3">Totales</td>
+                        <td class="num"><?php echo acctFmt((float)($trTot['opening_debit'] ?? 0), $currency); ?></td>
+                        <td class="num"><?php echo acctFmt((float)($trTot['opening_credit'] ?? 0), $currency); ?></td>
+                        <td class="num"><?php echo acctFmt((float)($trTot['debit'] ?? 0), $currency); ?></td>
+                        <td class="num"><?php echo acctFmt((float)($trTot['credit'] ?? 0), $currency); ?></td>
+                        <td class="num"><?php echo acctFmt((float)($trTot['closing_debit'] ?? 0), $currency); ?></td>
+                        <td class="num"><?php echo acctFmt((float)($trTot['closing_credit'] ?? 0), $currency); ?></td>
+                    </tr>
+                </tfoot>
+                <?php endif; ?>
             </table></div>
-        <?php endif; ?>
-    </div></div>
+        </div>
+    </div>
 
 <?php elseif ($tab === 'trial'): ?>
+    <div class="trial-switch">
+        <a class="btn btn-sm btn-primary" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=trial&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>&year=<?php echo (int)$balanceYear; ?>">Balance operativo</a>
+        <a class="btn btn-sm btn-secondary" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=trial&view=accounts&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">Balance de comprobación (cuentas)</a>
+    </div>
     <?php
     $mb = $monthlyBalance;
     $mt = $mb['totals'] ?? [];
@@ -674,41 +1196,53 @@ foreach ($accounts as $account) {
     </script>
 
 <?php elseif ($tab === 'statements'): ?>
+    <?php
+    $stmtProfit = (float)($statements['profit'] ?? 0);
+    $stmtPrior = (float)($statements['prior_profit'] ?? 0);
+    $equityAccounts = (float)($statements['totals']['equity'] ?? 0);
+    $equityTotal = (float)($statements['totals']['equity_with_results'] ?? ($equityAccounts + $stmtPrior + $stmtProfit));
+    $assetsTot = (float)($statements['totals']['assets'] ?? 0);
+    $liabTot = (float)($statements['totals']['liabilities'] ?? 0);
+    $stmtGap = round($assetsTot - ($liabTot + $equityTotal), 2);
+    ?>
     <p style="margin:0 0 12px;font-size:13px;color:var(--color-text-secondary);max-width:900px;">
         Situación financiera = saldos acumulados a la fecha «Hasta». Resultados = movimiento del periodo (Desde–Hasta).
-        Aún no hay asiento de cierre a utilidad del ejercicio: el patrimonio no incluye automáticamente el resultado del periodo
-        (Activo puede diferir de Pasivo + Patrimonio).
+        Mientras no exista asiento de cierre del ejercicio, el patrimonio incluye de forma calculada los resultados
+        de periodos anteriores a «Desde» y el resultado del periodo.
     </p>
     <div class="accounting-statements">
         <div class="card neumorphic"><div class="card-header"><h3>Estado de situación financiera</h3></div><div class="card-body">
-            <?php foreach (['assets' => 'Activos', 'liabilities' => 'Pasivos', 'equity' => 'Patrimonio'] as $group => $label): ?>
+            <?php foreach (['assets' => 'Activos', 'liabilities' => 'Pasivos'] as $group => $label): ?>
                 <h4><?php echo $label; ?></h4>
                 <?php foreach (($statements[$group] ?? []) as $row): ?>
                     <div class="accounting-statement-row"><span><?php echo htmlspecialchars($row['code'] . ' ' . $row['name']); ?></span><strong><?php echo acctFmt((float)$row['display_balance'], $currency); ?></strong></div>
                 <?php endforeach; ?>
                 <div class="accounting-statement-total"><span>Total <?php echo strtolower($label); ?></span><strong><?php echo acctFmt((float)($statements['totals'][$group] ?? 0), $currency); ?></strong></div>
             <?php endforeach; ?>
-            <?php
-            $stmtProfit = (float)($statements['profit'] ?? 0);
-            $equityWithProfit = (float)($statements['totals']['equity'] ?? 0) + $stmtProfit;
-            $assetsTot = (float)($statements['totals']['assets'] ?? 0);
-            $liabTot = (float)($statements['totals']['liabilities'] ?? 0);
-            ?>
-            <div class="accounting-statement-row" style="margin-top:10px;border-top:1px dashed #CBD5E1;padding-top:8px;">
-                <span>Resultado del periodo (referencia, sin cerrar)</span>
+            <h4>Patrimonio</h4>
+            <?php foreach (($statements['equity'] ?? []) as $row): ?>
+                <div class="accounting-statement-row"><span><?php echo htmlspecialchars($row['code'] . ' ' . $row['name']); ?></span><strong><?php echo acctFmt((float)$row['display_balance'], $currency); ?></strong></div>
+            <?php endforeach; ?>
+            <div class="accounting-statement-row">
+                <span>Resultados de periodos anteriores <small style="color:var(--color-text-secondary);">(calculado, antes de <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateFrom) ?: time())); ?>)</small></span>
+                <strong style="color:<?php echo $stmtPrior >= 0 ? '#059669' : '#DC2626'; ?>;"><?php echo acctFmt($stmtPrior, $currency); ?></strong>
+            </div>
+            <div class="accounting-statement-row">
+                <span>Resultado del periodo <small style="color:var(--color-text-secondary);">(calculado, sin cerrar)</small></span>
                 <strong style="color:<?php echo $stmtProfit >= 0 ? '#059669' : '#DC2626'; ?>;"><?php echo acctFmt($stmtProfit, $currency); ?></strong>
             </div>
-            <div class="accounting-statement-total">
-                <span>Pasivo + patrimonio + resultado</span>
-                <strong><?php echo acctFmt($liabTot + $equityWithProfit, $currency); ?></strong>
+            <div class="accounting-statement-total"><span>Total patrimonio</span><strong><?php echo acctFmt($equityTotal, $currency); ?></strong></div>
+            <div class="accounting-statement-total" style="margin-top:10px;">
+                <span>Pasivo + patrimonio</span>
+                <strong><?php echo acctFmt($liabTot + $equityTotal, $currency); ?></strong>
             </div>
-            <p style="font-size:12px;color:var(--color-text-secondary);margin:8px 0 0;">
+            <p style="font-size:12px;margin:8px 0 0;color:<?php echo abs($stmtGap) >= 1 ? '#DC2626' : 'var(--color-text-secondary)'; ?>;">
                 Activos <?php echo acctFmt($assetsTot, $currency); ?>
-                <?php if (abs($assetsTot - ($liabTot + $equityWithProfit)) >= 1): ?>
-                    · diferencia vs pasivo+patrimonio+resultado:
-                    <?php echo acctFmt($assetsTot - ($liabTot + $equityWithProfit), $currency); ?>
+                <?php if (abs($stmtGap) >= 1): ?>
+                    · diferencia contra pasivo + patrimonio: <?php echo acctFmt($stmtGap, $currency); ?>.
+                    Revise el balance de comprobación (algún comprobante descuadrado o cuenta sin tipo).
                 <?php else: ?>
-                    · cuadra con pasivo + patrimonio + resultado (referencia)
+                    · cuadra con pasivo + patrimonio.
                 <?php endif; ?>
             </p>
         </div></div>
@@ -772,6 +1306,18 @@ foreach ($accounts as $account) {
         <div class="stat-card neumorphic"><h4>Canceladas</h4><div class="stat-value"><?php echo fmtComm((float)$commissionList['cancelled'], $currency); ?></div></div>
     </div>
 
+    <?php $commissionPending = $commissionPending ?? ['count' => 0, 'amount' => 0, 'last_error' => '']; ?>
+    <?php if ((int)$commissionPending['count'] > 0): ?>
+    <div class="alert alert-warning" style="margin-bottom:16px;padding:12px 14px;border-radius:10px;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.45);">
+        <strong><?php echo (int)$commissionPending['count']; ?> comisión(es) de datáfono / link de pago sin gasto ni asiento</strong>
+        (<?php echo fmtComm((float)$commissionPending['amount'], $currency); ?>).
+        Se reintentan con «Sincronizar» en Contabilidad o con «Recalcular comisiones del periodo».
+        <?php if ($commissionPending['last_error'] !== ''): ?>
+            <br><small>Último error: <?php echo htmlspecialchars($commissionPending['last_error']); ?></small>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
     <div class="card neumorphic" style="margin-bottom:16px;">
         <div class="card-header"><h3>Parámetros de comisiones</h3></div>
         <div class="card-body">
@@ -799,14 +1345,68 @@ foreach ($accounts as $account) {
                         </select>
                     </div>
                 </div>
-                <h4 style="margin:18px 0 10px;">Comisión de pasarela (datáfono / tarjetas / link)</h4>
-                <div class="form-grid">
-                    <div class="form-group" style="grid-column:1/-1;"><label><input type="checkbox" name="gateway_auto" value="1" <?php echo !empty($commissionCfg['gateway_auto']) ? 'checked' : ''; ?>> Generar automáticamente al registrar el pago</label></div>
-                    <div class="form-group"><label>% Datáfono</label><input class="form-control" type="number" step="0.01" name="dataphone_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['dataphone_rate'] ?? 2.5)); ?>"></div>
-                    <div class="form-group"><label>% Link de pago</label><input class="form-control" type="number" step="0.01" name="payment_link_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['payment_link_rate'] ?? 2.5)); ?>"></div>
-                    <div class="form-group"><label>% Débito</label><input class="form-control" type="number" step="0.01" name="debit_card_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['debit_card_rate'] ?? 1.5)); ?>"></div>
-                    <div class="form-group"><label>% Crédito</label><input class="form-control" type="number" step="0.01" name="credit_card_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['credit_card_rate'] ?? 2.8)); ?>"></div>
-                    <div class="form-group"><label>% Tarjeta genérica</label><input class="form-control" type="number" step="0.01" name="card_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['card_rate'] ?? 2.8)); ?>"></div>
+                <h4 style="margin:18px 0 10px;">Comisión de pasarela (datáfono / link de pago)</h4>
+                <div class="form-group"><label><input type="checkbox" name="gateway_auto" value="1" <?php echo !empty($commissionCfg['gateway_auto']) ? 'checked' : ''; ?>> Generar automáticamente al registrar el pago</label></div>
+                <?php
+                $dpFee = (float)($commissionCfg['dataphone_fixed_fee'] ?? 0);
+                $dpFeeTxt = $dpFee > 0
+                    ? number_format($dpFee, (int)($currency['decimals'] ?? 0), $currency['decimal'] ?? ',', $currency['thousands'] ?? '.')
+                    : '';
+                ?>
+                <div class="gateway-dataphone-box">
+                    <div class="gateway-dataphone-box__head">
+                        <strong>Datáfono</strong>
+                        <small>Aplica a cada pago con tarjeta débito o crédito: costo fijo por transacción + % según el tipo de tarjeta.</small>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>Costo fijo por transacción ($)</label>
+                            <input class="form-control money-input" type="text" inputmode="decimal" data-money="1" autocomplete="off"
+                                   name="dataphone_fixed_fee" placeholder="0" value="<?php echo htmlspecialchars($dpFeeTxt); ?>">
+                        </div>
+                    </div>
+                    <div class="gateway-dataphone-box__subs">
+                        <div class="gateway-dataphone-box__sub">
+                            <span class="gateway-dataphone-box__sub-title">↳ Tarjeta débito</span>
+                            <div class="form-group" style="margin:0;"><label>% comisión débito</label><input class="form-control" type="number" step="0.01" min="0" max="30" name="debit_card_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['debit_card_rate'] ?? 1.5)); ?>"></div>
+                        </div>
+                        <div class="gateway-dataphone-box__sub">
+                            <span class="gateway-dataphone-box__sub-title">↳ Tarjeta crédito</span>
+                            <div class="form-group" style="margin:0;"><label>% comisión crédito</label><input class="form-control" type="number" step="0.01" min="0" max="30" name="credit_card_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['credit_card_rate'] ?? 2.8)); ?>"></div>
+                        </div>
+                    </div>
+                    <small class="gateway-dataphone-box__example" id="dataphoneFeeExample"></small>
+                </div>
+                <div class="form-grid" style="margin-top:12px;">
+                    <div class="form-group"><label>% Link de pago</label><input class="form-control" type="number" step="0.01" min="0" max="30" name="payment_link_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['payment_link_rate'] ?? 2.5)); ?>"></div>
+                </div>
+                <div class="gateway-dataphone-box gateway-tax-box" style="margin-top:12px;">
+                    <div class="gateway-dataphone-box__head">
+                        <strong>IVA y retenciones del adquirente</strong>
+                        <small>Lo que el banco / pasarela descuenta además de la comisión en cada pago con datáfono o link de pago. Deje en 0 lo que no le apliquen; valide las tarifas con su contador.</small>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>% IVA sobre la comisión</label>
+                            <input class="form-control" type="number" step="0.01" min="0" max="100" name="gateway_vat_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['gateway_vat_rate'] ?? 0)); ?>">
+                            <label style="font-weight:normal;margin-top:6px;"><input type="checkbox" name="gateway_vat_deductible" value="1" <?php echo !empty($commissionCfg['gateway_vat_deductible']) ? 'checked' : ''; ?>> IVA descontable (cuenta <?php echo htmlspecialchars((string)($commissionCfg['gateway_vat_account'] ?? '240802')); ?>); sin marcar se suma al gasto</label>
+                        </div>
+                        <div class="form-group">
+                            <label>% Retención en la fuente</label>
+                            <input class="form-control" type="number" step="0.01" min="0" max="100" name="gateway_withholding_renta_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['withholding_renta_rate'] ?? 0)); ?>">
+                            <small>Sobre el pago sin IVA · cuenta <?php echo htmlspecialchars((string)($commissionCfg['withholding_renta_account'] ?? '135515')); ?></small>
+                        </div>
+                        <div class="form-group">
+                            <label>% ReteIVA</label>
+                            <input class="form-control" type="number" step="0.01" min="0" max="100" name="gateway_withholding_iva_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['withholding_iva_rate'] ?? 0)); ?>">
+                            <small>Sobre el IVA de la venta · cuenta <?php echo htmlspecialchars((string)($commissionCfg['withholding_iva_account'] ?? '135517')); ?></small>
+                        </div>
+                        <div class="form-group">
+                            <label>ReteICA (por mil ‰)</label>
+                            <input class="form-control" type="number" step="0.001" min="0" max="1000" name="gateway_withholding_ica_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['withholding_ica_rate'] ?? 0)); ?>">
+                            <small>Sobre el pago sin IVA · cuenta <?php echo htmlspecialchars((string)($commissionCfg['withholding_ica_account'] ?? '135518')); ?></small>
+                        </div>
+                    </div>
                 </div>
                 <h4 style="margin:18px 0 10px;">Crédito largo (recargo por tramos)</h4>
                 <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">
@@ -848,6 +1448,34 @@ foreach ($accounts as $account) {
                 <input type="hidden" name="credit_over_60_days" value="<?php echo (int)($commissionCfg['credit_over_60_days'] ?? 60); ?>">
                 <input type="hidden" name="credit_over_60_rate" value="<?php echo htmlspecialchars((string)($commissionCfg['credit_over_60_rate'] ?? 0)); ?>">
                 <script>
+                (function () {
+                    var box = document.querySelector('.gateway-dataphone-box');
+                    var out = document.getElementById('dataphoneFeeExample');
+                    if (!box || !out) return;
+                    function num(v) {
+                        if (window.SeriMoney && typeof SeriMoney.parse === 'function') return SeriMoney.parse(v) || 0;
+                        return parseFloat(String(v || '').replace(/\./g, '').replace(',', '.')) || 0;
+                    }
+                    function money(n) {
+                        var r = Math.round(n * 100) / 100;
+                        return '$ ' + (window.SeriMoney && typeof SeriMoney.format === 'function'
+                            ? SeriMoney.format(r)
+                            : r.toLocaleString('es-CO', { maximumFractionDigits: 2 }));
+                    }
+                    function pct(n) { return String(Math.round(n * 100) / 100).replace('.', ','); }
+                    function refresh() {
+                        var fixed = num(box.querySelector('[name="dataphone_fixed_fee"]').value);
+                        var deb = parseFloat(box.querySelector('[name="debit_card_rate"]').value) || 0;
+                        var cre = parseFloat(box.querySelector('[name="credit_card_rate"]').value) || 0;
+                        var base = 100000;
+                        out.innerHTML = 'Ejemplo pago de ' + money(base) + ': '
+                            + '<strong>débito</strong> ' + money(fixed) + ' + ' + pct(deb) + '% = <strong>' + money(fixed + base * deb / 100) + '</strong> · '
+                            + '<strong>crédito</strong> ' + money(fixed) + ' + ' + pct(cre) + '% = <strong>' + money(fixed + base * cre / 100) + '</strong>';
+                    }
+                    box.addEventListener('input', refresh);
+                    box.addEventListener('change', refresh);
+                    refresh();
+                })();
                 function addCreditSurchargeTier() {
                     var wrap = document.getElementById('creditSurchargeTiers');
                     if (!wrap) return;
@@ -970,6 +1598,16 @@ foreach ($accounts as $account) {
                 </select>
                 <button class="btn btn-secondary" type="submit">Filtrar</button>
             </form>
+            <?php if ($canEdit): ?>
+            <form method="POST" action="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=recalc-commissions" data-ajax="true" style="margin:0;">
+                <?php echo \SoftNova\Core\csrf_field(); ?>
+                <input type="hidden" name="from" value="<?php echo htmlspecialchars($dateFrom); ?>">
+                <input type="hidden" name="to" value="<?php echo htmlspecialchars($dateTo); ?>">
+                <button class="btn btn-primary" type="submit"
+                        title="Crea las comisiones faltantes de pagos con datáfono / link de pago del periodo y contabiliza las pendientes"
+                        onclick="return confirm('¿Recalcular comisiones de datáfono / link de pago del <?php echo htmlspecialchars($dateFrom); ?> al <?php echo htmlspecialchars($dateTo); ?>? Solo crea las que falten; no duplica ni recrea las anuladas.')">Recalcular comisiones del periodo</button>
+            </form>
+            <?php endif; ?>
         </div>
         <div class="card-body">
             <?php if ($canEdit): ?>
@@ -992,14 +1630,30 @@ foreach ($accounts as $account) {
                             <input type="checkbox" name="ids[]" value="<?php echo (int)$c['id']; ?>">
                         <?php endif; ?></td>
                         <?php endif; ?>
-                        <td><?php echo date('d/m/Y H:i', strtotime($c['created_at'])); ?></td>
+                        <td><?php echo !empty($c['accrual_date'])
+                            ? date('d/m/Y', strtotime($c['accrual_date']))
+                            : date('d/m/Y H:i', strtotime($c['created_at'])); ?></td>
                         <td><?php echo ($c['commission_kind'] ?? '') === 'gateway' ? 'Pasarela' : 'Vendedor'; ?></td>
                         <td><?php echo htmlspecialchars($c['invoice_number'] ?? ('#' . $c['sale_id'])); ?></td>
-                        <td><?php echo htmlspecialchars($c['seller_name'] ?? ($c['payment_method'] ?? '—')); ?></td>
+                        <?php
+                        $cIsGateway = ($c['commission_kind'] ?? '') === 'gateway';
+                        $cMethod = (string)($c['payment_method'] ?? '');
+                        $cFixed = $cIsGateway
+                            ? round((float)$c['amount'] - round((float)$c['base_amount'] * (float)$c['rate'] / 100, 2), 2)
+                            : 0.0;
+                        $cVat = (float)($c['vat_amount'] ?? 0);
+                        $cRet = (float)($c['withholding_renta'] ?? 0) + (float)($c['withholding_iva'] ?? 0) + (float)($c['withholding_ica'] ?? 0);
+                        ?>
+                        <td><?php echo htmlspecialchars($c['seller_name'] ?? ($cMethod !== '' ? \SoftNova\Services\PaymentMethodCatalog::label($cMethod) : '—')); ?></td>
                         <td><?php echo fmtComm((float)$c['base_amount'], $currency); ?></td>
-                        <td><?php echo (float)$c['rate']; ?>%</td>
-                        <td><strong><?php echo fmtComm((float)$c['amount'], $currency); ?></strong></td>
-                        <td><span class="badge"><?php echo htmlspecialchars($c['status']); ?></span></td>
+                        <td><?php echo (float)$c['rate']; ?>%<?php if ($cFixed > 0.009): ?> <small style="color:var(--color-text-secondary);">+ <?php echo fmtComm($cFixed, $currency); ?></small><?php endif; ?></td>
+                        <td><strong><?php echo fmtComm((float)$c['amount'], $currency); ?></strong>
+                            <?php if ($cVat > 0.009): ?><br><small style="color:var(--color-text-secondary);">+ IVA <?php echo fmtComm($cVat, $currency); ?></small><?php endif; ?>
+                            <?php if ($cRet > 0.009): ?><br><small style="color:var(--color-text-secondary);">Retenciones <?php echo fmtComm($cRet, $currency); ?></small><?php endif; ?>
+                        </td>
+                        <td><span class="badge"><?php echo htmlspecialchars($c['status']); ?></span>
+                            <?php if (($c['status'] ?? '') === 'pending' && !empty($c['last_error'])): ?><br><small style="color:#DC2626;" title="<?php echo htmlspecialchars($c['last_error']); ?>">Error al contabilizar</small><?php endif; ?>
+                        </td>
                     </tr>
                 <?php endforeach; ?>
                 </tbody>
@@ -1319,8 +1973,14 @@ foreach ($accounts as $account) {
                             <td style="text-align:right;"><?php echo $fmtMoney($led['generated_net'] ?? 0); ?></td>
                         </tr>
                         <tr>
-                            <td>IVA descontable (compras − NC)</td>
-                            <td style="text-align:right;"><?php echo $fmtMoney($docs['purchases_net'] ?? 0); ?></td>
+                            <td>
+                                IVA descontable (compras − NC + comisiones de pasarela)
+                                <div style="font-size:12px;color:var(--color-text-secondary);">
+                                    Compras <?php echo $fmtMoney($docs['purchases_net'] ?? 0); ?>
+                                    · Comisiones datáfono / link <?php echo $fmtMoney($docs['gateway_commission_tax'] ?? 0); ?>
+                                </div>
+                            </td>
+                            <td style="text-align:right;"><?php echo $fmtMoney($docs['deductible_net'] ?? ($docs['purchases_net'] ?? 0)); ?></td>
                             <td style="text-align:right;"><?php echo $fmtMoney($led['deductible_net'] ?? 0); ?></td>
                         </tr>
                         <tr>
@@ -1339,6 +1999,15 @@ foreach ($accounts as $account) {
                         <tr><td>IVA NC ventas</td><td style="text-align:right;"><?php echo $fmtMoney($docs['sales_credit_tax'] ?? 0); ?></td></tr>
                         <tr><td>IVA compras</td><td style="text-align:right;"><?php echo $fmtMoney($docs['purchases_tax'] ?? 0); ?></td></tr>
                         <tr><td>IVA NC compras</td><td style="text-align:right;"><?php echo $fmtMoney($docs['purchases_credit_tax'] ?? 0); ?></td></tr>
+                        <tr>
+                            <td>
+                                IVA comisiones datáfono / link de pago
+                                <?php if (isset($docs['gateway_vat_deductible']) && !$docs['gateway_vat_deductible']): ?>
+                                    <div style="font-size:12px;color:var(--color-text-secondary);">No descontable según Comisiones: se lleva como mayor gasto.</div>
+                                <?php endif; ?>
+                            </td>
+                            <td style="text-align:right;"><?php echo $fmtMoney($docs['gateway_commission_tax'] ?? 0); ?></td>
+                        </tr>
                     </tbody>
                 </table>
             </div>
@@ -1568,7 +2237,11 @@ foreach ($accounts as $account) {
         <div class="modal-header"><h3 id="accountModalTitle">Cuenta contable</h3><button type="button" class="modal-close" onclick="closeModal('accountModal')">&times;</button></div>
         <form method="POST" action="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=save-account" data-ajax="true">
             <?php echo \SoftNova\Core\csrf_field(); ?><input type="hidden" name="id" id="accountId">
-            <div class="modal-body"><div class="form-grid">
+            <div class="modal-body">
+            <p id="accountSystemHint" style="display:none;font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">
+                Cuenta de sistema: la usan ventas, compras, gastos y caja. Solo se puede cambiar el nombre.
+            </p>
+            <div class="form-grid">
                 <div class="form-group"><label>Código *</label><input class="form-control" name="code" id="accountCode" maxlength="30" required></div>
                 <div class="form-group"><label>Nombre *</label><input class="form-control" name="name" id="accountName" maxlength="180" required></div>
                 <div class="form-group"><label>Tipo *</label><select class="form-control" name="account_type" id="accountType" required><?php foreach ($types as $value => $label): ?><option value="<?php echo $value; ?>"><?php echo $label; ?></option><?php endforeach; ?></select></div>
@@ -1585,7 +2258,25 @@ foreach ($accounts as $account) {
 <div id="entryDetailModal" class="modal-overlay" style="display:none;">
     <div class="modal-content" style="max-width:900px;">
         <div class="modal-header"><h3 id="entryDetailTitle">Comprobante</h3><button type="button" class="modal-close" onclick="closeModal('entryDetailModal')">&times;</button></div>
-        <div class="modal-body" id="entryDetailBody"><p class="dashboard-empty">Cargando...</p></div>
+        <div class="modal-body">
+            <div id="entryDetailBody"><p class="dashboard-empty">Cargando...</p></div>
+            <?php if ($canDelete): ?>
+            <div id="entryVoidBox" class="entry-void-box" style="display:none;">
+                <form method="POST" action="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=void-entry" data-ajax="true">
+                    <?php echo \SoftNova\Core\csrf_field(); ?>
+                    <input type="hidden" name="entry_id" id="voidEntryId" value="">
+                    <div class="form-group">
+                        <label for="voidEntryReason"><strong>Anular comprobante manual</strong> · motivo *</label>
+                        <input class="form-control" type="text" name="reason" id="voidEntryReason" minlength="5" maxlength="200" required placeholder="Ej.: valor digitado errado, se registra de nuevo">
+                    </div>
+                    <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 8px;">
+                        Se genera un comprobante de reversión con los mismos valores invertidos. El original queda como «Anulado»; ninguno se borra.
+                    </p>
+                    <button type="submit" class="btn btn-danger btn-sm" data-confirm="¿Anular este comprobante? Se registrará el asiento de reversión.">Anular comprobante</button>
+                </form>
+            </div>
+            <?php endif; ?>
+        </div>
     </div>
 </div>
 
@@ -1595,6 +2286,20 @@ foreach ($accounts as $account) {
 .accounting-statement-row,.accounting-statement-total{display:flex;justify-content:space-between;gap:15px;padding:7px 0;border-bottom:1px solid var(--color-border)}
 .accounting-statement-total{font-weight:700;border-top:2px solid var(--color-border);border-bottom:0}
 @media(max-width:900px){.accounting-statements{grid-template-columns:1fr}}
+.trial-switch{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.trial-checks{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.trial-table .num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.trial-table th.trial-group{text-align:center;border-bottom:1px solid var(--color-border)}
+.trial-table .trial-total td{font-weight:700;border-top:2px solid var(--color-border);background:var(--dmb-F1F5F9, #F1F5F9)}
+.ledger-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px}
+.ledger-summary div{padding:10px 12px;border:1px solid var(--color-border);border-radius:8px;background:var(--dmb-F8FAFC, #F8FAFC);display:flex;flex-direction:column;gap:4px}
+.ledger-summary span{font-size:12px;color:var(--color-text-secondary)}
+.ledger-summary strong{font-size:15px;font-variant-numeric:tabular-nums}
+.ledger-note{margin-top:12px;padding:10px 12px;border:1px solid #E2E8F0;border-radius:8px;background:var(--dmb-F8FAFC, #F8FAFC);font-size:12px;color:var(--color-text-secondary);line-height:1.5}
+.ledger-note ul{margin:6px 0 0;padding-left:18px}
+.ledger-note strong{color:var(--color-text)}
+.entry-void-box{margin-top:16px;padding:12px 14px;border:1px solid #FECACA;border-radius:8px;background:var(--dmb-FEF2F2, #FEF2F2)}
+.entry-void-box .form-group{margin:0 0 8px}
 </style>
 
 <script>
@@ -1659,6 +2364,7 @@ function newAccountingAccount() {
     document.getElementById('accountNature').value = 'debit';
     document.getElementById('accountStatus').value = 'active';
     document.getElementById('accountAccepts').checked = true;
+    setAccountSystemLock(false);
     openModal('accountModal');
 }
 
@@ -1671,7 +2377,22 @@ function editAccountingAccount(account) {
     document.getElementById('accountNature').value = account.nature;
     document.getElementById('accountStatus').value = account.status;
     document.getElementById('accountAccepts').checked = Number(account.accepts_entries) === 1;
+    setAccountSystemLock(Number(account.is_system) === 1);
     openModal('accountModal');
+}
+
+function setAccountSystemLock(locked) {
+    document.getElementById('accountCode').readOnly = locked;
+    ['accountType', 'accountNature', 'accountStatus'].forEach(function(id){
+        var el = document.getElementById(id);
+        el.style.pointerEvents = locked ? 'none' : '';
+        el.style.opacity = locked ? '0.65' : '';
+        el.tabIndex = locked ? -1 : 0;
+    });
+    var accepts = document.getElementById('accountAccepts');
+    accepts.style.pointerEvents = locked ? 'none' : '';
+    var hint = document.getElementById('accountSystemHint');
+    if (hint) hint.style.display = locked ? 'block' : 'none';
 }
 
 function renderExpenseSourceDocument(doc) {
@@ -1787,6 +2508,8 @@ function renderSourceDocument(doc) {
 function showAccountingEntry(id) {
     var url = <?php echo json_encode($viewInstance->route('app/contabilidad')); ?> + '?action=entry&id=' + encodeURIComponent(id);
     document.getElementById('entryDetailBody').innerHTML = '<p class="dashboard-empty">Cargando...</p>';
+    var voidBox = document.getElementById('entryVoidBox');
+    if (voidBox) voidBox.style.display = 'none';
     openModal('entryDetailModal');
     fetch(url, {headers:{'X-Requested-With':'XMLHttpRequest'}})
         .then(function(response){ return response.json(); })
@@ -1794,7 +2517,19 @@ function showAccountingEntry(id) {
             if (!data.success) throw new Error(data.message || 'No se pudo cargar');
             var entry = data.entry;
             document.getElementById('entryDetailTitle').textContent = entry.entry_number + ' · ' + entry.description;
-            var html = '<p style="margin:0 0 10px;"><strong>Fecha:</strong> ' + escapeAccounting(entry.entry_date) + ' &nbsp; <strong>Estado:</strong> ' + escapeAccounting(entry.status) + '</p>';
+            var statusLabels = {posted: 'Contabilizado', reversed: 'Anulado', draft: 'Borrador'};
+            var html = '<p style="margin:0 0 10px;"><strong>Fecha:</strong> ' + escapeAccounting(entry.entry_date) + ' &nbsp; <strong>Estado:</strong> ' + escapeAccounting(statusLabels[entry.status] || entry.status) + (entry.is_manual ? ' &nbsp; <span class="badge badge-info">Manual</span>' : '') + '</p>';
+            if (entry.reversed_by) {
+                html += '<div class="alert alert-warning" style="margin:0 0 10px;padding:8px 12px;">Anulado por <a href="#" onclick="showAccountingEntry(' + Number(entry.reversed_by.id) + ');return false;">' + escapeAccounting(entry.reversed_by.entry_number) + '</a> (' + escapeAccounting(entry.reversed_by.entry_date) + ').</div>';
+            }
+            if (entry.reversal_of) {
+                html += '<div class="alert alert-info" style="margin:0 0 10px;padding:8px 12px;">Reversión del comprobante <a href="#" onclick="showAccountingEntry(' + Number(entry.reversal_of.id) + ');return false;">' + escapeAccounting(entry.reversal_of.entry_number) + '</a>.</div>';
+            }
+            if (voidBox) {
+                document.getElementById('voidEntryId').value = entry.can_void ? entry.id : '';
+                document.getElementById('voidEntryReason').value = '';
+                voidBox.style.display = entry.can_void ? 'block' : 'none';
+            }
             if (entry.source_document) {
                 html += renderSourceDocument(entry.source_document);
             }

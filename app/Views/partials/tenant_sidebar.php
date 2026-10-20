@@ -43,6 +43,7 @@ $allModules = [
     'gastos'    => ['route' => 'app/gastos', 'label' => 'Gastos', 'icon' => 'dollar'],
     'reportes'  => ['route' => 'app/reportes', 'label' => 'Reportes', 'icon' => 'file'],
     'contabilidad'=>['route' => 'app/contabilidad', 'label' => 'Contabilidad', 'icon' => 'ledger'],
+    'bancos'    => ['route' => 'app/bancos', 'label' => 'Bancos', 'icon' => 'bank'],
     'nomina'    => ['route' => 'app/nomina', 'label' => 'Nómina', 'icon' => 'payroll'],
 ];
 
@@ -51,7 +52,7 @@ $moduleGroups = [
     'Principal'  => ['dashboard', 'caja', 'ventas'],
     'Inventario' => ['inventario', 'prestamos', 'consignacion', 'compras'],
     'Comercial'  => ['clientes', 'proveedores', 'cotizaciones'],
-    'Finanzas'   => ['gastos', 'reportes', 'contabilidad', 'nomina'],
+    'Finanzas'   => ['gastos', 'reportes', 'contabilidad', 'bancos', 'nomina'],
 ];
 
 // Filtrar módulos por rol del usuario
@@ -67,8 +68,9 @@ foreach ($allModules as $key => $mod) {
     $planAccess = $showAll
         || in_array($key, $allowedModules, true)
         || ($key === 'prestamos' && in_array('inventario', $allowedModules, true))
-        || ($key === 'consignacion' && in_array('inventario', $allowedModules, true));
-    if ($planAccess && \SoftNova\Core\TenantMiddleware::canAccess($key)) {
+        || ($key === 'consignacion' && in_array('inventario', $allowedModules, true))
+        || ($key === 'bancos' && in_array('contabilidad', $allowedModules, true));
+    if ($planAccess && \SoftNova\Core\TenantMiddleware::canAccess($key === 'bancos' ? 'contabilidad' : $key)) {
         $visibleModules[$key] = $mod;
     }
 }
@@ -93,6 +95,7 @@ function tenantIcon(string $name): string {
         'truck' => '<rect x="1" y="3" width="15" height="13"></rect><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"></polygon><circle cx="5.5" cy="18.5" r="2.5"></circle><circle cx="18.5" cy="18.5" r="2.5"></circle>',
         'bag' => '<path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"></path><line x1="3" y1="6" x2="21" y2="6"></line><path d="M16 10a4 4 0 0 1-8 0"></path>',
         'quote' => '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><line x1="10" y1="9" x2="8" y2="9"></line>',
+        'bank' => '<path d="M3 10l9-6 9 6"></path><line x1="4" y1="10" x2="20" y2="10"></line><line x1="6" y1="10" x2="6" y2="18"></line><line x1="10" y1="10" x2="10" y2="18"></line><line x1="14" y1="10" x2="14" y2="18"></line><line x1="18" y1="10" x2="18" y2="18"></line><line x1="3" y1="21" x2="21" y2="21"></line><line x1="4" y1="18" x2="20" y2="18"></line>',
         'ledger' => '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path><line x1="9" y1="7" x2="16" y2="7"></line><line x1="9" y1="11" x2="14" y2="11"></line>',
         'file' => '<line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line>',
         'dollar' => '<line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>',

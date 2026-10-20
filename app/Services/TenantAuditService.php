@@ -196,6 +196,7 @@ class TenantAuditService
             'prestamos' => 'Préstamos',
             'contabilidad' => 'Contabilidad',
             'nomina' => 'Nómina',
+            'bancos' => 'Bancos',
             'configuracion' => 'Configuración',
             'usuarios' => 'Usuarios',
             'clientes' => 'Clientes',
@@ -255,13 +256,18 @@ class TenantAuditService
             'purchase_order', 'purchase_invoice', 'purchase_credit_note', 'supplier_payment' => '/app/compras?action=facturas',
             'accounting_entry' => '/app/contabilidad?tab=entries',
             'payroll_run' => '/app/nomina?tab=runs&action=run_detail&id=',
+            'payroll_payment' => '/app/nomina?tab=payments',
+            'bank_account' => '/app/bancos?tab=cuentas',
+            'bank_statement' => '/app/bancos?tab=conciliacion&statement_id=',
+            'bank_posting' => '/app/bancos?tab=conciliacion',
+            'bold_settlement' => '/app/bancos?tab=bold&settlement_id=',
             default => null,
         };
         if ($path === null) {
             return null;
         }
 
-        if ($entityType === 'payroll_run') {
+        if (in_array($entityType, ['payroll_run', 'bank_statement', 'bold_settlement'], true)) {
             $path .= $entityId;
         }
 

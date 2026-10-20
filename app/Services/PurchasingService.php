@@ -94,6 +94,9 @@ class PurchasingService
             if (!isset($cols['commercial_discount_amount'])) {
                 $alters[] = 'ADD COLUMN commercial_discount_amount DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER commercial_discount_pct';
             }
+            if (!isset($cols['supplier_invoice_value'])) {
+                $alters[] = 'ADD COLUMN supplier_invoice_value DECIMAL(14,2) NULL AFTER total';
+            }
             if (!isset($cols['due_date'])) {
                 $alters[] = 'ADD COLUMN due_date DATE NULL AFTER expected_date';
             }
@@ -173,19 +176,22 @@ class PurchasingService
         $tax = round(max(0, $tax), 2);
         $gross = round($subtotal + $tax, 2);
         $earlyPct = max(0, min(100, round($earlyPct, 2)));
-        $commercialPct = max(0, min(100, round($commercialPct, 2)));
+        // % comercial siempre entero (0–100).
+        $commercialPct = max(0, min(100, (float)(int)round($commercialPct)));
         $commercialAmountInput = max(0, round($commercialAmountInput, 2));
 
+        // Desc. comercial sobre el subtotal (antes de IVA): Total bruto − dcto. líneas − comercial = Sub total → + IVA = Neto.
         // Si hay monto en $, prevalece; el % guardado queda en 0 para no recalcular mal después.
         $amountWins = $commercialAmountInput > 0.009;
         $commercialAmt = $amountWins
-            ? min($commercialAmountInput, $gross)
-            : round($gross * ($commercialPct / 100), 2);
+            ? min($commercialAmountInput, $subtotal)
+            : round($subtotal * ($commercialPct / 100), 2);
         $storeCommercialPct = $amountWins ? 0.0 : $commercialPct;
 
-        $remaining = max(0, round($gross - $commercialAmt, 2));
-        $earlyAmt = round($remaining * ($earlyPct / 100), 2);
-        $total = max(0, round($remaining - $earlyAmt, 2));
+        $netSubtotal = max(0, round($subtotal - $commercialAmt, 2));
+        $afterCommercial = round($netSubtotal + $tax, 2);
+        $earlyAmt = round($afterCommercial * ($earlyPct / 100), 2);
+        $total = max(0, round($afterCommercial - $earlyAmt, 2));
 
         return [
             'gross' => $gross,
@@ -270,6 +276,9 @@ class PurchasingService
                 'product_name' => $name,
                 'quantity' => $qty,
                 'unit_cost' => $cost,
+                'inventory_cost' => isset($item['inventory_cost']) && (float)$item['inventory_cost'] > 0.009
+                    ? round((float)$item['inventory_cost'], 2)
+                    : null,
                 'tax_rate' => $rate,
                 'tax_amount' => $lineTax,
                 'subtotal' => $lineSub,
@@ -362,13 +371,63 @@ class PurchasingService
         }
         $orderId = (int)$this->db->lastInsertId();
 
+        $this->insertOrderItemRows($orderId, $normalized);
+
+        return $orderId;
+    }
+
+    /**
+     * @param list<array<string,mixed>> $rows líneas ya normalizadas
+     */
+    private function insertOrderItemRows(int $orderId, array $rows): void
+    {
+        $withInv = false;
+        foreach ($rows as $row) {
+            if (($row['inventory_cost'] ?? null) !== null) {
+                $withInv = true;
+                break;
+            }
+        }
+        if ($withInv) {
+            try {
+                $stmt = $this->db->prepare(
+                    "INSERT INTO purchase_order_items
+                        (purchase_order_id, product_id, product_name, barcode, product_code, quantity, unit_cost,
+                         inventory_cost, tax_rate, tax_amount, subtotal, line_total, lot_code, expiry_date)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                );
+                foreach ($rows as $row) {
+                    $stmt->execute([
+                        $orderId,
+                        $row['product_id'],
+                        $row['product_name'],
+                        $row['barcode'],
+                        $row['product_code'],
+                        $row['quantity'],
+                        $row['unit_cost'],
+                        $row['inventory_cost'] ?? null,
+                        $row['tax_rate'],
+                        $row['tax_amount'],
+                        $row['subtotal'],
+                        $row['line_total'],
+                        $row['lot_code'],
+                        $row['expiry_date'],
+                    ]);
+                }
+                return;
+            } catch (\PDOException $e) {
+                // Columna inventory_cost aún no migrada: insertar sin ella.
+                $this->query("DELETE FROM purchase_order_items WHERE purchase_order_id = ?", [$orderId]);
+            }
+        }
+
         $stmt = $this->db->prepare(
             "INSERT INTO purchase_order_items
                 (purchase_order_id, product_id, product_name, barcode, product_code, quantity, unit_cost,
                  tax_rate, tax_amount, subtotal, line_total, lot_code, expiry_date)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
-        foreach ($normalized as $row) {
+        foreach ($rows as $row) {
             $stmt->execute([
                 $orderId,
                 $row['product_id'],
@@ -385,8 +444,6 @@ class PurchasingService
                 $row['expiry_date'],
             ]);
         }
-
-        return $orderId;
     }
 
     /**
@@ -580,9 +637,14 @@ class PurchasingService
         [$whereSql, $params] = $this->orderFilters($status, $dueFilter, $filters);
         $limit = max(1, min(200, $limit));
         $offset = max(0, $offset);
-        $orderBy = $dueFilter !== ''
-            ? 'ORDER BY po.due_date IS NULL, po.due_date ASC, po.id DESC'
-            : 'ORDER BY po.order_date DESC, po.id DESC';
+        $customOrder = trim((string)($filters['orderSql'] ?? ''));
+        if ($customOrder !== '') {
+            $orderBy = 'ORDER BY ' . $customOrder . ', po.id DESC';
+        } else {
+            $orderBy = $dueFilter !== ''
+                ? 'ORDER BY po.due_date IS NULL, po.due_date ASC, po.id DESC'
+                : 'ORDER BY po.order_date DESC, po.id DESC';
+        }
         return $this->query(
             "SELECT po.*, s.name supplier_name,
                     DATEDIFF(CURDATE(), po.due_date) AS days_overdue
@@ -760,6 +822,9 @@ class PurchasingService
                 'product_name' => $name,
                 'quantity' => $qty,
                 'unit_cost' => $cost,
+                'inventory_cost' => isset($item['inventory_cost']) && (float)$item['inventory_cost'] > 0.009
+                    ? round((float)$item['inventory_cost'], 2)
+                    : null,
                 'tax_rate' => $rate,
                 'tax_amount' => $lineTax,
                 'subtotal' => $lineSub,
@@ -792,29 +857,7 @@ class PurchasingService
         $total = $disc['total'];
 
         $this->query("DELETE FROM purchase_order_items WHERE purchase_order_id = ?", [$orderId]);
-        $stmt = $this->db->prepare(
-            "INSERT INTO purchase_order_items
-                (purchase_order_id, product_id, product_name, barcode, product_code, quantity, unit_cost,
-                 tax_rate, tax_amount, subtotal, line_total, lot_code, expiry_date)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        );
-        foreach ($normalized as $row) {
-            $stmt->execute([
-                $orderId,
-                $row['product_id'],
-                $row['product_name'],
-                $row['barcode'],
-                $row['product_code'],
-                $row['quantity'],
-                $row['unit_cost'],
-                $row['tax_rate'],
-                $row['tax_amount'],
-                $row['subtotal'],
-                $row['line_total'],
-                $row['lot_code'],
-                $row['expiry_date'],
-            ]);
-        }
+        $this->insertOrderItemRows($orderId, $normalized);
 
         try {
             $this->query(
@@ -894,14 +937,23 @@ class PurchasingService
         [$whereSql, $params] = $this->invoiceFilters($paymentFilter, $dueFilter, $filters);
         $limit = max(1, min(20000, $limit));
         $offset = max(0, $offset);
-        $byDue = strtolower(trim($paymentFilter)) === 'unpaid'
-            || in_array(strtolower(trim($dueFilter)), ['overdue', 'due_today', 'due_soon'], true);
-        $orderBy = $byDue
-            ? 'po.due_date IS NULL, po.due_date ASC, po.id ASC'
-            : 'COALESCE(po.invoice_date, po.warehouse_date, po.order_date) DESC, po.id DESC';
+        $customOrder = trim((string)($filters['orderSql'] ?? ''));
+        if ($customOrder !== '') {
+            $orderBy = $customOrder . ', po.id DESC';
+        } else {
+            $byDue = strtolower(trim($paymentFilter)) === 'unpaid'
+                || in_array(strtolower(trim($dueFilter)), ['overdue', 'due_today', 'due_soon'], true);
+            $orderBy = $byDue
+                ? 'po.due_date IS NULL, po.due_date ASC, po.id ASC'
+                : 'COALESCE(po.invoice_date, po.warehouse_date, po.order_date) DESC, po.id DESC';
+        }
         return $this->query(
             "SELECT po.*, s.name supplier_name,
-                    DATEDIFF(CURDATE(), po.due_date) AS days_overdue
+                    DATEDIFF(CURDATE(), po.due_date) AS days_overdue,
+                    COALESCE((
+                        SELECT SUM(sp.discount_amount) FROM supplier_payments sp
+                        WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                    ), 0) AS payment_discount_total
              FROM purchase_orders po
              LEFT JOIN suppliers s ON s.id = po.supplier_id
              {$whereSql}
@@ -924,7 +976,10 @@ class PurchasingService
                 "SELECT COUNT(*) AS cnt,
                         COALESCE(SUM(CASE
                             WHEN po.status = 'received' AND COALESCE(po.payment_mode, 'payable') = 'payable'
-                            THEN GREATEST(po.total - COALESCE(po.paid_total, 0) - COALESCE(po.credit_total, 0), 0)
+                            THEN GREATEST(COALESCE(NULLIF(po.supplier_invoice_value, 0), po.total) - COALESCE(po.paid_total, 0) - COALESCE(po.credit_total, 0) - COALESCE((
+                                SELECT SUM(sp.discount_amount) FROM supplier_payments sp
+                                WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                            ), 0), 0)
                             ELSE 0 END), 0) AS balance
                  FROM purchase_orders po
                  LEFT JOIN suppliers s ON s.id = po.supplier_id
@@ -1196,17 +1251,26 @@ class PurchasingService
 
                 $debtCover = null;
                 $invoiceUnitCost = round((float)($item['unit_cost'] ?? 0), 2);
+                $inventoryOverride = round(max(0, (float)($item['inventory_cost'] ?? 0)), 2);
                 $isBonus = $invoiceUnitCost <= 0.009;
                 // Factura: bonificación a $0. Inventario: conservar costo (no diluir WAC).
-                $unitCost = $isBonus
-                    ? $this->resolveBonusInventoryCost($order, $item, $productId)
-                    : $invoiceUnitCost;
+                // Costo inventario manual (factura importada) manda sobre ambos.
+                if ($inventoryOverride > 0.009) {
+                    $unitCost = $inventoryOverride;
+                } else {
+                    $unitCost = $isBonus
+                        ? $this->resolveBonusInventoryCost($order, $item, $productId)
+                        : $invoiceUnitCost;
+                }
                 $note = 'OC ' . $order['order_number'] . ($invoiceNumber !== '' ? (' / Factura ' . $invoiceNumber) : '');
                 if ($isBonus) {
                     $note .= ' · Bonificación (factura $0';
                     if ($unitCost > 0.009) {
                         $note .= ' · inventario valorizado a ' . number_format($unitCost, 2, '.', '');
                     }
+                } elseif ($inventoryOverride > 0.009 && abs($inventoryOverride - $invoiceUnitCost) > 0.009) {
+                    $note .= ' · Costo inventario ' . number_format($inventoryOverride, 2, '.', '')
+                        . ' (factura ' . number_format($invoiceUnitCost, 2, '.', '') . ')';
                 }
                 $movementId = $stock->increase(
                     $productId,
@@ -1352,7 +1416,10 @@ class PurchasingService
             if ($itemId > 0 && (int)($other['id'] ?? 0) === $itemId) {
                 continue;
             }
-            $sibling = round((float)($other['unit_cost'] ?? 0), 2);
+            $sibling = round((float)($other['inventory_cost'] ?? 0), 2);
+            if ($sibling <= 0.009) {
+                $sibling = round((float)($other['unit_cost'] ?? 0), 2);
+            }
             if ($sibling > 0.009) {
                 return $sibling;
             }
@@ -1714,6 +1781,85 @@ class PurchasingService
     }
 
     /**
+     * Anulación (sin NC) de una OC pagada con efectivo del cajón: devuelve al cajón lo que salió.
+     * Si la caja del egreso sigue abierta, vuelve a esa misma caja (neto $0);
+     * si ya se cerró, entra como ingreso en la caja abierta actual.
+     */
+    public function syncCashForVoidedOrder(int $orderId): string
+    {
+        $order = $this->query(
+            "SELECT po.order_number, po.payment_mode, s.name supplier_name
+             FROM purchase_orders po
+             LEFT JOIN suppliers s ON s.id = po.supplier_id
+             WHERE po.id = ?",
+            [$orderId]
+        )->fetch();
+        if (!$order || (string)($order['payment_mode'] ?? '') !== 'cash') {
+            return '';
+        }
+        try {
+            $out = $this->query(
+                "SELECT COALESCE(SUM(amount), 0) AS total, MAX(cash_session_id) AS session_id
+                 FROM cash_movements
+                 WHERE reference_type = 'purchase_order' AND reference_id = ? AND type = 'expense'",
+                [$orderId]
+            )->fetch() ?: [];
+        } catch (\Throwable $e) {
+            return '';
+        }
+        $amount = round((float)($out['total'] ?? 0), 2);
+        if ($amount <= 0.009) {
+            return 'La compra no tuvo egreso de cajón; no se movió la caja.';
+        }
+        $sessionId = null;
+        $originSession = (int)($out['session_id'] ?? 0);
+        if ($originSession > 0) {
+            $open = $this->query(
+                "SELECT id FROM cash_sessions WHERE id = ? AND status = 'open' LIMIT 1",
+                [$originSession]
+            )->fetchColumn();
+            if ($open) {
+                $sessionId = $originSession;
+            }
+        }
+        $label = 'Devolución anulación OC ' . ($order['order_number'] ?? ('#' . $orderId))
+            . (!empty($order['supplier_name']) ? ' · ' . $order['supplier_name'] : '');
+        $note = $this->postCashMovement($amount, $label, 'income', 'purchase_order_cancel', $orderId, $sessionId);
+        if ($note === 'Ingreso a caja registrado.') {
+            return $sessionId !== null
+                ? 'El dinero volvió a la caja del día.'
+                : 'El dinero entró como ingreso en la caja abierta.';
+        }
+        return $note;
+    }
+
+    /**
+     * Si la compra salió del cajón, reversarla (anulación o NC) exige una caja abierta
+     * donde reingresar el efectivo; si no, el cajón y la contabilidad quedan descuadrados.
+     */
+    public function assertCashDrawerForReversal(int $orderId): void
+    {
+        try {
+            $mode = (string)$this->query(
+                "SELECT payment_mode FROM purchase_orders WHERE id = ?",
+                [$orderId]
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            return;
+        }
+        if ($mode !== 'cash' || !$this->hasCashMovementRef('purchase_order', $orderId)) {
+            return;
+        }
+        if ((new CashService($this->db))->getOpenSession()) {
+            return;
+        }
+        throw new \RuntimeException(
+            'Esta compra se pagó con efectivo del cajón. Abra la caja antes de anularla o hacerle nota crédito, '
+            . 'para que el dinero se reintegre al cajón.'
+        );
+    }
+
+    /**
      * Devuelve a caja el egreso de un abono a proveedor (tras cancelarlo en anulación).
      */
     public function syncCashReverseForSupplierPayment(int $paymentId): string
@@ -1798,7 +1944,8 @@ class PurchasingService
         string $description,
         string $type,
         string $referenceType,
-        int $referenceId
+        int $referenceId,
+        ?int $sessionId = null
     ): string {
         $amount = round(max(0, $amount), 2);
         if ($amount <= 0.009 || $referenceId <= 0) {
@@ -1812,7 +1959,7 @@ class PurchasingService
             return 'Aviso: no hay caja abierta; el movimiento de efectivo no se registró en el cajón (sí en contabilidad).';
         }
         try {
-            $ok = $cash->registerMovement($amount, $description, $type, $referenceType, $referenceId);
+            $ok = $cash->registerMovement($amount, $description, $type, $referenceType, $referenceId, $sessionId);
             if ($ok === false) {
                 return 'Aviso: no se pudo registrar el movimiento en caja física.';
             }
@@ -1901,6 +2048,19 @@ class PurchasingService
             $notes = substr($notes, 0, 255);
         }
 
+        // Valor neto de la factura del proveedor + dcto. pronto pago (modal de abono).
+        $invoiceValueOpt = isset($options['invoice_value'])
+            ? round((float)$options['invoice_value'], 2)
+            : 0.0;
+        $discountPct = isset($options['discount_pct'])
+            ? max(0.0, min(100.0, round((float)$options['discount_pct'], 2)))
+            : 0.0;
+        $discountAmountOpt = isset($options['discount_amount'])
+            ? round((float)$options['discount_amount'], 2)
+            : 0.0;
+        $discountAmount = 0.0;
+        $payableBase = self::effectivePayableBase($order);
+
         $this->db->beginTransaction();
         try {
             // Bloqueo + revalidación de saldo dentro de la TX (evita sobre-abono por doble clic).
@@ -1908,13 +2068,43 @@ class PurchasingService
                 "SELECT id FROM purchase_orders WHERE id = ? FOR UPDATE",
                 [$orderId]
             )->fetch();
+
+            // La factura física manda: si el usuario confirma otro valor neto,
+            // ese queda como base de la CxP y el saldo se recalcula sobre él.
+            if ($invoiceValueOpt > 0.009) {
+                $payableBase = $invoiceValueOpt;
+                try {
+                    $this->query(
+                        "UPDATE purchase_orders SET supplier_invoice_value = ? WHERE id = ?",
+                        [$payableBase, $orderId]
+                    );
+                } catch (\Throwable $e) {
+                    // Columna aún no migrada: se sigue con el total del sistema.
+                    $payableBase = self::effectivePayableBase($order);
+                }
+            }
+
             $balance = $this->orderBalance($orderId);
             if ($balance <= 0.009) {
                 throw new \RuntimeException('Esta orden ya está pagada en su totalidad');
             }
-            if ($amount - $balance > 0.009) {
+
+            // Dcto. pronto pago sobre el valor de factura; nunca supera el saldo vigente.
+            // Si el usuario escribió el monto, ese manda (y el % se deriva); si no, manda el %.
+            if ($discountAmountOpt > 0.009) {
+                $discountAmount = min($discountAmountOpt, $balance);
+                $discountPct = $payableBase > 0
+                    ? round($discountAmount / $payableBase * 100, 2)
+                    : 0.0;
+            } else {
+                $discountAmount = $discountPct > 0
+                    ? min(round($payableBase * ($discountPct / 100), 2), $balance)
+                    : 0.0;
+            }
+            $balanceAfterDiscount = round($balance - $discountAmount, 2);
+            if ($amount - $balanceAfterDiscount > 0.009) {
                 throw new \InvalidArgumentException(
-                    'El abono supera el saldo pendiente (' . number_format($balance, 2, ',', '.') . ')'
+                    'El abono supera el saldo pendiente (' . number_format($balanceAfterDiscount, 2, ',', '.') . ')'
                 );
             }
 
@@ -1923,8 +2113,9 @@ class PurchasingService
                     "INSERT INTO supplier_payments
                         (supplier_id, purchase_order_id, payment_date, amount,
                          payment_method, cash_from_drawer, cash_source_note, reference, notes,
-                         receipt_path, receipt_mime, receipt_original_name, created_by)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         receipt_path, receipt_mime, receipt_original_name, created_by,
+                         invoice_value, discount_pct, discount_amount)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (int)$order['supplier_id'],
                         $orderId,
@@ -1939,15 +2130,22 @@ class PurchasingService
                         $receiptMime !== '' ? $receiptMime : null,
                         $receiptName !== '' ? $receiptName : null,
                         $_SESSION['tenant_user_id'] ?? null,
+                        $payableBase > 0 ? $payableBase : null,
+                        $discountPct,
+                        $discountAmount,
                     ]
                 );
             } catch (\Throwable $e) {
                 // Installs sin columnas nuevas: insert clásico.
                 if (!str_contains($e->getMessage(), 'cash_from_drawer')
                     && !str_contains($e->getMessage(), 'cash_source_note')
+                    && !str_contains($e->getMessage(), 'invoice_value')
+                    && !str_contains($e->getMessage(), 'discount_pct')
+                    && !str_contains($e->getMessage(), 'discount_amount')
                 ) {
                     throw $e;
                 }
+                $discountAmount = 0.0;
                 $this->query(
                     "INSERT INTO supplier_payments
                         (supplier_id, purchase_order_id, payment_date, amount,
@@ -2006,6 +2204,9 @@ class PurchasingService
                 'payment_id' => $paymentId,
                 'amount' => $amount,
                 'payment_method' => $paymentMethod,
+                'invoice_value' => $payableBase,
+                'discount_pct' => $discountPct,
+                'discount_amount' => $discountAmount,
                 'balance' => $status['balance'],
             ]
         );
@@ -2016,18 +2217,36 @@ class PurchasingService
             'balance' => $status['balance'],
             'payment_status' => $status['payment_status'],
             'cash_from_drawer' => $cashFromDrawer,
+            'invoice_value' => $payableBase,
+            'discount_pct' => $discountPct,
+            'discount_amount' => $discountAmount,
         ];
     }
 
-    /** Saldo pendiente de la orden: total − abonos − notas de crédito. */
+    /**
+     * Base efectiva de la cuenta por pagar: valor neto de la factura entregada
+     * por el proveedor (confirmado en el modal de abono) si existe; si no, el
+     * total neto calculado por el sistema.
+     */
+    public static function effectivePayableBase(array $order): float
+    {
+        $inv = round((float)($order['supplier_invoice_value'] ?? 0), 2);
+        return $inv > 0.009 ? $inv : round((float)($order['total'] ?? 0), 2);
+    }
+
+    /** Saldo pendiente: base efectiva − abonos − notas de crédito − dctos. pronto pago aplicados al pagar. */
     public function orderBalance(int $orderId): float
     {
         $row = $this->query(
-            "SELECT po.total,
+            "SELECT COALESCE(NULLIF(po.supplier_invoice_value, 0), po.total) base_total,
                     COALESCE((
                         SELECT SUM(sp.amount) FROM supplier_payments sp
                         WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
                     ), 0) paid,
+                    COALESCE((
+                        SELECT SUM(sp.discount_amount) FROM supplier_payments sp
+                        WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                    ), 0) discounted,
                     COALESCE((
                         SELECT SUM(cn.total) FROM purchase_credit_notes cn
                         WHERE cn.purchase_order_id = po.id AND cn.status = 'posted'
@@ -2039,7 +2258,10 @@ class PurchasingService
         if (!$row) {
             return 0.0;
         }
-        return round((float)$row['total'] - (float)$row['paid'] - (float)$row['credited'], 2);
+        return round(
+            (float)$row['base_total'] - (float)$row['paid'] - (float)$row['discounted'] - (float)$row['credited'],
+            2
+        );
     }
 
     /**
@@ -2050,11 +2272,15 @@ class PurchasingService
     public function refreshPaymentStatus(int $orderId): array
     {
         $row = $this->query(
-            "SELECT po.total, po.payment_mode,
+            "SELECT po.total, COALESCE(NULLIF(po.supplier_invoice_value, 0), po.total) base_total, po.payment_mode,
                     COALESCE((
                         SELECT SUM(sp.amount) FROM supplier_payments sp
                         WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
                     ), 0) paid,
+                    COALESCE((
+                        SELECT SUM(sp.discount_amount) FROM supplier_payments sp
+                        WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                    ), 0) discounted,
                     COALESCE((
                         SELECT SUM(cn.total) FROM purchase_credit_notes cn
                         WHERE cn.purchase_order_id = po.id AND cn.status = 'posted'
@@ -2068,19 +2294,23 @@ class PurchasingService
         }
 
         $total = round((float)$row['total'], 2);
+        $base = round((float)$row['base_total'], 2);
         $paid = round((float)$row['paid'], 2);
+        $discounted = round((float)($row['discounted'] ?? 0), 2);
         $credited = round((float)$row['credited'], 2);
 
         // Los modos distintos de 'payable' se pagaron de contado al recibir.
         // Tras una NC, el "pagado" efectivo es el bruto menos lo acreditado (evita saldo negativo ficticio).
         if ((string)($row['payment_mode'] ?? 'payable') !== 'payable') {
             $paid = max(0.0, round($total - $credited, 2));
+            $discounted = 0.0;
+            $base = $total;
         }
 
-        $balance = round($total - $paid - $credited, 2);
+        $balance = round($base - $paid - $discounted - $credited, 2);
         $status = match (true) {
             $balance <= 0.009 => 'paid',
-            ($paid + $credited) > 0.009 => 'partial',
+            ($paid + $credited + $discounted) > 0.009 => 'partial',
             default => 'pending',
         };
 
@@ -2099,6 +2329,8 @@ class PurchasingService
         return [
             'paid_total' => $paid,
             'credit_total' => $credited,
+            'discount_total' => $discounted,
+            'base_total' => $base,
             'balance' => $balance,
             'payment_status' => $status,
         ];
@@ -2530,13 +2762,14 @@ class PurchasingService
     }
 
     /**
-     * Anula una OC ya recibida por error: NC total con salida de stock,
-     * asiento inverso (vía postPurchaseCreditNote), caja si aplica, y status cancelled.
+     * Anula una OC ya recibida por error: salida de stock y status cancelled, sin NC
+     * (el controller reversa el asiento de la OC y devuelve el efectivo al cajón).
+     * Si la OC ya tenía NC parciales, el resto se acredita por NC (comportamiento previo).
      * Si había abonos, los cancela automáticamente (el controller revierte contabilidad/caja).
      *
      * @return array{
      *   credit_note_id:int,credit_number:string,total:float,
-     *   order_id:int,order_number:string,reversed_payments:list<array>,already_credited?:bool
+     *   order_id:int,order_number:string,reversed_payments:list<array>,already_credited?:bool,direct?:bool
      * }
      */
     public function voidReceivedOrder(int $orderId, string $reason = ''): array
@@ -2589,6 +2822,44 @@ class PurchasingService
             } catch (\Throwable $e) {
                 // continue
             }
+        }
+
+        // Sin NC previas: anulación directa (reverso de inventario, sin documento NC).
+        // Con NC parciales reales se acredita el resto por NC para no duplicar su asiento.
+        if (!$alreadyFullyCredited && !$this->hasPostedCreditNotes($orderId)) {
+            $fullReason = 'ANULACIÓN OC: ' . $reason;
+            try {
+                $this->voidReceivedOrderDirect($orderId, $order, $lines, $fullReason);
+            } catch (\Throwable $e) {
+                $this->restorePaymentsAfterFailedVoid($reversedPayments);
+                try {
+                    $this->refreshPaymentStatus($orderId);
+                } catch (\Throwable $ignore) {
+                }
+                throw $e;
+            }
+
+            TenantAuditService::safeLog(
+                $this->db,
+                'cancel',
+                'compras',
+                'Anulación factura/OC ' . (string)($order['order_number'] ?? '') . ': ' . mb_substr($fullReason, 0, 160),
+                'purchase_order',
+                $orderId,
+                ['reason' => $fullReason, 'direct' => true],
+                'warning'
+            );
+
+            return [
+                'credit_note_id' => 0,
+                'credit_number' => '',
+                'total' => round((float)($order['total'] ?? 0), 2),
+                'order_id' => $orderId,
+                'order_number' => (string)($order['order_number'] ?? ''),
+                'already_credited' => false,
+                'direct' => true,
+                'reversed_payments' => $reversedPayments,
+            ];
         }
 
         if ($alreadyFullyCredited) {
@@ -2662,7 +2933,74 @@ class PurchasingService
         }
     }
 
-    private function finalizeVoidedOrder(int $orderId, string $reason): void
+    private function hasPostedCreditNotes(int $orderId): bool
+    {
+        try {
+            return (int)$this->query(
+                "SELECT COUNT(*) FROM purchase_credit_notes WHERE purchase_order_id = ? AND status = 'posted'",
+                [$orderId]
+            )->fetchColumn() > 0;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Saca del inventario lo recibido (movimiento purchase_cancel) y marca la OC anulada.
+     * Contabilidad y caja los revierte el controller.
+     *
+     * @param array<string,mixed> $order
+     * @param list<array{purchase_order_item_id:int,quantity:int}> $lines
+     */
+    private function voidReceivedOrderDirect(int $orderId, array $order, array $lines, string $reason): void
+    {
+        $itemsById = [];
+        foreach ($order['items'] as $item) {
+            $itemsById[(int)$item['id']] = $item;
+        }
+        $stock = new StockService($this->db);
+
+        $ownTx = !$this->db->inTransaction();
+        if ($ownTx) {
+            $this->db->beginTransaction();
+        }
+        try {
+            $locked = $this->query(
+                "SELECT id, status FROM purchase_orders WHERE id = ? FOR UPDATE",
+                [$orderId]
+            )->fetch();
+            if (!$locked || (string)($locked['status'] ?? '') !== 'received') {
+                throw new \RuntimeException('Solo se pueden anular facturas/OC ya recibidas');
+            }
+
+            foreach ($lines as $line) {
+                $item = $itemsById[(int)$line['purchase_order_item_id']] ?? null;
+                if (!$item || empty($item['product_id'])) {
+                    continue;
+                }
+                $stock->decrease(
+                    (int)$item['product_id'],
+                    (int)$line['quantity'],
+                    'purchase_cancel',
+                    $orderId,
+                    'Anulación OC ' . (string)($order['order_number'] ?? ('#' . $orderId)),
+                    round((float)($item['unit_cost'] ?? 0), 2)
+                );
+            }
+
+            $this->finalizeVoidedOrder($orderId, $reason, false);
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->commit();
+            }
+        } catch (\Throwable $e) {
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
+    }
+
+    private function finalizeVoidedOrder(int $orderId, string $reason, bool $refresh = true): void
     {
         $note = 'ANULADA POST-RECEPCIÓN: ' . ($reason !== '' ? $reason : date('Y-m-d H:i'));
         $voidReason = mb_substr($reason !== '' ? $reason : $note, 0, 255);
@@ -2687,6 +3025,9 @@ class PurchasingService
                  WHERE id = ? AND status IN ('received','cancelled')",
                 [$note, $orderId]
             );
+        }
+        if (!$refresh) {
+            return;
         }
         // Si ya estaba cancelled, igual refrescar saldos.
         try {
@@ -2820,11 +3161,15 @@ class PurchasingService
         try {
             return $this->query(
                 "SELECT po.id, po.order_number, po.invoice_number, po.order_date, po.due_date,
-                        po.total, po.payment_status, s.name supplier_name, po.supplier_id,
+                        po.total, po.supplier_invoice_value, po.payment_status, s.name supplier_name, po.supplier_id,
                         COALESCE((
                             SELECT SUM(sp.amount) FROM supplier_payments sp
                             WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
                         ), 0) paid_amount,
+                        COALESCE((
+                            SELECT SUM(sp.discount_amount) FROM supplier_payments sp
+                            WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                        ), 0) discount_amount,
                         COALESCE((
                             SELECT SUM(cn.total) FROM purchase_credit_notes cn
                             WHERE cn.purchase_order_id = po.id AND cn.status = 'posted'
@@ -2834,8 +3179,11 @@ class PurchasingService
                  LEFT JOIN suppliers s ON s.id = po.supplier_id
                  WHERE po.status = 'received'
                    AND COALESCE(po.payment_mode, 'payable') = 'payable'
-                   AND po.total - COALESCE((
+                   AND COALESCE(NULLIF(po.supplier_invoice_value, 0), po.total) - COALESCE((
                         SELECT SUM(sp.amount) FROM supplier_payments sp
+                        WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                   ), 0) - COALESCE((
+                        SELECT SUM(sp.discount_amount) FROM supplier_payments sp
                         WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
                    ), 0) - COALESCE((
                         SELECT SUM(cn.total) FROM purchase_credit_notes cn
@@ -2854,8 +3202,11 @@ class PurchasingService
     {
         try {
             return round((float)$this->query(
-                "SELECT COALESCE(SUM(po.total - COALESCE((
+                "SELECT COALESCE(SUM(COALESCE(NULLIF(po.supplier_invoice_value, 0), po.total) - COALESCE((
                         SELECT SUM(sp.amount) FROM supplier_payments sp
+                        WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                   ), 0) - COALESCE((
+                        SELECT SUM(sp.discount_amount) FROM supplier_payments sp
                         WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
                    ), 0) - COALESCE((
                         SELECT SUM(cn.total) FROM purchase_credit_notes cn

@@ -250,6 +250,12 @@ class EcommerceIntegrationService
             error_log('Ecommerce accounting: ' . $e->getMessage());
         }
 
+        try {
+            (new CommissionService($this->db))->processSale($saleId);
+        } catch (\Throwable $e) {
+            error_log('Ecommerce commissions: ' . $e->getMessage());
+        }
+
         return $saleId;
     }
 

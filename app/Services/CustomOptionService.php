@@ -16,6 +16,7 @@ class CustomOptionService
     public const GROUP_EXPENSE_CATEGORY = 'expense_category';
     public const GROUP_LOAN_REASON = 'loan_reason';
     public const GROUP_LOAN_RECEIVED_REASON = 'loan_received_reason';
+    public const GROUP_CREDIT_TERM = 'credit_term';
 
     private \PDO $db;
 
@@ -96,6 +97,14 @@ class CustomOptionService
             ],
             self::GROUP_PAYMENT_METHOD => [],
             self::GROUP_DISCOUNT_PERCENT => [],
+            self::GROUP_CREDIT_TERM => [
+                ['value' => 'net_15', 'label' => '15 días'],
+                ['value' => 'net_30', 'label' => '30 días'],
+                ['value' => 'net_60', 'label' => '60 días'],
+                ['value' => 'net_90', 'label' => '90 días'],
+                ['value' => 'net_120', 'label' => '120 días'],
+                ['value' => 'overdue', 'label' => 'Vencido'],
+            ],
             self::GROUP_PRODUCT_LOCATION => [
                 ['value' => 'Bodega', 'label' => 'Bodega'],
                 ['value' => 'Almacén 1', 'label' => 'Almacén 1'],
@@ -163,6 +172,13 @@ class CustomOptionService
             $seen[$value] = true;
             $out[] = $opt;
         }
+        if ($group === self::GROUP_CREDIT_TERM) {
+            usort($out, static function (array $a, array $b): int {
+                $da = SalesDocumentService::customTermDays((string)$a['value']) ?? PHP_INT_MAX;
+                $db = SalesDocumentService::customTermDays((string)$b['value']) ?? PHP_INT_MAX;
+                return $da <=> $db;
+            });
+        }
         if ($includeOther) {
             $out[] = ['value' => '__other__', 'label' => 'Otro'];
         }
@@ -208,6 +224,7 @@ class CustomOptionService
             self::GROUP_EXPENSE_CATEGORY,
             self::GROUP_LOAN_REASON,
             self::GROUP_LOAN_RECEIVED_REASON,
+            self::GROUP_CREDIT_TERM,
         ];
         if (!in_array($group, $allowed, true)) {
             throw new \InvalidArgumentException('Grupo de opciones no permitido');
@@ -221,7 +238,7 @@ class CustomOptionService
         if ($label === '') {
             throw new \InvalidArgumentException('Escriba una opción válida');
         }
-        if ($group !== self::GROUP_DISCOUNT_PERCENT && mb_strlen($label) < 2) {
+        if (!in_array($group, [self::GROUP_DISCOUNT_PERCENT, self::GROUP_CREDIT_TERM], true) && mb_strlen($label) < 2) {
             throw new \InvalidArgumentException('Escriba una opción válida (mínimo 2 caracteres)');
         }
         if (mb_strlen($label) > 120) {
@@ -249,7 +266,20 @@ class CustomOptionService
             ];
         }
 
-        if ($group === self::GROUP_DISCOUNT_PERCENT) {
+        if ($group === self::GROUP_CREDIT_TERM) {
+            $digits = preg_replace('/\D/', '', $label) ?? '';
+            $days = $digits === '' ? 0 : (int)$digits;
+            if ($days < 1 || $days > 3650) {
+                throw new \InvalidArgumentException('El plazo debe ser un número de días entre 1 y 3650');
+            }
+            $value = 'net_' . $days;
+            $label = $days === 1 ? '1 día' : ($days . ' días');
+            foreach ($this->options($group, false) as $opt) {
+                if ((string)$opt['value'] === $value) {
+                    return ['value' => $value, 'label' => (string)$opt['label'], 'created' => false];
+                }
+            }
+        } elseif ($group === self::GROUP_DISCOUNT_PERCENT) {
             $pct = (float)str_replace(',', '.', preg_replace('/[^\d.,]/', '', $label) ?? '0');
             if ($pct <= 0 || $pct > 100) {
                 throw new \InvalidArgumentException('El descuento debe estar entre 0.01 y 100');

@@ -33,6 +33,7 @@ class SupplyChainSchema
         self::ensureSupplierPayments($db);
         self::ensurePurchaseCreditNotes($db);
         self::ensureExtraColumns($db);
+        ProductCostHistory::ensure($db);
     }
 
     /**
@@ -382,6 +383,10 @@ class SupplyChainSchema
             ['purchase_order_items', 'barcode', 'VARCHAR(64) NULL AFTER product_name'],
             ['purchase_order_items', 'product_code', 'VARCHAR(255) NULL AFTER barcode'],
 
+            // Costo de inventario por línea (kardex + promedio del producto); NULL = igual al costo de factura.
+            ['purchase_invoice_import_items', 'inventory_cost', 'DECIMAL(12,2) NULL AFTER unit_cost'],
+            ['purchase_order_items', 'inventory_cost', 'DECIMAL(12,2) NULL AFTER unit_cost'],
+
             // Descarte de borrador de factura (trazabilidad de revisión)
             ['purchase_invoice_imports', 'discarded_at', 'DATETIME NULL AFTER confirmed_at'],
             ['purchase_invoice_imports', 'discarded_by', 'INT UNSIGNED NULL AFTER discarded_at'],
@@ -401,6 +406,12 @@ class SupplyChainSchema
             // Efectivo: 1 = sale del cajón POS; 0 = otro origen (no descuenta caja)
             ['supplier_payments', 'cash_from_drawer', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER payment_method'],
             ['supplier_payments', 'cash_source_note', 'VARCHAR(255) NULL AFTER cash_from_drawer'],
+            // Valor neto de la factura física usado como base del abono + dcto. pronto pago aplicado al pagar
+            ['supplier_payments', 'invoice_value', 'DECIMAL(14,2) NULL AFTER cash_source_note'],
+            ['supplier_payments', 'discount_pct', 'DECIMAL(5,2) NOT NULL DEFAULT 0 AFTER invoice_value'],
+            ['supplier_payments', 'discount_amount', 'DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER discount_pct'],
+            // Base efectiva de la CxP cuando la factura del proveedor difiere del total del sistema
+            ['purchase_orders', 'supplier_invoice_value', 'DECIMAL(14,2) NULL AFTER total'],
         ] as [$table, $column, $definition]) {
             self::addColumnIfMissing($db, $table, $column, $definition);
         }

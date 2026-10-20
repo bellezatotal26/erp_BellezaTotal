@@ -16,6 +16,8 @@ use function SoftNova\Core\base_url;
 class TenantGastosController extends TenantController
 {
     private const MAX_RECEIPT_BYTES = 5242880; // 5 MB
+    private const PAYROLL_EXPENSE_LOCKED = 'Este gasto lo generó una liquidación de nómina. Para corregirlo use Nómina → Liquidaciones → «Anular pago».';
+    private const BANK_EXPENSE_LOCKED = 'Este gasto lo generó el módulo Bancos (extracto o liquidación Bold). Para corregirlo anule el registro en Bancos.';
     private const ALLOWED_RECEIPT_MIME = [
         'image/jpeg' => 'jpg',
         'image/png' => 'png',
@@ -134,6 +136,25 @@ class TenantGastosController extends TenantController
         $whereParts[] = "COALESCE(e.status, 'active') <> 'cancelled'";
         $where = $whereParts === [] ? '' : ('WHERE ' . implode(' AND ', $whereParts));
 
+        $sortMap = [
+            'date' => 'e.expense_date',
+            'user' => 'u.name',
+            'description' => 'e.description',
+            'category' => 'ec.name',
+            'supplier' => 's.name',
+            'amount' => 'e.amount',
+            'method' => 'e.payment_method',
+            'entry' => 'ae.entry_number',
+        ];
+        $sort = (string)$this->request->get('sort', '');
+        $dir = strtolower((string)$this->request->get('dir', 'desc')) === 'asc' ? 'asc' : 'desc';
+        if ($sort === '' || !isset($sortMap[$sort])) {
+            $sort = '';
+            $orderSql = 'e.expense_date DESC, e.id DESC';
+        } else {
+            $orderSql = $sortMap[$sort] . ' ' . strtoupper($dir) . ', e.id DESC';
+        }
+
         $per = $this->resolvePerPage();
         $countSql = "SELECT COUNT(*) as c
              FROM expenses e
@@ -155,10 +176,31 @@ class TenantGastosController extends TenantController
              LEFT JOIN accounting_entries ae ON ae.source_type = 'expense'
                  AND ae.source_id = e.id AND ae.status = 'posted' AND ae.source_event = 'created'
              {$where}
-             ORDER BY e.expense_date DESC, e.id DESC
+             ORDER BY {$orderSql}
              LIMIT {$pagination['perPage']} OFFSET {$pagination['offset']}",
             $params
         )->fetchAll();
+        $expenseIds = array_map(static fn ($r) => (int)$r['id'], $expenses);
+        $payrollRuns = [];
+        if ($expenseIds) {
+            try {
+                $payrollRuns = $this->query(
+                    'SELECT expense_id, id FROM payroll_runs
+                     WHERE expense_id IN (' . implode(',', array_fill(0, count($expenseIds), '?')) . ')',
+                    $expenseIds
+                )->fetchAll(\PDO::FETCH_KEY_PAIR);
+            } catch (\Throwable $e) {
+                $payrollRuns = [];
+            }
+        }
+        foreach ($expenses as &$expRow) {
+            $runId = (int)($payrollRuns[(int)$expRow['id']] ?? 0);
+            $expRow['payroll_run_id'] = $runId;
+            $expRow['is_payroll'] = $runId > 0
+                || strtolower(trim((string)($expRow['category'] ?? ''))) === ExpenseCategoryService::PAYROLL_CODE;
+            $expRow['is_bank'] = !$expRow['is_payroll'] && self::isBankExpense($expRow);
+        }
+        unset($expRow);
 
         $monthUserSql = " AND COALESCE(status, 'active') <> 'cancelled'";
         $monthUserParams = [];
@@ -263,7 +305,22 @@ class TenantGastosController extends TenantController
                 'payment_method' => $paymentFilter !== '' ? $paymentFilter : null,
                 'supplier_id' => $supplierFilter > 0 ? (string)$supplierFilter : null,
                 'per_page' => $per['perPage'] !== 20 ? (string)$per['perPage'] : null,
+                'sort' => $sort !== '' ? $sort : null,
+                'dir' => $sort !== '' ? $dir : null,
             ], static fn($v) => $v !== null && $v !== ''),
+            'sortFilters' => [
+                'sort' => $sort,
+                'dir' => $dir,
+                'query' => array_filter([
+                    'q' => $q !== '' ? $q : null,
+                    'kind' => $kindFilter !== '' ? $kindFilter : null,
+                    'from' => $from !== '' ? $from : null,
+                    'to' => $to !== '' ? $to : null,
+                    'payment_method' => $paymentFilter !== '' ? $paymentFilter : null,
+                    'supplier_id' => $supplierFilter > 0 ? (string)$supplierFilter : null,
+                    'per_page' => $per['perPage'] !== 20 ? (string)$per['perPage'] : null,
+                ], static fn($v) => $v !== null && $v !== ''),
+            ],
             'paymentMethods' => PaymentMethodCatalog::all(),
         ]));
     }
@@ -457,6 +514,14 @@ class TenantGastosController extends TenantController
             $this->respond(false, 'Este gasto está anulado y no se puede editar', '/app/gastos');
             return;
         }
+        if ($this->isPayrollExpense($id, $existing)) {
+            $this->respond(false, self::PAYROLL_EXPENSE_LOCKED, '/app/gastos');
+            return;
+        }
+        if (self::isBankExpense($existing)) {
+            $this->respond(false, self::BANK_EXPENSE_LOCKED, '/app/gastos');
+            return;
+        }
         if (!$isAdmin && $ownUserId > 0 && (int)($existing['user_id'] ?? 0) !== $ownUserId) {
             $this->respond(false, 'No puede editar gastos de otro usuario', '/app/gastos');
             return;
@@ -590,7 +655,7 @@ class TenantGastosController extends TenantController
         $id = (int)$this->request->post('id');
         try {
             $expense = $this->query(
-                "SELECT description, receipt_path, status FROM expenses WHERE id = ?",
+                "SELECT description, receipt_path, status, notes, category FROM expenses WHERE id = ?",
                 [$id]
             )->fetch();
             if (!$expense) {
@@ -598,6 +663,12 @@ class TenantGastosController extends TenantController
             }
             if (($expense['status'] ?? 'active') === 'cancelled') {
                 throw new \RuntimeException('Este gasto ya está anulado');
+            }
+            if ($this->isPayrollExpense($id, $expense)) {
+                throw new \RuntimeException(self::PAYROLL_EXPENSE_LOCKED);
+            }
+            if (self::isBankExpense($expense)) {
+                throw new \RuntimeException(self::BANK_EXPENSE_LOCKED);
             }
             $reversed = true;
             try {
@@ -629,6 +700,14 @@ class TenantGastosController extends TenantController
                      WHERE id = ?",
                     [date('Y-m-d H:i'), $id]
                 );
+            }
+            if (str_contains((string)($expense['notes'] ?? ''), 'sales_commission:')) {
+                try {
+                    (new \SoftNova\Services\CommissionService($this->db))
+                        ->cancelByExpense($id, (string)$expense['notes']);
+                } catch (\Throwable $e) {
+                    error_log('Cancelar comisión del gasto ' . $id . ': ' . $e->getMessage());
+                }
             }
             $cashReversed = $this->cash->reverseExpenseMovements($id, $expense['description']);
             $message = $reversed
@@ -683,6 +762,32 @@ class TenantGastosController extends TenantController
     /**
      * @return array{path:string,original:string,mime:string}|null|false
      */
+    /** Gasto creado desde Bancos (registro de extracto o liquidación Bold): solo se anula desde Bancos. */
+    private static function isBankExpense(array $row): bool
+    {
+        $notes = ltrim((string)($row['notes'] ?? ''));
+        return str_starts_with($notes, 'bank_posting:') || str_starts_with($notes, 'bold_settlement:');
+    }
+
+    /** Gasto creado por una liquidación de nómina: solo se gestiona desde el módulo Nómina. */
+    private function isPayrollExpense(int $id, ?array $row = null): bool
+    {
+        if ($row === null || !array_key_exists('category', $row)) {
+            $row = $this->query('SELECT category FROM expenses WHERE id = ?', [$id])->fetch() ?: [];
+        }
+        if (strtolower(trim((string)($row['category'] ?? ''))) === ExpenseCategoryService::PAYROLL_CODE) {
+            return true;
+        }
+        try {
+            return (bool)$this->query(
+                'SELECT 1 FROM payroll_runs WHERE expense_id = ? LIMIT 1',
+                [$id]
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
     private function storeReceiptUpload(): array|null|false
     {
         if (empty($_FILES['receipt_file']['tmp_name'])) {
@@ -791,6 +896,21 @@ class TenantGastosController extends TenantController
         $whereParts[] = "COALESCE(e.status, 'active') <> 'cancelled'";
         $where = $whereParts === [] ? '' : ('WHERE ' . implode(' AND ', $whereParts));
 
+        $sortMap = [
+            'date' => 'e.expense_date',
+            'user' => 'u.name',
+            'description' => 'e.description',
+            'category' => 'ec.name',
+            'supplier' => 's.name',
+            'amount' => 'e.amount',
+            'method' => 'e.payment_method',
+        ];
+        $sort = (string)$this->request->get('sort', '');
+        $dir = strtolower((string)$this->request->get('dir', 'desc')) === 'asc' ? 'asc' : 'desc';
+        $orderSql = ($sort !== '' && isset($sortMap[$sort]))
+            ? $sortMap[$sort] . ' ' . strtoupper($dir) . ', e.id DESC'
+            : 'e.expense_date DESC';
+
         $sql = "SELECT e.expense_date,
                     COALESCE(NULLIF(TRIM(u.name), ''), 'Sin usuario') AS user_name,
                     e.description, COALESCE(ec.name, e.category) category,
@@ -801,7 +921,7 @@ class TenantGastosController extends TenantController
              LEFT JOIN suppliers s ON e.supplier_id = s.id
              LEFT JOIN users u ON u.id = e.user_id
              {$where}
-             ORDER BY e.expense_date DESC";
+             ORDER BY {$orderSql}";
         $rows = $this->query($sql, $params)->fetchAll();
 
         $csvRows = [];

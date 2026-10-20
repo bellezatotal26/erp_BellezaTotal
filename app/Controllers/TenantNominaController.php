@@ -36,6 +36,9 @@ class TenantNominaController extends TenantController
                 'create_run' => $this->createRun(),
                 'pay_run' => $this->payRun(),
                 'cancel_run' => $this->cancelRun(),
+                'cancel_paid_run' => $this->cancelPaidRun(),
+                'save_liability_payment' => $this->saveLiabilityPayment(),
+                'cancel_liability_payment' => $this->cancelLiabilityPayment(),
                 'save_params' => $this->saveParams(),
                 'save_incapacity' => $this->saveIncapacity(),
                 'save_overtime' => $this->saveOvertime(),
@@ -70,8 +73,19 @@ class TenantNominaController extends TenantController
         }
 
         $tab = (string)$this->request->get('tab', 'employees');
-        if (!in_array($tab, ['employees', 'schedules', 'runs', 'params'], true)) {
+        if (!in_array($tab, ['employees', 'schedules', 'runs', 'payments', 'params'], true)) {
             $tab = 'employees';
+        }
+        $liabilities = [];
+        $liabilityPayments = [];
+        if ($tab === 'payments') {
+            try {
+                $liabilities = $this->payroll->liabilitySummary();
+                $liabilityPayments = $this->payroll->liabilityPayments(100);
+            } catch (\Throwable $e) {
+                error_log('Nomina pagos: ' . $e->getMessage());
+                $_SESSION['error'] = 'No se pudieron cargar los pagos de nómina: ' . $e->getMessage();
+            }
         }
 
         $empFilters = $this->employeeFilters();
@@ -134,6 +148,8 @@ class TenantNominaController extends TenantController
             'runYears' => $runYears,
             'activeCount' => $activeCount,
             'monthPayroll' => $monthPayroll,
+            'liabilities' => $liabilities,
+            'liabilityPayments' => $liabilityPayments,
         ]));
     }
 
@@ -455,12 +471,15 @@ class TenantNominaController extends TenantController
             $id = (int)$this->request->post('id', 0);
             $result = $this->payroll->postAndPay($id);
             $entryId = (int)($result['accounting_entry_id'] ?? 0);
-            $msg = 'Nómina contabilizada (asiento #' . $entryId . ') y marcada como pagada. No descuenta el cajón de caja.';
+            $msg = 'Nómina contabilizada (asiento #' . $entryId . ') y marcada como pagada. Gasto registrado por el costo total: '
+                . number_format((float)($result['company_cost'] ?? 0), 0, ',', '.')
+                . '. No descuenta el cajón de caja.';
             (new \SoftNova\Services\TenantAuditService($this->db))->log(
                 'pay',
                 'nomina',
                 'Nómina pagada: ' . ($result['run_number'] ?? '') . ' · neto '
                     . number_format((float)($result['net_total'] ?? 0), 0, ',', '.')
+                    . ' · costo total ' . number_format((float)($result['company_cost'] ?? 0), 0, ',', '.')
                     . ' · asiento contable #' . $entryId,
                 'payroll_run',
                 $id
@@ -479,6 +498,83 @@ class TenantNominaController extends TenantController
             $this->respond(true, 'Liquidación cancelada', '/app/nomina?tab=runs');
         } catch (\Throwable $e) {
             $this->respond(false, $e->getMessage(), '/app/nomina?tab=runs');
+        }
+    }
+
+    private function cancelPaidRun(): void
+    {
+        TenantMiddleware::authorize('nomina', 'delete');
+        $id = (int)$this->request->post('id', 0);
+        $back = '/app/nomina?tab=runs&action=run_detail&id=' . $id;
+        try {
+            $result = $this->payroll->cancelPaidRun($id, (string)$this->request->post('reason', ''));
+            (new \SoftNova\Services\TenantAuditService($this->db))->log(
+                'cancel',
+                'nomina',
+                'Pago de nómina anulado: ' . $result['run_number'] . ' · motivo: '
+                    . mb_substr(trim((string)$this->request->post('reason', '')), 0, 200)
+                    . ' · reversiones: ' . (count($result['reversals']) ? '#' . implode(', #', $result['reversals']) : 'ninguna'),
+                'payroll_run',
+                $id
+            );
+            $this->respond(
+                true,
+                'Pago anulado: asientos revertidos y gasto anulado. La liquidación quedó en borrador para corregirla.',
+                $back
+            );
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), $back);
+        }
+    }
+
+    private function saveLiabilityPayment(): void
+    {
+        TenantMiddleware::authorize('nomina', 'edit');
+        try {
+            $amounts = $this->request->post('amounts', []);
+            $result = $this->payroll->createLiabilityPayment([
+                'payment_date' => (string)$this->request->post('payment_date', date('Y-m-d')),
+                'kind' => (string)$this->request->post('kind', 'pila'),
+                'payment_method' => (string)$this->request->post('payment_method', 'transfer'),
+                'reference' => (string)$this->request->post('reference', ''),
+                'notes' => (string)$this->request->post('notes', ''),
+                'amounts' => is_array($amounts) ? $amounts : [],
+            ], (int)($_SESSION['tenant_user_id'] ?? 0) ?: null);
+            (new \SoftNova\Services\TenantAuditService($this->db))->log(
+                'create',
+                'nomina',
+                'Pago de nómina registrado · ' . number_format($result['total'], 0, ',', '.')
+                    . ' · asiento contable #' . $result['entry_id'],
+                'payroll_payment',
+                $result['id']
+            );
+            $this->respond(
+                true,
+                'Pago registrado (' . number_format($result['total'], 0, ',', '.') . ') y contabilizado. No genera gasto: el costo ya se causó en la nómina.',
+                '/app/nomina?tab=payments'
+            );
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/nomina?tab=payments');
+        }
+    }
+
+    private function cancelLiabilityPayment(): void
+    {
+        TenantMiddleware::authorize('nomina', 'delete');
+        try {
+            $id = (int)$this->request->post('id', 0);
+            $result = $this->payroll->cancelLiabilityPayment($id, (string)$this->request->post('reason', ''));
+            (new \SoftNova\Services\TenantAuditService($this->db))->log(
+                'cancel',
+                'nomina',
+                'Pago de nómina anulado · ' . number_format($result['total'], 0, ',', '.')
+                    . ($result['reversal_id'] > 0 ? ' · reversión #' . $result['reversal_id'] : ''),
+                'payroll_payment',
+                $id
+            );
+            $this->respond(true, 'Pago anulado y asiento revertido', '/app/nomina?tab=payments');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/nomina?tab=payments');
         }
     }
 
@@ -559,8 +655,14 @@ class TenantNominaController extends TenantController
             return;
         }
         $accountingEntry = $this->query(
-            "SELECT id, entry_number FROM accounting_entries
+            "SELECT id, entry_number, entry_date FROM accounting_entries
              WHERE source_type = 'payroll' AND source_id = ? AND status = 'posted' AND source_event = 'created'
+             ORDER BY id DESC LIMIT 1",
+            [$id]
+        )->fetch() ?: null;
+        $paymentEntry = $this->query(
+            "SELECT id, entry_number, entry_date FROM accounting_entries
+             WHERE source_type = 'payroll' AND source_id = ? AND status = 'posted' AND source_event = 'payment'
              ORDER BY id DESC LIMIT 1",
             [$id]
         )->fetch() ?: null;
@@ -572,6 +674,7 @@ class TenantNominaController extends TenantController
             'params' => $this->payroll->params(),
             'detail' => $detail,
             'accountingEntry' => $accountingEntry,
+            'paymentEntry' => $paymentEntry,
             'q' => '',
             'statusFilter' => '',
             'activeCount' => 0,

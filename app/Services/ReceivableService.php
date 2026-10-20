@@ -143,20 +143,21 @@ class ReceivableService
     
     public function listOpen(int $limit = 10): array
     {
-        // Fuente de verdad: ventas con saldo pendiente (aunque no exista fila en receivables)
+        // Fuente de verdad: ventas con saldo pendiente neto de NC (aunque no exista fila en receivables)
+        $cnJoin = $this->creditNotesJoinSql();
         return $this->query(
             "SELECT
                 s.id as sale_id,
                 s.invoice_number,
                 s.customer_id,
-                s.total as total_amount,
+                GREATEST(s.total - COALESCE(cn.credit_total, 0), 0) as total_amount,
                 COALESCE(p.paid_amount, 0) as paid_amount,
-                GREATEST(s.total - COALESCE(p.paid_amount, 0), 0) as balance,
+                GREATEST(s.total - COALESCE(cn.credit_total, 0) - COALESCE(p.paid_amount, 0), 0) as balance,
                 COALESCE(r.due_date, DATE_ADD(DATE(s.sale_date), INTERVAL 15 DAY)) as due_date,
                 GREATEST(DATEDIFF(CURDATE(), COALESCE(r.due_date, DATE_ADD(DATE(s.sale_date), INTERVAL 15 DAY))), 0) as days_overdue,
                 CASE
                     WHEN COALESCE(p.paid_amount, 0) <= 0 THEN 'open'
-                    WHEN COALESCE(p.paid_amount, 0) < s.total THEN 'partial'
+                    WHEN COALESCE(p.paid_amount, 0) < GREATEST(s.total - COALESCE(cn.credit_total, 0), 0) THEN 'partial'
                     ELSE 'paid'
                 END as status,
                 COALESCE(
@@ -170,11 +171,12 @@ class ReceivableService
                 FROM sale_payments
                 GROUP BY sale_id
              ) p ON p.sale_id = s.id
+             {$cnJoin}
              LEFT JOIN receivables r ON r.sale_id = s.id AND r.status != 'cancelled'
              LEFT JOIN customers c ON c.id = s.customer_id
              WHERE s.payment_status IN ('pending', 'partial')
                AND s.status NOT IN ('cancelled')
-               AND (s.total - COALESCE(p.paid_amount, 0)) > 0.009
+               AND (s.total - COALESCE(cn.credit_total, 0) - COALESCE(p.paid_amount, 0)) > 0.009
              ORDER BY due_date ASC, s.sale_date DESC
              LIMIT " . (int)$limit
         )->fetchAll();
@@ -186,6 +188,7 @@ class ReceivableService
      */
     public function summary(): array
     {
+        $cnJoin = $this->creditNotesJoinSql();
         $row = $this->query(
             "SELECT
                 COALESCE(SUM(bal), 0) total,
@@ -193,17 +196,18 @@ class ReceivableService
                 COALESCE(SUM(CASE WHEN days_overdue > 0 THEN bal ELSE 0 END), 0) overdue_total,
                 COALESCE(SUM(CASE WHEN days_overdue > 0 THEN 1 ELSE 0 END), 0) overdue_count
              FROM (
-                SELECT GREATEST(s.total - COALESCE(p.paid_amount, 0), 0) bal,
+                SELECT GREATEST(s.total - COALESCE(cn.credit_total, 0) - COALESCE(p.paid_amount, 0), 0) bal,
                        GREATEST(DATEDIFF(CURDATE(), COALESCE(r.due_date, DATE_ADD(DATE(s.sale_date), INTERVAL 15 DAY))), 0) days_overdue
                 FROM sales s
                 LEFT JOIN (
                     SELECT sale_id, COALESCE(SUM(amount), 0) as paid_amount
                     FROM sale_payments GROUP BY sale_id
                 ) p ON p.sale_id = s.id
+                {$cnJoin}
                 LEFT JOIN receivables r ON r.sale_id = s.id AND r.status != 'cancelled'
                 WHERE s.payment_status IN ('pending', 'partial')
                   AND s.status NOT IN ('cancelled')
-                  AND (s.total - COALESCE(p.paid_amount, 0)) > 0.009
+                  AND (s.total - COALESCE(cn.credit_total, 0) - COALESCE(p.paid_amount, 0)) > 0.009
              ) x"
         )->fetch() ?: [];
 
@@ -221,6 +225,7 @@ class ReceivableService
      */
     public function agingByDueDate(): array
     {
+        $cnJoin = $this->creditNotesJoinSql();
         $row = $this->query(
             "SELECT
                 COALESCE(SUM(bal), 0) total,
@@ -231,17 +236,18 @@ class ReceivableService
                 COALESCE(SUM(CASE WHEN days_overdue > 90 THEN bal ELSE 0 END), 0) d90,
                 COUNT(*) cnt
              FROM (
-                SELECT GREATEST(s.total - COALESCE(p.paid_amount, 0), 0) bal,
+                SELECT GREATEST(s.total - COALESCE(cn.credit_total, 0) - COALESCE(p.paid_amount, 0), 0) bal,
                        GREATEST(DATEDIFF(CURDATE(), COALESCE(r.due_date, DATE_ADD(DATE(s.sale_date), INTERVAL 15 DAY))), 0) days_overdue
                 FROM sales s
                 LEFT JOIN (
                     SELECT sale_id, COALESCE(SUM(amount), 0) as paid_amount
                     FROM sale_payments GROUP BY sale_id
                 ) p ON p.sale_id = s.id
+                {$cnJoin}
                 LEFT JOIN receivables r ON r.sale_id = s.id AND r.status != 'cancelled'
                 WHERE s.payment_status IN ('pending', 'partial')
                   AND s.status NOT IN ('cancelled')
-                  AND (s.total - COALESCE(p.paid_amount, 0)) > 0.009
+                  AND (s.total - COALESCE(cn.credit_total, 0) - COALESCE(p.paid_amount, 0)) > 0.009
              ) x"
         )->fetch() ?: [];
 
@@ -329,8 +335,10 @@ class ReceivableService
      */
     public function syncFromOpenSales(): void
     {
+        $cnJoin = $this->creditNotesJoinSql();
         $rows = $this->query(
-            "SELECT s.id, s.invoice_number, s.customer_id, s.total, s.notes,
+            "SELECT s.id, s.invoice_number, s.customer_id, s.notes,
+                    GREATEST(s.total - COALESCE(cn.credit_total, 0), 0) as net_total,
                     COALESCE(p.paid_amount, 0) as paid_amount
              FROM sales s
              LEFT JOIN (
@@ -338,20 +346,42 @@ class ReceivableService
                 FROM sale_payments
                 GROUP BY sale_id
              ) p ON p.sale_id = s.id
+             {$cnJoin}
              WHERE s.payment_status IN ('pending', 'partial')
                AND s.status NOT IN ('cancelled')
-               AND (s.total - COALESCE(p.paid_amount, 0)) > 0.009"
+               AND (s.total - COALESCE(cn.credit_total, 0) - COALESCE(p.paid_amount, 0)) > 0.009"
         )->fetchAll();
-        
+
         foreach ($rows as $row) {
             $this->upsertFromSale(
                 (int)$row['id'],
                 !empty($row['customer_id']) ? (int)$row['customer_id'] : null,
                 (string)$row['invoice_number'],
-                (float)$row['total'],
+                (float)$row['net_total'],
                 (float)$row['paid_amount'],
                 $row['notes'] ?? null
             );
         }
+    }
+
+    /** JOIN opcional de NC posted; si la tabla no existe, no suma créditos. */
+    private function creditNotesJoinSql(): string
+    {
+        static $sql = null;
+        if ($sql !== null) {
+            return $sql;
+        }
+        try {
+            $this->query('SELECT 1 FROM sale_credit_notes LIMIT 0');
+            $sql = "LEFT JOIN (
+                        SELECT sale_id, COALESCE(SUM(total), 0) AS credit_total
+                        FROM sale_credit_notes
+                        WHERE status = 'posted'
+                        GROUP BY sale_id
+                    ) cn ON cn.sale_id = s.id";
+        } catch (\Throwable $e) {
+            $sql = 'LEFT JOIN (SELECT 0 AS sale_id, 0 AS credit_total WHERE 1 = 0) cn ON cn.sale_id = s.id';
+        }
+        return $sql;
     }
 }

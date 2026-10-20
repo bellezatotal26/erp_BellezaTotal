@@ -196,6 +196,8 @@
         items = [];
         resetDiscount();
         if (elCashReceived) elCashReceived.value = '';
+        var elSaleNotes = document.getElementById('posSaleNotes');
+        if (elSaleNotes) elSaleNotes.value = '';
         if (elPayType) elPayType.value = 'full';
         if (typeof togglePosCredit === 'function') togglePosCredit();
         renderCart();
@@ -888,11 +890,12 @@
     function creditTermsDays() {
         if (!elPayType || elPayType.value !== 'credit') return 0;
         var t = (elPayTerms && elPayTerms.value) || 'net_30';
-        if (t === 'net_15') return 15;
-        if (t === 'net_30') return 30;
-        if (t === 'net_60') return 60;
-        if (t === 'net_90') return 90;
-        if (t === 'net_120') return 120;
+        if (t === 'overdue') return 0;
+        var m = /^net_(\d{1,4})$/.exec(t);
+        if (m) {
+            var d = parseInt(m[1], 10);
+            if (d >= 1 && d <= 3650) return d;
+        }
         return 30;
     }
 
@@ -2485,6 +2488,8 @@
         items = [];
         resetDiscount();
         if (elCashReceived) elCashReceived.value = '';
+        var elSaleNotes = document.getElementById('posSaleNotes');
+        if (elSaleNotes) elSaleNotes.value = '';
         if (elPayType) elPayType.value = 'full';
         if (elPayTerms) elPayTerms.value = 'net_30';
         if (elInitialPay) elInitialPay.value = '0';
@@ -2552,6 +2557,16 @@
             return;
         }
 
+        if (payType === 'credit' && elPayTerms
+            && (elPayTerms.dataset.customSaving === '1' || !/^(net_\d{1,4}|overdue)$/.test(elPayTerms.value || ''))) {
+            if (typeof showAlert === 'function') {
+                showAlert(elPayTerms.dataset.customSaving === '1'
+                    ? 'Espere a que se guarde el nuevo plazo.'
+                    : 'Seleccione un plazo de crédito válido.', 'error');
+            }
+            return;
+        }
+
         if (mixed) {
             if (splits.length < 2) {
                 if (typeof showAlert === 'function') {
@@ -2615,6 +2630,9 @@
         if (payType === 'credit' && elInitialPay) {
             fd.append('initial_payment', String(parseMoneyInput(elInitialPay.value || '0')));
         }
+        var userObsEl = document.getElementById('posSaleNotes');
+        var userObs = userObsEl ? String(userObsEl.value || '').trim() : '';
+        if (userObs.length > 255) userObs = userObs.slice(0, 255);
         var notes = 'Venta rápida desde caja';
         if (!online) notes += ' | Offline';
         var comboNames = [];
@@ -2648,6 +2666,9 @@
             notes += ' | Recibido: ' + recv + ' | Cambio: ' + change;
             fd.append('cash_received', String(recv));
             fd.append('cash_change', String(change));
+        }
+        if (userObs) {
+            notes = userObs + ' | ' + notes;
         }
         fd.append('notes', notes);
         var pct = discountPercent();

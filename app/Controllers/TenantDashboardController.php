@@ -110,8 +110,11 @@ class TenantDashboardController extends TenantController
                 foreach ($openPayables as &$po) {
                     $paid = (float)($po['paid_amount'] ?? 0);
                     $credit = (float)($po['credit_amount'] ?? 0);
-                    $total = (float)($po['total'] ?? 0);
-                    $po['balance'] = round(max(0, $total - $paid - $credit), 2);
+                    $discount = (float)($po['discount_amount'] ?? 0);
+                    $total = !empty($po['supplier_invoice_value'])
+                        ? (float)$po['supplier_invoice_value']
+                        : (float)($po['total'] ?? 0);
+                    $po['balance'] = round(max(0, $total - $paid - $credit - $discount), 2);
                 }
                 unset($po);
                 $payablesTotal = $purchasing->payableTotal();
@@ -325,7 +328,8 @@ class TenantDashboardController extends TenantController
                 TenantMiddleware::canDo('create', 'ventas')
                 || TenantMiddleware::canDo('edit', 'ventas')
                 || TenantMiddleware::canDo('create', 'caja'),
-            \SoftNova\Services\CustomOptionService::GROUP_DISCOUNT_PERCENT =>
+            \SoftNova\Services\CustomOptionService::GROUP_DISCOUNT_PERCENT,
+            \SoftNova\Services\CustomOptionService::GROUP_CREDIT_TERM =>
                 TenantMiddleware::canDo('create', 'ventas')
                 || TenantMiddleware::canDo('create', 'caja'),
             \SoftNova\Services\CustomOptionService::GROUP_CUSTOMER_SOURCE =>

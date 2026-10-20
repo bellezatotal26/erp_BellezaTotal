@@ -290,6 +290,48 @@ class TenantOpsSchema
         self::addColumnIfMissing($db, 'payroll_items', 'vacation_provision', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER cesantias_interest');
         self::addColumnIfMissing($db, 'payroll_runs', 'vacation_total', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER cesantias_total');
         self::addColumnIfMissing($db, 'payroll_runs', 'include_vacaciones', 'TINYINT(1) NOT NULL DEFAULT 0 AFTER include_cesantias');
+
+        // Pagos de pasivos laborales (PILA, parafiscales, cesantías, intereses, vacaciones, salarios por pagar).
+        try {
+            self::ensurePayrollPaymentTables($db);
+        } catch (\Throwable $e) {
+            error_log('Payroll schema liability payments: ' . $e->getMessage());
+        }
+    }
+
+    private static function ensurePayrollPaymentTables(\PDO $db): void
+    {
+        $db->exec(
+            "CREATE TABLE IF NOT EXISTS payroll_liability_payments (
+                id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                payment_date DATE NOT NULL,
+                kind VARCHAR(20) NOT NULL DEFAULT 'pila',
+                payment_method VARCHAR(50) NOT NULL DEFAULT 'transfer',
+                total DECIMAL(14,2) NOT NULL DEFAULT 0.00,
+                reference VARCHAR(120) NULL,
+                notes VARCHAR(255) NULL,
+                status ENUM('active','cancelled') NOT NULL DEFAULT 'active',
+                cancel_reason VARCHAR(255) NULL,
+                cancelled_at DATETIME NULL,
+                entry_id BIGINT UNSIGNED NULL,
+                user_id INT UNSIGNED NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_plp_date (payment_date),
+                KEY idx_plp_status (status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        );
+        $db->exec(
+            "CREATE TABLE IF NOT EXISTS payroll_liability_payment_lines (
+                id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                payment_id INT UNSIGNED NOT NULL,
+                concept VARCHAR(30) NOT NULL,
+                account_code VARCHAR(20) NOT NULL,
+                amount DECIMAL(14,2) NOT NULL DEFAULT 0.00,
+                KEY idx_plpl_payment (payment_id),
+                CONSTRAINT fk_plpl_payment FOREIGN KEY (payment_id)
+                    REFERENCES payroll_liability_payments(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        );
     }
 
     private static function addColumnIfMissing(\PDO $db, string $table, string $column, string $definition): void

@@ -270,7 +270,7 @@ class StockService
     ): void {
         $skip = [
             'sale', 'return', 'sale_credit_note',
-            'purchase_order', 'purchase', 'purchase_credit_note',
+            'purchase_order', 'purchase', 'purchase_credit_note', 'purchase_cancel',
         ];
         if (in_array($referenceType, $skip, true)) {
             return;
@@ -444,8 +444,8 @@ class StockService
             throw new \RuntimeException('Producto no encontrado');
         }
 
-        // NC de compra: puede operar aunque el producto esté inactivo (ya no se vende).
-        $forceDocOut = in_array($referenceType, ['purchase_credit_note'], true);
+        // NC / anulación de compra: puede operar aunque el producto esté inactivo (ya no se vende).
+        $forceDocOut = in_array($referenceType, ['purchase_credit_note', 'purchase_cancel'], true);
         if (($product['status'] ?? '') !== 'active' && !$forceDocOut) {
             throw new \RuntimeException('Producto inactivo: ' . ($product['name'] ?? ('#' . $productId)));
         }
@@ -483,7 +483,8 @@ class StockService
             if ($forceDocOut) {
                 $allowOversell = true;
                 $skipDebt = true;
-                $extra = ' · Sin stock en bodega al acreditar (disp. ' . $available . ')';
+                $extra = ' · Sin stock en bodega al ' . ($referenceType === 'purchase_cancel' ? 'anular' : 'acreditar')
+                    . ' (disp. ' . $available . ')';
                 $notes = $notes !== '' ? ($notes . $extra) : ('Salida NC compra' . $extra);
             } else {
                 try {
@@ -653,6 +654,7 @@ class StockService
         }
 
         // Promedio ponderado (WAC). Las bonificaciones ya vienen valorizadas (o se igualan al costo actual).
+        $newWac = null;
         if ($updatePurchasePrice) {
             $newWac = $this->weightedAverageCost($oldStock, $oldCost, $quantity, $cost);
             $this->query(
@@ -678,6 +680,21 @@ class StockService
             $paymentMode,
             $movementDate
         );
+
+        if ($newWac !== null) {
+            ProductCostHistory::record($this->db, $productId, $oldCost, (float)$newWac, [
+                'qty' => $quantity,
+                'unit_cost_in' => $cost,
+                'stock_before' => $oldStock,
+                'stock_after' => $after,
+                'source' => in_array($referenceType, ['purchase_order', 'purchase'], true) ? 'purchase' : 'entry',
+                'reference_type' => $referenceType,
+                'reference_id' => $referenceId,
+                'movement_id' => $movementId,
+                'note' => $notes,
+                'effective_date' => $movementDate,
+            ]);
+        }
 
         $this->registerLotEntry(
             $productId,
@@ -2650,6 +2667,8 @@ class StockService
             $lines[] = 'Entrada por compra a proveedor';
         } elseif ($ref === 'purchase_credit_note') {
             $lines[] = 'Ajuste por nota de crédito de compra';
+        } elseif ($ref === 'purchase_cancel') {
+            $lines[] = 'Salida por anulación de compra';
         } elseif ($ref === 'sale_credit_note') {
             $lines[] = 'Reingreso por nota de crédito de venta (devolución cliente)';
         }
@@ -3174,7 +3193,7 @@ class StockService
              JOIN products p ON p.id = sm.product_id AND COALESCE(p.product_type, 'product') = 'product'
              WHERE sm.accounting_entry_id IS NULL
                AND COALESCE(sm.total_cost, 0) > 0
-               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return', 'loan_received', 'loan_received_return', 'loan_received_settle', 'status_change', 'consignment_in', 'consignment_return')
+               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'purchase_cancel', 'loan', 'loan_return', 'loan_received', 'loan_received_return', 'loan_received_settle', 'status_change', 'consignment_in', 'consignment_return')
                AND (
                     sm.type = 'in'
                     OR sm.type = 'out'
@@ -3194,7 +3213,7 @@ class StockService
              JOIN products p ON p.id = sm.product_id AND COALESCE(p.product_type, 'product') = 'product'
              WHERE sm.accounting_entry_id IS NULL
                AND COALESCE(sm.total_cost, 0) > 0
-               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'loan', 'loan_return', 'loan_received', 'loan_received_return', 'loan_received_settle', 'status_change', 'consignment_in', 'consignment_return')
+               AND COALESCE(sm.reference_type, '') NOT IN ('sale', 'return', 'sale_credit_note', 'purchase_order', 'purchase_credit_note', 'purchase_cancel', 'loan', 'loan_return', 'loan_received', 'loan_received_return', 'loan_received_settle', 'status_change', 'consignment_in', 'consignment_return')
                AND (
                     sm.type = 'in'
                     OR sm.type = 'out'
@@ -3234,7 +3253,7 @@ class StockService
         if (in_array($ref, [
                 'adjustment', 'csv_export', 'sale', 'inventory_exit', 'loan',
                 'loan_return', 'loan_received', 'loan_received_return', 'loan_received_settle',
-                'purchase_credit_note',
+                'purchase_credit_note', 'purchase_cancel',
             ], true)
             || $type === 'out'
         ) {

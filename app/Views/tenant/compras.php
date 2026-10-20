@@ -34,6 +34,11 @@ $currency = $currency ?? ['symbol' => '$', 'decimals' => 0, 'decimal' => ',', 't
 $pagination = $pagination ?? null;
 $perPageOptions = $perPageOptions ?? [20, 50, 100, 200];
 $listQuery = $listQuery ?? [];
+$sortFilters = $sortFilters ?? [
+    'sort' => '',
+    'dir' => 'desc',
+    'query' => $listQuery,
+];
 $canCreate = \SoftNova\Core\TenantMiddleware::canDo('create', 'compras');
 $needBarcode = !$creditNotesPanel;
 $canEdit = \SoftNova\Core\TenantMiddleware::canDo('edit', 'compras');
@@ -252,12 +257,206 @@ $tabBtn = static function (bool $active): string {
 };
 ?>
 
-<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center;">
+<?php
+$purchaseBudget = $purchaseBudget ?? null;
+$canEditBudget = \SoftNova\Core\TenantMiddleware::isManagement();
+?>
+<div class="po-top-row">
+<div class="po-top-row__tabs">
     <a href="<?php echo $comprasBase; ?>" class="<?php echo $tabBtn(!$isFacturasTab); ?>">Órdenes de compra</a>
     <a href="<?php echo $comprasBase; ?>?action=facturas" class="<?php echo $tabBtn($isFacturasTab); ?>">Facturas</a>
     <a href="<?php echo $comprasBase; ?>?action=notas_credito" class="btn btn-secondary">Notas de crédito</a>
     <a href="<?php echo $comprasBase; ?>?action=reposicion" class="btn btn-secondary">Panel de reposición</a>
 </div>
+<?php if (is_array($purchaseBudget)): ?>
+<?php
+$pb = $purchaseBudget;
+$pbLevel = (string)$pb['level'];
+$pbBarPct = min(100, max(0, (float)$pb['pct']));
+?>
+<?php
+$pbFrom = (string)($pb['from'] ?? date('Y-m-01'));
+$pbTo = (string)($pb['to'] ?? date('Y-m-t'));
+$pbPendingCount = (int)($pb['pending_count'] ?? 0);
+$pbPendingTotal = (float)($pb['pending_total'] ?? 0);
+$pbDiscountsTotal = (float)($pb['discounts_total'] ?? 0);
+$pbTip = 'OC pendientes: ' . fmtC((float)$pb['orders_total'], $currency) . ' (' . (int)$pb['orders_count'] . ')'
+    . ' · Facturas recibidas: ' . fmtC((float)$pb['invoices_total'], $currency) . ' (' . (int)$pb['invoices_count'] . ', neto de NC)'
+    . ' · Facturas leídas por confirmar: ' . fmtC($pbPendingTotal, $currency) . ' (' . $pbPendingCount . ', sin las enlazadas a una OC abierta)'
+    . ' · Descuentos comerciales: ' . fmtC($pbDiscountsTotal, $currency);
+if ($pbLevel !== 'none') {
+    $pbTip .= ' · Alerta amarilla desde ' . (int)$pb['warn_pct'] . '%';
+    if (!empty($pb['prorated'])) {
+        $pbTip .= ' · Límite proporcional al rango (mensual ' . fmtC((float)$pb['monthly_limit'], $currency) . ')';
+    }
+}
+?>
+<div class="card neumorphic po-budget po-budget--<?php echo htmlspecialchars($pbLevel); ?>" title="<?php echo htmlspecialchars($pbTip); ?>">
+    <div class="po-budget__head">
+        <div class="po-budget__lights" aria-hidden="true">
+            <span class="po-budget__light po-budget__light--red<?php echo $pbLevel === 'red' ? ' is-on' : ''; ?>"></span>
+            <span class="po-budget__light po-budget__light--yellow<?php echo $pbLevel === 'yellow' ? ' is-on' : ''; ?>"></span>
+            <span class="po-budget__light po-budget__light--green<?php echo $pbLevel === 'green' ? ' is-on' : ''; ?>"></span>
+        </div>
+        <div class="po-budget__title">
+            <h4>Semáforo compras · <?php echo htmlspecialchars((string)$pb['month_label']); ?></h4>
+            <span class="po-budget__status"><?php echo htmlspecialchars((string)$pb['label']); ?></span>
+        </div>
+        <?php if ($canEditBudget): ?>
+            <button type="button" class="btn btn-sm btn-secondary po-budget__edit" onclick="openPurchaseLimitModal()">
+                <?php echo $pbLevel === 'none' ? 'Definir límite' : 'Editar'; ?>
+            </button>
+        <?php endif; ?>
+    </div>
+    <form method="GET" action="<?php echo $comprasBase; ?>" class="po-budget__range">
+        <?php if ($isFacturasTab): ?><input type="hidden" name="action" value="facturas"><?php endif; ?>
+        <label>Desde <input type="date" name="pb_from" class="form-control" value="<?php echo htmlspecialchars($pbFrom); ?>"></label>
+        <label>Hasta <input type="date" name="pb_to" class="form-control" value="<?php echo htmlspecialchars($pbTo); ?>"></label>
+        <button type="submit" class="btn btn-sm btn-secondary">Filtrar</button>
+        <?php if (empty($pb['is_default_range'])): ?>
+            <a href="<?php echo $comprasBase; ?><?php echo $isFacturasTab ? '?action=facturas' : ''; ?>" class="po-budget__reset">Mes actual</a>
+        <?php endif; ?>
+    </form>
+    <?php if ($pbLevel === 'none'): ?>
+        <div class="po-budget__line">
+            <span>Compras del periodo (OC + facturas + leídas por confirmar): <strong><?php echo fmtC((float)$pb['used'], $currency); ?></strong></span>
+        </div>
+    <?php else: ?>
+        <div class="po-budget__bar">
+            <div class="po-budget__fill" style="width:<?php echo $pbBarPct; ?>%;"></div>
+            <span class="po-budget__mark" style="left:<?php echo (int)$pb['warn_pct']; ?>%;"></span>
+        </div>
+        <div class="po-budget__line">
+            <span><strong><?php echo fmtC((float)$pb['used'], $currency); ?></strong> de <?php echo fmtC((float)$pb['limit'], $currency); ?><?php echo !empty($pb['prorated']) ? ' <small>(proporcional)</small>' : ''; ?> (<?php echo number_format((float)$pb['pct'], 1, ',', '.'); ?>%)</span>
+            <?php if ((float)$pb['available'] >= 0): ?>
+                <span>Disponible <strong class="po-budget__avail"><?php echo fmtC((float)$pb['available'], $currency); ?></strong></span>
+            <?php else: ?>
+                <span>Excedido <strong class="po-budget__over"><?php echo fmtC(abs((float)$pb['available']), $currency); ?></strong></span>
+            <?php endif; ?>
+        </div>
+    <?php endif; ?>
+    <div class="po-budget__line po-budget__line--sub">
+        <span>OC: <?php echo fmtC((float)$pb['orders_total'], $currency); ?> (<?php echo (int)$pb['orders_count']; ?>)</span>
+        <span>Facturas: <?php echo fmtC((float)$pb['invoices_total'], $currency); ?> (<?php echo (int)$pb['invoices_count']; ?>)</span>
+        <span class="<?php echo $pbPendingCount > 0 ? 'po-budget__pending' : ''; ?>">Leídas por confirmar:
+            <?php if ($pbPendingCount > 0): ?>
+                <a href="<?php echo $comprasBase; ?>?action=facturas#pendingInvoicesCard"><?php echo fmtC($pbPendingTotal, $currency); ?> (<?php echo $pbPendingCount; ?>)</a>
+            <?php else: ?>
+                <?php echo fmtC(0, $currency); ?> (0)
+            <?php endif; ?>
+        </span>
+        <span title="Suma de descuentos comerciales de facturas recibidas y leídas por confirmar del periodo">
+            Descuentos: <strong style="color:var(--dmc-B45309, #B45309);"><?php echo fmtC($pbDiscountsTotal, $currency); ?></strong>
+        </span>
+    </div>
+</div>
+<?php endif; ?>
+</div>
+
+<?php if (is_array($purchaseBudget) && $canEditBudget): ?>
+<div id="purchaseLimitModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:440px;">
+        <div class="modal-header">
+            <h3>Límite mensual de compras</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('purchaseLimitModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $comprasBase; ?>?action=purchase_limit">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="return" value="<?php echo $isFacturasTab ? 'facturas' : ''; ?>">
+            <?php if (empty($pb['is_default_range'])): ?>
+                <input type="hidden" name="pb_from" value="<?php echo htmlspecialchars($pbFrom); ?>">
+                <input type="hidden" name="pb_to" value="<?php echo htmlspecialchars($pbTo); ?>">
+            <?php endif; ?>
+            <div class="modal-body">
+                <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 12px;">
+                    Suma las OC pendientes, las facturas recibidas (descontando notas crédito) y las facturas leídas
+                    pendientes de confirmar del periodo. Las anuladas o descartadas no cuentan.
+                    Con un rango distinto a un mes, el límite se aplica en proporción a los días.
+                    Deje el monto en 0 para desactivar el semáforo.
+                </p>
+                <div class="form-group">
+                    <label for="poBudgetLimit">Monto límite mensual</label>
+                    <input type="number" name="limit" id="poBudgetLimit" class="form-control" min="0" step="1"
+                           value="<?php echo (float)($pb['monthly_limit'] ?? $pb['limit']) > 0 ? htmlspecialchars((string)round((float)($pb['monthly_limit'] ?? $pb['limit']))) : ''; ?>"
+                           placeholder="Ej: 15000000">
+                </div>
+                <div class="form-group" style="margin-bottom:0;">
+                    <label for="poBudgetWarn">Alerta amarilla desde (% del límite)</label>
+                    <input type="number" name="warn_pct" id="poBudgetWarn" class="form-control" min="1" max="99" step="1"
+                           value="<?php echo (int)$pb['warn_pct']; ?>" required>
+                </div>
+            </div>
+            <div class="modal-footer" style="display:flex;justify-content:flex-end;gap:8px;">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('purchaseLimitModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-primary">Guardar</button>
+            </div>
+        </form>
+    </div>
+</div>
+<script>
+function openPurchaseLimitModal() {
+    document.getElementById('purchaseLimitModal').style.display = 'flex';
+    var el = document.getElementById('poBudgetLimit');
+    if (el) { el.focus(); }
+}
+</script>
+<?php endif; ?>
+
+<style>
+.po-budget { flex: 0 0 calc(50% - 6px); padding: 14px 18px; margin: 0; border-left: 5px solid #94A3B8; min-width: 0;
+    display: flex; flex-direction: column; justify-content: center; gap: 2px; }
+@media (max-width: 900px) { .po-budget { flex-basis: 100%; } }
+.po-budget--green { border-left-color: #10B981; }
+.po-budget--yellow { border-left-color: #F59E0B; }
+.po-budget--red { border-left-color: #DC2626; }
+.po-budget__head { display: flex; align-items: center; gap: 12px; }
+.po-budget__lights { display: flex; gap: 5px; padding: 5px 7px; border-radius: 14px; background: #1F2937; flex-shrink: 0; }
+.po-budget__light { width: 13px; height: 13px; border-radius: 50%; opacity: .22; }
+.po-budget__light--red { background: #EF4444; }
+.po-budget__light--yellow { background: #FBBF24; }
+.po-budget__light--green { background: #10B981; }
+.po-budget__light.is-on { opacity: 1; box-shadow: 0 0 6px currentColor; }
+.po-budget__light--red.is-on { color: #EF4444; }
+.po-budget__light--yellow.is-on { color: #FBBF24; }
+.po-budget__light--green.is-on { color: #10B981; }
+.po-budget__title { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.po-budget__title h4 { margin: 0; font-size: 14px; white-space: nowrap; }
+.po-budget__status { font-size: 12px; font-weight: 600; color: var(--color-text-secondary); }
+.po-budget__edit { padding: 3px 10px; font-size: 12px; flex-shrink: 0; }
+.po-budget--green .po-budget__status { color: #059669; }
+.po-budget--yellow .po-budget__status { color: #B45309; }
+.po-budget--red .po-budget__status { color: #DC2626; }
+.po-budget__bar { position: relative; height: 9px; border-radius: 5px; background: rgba(148,163,184,.25); margin: 10px 0 4px; overflow: hidden; }
+.po-budget__fill { height: 100%; border-radius: 6px; background: #10B981; transition: width .4s; }
+.po-budget--yellow .po-budget__fill { background: #F59E0B; }
+.po-budget--red .po-budget__fill { background: #DC2626; }
+.po-budget__mark { position: absolute; top: 0; bottom: 0; width: 2px; background: rgba(31,41,55,.45); }
+.po-top-row { display: flex; align-items: stretch; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+.po-top-row__tabs { flex: 1 1 auto; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; align-content: center; }
+.po-budget__line { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 12px; color: var(--color-text-secondary); margin-top: 4px; }
+.po-budget__line strong { font-size: 14px; color: var(--color-text-primary, inherit); }
+.po-budget__line--sub { font-size: 11px; margin-top: 2px; opacity: .85; }
+.po-budget__line strong.po-budget__avail { color: #059669; }
+.po-budget__line strong.po-budget__over { color: #DC2626; }
+.po-budget__range { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0 0; font-size: 12px; color: var(--color-text-secondary); }
+.po-budget__range label { display: inline-flex; align-items: center; gap: 5px; margin: 0; font-weight: 500; }
+.po-budget__range input[type="date"] { width: auto; min-width: 0; padding: 3px 6px; height: 28px; font-size: 12px; }
+.po-budget__range .btn { padding: 3px 10px; font-size: 12px; }
+.po-budget__reset { font-size: 12px; }
+.po-budget__pending, .po-budget__pending a { color: #B45309; font-weight: 600; }
+.po-line-total { height: 38px; display: flex; align-items: center; justify-content: flex-end; padding: 0 8px;
+    border-radius: 8px; background: rgba(148,163,184,.12); font-weight: 600; font-size: 13px; white-space: nowrap; }
+.po-totals { margin: 14px 0 0 auto; max-width: 320px; padding: 10px 14px; border-radius: 10px;
+    background: rgba(148,163,184,.10); border: 1px solid rgba(148,163,184,.30); }
+.po-totals__row { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; padding: 3px 0; }
+.po-totals__row small { color: var(--color-text-secondary); font-weight: normal; }
+.po-totals__row--grand { border-top: 1px solid rgba(148,163,184,.35); margin-top: 4px; padding-top: 7px; font-size: 15px; }
+.po-totals__row--grand strong { color: var(--color-accent-text, var(--color-primary)); }
+.po-pct-wrap { position: relative; display: flex; align-items: center; width: 100%; max-width: 96px; }
+.po-pct-wrap .form-control { padding-right: 26px; width: 100%; }
+.po-pct-wrap .po-pct-affix { position: absolute; right: 8px; font-size: 13px; font-weight: 600; color: var(--color-text-secondary); pointer-events: none; }
+.po-com-disc-fields { display: grid; grid-template-columns: 96px minmax(140px, 1fr); gap: 8px; align-items: center; max-width: 420px; }
+</style>
 
 <?php if ($isFacturasTab): ?>
 <div class="stats-grid">
@@ -320,6 +519,10 @@ $tabBtn = static function (bool $active): string {
 <form method="GET" action="<?php echo $comprasBase; ?>" class="inv-filters-form" style="margin-bottom:16px;">
     <?php if ($isFacturasTab): ?>
         <input type="hidden" name="action" value="facturas">
+    <?php endif; ?>
+    <?php if (!empty($sortFilters['sort'])): ?>
+        <input type="hidden" name="sort" value="<?php echo htmlspecialchars((string)$sortFilters['sort']); ?>">
+        <input type="hidden" name="dir" value="<?php echo htmlspecialchars((string)($sortFilters['dir'] ?? 'desc')); ?>">
     <?php endif; ?>
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
         <div class="form-group" style="margin:0;flex:1;min-width:200px;">
@@ -403,7 +606,7 @@ $tabBtn = static function (bool $active): string {
 </p>
 
 <?php if ($isFacturasTab && !empty($pendingInvoices)): ?>
-<div class="card neumorphic" style="margin-bottom:18px;border-left:4px solid #F59E0B;">
+<div class="card neumorphic" id="pendingInvoicesCard" style="margin-bottom:18px;border-left:4px solid #F59E0B;">
     <div class="card-header"><h3>Facturas leídas pendientes de confirmar</h3></div>
     <div class="card-body">
         <p style="font-size:13px;color:var(--color-text-secondary);margin-top:0;">
@@ -429,6 +632,9 @@ $tabBtn = static function (bool $active): string {
                                 <button type="submit" class="btn btn-sm btn-danger" onclick="return confirm('¿Descartar esta factura leída?')">Descartar</button>
                             </form>
                         <?php endif; ?>
+                        <a class="btn btn-sm btn-secondary"
+                           href="<?php echo $comprasBase; ?>?action=invoice_export_xlsx&amp;import_id=<?php echo (int)$inv['id']; ?>"
+                           title="Descargar Excel con productos y totales (montos en formato moneda)">Excel</a>
                     </td>
                 </tr>
             <?php endforeach; ?>
@@ -529,11 +735,28 @@ $tabBtn = static function (bool $active): string {
                 <thead>
                     <tr>
                         <?php if ($isFacturasTab): ?>
-                            <th>Factura</th><th>OC</th><th>Fecha</th><th>Vence</th><th>Proveedor</th><th>Foto</th>
-                            <th>Total</th><th>NC</th><th>Neto</th><th>Abonado</th><th>Saldo</th><th>Pago</th><th>Asiento</th><th>Acciones</th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Factura', 'column' => 'invoice', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'OC', 'column' => 'order', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Fecha', 'column' => 'date', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Vence', 'column' => 'due', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Proveedor', 'column' => 'supplier', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Total', 'column' => 'total', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Dcto.', 'column' => 'discount', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'NC', 'column' => 'credit', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Neto', 'column' => 'net', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Abonado', 'column' => 'paid', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Saldo', 'column' => 'balance', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Pago', 'column' => 'payment', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th>Asiento</th>
+                            <th>Acciones</th>
                         <?php else: ?>
-                            <th>OC</th><th>Fecha</th><th>Entrega est.</th><th>Proveedor</th>
-                            <th>Total est.</th><th>Estado</th><th>Acciones</th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'OC', 'column' => 'order', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Fecha', 'column' => 'date', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Entrega est.', 'column' => 'expected', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Proveedor', 'column' => 'supplier', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Total est.', 'column' => 'total', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th><?php $viewInstance->partial('sortable_th', ['label' => 'Estado', 'column' => 'status', 'filters' => $sortFilters, 'baseUrl' => $comprasBase]); ?></th>
+                            <th>Acciones</th>
                         <?php endif; ?>
                     </tr>
                 </thead>
@@ -549,10 +772,15 @@ $tabBtn = static function (bool $active): string {
                     };
                     $creditTot = round((float)($o['credit_total'] ?? 0), 2);
                     $orderNet = round((float)$o['total'] - $creditTot, 2);
+                    $payDiscTot = round((float)($o['payment_discount_total'] ?? 0), 2);
+                    $payBase = !empty($o['supplier_invoice_value'])
+                        ? (float)$o['supplier_invoice_value']
+                        : (float)$o['total'];
                     $orderBalance = round(
-                        (float)$o['total']
+                        $payBase
                         - (float)($o['paid_total'] ?? 0)
-                        - $creditTot,
+                        - $creditTot
+                        - $payDiscTot,
                         2
                     );
                     $isVoided = $st === 'cancelled' && (
@@ -575,6 +803,11 @@ $tabBtn = static function (bool $active): string {
                         'card' => 'Tarjeta',
                         default => 'Crédito',
                     };
+                    $comDiscAmt = round((float)($o['commercial_discount_amount'] ?? 0), 2);
+                    $comDiscPct = (float)($o['commercial_discount_pct'] ?? 0);
+                    if ($comDiscAmt <= 0.009 && $comDiscPct > 0.009) {
+                        $comDiscAmt = round((float)($o['subtotal'] ?? 0) * $comDiscPct / 100, 2);
+                    }
                     ?>
                     <tr<?php echo ($fullyCredited || $isVoided) ? ' style="opacity:0.78;"' : ''; ?>>
                         <?php if ($isFacturasTab): ?>
@@ -611,21 +844,27 @@ $tabBtn = static function (bool $active): string {
                                 <?php endif; ?>
                             </td>
                             <td><?php echo htmlspecialchars($o['supplier_name'] ?? '—'); ?></td>
-                            <td>
-                                <?php if (!empty($o['invoice_path'])): ?>
-                                    <a class="btn btn-sm btn-secondary" href="<?php echo $comprasBase; ?>?action=invoice&id=<?php echo (int)$o['id']; ?>" target="_blank" title="Ver foto/PDF factura">Ver</a>
-                                <?php else: ?>
-                                    —
-                                <?php endif; ?>
-                            </td>
                             <td style="font-weight:600;"><?php echo fmtC((float)$o['total'], $currency); ?></td>
+                            <td style="color:<?php echo $comDiscAmt > 0.009 ? 'var(--dmc-B45309, #B45309)' : 'inherit'; ?>;"
+                                title="<?php echo $comDiscPct > 0.009 ? htmlspecialchars((string)(int)round($comDiscPct) . '% comercial') : 'Descuento comercial'; ?>">
+                                <?php
+                                if ($comDiscAmt > 0.009) {
+                                    echo '−' . fmtC($comDiscAmt, $currency);
+                                    if ($comDiscPct > 0.009) {
+                                        echo '<div style="font-size:11px;opacity:.8;">' . (int)round($comDiscPct) . '%</div>';
+                                    }
+                                } else {
+                                    echo '—';
+                                }
+                                ?>
+                            </td>
                             <td style="color:<?php echo $creditTot > 0.009 ? '#B45309' : 'inherit'; ?>;">
                                 <?php echo $creditTot > 0.009 ? ('−' . fmtC($creditTot, $currency)) : '—'; ?>
                             </td>
-                            <td style="font-weight:600;"><?php echo fmtC(max(0, $orderNet), $currency); ?></td>
-                            <td style="color:#10B981;"><?php echo fmtC((float)($o['paid_total'] ?? 0), $currency); ?></td>
+                            <td style="font-weight:600;"><?php echo fmtC($isVoided ? 0 : max(0, $orderNet), $currency); ?></td>
+                            <td style="color:#10B981;"><?php echo fmtC($isVoided ? 0 : (float)($o['paid_total'] ?? 0), $currency); ?></td>
                             <td style="font-weight:600;color:<?php echo $isPayable ? '#DC2626' : '#10B981'; ?>;">
-                                <?php echo fmtC(max(0, $orderBalance), $currency); ?>
+                                <?php echo fmtC($isVoided ? 0 : max(0, $orderBalance), $currency); ?>
                             </td>
                             <td style="font-size:12px;"><?php echo htmlspecialchars($payLabel); ?></td>
                             <td style="font-size:12px;"><?php echo htmlspecialchars($o['accounting_entry_id'] ? ('#' . $o['accounting_entry_id']) : '—'); ?></td>
@@ -652,14 +891,27 @@ $tabBtn = static function (bool $active): string {
                                             title="Nota de crédito / devolución">NC</button>
                                 <?php endif; ?>
                                 <?php if (!$isVoided && $canEdit && $isPayable): ?>
+                                    <?php
+                                    $payPayload = htmlspecialchars(json_encode([
+                                        'id' => (int)$o['id'],
+                                        'number' => (string)$o['order_number'],
+                                        'supplier' => (string)($o['supplier_name'] ?? ''),
+                                        'total' => (float)$o['total'],
+                                        'invoiceValue' => $payBase,
+                                        'paid' => (float)($o['paid_total'] ?? 0),
+                                        'credited' => $creditTot,
+                                        'discounts' => $payDiscTot,
+                                        'balance' => max(0, $orderBalance),
+                                    ], JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP), ENT_QUOTES);
+                                    ?>
                                     <button type="button" class="btn btn-sm btn-primary"
-                                            onclick="openPayModal(<?php echo (int)$o['id']; ?>, '<?php echo htmlspecialchars($o['order_number'], ENT_QUOTES); ?>', <?php echo $orderBalance; ?>, '<?php echo htmlspecialchars($o['supplier_name'] ?? '', ENT_QUOTES); ?>')"
+                                            onclick="openPayModal(<?php echo $payPayload; ?>)"
                                             title="Registrar abono al proveedor">Abonar</button>
                                 <?php endif; ?>
                                 <?php if (!$isVoided && ($canEdit || !empty($canDelete)) && !$fullyCredited): ?>
                                     <button type="button" class="btn btn-sm btn-danger"
                                             onclick="voidReceivedOrder(<?php echo (int)$o['id']; ?>, '<?php echo htmlspecialchars($o['order_number'], ENT_QUOTES); ?>')"
-                                            title="Anular factura recibida por error (devolución total + stock + asiento)">Anular</button>
+                                            title="Anular factura recibida por error (revierte stock, asiento y caja; sin NC)">Anular</button>
                                 <?php elseif (!$isVoided && ($canEdit || !empty($canDelete)) && $fullyCredited): ?>
                                     <button type="button" class="btn btn-sm btn-danger"
                                             onclick="voidReceivedOrder(<?php echo (int)$o['id']; ?>, '<?php echo htmlspecialchars($o['order_number'], ENT_QUOTES); ?>')"
@@ -746,7 +998,7 @@ $tabBtn = static function (bool $active): string {
                 </p>
                 <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 12px;">
                     La OC es solo el pedido para enviar al proveedor.
-                    Foto, vencimiento, dsto. pronto pago y recepción van en <strong>Cargar factura</strong> o al <strong>Recibir</strong>.
+                    Foto, vencimiento, descuento comercial y recepción van en <strong>Cargar factura</strong> o al <strong>Recibir</strong>.
                 </p>
                 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
                     <div class="form-group" style="margin:0;">
@@ -782,6 +1034,11 @@ $tabBtn = static function (bool $active): string {
                 </div>
                 <div id="poItems"></div>
                 <button type="button" class="btn btn-secondary" onclick="addPoItem()" style="margin-top:8px;">+ Agregar línea vacía</button>
+                <div class="po-totals" id="poTotals">
+                    <div class="po-totals__row"><span>Subtotal <small id="poTotalsCount"></small></span><strong id="poTotalSubtotal">$ 0</strong></div>
+                    <div class="po-totals__row"><span>IVA</span><strong id="poTotalTax">$ 0</strong></div>
+                    <div class="po-totals__row po-totals__row--grand"><span>Total OC</span><strong id="poTotalGrand">$ 0</strong></div>
+                </div>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('purchaseModal').style.display='none'">Cancelar</button>
@@ -820,14 +1077,14 @@ $tabBtn = static function (bool $active): string {
                     <label>Vencimiento de pago <span class="field-tip" data-tip="Fecha límite para pagar al proveedor (CxP). Se usa en filtros de vencidas / por vencer." tabindex="0">?</span></label>
                     <input type="date" name="due_date" id="receiveDueDate" class="form-control">
                 </div>
-                <div class="form-group" style="margin:0;">
-                    <label>Desc. pronto pago % <span class="field-tip" data-tip="Solo aplica si paga antes del vencimiento. Reduce el total de la OC/factura." tabindex="0">?</span></label>
-                    <input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" id="receiveEarlyDiscount" class="form-control" value="" placeholder="0">
-                </div>
+                <input type="hidden" name="early_payment_discount_pct" id="receiveEarlyDiscount" value="0">
                 <div class="form-group" style="margin:0;grid-column:1/-1;">
-                    <label>Desc. comercial <span class="field-tip" data-tip="Descuento general de la factura (siempre aplica). Indique % o monto $; si hay monto, manda el $." tabindex="0">?</span></label>
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-                        <input type="number" step="0.01" min="0" max="100" name="commercial_discount_pct" id="receiveCommercialPct" class="form-control" value="" placeholder="%">
+                    <label>Desc. comercial <span class="field-tip" data-tip="Descuento general sobre el subtotal (antes de IVA). Indique % entero (0–100) o monto $; si hay monto, manda el $." tabindex="0">?</span></label>
+                    <div class="po-com-disc-fields">
+                        <div class="po-pct-wrap">
+                            <input type="number" step="1" min="0" max="100" inputmode="numeric" name="commercial_discount_pct" id="receiveCommercialPct" class="form-control" value="" placeholder="0" title="Porcentaje entero" oninput="poClampCommercialPct(this)">
+                            <span class="po-pct-affix">%</span>
+                        </div>
                         <input type="text" inputmode="decimal" name="commercial_discount_amount" id="receiveCommercialAmt" class="form-control money-input" data-money="1" value="" placeholder="$ monto" autocomplete="off">
                     </div>
                 </div>
@@ -842,7 +1099,7 @@ $tabBtn = static function (bool $active): string {
                 </div>
             </div>
             <div class="form-group">
-                <label>Foto / PDF factura <span class="field-tip" data-tip="Adjunto de evidencia (foto o PDF). Se consulta después desde Facturas → Ver." tabindex="0">?</span></label>
+                <label>Foto / PDF factura <span class="field-tip" data-tip="Adjunto de evidencia (foto o PDF). Se consulta después al abrir Facturas → Ver (detalle)." tabindex="0">?</span></label>
                 <input type="file" name="invoice_file" class="form-control" accept="image/jpeg,image/png,image/webp,application/pdf">
             </div>
             <div class="form-group">
@@ -894,13 +1151,32 @@ $tabBtn = static function (bool $active): string {
             <button type="button" class="modal-close" onclick="document.getElementById('payModal').style.display='none'">&times;</button>
         </div>
         <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=pay"
-              data-ajax="true" enctype="multipart/form-data">
+              data-ajax="true" enctype="multipart/form-data" id="payForm">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="id" id="payOrderId">
             <p id="payOrderLabel" style="font-weight:600;margin-bottom:4px;"></p>
             <p id="payBalanceLabel" style="font-size:13px;color:var(--color-text-secondary);margin-bottom:12px;"></p>
             <div class="form-group">
-                <label>Valor del abono * <span class="field-tip" data-tip="Monto que paga ahora al proveedor. No puede superar el saldo pendiente (total − abonos − notas de crédito)." tabindex="0">?</span></label>
+                <label>Valor de Factura * <span class="field-tip" data-tip="Valor neto que indica la factura entregada por el proveedor. El saldo pendiente se recalcula sobre este valor; si difiere del total del sistema, queda guardado como base de la cuenta por pagar." tabindex="0">?</span></label>
+                <input type="text" inputmode="decimal" name="invoice_value" id="payInvoiceValue" class="form-control money-input" data-money="1" required placeholder="0">
+                <small id="payInvoiceHint" style="color:var(--color-text-secondary);display:block;margin-top:4px;"></small>
+            </div>
+            <div class="form-group">
+                <label>Dcto. Pronto Pago <span class="field-tip" data-tip="Descuento que el proveedor concede por pagar antes del vencimiento. Escriba el porcentaje o el monto: el otro se calcula solo sobre el Valor de Factura. Reduce el saldo a pagar y contablemente se reconoce como ingreso por descuentos (421040)." tabindex="0">?</span></label>
+                <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                    <div class="po-pct-wrap">
+                        <input type="number" step="0.01" min="0" max="100" inputmode="decimal" name="discount_pct" id="payDiscountPct" class="form-control" placeholder="0">
+                        <span class="po-pct-affix">%</span>
+                    </div>
+                    <span style="color:var(--color-text-secondary);font-weight:600;">=</span>
+                    <div style="flex:1;min-width:150px;">
+                        <input type="text" inputmode="decimal" name="discount_amount" id="payDiscountAmount" class="form-control money-input" data-money="1" placeholder="$ 0">
+                    </div>
+                </div>
+                <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">Escriba el % o el monto; el otro valor se calcula automáticamente.</small>
+            </div>
+            <div class="form-group">
+                <label>Valor del abono * <span class="field-tip" data-tip="Monto que paga ahora al proveedor. No puede superar el restante: Valor de Factura − dcto. pronto pago − abonos y notas de crédito anteriores." tabindex="0">?</span></label>
                 <input type="text" inputmode="decimal" name="amount" id="payAmount" class="form-control money-input" data-money="1" required placeholder="0">
             </div>
             <div class="form-group">
@@ -955,12 +1231,23 @@ $tabBtn = static function (bool $active): string {
                 <label>Notas <span class="field-tip" data-tip="Observación interna del abono (quién pagó, acuerdo, etc.)." tabindex="0">?</span></label>
                 <input type="text" name="notes" class="form-control">
             </div>
+            <div class="po-totals" id="payTotals" style="max-width:none;margin:14px 0 6px;">
+                <div class="po-totals__row"><span>Valor factura</span><strong id="paySumInvoice">$ 0</strong></div>
+                <div class="po-totals__row"><span>Dcto. pronto pago</span><strong id="paySumDiscount">− $ 0</strong></div>
+                <div class="po-totals__row"><span>Abonos y NC anteriores</span><strong id="paySumPrevious">− $ 0</strong></div>
+                <div class="po-totals__row"><span>Este abono</span><strong id="paySumAmount">− $ 0</strong></div>
+                <div class="po-totals__row po-totals__row--grand"><span>Restante</span><strong id="paySumRemaining">$ 0</strong></div>
+            </div>
+            <p id="payTotalsError" style="display:none;font-size:12px;color:var(--dmc-DC2626, #DC2626);margin:0 0 8px;">
+                El abono supera el restante. Ajuste el valor del abono, el dcto. o el Valor de Factura.
+            </p>
             <p style="font-size:12px;color:var(--color-text-secondary);">
-                Genera el asiento <em>Proveedores (220505) débito / Caja o Bancos crédito</em>.
+                Genera el asiento <em>Proveedores (220505) débito / Caja o Bancos crédito</em>
+                <span id="payDiscountNote" style="display:none;">y el dcto. pronto pago como <em>ingreso por descuentos (421040)</em></span>.
             </p>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('payModal').style.display='none'">Cancelar</button>
-                <button type="submit" class="btn btn-primary">Registrar abono</button>
+                <button type="submit" class="btn btn-primary" id="paySubmitBtn">Registrar abono</button>
             </div>
         </form>
     </div>
@@ -1004,44 +1291,167 @@ $tabBtn = static function (bool $active): string {
         };
     ?></h3></div>
     <div class="card-body">
-        <div class="table-container"><table>
+        <style>
+            .pay-sort { background:none;border:0;color:inherit;font:inherit;font-weight:700;cursor:pointer;padding:0;white-space:nowrap; }
+            .pay-sort:hover { text-decoration:underline; }
+            .pay-sort__arrow { opacity:.35;font-weight:400; }
+            .pay-sort.is-active .pay-sort__arrow { opacity:1; }
+        </style>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px;">
+            <div style="flex:1;min-width:210px;">
+                <label for="payablesSearch" style="display:block;font-size:12px;font-weight:600;margin-bottom:4px;">Buscar en cuentas por pagar</label>
+                <input type="text" id="payablesSearch" class="form-control" placeholder="OC, proveedor o N° de factura…" autocomplete="off">
+            </div>
+            <div>
+                <label for="payablesDue" style="display:block;font-size:12px;font-weight:600;margin-bottom:4px;">Vencimiento</label>
+                <select id="payablesDue" class="form-control">
+                    <option value="">Todas</option>
+                    <option value="overdue">Vencidas</option>
+                    <option value="today">Vencen hoy</option>
+                    <option value="soon">Por vencer (7 días)</option>
+                    <option value="future">Aún no vencen</option>
+                    <option value="none">Sin fecha</option>
+                </select>
+            </div>
+            <span id="payablesSummary" style="font-size:13px;color:var(--color-text-secondary);padding-bottom:8px;"></span>
+        </div>
+        <div class="table-container"><table id="payablesTable">
             <thead>
                 <tr>
-                    <th>OC</th><th>Proveedor</th><th>Factura</th><th>Vence</th>
-                    <th>Total</th><th>Abonado</th><th>Saldo</th><th></th>
+                    <th><button type="button" class="pay-sort" data-pay-sort="oc" title="Clic: A→Z · otro clic: Z→A">OC <span class="pay-sort__arrow">↕</span></button></th>
+                    <th><button type="button" class="pay-sort" data-pay-sort="supplier" title="Clic: A→Z · otro clic: Z→A">Proveedor <span class="pay-sort__arrow">↕</span></button></th>
+                    <th><button type="button" class="pay-sort" data-pay-sort="invoice" title="Clic: A→Z · otro clic: Z→A">Factura <span class="pay-sort__arrow">↕</span></button></th>
+                    <th><button type="button" class="pay-sort" data-pay-sort="due" title="Clic: más antigua→reciente · otro clic: inversa">Vence <span class="pay-sort__arrow">↕</span></button></th>
+                    <th><button type="button" class="pay-sort" data-pay-sort="total" title="Clic: menor→mayor · otro clic: mayor→menor">Total <span class="pay-sort__arrow">↕</span></button></th>
+                    <th><button type="button" class="pay-sort" data-pay-sort="paid" title="Clic: menor→mayor · otro clic: mayor→menor">Abonado <span class="pay-sort__arrow">↕</span></button></th>
+                    <th><button type="button" class="pay-sort" data-pay-sort="balance" title="Clic: menor→mayor · otro clic: mayor→menor">Saldo <span class="pay-sort__arrow">↕</span></button></th>
+                    <th></th>
                 </tr>
             </thead>
             <tbody>
             <?php foreach ($payableOrders as $p): ?>
                 <?php
-                $saldo = round((float)$p['total'] - (float)$p['paid_amount'] - (float)($p['credit_amount'] ?? 0), 2);
+                $pBase = !empty($p['supplier_invoice_value']) ? (float)$p['supplier_invoice_value'] : (float)$p['total'];
+                $pDisc = round((float)($p['discount_amount'] ?? 0), 2);
+                $saldo = round($pBase - (float)$p['paid_amount'] - (float)($p['credit_amount'] ?? 0) - $pDisc, 2);
                 $overdue = $p['due_date'] && (int)($p['days_overdue'] ?? 0) > 0;
+                $pPayPayload = htmlspecialchars(json_encode([
+                    'id' => (int)$p['id'],
+                    'number' => (string)$p['order_number'],
+                    'supplier' => (string)($p['supplier_name'] ?? ''),
+                    'total' => (float)$p['total'],
+                    'invoiceValue' => $pBase,
+                    'paid' => (float)$p['paid_amount'],
+                    'credited' => (float)($p['credit_amount'] ?? 0),
+                    'discounts' => $pDisc,
+                    'balance' => max(0, $saldo),
+                ], JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP), ENT_QUOTES);
                 ?>
-                <tr>
-                    <td><strong><?php echo htmlspecialchars($p['order_number']); ?></strong></td>
-                    <td><?php echo htmlspecialchars($p['supplier_name'] ?? '—'); ?></td>
-                    <td><?php echo htmlspecialchars($p['invoice_number'] ?? '—'); ?></td>
-                    <td<?php echo $overdue ? ' style="color:var(--dmc-DC2626, #DC2626);font-weight:600;"' : ''; ?>>
+                <?php
+                $pDays = $p['due_date'] ? (int)($p['days_overdue'] ?? 0) : null;
+                $pDueState = $pDays === null ? 'none' : ($pDays > 0 ? 'overdue' : ($pDays === 0 ? 'today' : ($pDays >= -7 ? 'soon' : 'future')));
+                $pSearch = htmlspecialchars($p['order_number'] . ' ' . ($p['supplier_name'] ?? '') . ' ' . ($p['invoice_number'] ?? ''), ENT_QUOTES);
+                ?>
+                <tr data-search="<?php echo $pSearch; ?>" data-due="<?php echo $pDueState; ?>">
+                    <td data-v="<?php echo htmlspecialchars($p['order_number'], ENT_QUOTES); ?>"><strong><?php echo htmlspecialchars($p['order_number']); ?></strong></td>
+                    <td data-v="<?php echo htmlspecialchars($p['supplier_name'] ?? '', ENT_QUOTES); ?>"><?php echo htmlspecialchars($p['supplier_name'] ?? '—'); ?></td>
+                    <td data-v="<?php echo htmlspecialchars($p['invoice_number'] ?? '', ENT_QUOTES); ?>"><?php echo htmlspecialchars($p['invoice_number'] ?? '—'); ?></td>
+                    <td data-v="<?php echo $p['due_date'] ? date('Y-m-d', strtotime($p['due_date'])) : ''; ?>"<?php echo $overdue ? ' style="color:var(--dmc-DC2626, #DC2626);font-weight:600;"' : ''; ?>>
                         <?php echo $p['due_date'] ? date('d/m/Y', strtotime($p['due_date'])) : '—'; ?>
                         <?php echo $overdue ? ' (' . (int)$p['days_overdue'] . ' d)' : ''; ?>
                     </td>
-                    <td><?php echo fmtC((float)$p['total'], $currency); ?></td>
-                    <td style="color:#10B981;"><?php echo fmtC((float)$p['paid_amount'], $currency); ?></td>
-                    <td style="font-weight:600;color:var(--dmc-DC2626, #DC2626);"><?php echo fmtC($saldo, $currency); ?></td>
+                    <td data-v="<?php echo (float)$p['total']; ?>"><?php echo fmtC((float)$p['total'], $currency); ?></td>
+                    <td data-v="<?php echo (float)$p['paid_amount']; ?>" style="color:#10B981;"><?php echo fmtC((float)$p['paid_amount'], $currency); ?></td>
+                    <td data-v="<?php echo $saldo; ?>" style="font-weight:600;color:var(--dmc-DC2626, #DC2626);"><?php echo fmtC($saldo, $currency); ?></td>
                     <td>
                         <?php if ($canEdit): ?>
                             <button type="button" class="btn btn-sm btn-primary"
-                                    onclick="openPayModal(<?php echo (int)$p['id']; ?>, '<?php echo htmlspecialchars($p['order_number'], ENT_QUOTES); ?>', <?php echo $saldo; ?>, '<?php echo htmlspecialchars($p['supplier_name'] ?? '', ENT_QUOTES); ?>')">Abonar</button>
+                                    onclick="openPayModal(<?php echo $pPayPayload; ?>)">Abonar</button>
                             <button type="button" class="btn btn-sm btn-secondary"
                                     onclick="openCreditNoteModal(<?php echo (int)$p['id']; ?>)">NC</button>
                         <?php endif; ?>
                     </td>
                 </tr>
             <?php endforeach; ?>
+                <tr id="payablesEmpty" style="display:none;">
+                    <td colspan="8" style="text-align:center;color:var(--color-text-secondary);padding:18px;">Sin cuentas por pagar para ese filtro.</td>
+                </tr>
             </tbody>
         </table></div>
     </div>
 </div>
+<script>
+(function () {
+    var table = document.getElementById('payablesTable');
+    if (!table) return;
+    var tbody = table.querySelector('tbody');
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr[data-search]'));
+    var emptyRow = document.getElementById('payablesEmpty');
+    var search = document.getElementById('payablesSearch');
+    var dueSel = document.getElementById('payablesDue');
+    var summary = document.getElementById('payablesSummary');
+    var colIdx = { oc: 0, supplier: 1, invoice: 2, due: 3, total: 4, paid: 5, balance: 6 };
+    var sortKey = 'due';
+    var sortDir = 1;
+
+    function norm(s) {
+        return String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    }
+    function cellVal(row, key) {
+        var td = row.children[colIdx[key]];
+        if (!td) return '';
+        var v = td.getAttribute('data-v');
+        return v === null ? td.textContent : v;
+    }
+    function apply() {
+        var q = norm(search ? search.value.trim() : '');
+        var f = dueSel ? dueSel.value : '';
+        rows.sort(function (a, b) {
+            var va = cellVal(a, sortKey), vb = cellVal(b, sortKey), cmp = 0;
+            if (sortKey === 'total' || sortKey === 'paid' || sortKey === 'balance') {
+                cmp = (parseFloat(va) || 0) - (parseFloat(vb) || 0);
+            } else if (sortKey === 'due') {
+                cmp = String(va || '9999-12-31').localeCompare(String(vb || '9999-12-31'));
+            } else {
+                cmp = norm(va).localeCompare(norm(vb), 'es');
+            }
+            return cmp * sortDir;
+        });
+        var shown = 0, sum = 0;
+        rows.forEach(function (r) {
+            tbody.appendChild(r);
+            var ok = (!q || norm(r.getAttribute('data-search')).indexOf(q) > -1)
+                && (!f || r.getAttribute('data-due') === f);
+            r.style.display = ok ? '' : 'none';
+            if (ok) { shown++; sum += parseFloat(cellVal(r, 'balance')) || 0; }
+        });
+        if (emptyRow) {
+            emptyRow.style.display = shown ? 'none' : '';
+            tbody.appendChild(emptyRow);
+        }
+        if (summary) {
+            summary.textContent = shown + (shown === 1 ? ' cuenta' : ' cuentas') + ' · Saldo total: ' + poMoney(sum);
+        }
+        Array.prototype.forEach.call(table.querySelectorAll('.pay-sort'), function (btn) {
+            var active = btn.getAttribute('data-pay-sort') === sortKey;
+            btn.classList.toggle('is-active', active);
+            var arrow = btn.querySelector('.pay-sort__arrow');
+            if (arrow) arrow.textContent = active ? (sortDir === 1 ? '↑' : '↓') : '↕';
+        });
+    }
+    Array.prototype.forEach.call(table.querySelectorAll('.pay-sort'), function (btn) {
+        btn.addEventListener('click', function () {
+            var key = btn.getAttribute('data-pay-sort');
+            if (sortKey === key) sortDir = sortDir * -1;
+            else { sortKey = key; sortDir = 1; }
+            apply();
+        });
+    });
+    if (search) search.addEventListener('input', apply);
+    if (dueSel) dueSel.addEventListener('change', apply);
+    apply();
+})();
+</script>
 <?php endif; ?>
 
 <?php if ($canCreate): ?>
@@ -1168,18 +1578,17 @@ $tabBtn = static function (bool $active): string {
                             <option value="card">Tarjeta</option>
                         </select>
                     </div>
+                    <input type="hidden" name="early_payment_discount_pct" value="0">
                     <div class="form-group">
-                        <label>Desc. pronto pago % <span class="field-tip" data-tip="Solo aplica si paga antes del vencimiento. Reduce el total de la factura." tabindex="0">?</span></label>
-                        <input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" class="form-control" value="" placeholder="0">
-                        <small style="color:var(--color-text-secondary);">Opcional. Condicionado a pago anticipado.</small>
-                    </div>
-                    <div class="form-group">
-                        <label>Desc. comercial <span class="field-tip" data-tip="Descuento general de la factura (siempre aplica). Puede indicar % o monto en pesos; si hay monto, manda el monto." tabindex="0">?</span></label>
-                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-                            <input type="number" step="0.01" min="0" max="100" name="commercial_discount_pct" class="form-control" value="" placeholder="%">
+                        <label>Desc. comercial <span class="field-tip" data-tip="Descuento general de la factura sobre el subtotal (antes de IVA). Indique % entero (0–100) o monto $; si hay monto, manda el $." tabindex="0">?</span></label>
+                        <div class="po-com-disc-fields">
+                            <div class="po-pct-wrap">
+                                <input type="number" step="1" min="0" max="100" inputmode="numeric" name="commercial_discount_pct" class="form-control" value="" placeholder="0" title="Porcentaje entero" oninput="poClampCommercialPct(this)">
+                                <span class="po-pct-affix">%</span>
+                            </div>
                             <input type="text" inputmode="decimal" name="commercial_discount_amount" class="form-control money-input" data-money="1" value="" placeholder="$ monto" autocomplete="off">
                         </div>
-                        <small style="color:var(--color-text-secondary);">Siempre aplica. Use % o $ (si llena $, prevalece el monto).</small>
+                        <small style="color:var(--color-text-secondary);">Siempre aplica. Use % entero o $ (si llena $, prevalece el monto).</small>
                     </div>
                     <div class="form-group">
                         <label>Cruce con OC <span class="field-tip" data-tip="Órdenes de compra abiertas del proveedor elegido. Al seleccionarla se cruza con la factura entrante (cantidades y costos) antes de ingresar al inventario." tabindex="0">?</span></label>
@@ -1206,7 +1615,12 @@ $tabBtn = static function (bool $active): string {
                                accept=".csv,.txt,.pdf,.xml,.zip,.xlsx,.xlsm,.ods,.docx,image/*">
                         <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
                             Preferible <strong>.xlsx</strong> o <strong>CSV</strong> con la plantilla Seri.
-                            Separador <strong>;</strong>. Columnas: Referencia, EAN, Descripcion, Cantidad, Bonif, Costo_unitario, IVA, Descuento, Total_linea, Lote, Vencimiento, Precio_venta.
+                            Separador <strong>;</strong>. Columnas: Referencia, EAN, Descripcion, Cantidad, Bonif, Costo_factura, IVA, Descuento, Total_linea, Lote, Vencimiento, Costo_inventario, Precio_venta.
+                        </small>
+                        <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
+                            <strong>Costo_factura:</strong> costo unitario de la factura (contabilidad y CxP; también acepta el encabezado antiguo Costo_unitario).
+                            <strong>Costo_inventario:</strong> opcional, nuevo precio de costo del producto en Inventario; vacío = se calcula desde el costo factura.
+                            <strong>Precio_venta:</strong> opcional, actualiza el precio de venta.
                         </small>
                         <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
                             <strong>EAN:</strong> escríbalo completo (13 dígitos), sin notación científica. En Excel formatee la columna como Texto antes de pegar.
@@ -1254,8 +1668,8 @@ $tabBtn = static function (bool $active): string {
 </div>
 
 <!-- Alta rápida de proveedor (por encima de cargar factura / revisión) -->
-<div id="quickSupplierModal" class="modal-overlay" style="display:none;z-index:1400;">
-    <div class="modal-content neumorphic" style="max-width:520px;max-height:85vh;overflow-y:auto;position:relative;z-index:1401;">
+<div id="quickSupplierModal" class="modal-overlay" style="display:none;z-index:11100;">
+    <div class="modal-content neumorphic" style="max-width:520px;max-height:85vh;overflow-y:auto;position:relative;z-index:11101;">
         <div class="modal-header">
             <h3>Nuevo proveedor</h3>
             <button type="button" class="modal-close" onclick="closeQuickSupplierModal()">&times;</button>
@@ -1309,8 +1723,8 @@ $tabBtn = static function (bool $active): string {
 </div>
 
 <!-- Alta rápida de producto (desde revisión de factura) -->
-<div id="quickProductModal" class="modal-overlay" style="display:none;z-index:1450;">
-    <div class="modal-content neumorphic" style="max-width:560px;max-height:90vh;overflow-y:auto;position:relative;z-index:1451;">
+<div id="quickProductModal" class="modal-overlay" style="display:none;z-index:11150;">
+    <div class="modal-content neumorphic" style="max-width:560px;max-height:90vh;overflow-y:auto;position:relative;z-index:11151;">
         <div class="modal-header">
             <h3>Nuevo producto</h3>
             <button type="button" class="modal-close" onclick="closeQuickProductModal()">&times;</button>
@@ -1637,6 +2051,53 @@ function setSupplierCombobox(hiddenId, searchId, supplierId) {
     input.value = found ? found.name : ('#' + id);
 }
 
+/** Desc. comercial %: solo enteros 0–100. */
+function poClampCommercialPct(el) {
+    if (!el) return;
+    if (el.value === '' || el.value === '-') return;
+    var n = Math.round(parseFloat(String(el.value).replace(',', '.')) || 0);
+    if (n < 0) n = 0;
+    if (n > 100) n = 100;
+    if (String(n) !== String(el.value)) el.value = String(n);
+}
+
+/** Evita scroll chaining: al llegar al final del modal no sigue el fondo. */
+function poLockPageScroll(lock) {
+    var b = document.body;
+    if (!b) return;
+    if (lock) {
+        if (b.dataset.poScrollLocked === '1') return;
+        b.dataset.poScrollLocked = '1';
+        b.dataset.poScrollY = String(window.scrollY || window.pageYOffset || 0);
+        b.style.overflow = 'hidden';
+        b.style.position = 'fixed';
+        b.style.top = '-' + (b.dataset.poScrollY || '0') + 'px';
+        b.style.left = '0';
+        b.style.right = '0';
+        b.style.width = '100%';
+        return;
+    }
+    if (b.dataset.poScrollLocked !== '1') return;
+    var y = parseInt(b.dataset.poScrollY || '0', 10) || 0;
+    delete b.dataset.poScrollLocked;
+    delete b.dataset.poScrollY;
+    b.style.overflow = '';
+    b.style.position = '';
+    b.style.top = '';
+    b.style.left = '';
+    b.style.right = '';
+    b.style.width = '';
+    window.scrollTo(0, y);
+}
+function poSyncInvoiceModalScrollLock() {
+    var open = false;
+    ['invoiceUploadModal', 'invoiceReviewModal'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el && el.style.display === 'flex') open = true;
+    });
+    poLockPageScroll(open);
+}
+
 function openInvoiceUpload() {
     document.getElementById('invoiceUploadForm').reset();
     setSupplierCombobox('invoiceSupplierId', 'invoiceSupplierSearch', '');
@@ -1651,9 +2112,11 @@ function openInvoiceUpload() {
         wh.onchange = function() { poRemember(wh.value); };
     }
     document.getElementById('invoiceUploadModal').style.display = 'flex';
+    poSyncInvoiceModalScrollLock();
 }
 function closeInvoiceUpload() {
     document.getElementById('invoiceUploadModal').style.display = 'none';
+    poSyncInvoiceModalScrollLock();
 }
 function persistInvoiceReviewDraft() {
     return new Promise(function(resolve, reject) {
@@ -1701,6 +2164,7 @@ function closeInvoiceReview(opts) {
 
     if (skipSave) {
         if (modal) modal.style.display = 'none';
+        poSyncInvoiceModalScrollLock();
         return;
     }
 
@@ -1714,6 +2178,7 @@ function closeInvoiceReview(opts) {
     persistInvoiceReviewDraft()
     .then(function(d) {
         if (modal) modal.style.display = 'none';
+        poSyncInvoiceModalScrollLock();
         if (d && typeof showAlert === 'function') {
             showAlert(d.message || 'Borrador guardado', 'success');
         }
@@ -2015,6 +2480,7 @@ function openInvoiceReview(importId, triggerBtn) {
             + '</div>';
         document.getElementById('irImportId').value = String(importId || '');
         modal.style.display = 'flex';
+        poSyncInvoiceModalScrollLock();
     }
     if (triggerBtn) {
         triggerBtn.disabled = true;
@@ -2029,6 +2495,7 @@ function openInvoiceReview(importId, triggerBtn) {
     .then(function(d) {
         if (!d.success) {
             if (modal) modal.style.display = 'none';
+            poSyncInvoiceModalScrollLock();
             return showAlert(d.message || 'No se pudo cargar la factura', 'error');
         }
         window._invoiceReviewOpenOrders = d.open_orders || [];
@@ -2045,6 +2512,7 @@ function openInvoiceReview(importId, triggerBtn) {
     })
     .catch(function() {
         if (modal) modal.style.display = 'none';
+        poSyncInvoiceModalScrollLock();
         showAlert('No se pudo cargar la factura', 'error');
     })
     .finally(function() {
@@ -2114,7 +2582,17 @@ function renderInvoiceReview(imp, items) {
              '</div>';
     }
 
-    h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px;">';
+    var metaSummary = [];
+    if (imp.supplier_name) metaSummary.push(esc(imp.supplier_name));
+    if (imp.invoice_number) metaSummary.push('N.º ' + esc(imp.invoice_number));
+    if (imp.linked_order_id) metaSummary.push('con OC');
+    var metaOpen = !imp.supplier_id || (window.innerHeight > 900 && window.innerWidth > 1440);
+    h += '<details class="inv-review-meta"' + (metaOpen ? ' open' : '') + '>' +
+         '<summary><span class="inv-review-meta__title">Datos de la factura y pago</span>' +
+         '<span class="inv-review-meta__hint">' +
+         (metaSummary.length ? metaSummary.join(' · ') + ' — ' : '') +
+         'proveedor, OC, fechas, descuentos, forma de pago y nota</span></summary>';
+    h += '<div class="inv-review-meta__grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px;">';
     h += '<div class="form-group" style="margin:0;grid-column:1/-1;"><label>Proveedor *' + tip('Proveedor de la factura. Debe coincidir para casar códigos y CxP.') + '</label>' +
          '<div class="customer-combobox invoice-supplier-combobox" id="reviewSupplierCombobox">' +
          '<input type="hidden" name="supplier_id" id="reviewSupplierId" value="' + esc(imp.supplier_id || '') + '" required>' +
@@ -2137,15 +2615,15 @@ function renderInvoiceReview(imp, items) {
          '<input type="date" name="due_date" class="form-control" value="' + esc(poIsoDate(imp.due_date)) + '"></div>';
     h += '<div class="form-group" style="margin:0;"><label>Recepción de bodega *' + tip('Fecha real de ingreso a inventario y del asiento contable. Puede diferir de la fecha de factura.') + '</label>' +
          '<input type="date" name="warehouse_date" class="form-control" value="' + esc(poDefaultWarehouseDate(imp)) + '" required></div>';
-    h += '<div class="form-group" style="margin:0;"><label>Desc. pronto pago %' + tip('Solo si paga antes del vencimiento. Reduce el total al confirmar.') + '</label>' +
-         '<input type="number" step="0.01" min="0" max="100" name="early_payment_discount_pct" class="form-control" value="' +
-         (imp.early_payment_discount_pct != null && imp.early_payment_discount_pct !== '' ? esc(imp.early_payment_discount_pct) : '0') +
-         '" placeholder="0" oninput="recalcInvoiceReviewTotals()"></div>';
-    h += '<div class="form-group" style="margin:0;grid-column:1/-1;"><label>Desc. comercial' + tip('Descuento general de la factura: siempre aplica. Indique % o monto $; si hay monto, manda el $.') + '</label>' +
-         '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">' +
-         '<input type="number" step="0.01" min="0" max="100" name="commercial_discount_pct" class="form-control" value="' +
-         (imp.commercial_discount_pct != null && imp.commercial_discount_pct !== '' ? esc(imp.commercial_discount_pct) : '0') +
-         '" placeholder="% comercial" oninput="recalcInvoiceReviewTotals()">' +
+    h += '<input type="hidden" name="early_payment_discount_pct" value="0">';
+    var comPctVal = Math.max(0, Math.min(100, Math.round(parseFloat(imp.commercial_discount_pct) || 0)));
+    h += '<div class="form-group" style="margin:0;grid-column:1/-1;"><label>Desc. comercial' + tip('Descuento general sobre el subtotal (antes de IVA). Indique % entero (0–100) o monto $; si hay monto, manda el $.') + '</label>' +
+         '<div class="po-com-disc-fields">' +
+         '<div class="po-pct-wrap">' +
+         '<input type="number" step="1" min="0" max="100" inputmode="numeric" name="commercial_discount_pct" class="form-control" value="' +
+         comPctVal +
+         '" placeholder="0" title="Porcentaje entero" oninput="poClampCommercialPct(this);recalcInvoiceReviewTotals()">' +
+         '<span class="po-pct-affix">%</span></div>' +
          '<input type="text" inputmode="decimal" name="commercial_discount_amount" class="form-control money-input" data-money="1" value="' +
          esc(window.SeriMoney
             ? SeriMoney.format(imp.commercial_discount_amount != null && imp.commercial_discount_amount !== '' ? imp.commercial_discount_amount : 0)
@@ -2163,7 +2641,7 @@ function renderInvoiceReview(imp, items) {
          'placeholder="Ej. mercancía incompleta, acuerdo de precio, pendiente de revisión…">' +
          esc(imp.review_notes || '') + '</textarea>' +
          '<small style="color:var(--color-text-secondary);display:block;margin-top:4px;">Opcional. Se verá al abrir «Ver» en Facturas / compras.</small></div>';
-    h += '</div>';
+    h += '</div></details>';
 
     if (imp.parse_notes) {
         h += '<p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 10px;">Lectura: ' + esc(imp.parse_notes) + '</p>';
@@ -2212,11 +2690,16 @@ function renderInvoiceReview(imp, items) {
              bonifCount + ' línea(s) de bonificación/regalo: en la factura quedan a $0; en inventario conservan el costo (no diluyen el promedio).</p>';
     }
 
-    h += '<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 10px;font-size:12px;">' +
-         '<span style="display:inline-flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:3px;background:rgba(16,185,129,0.35);border:1px solid #10B981;"></span> Factura cargada</span>' +
-         '<span style="display:inline-flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:3px;background:rgba(245,158,11,0.4);border:1px solid #F59E0B;"></span> Desde OC (Omitir = pendiente en recepción parcial)</span>' +
-         '<span style="display:inline-flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:3px;background:rgba(59,130,246,0.2);border:1px solid #3B82F6;"></span> Bonificación (factura $0 · inventario con costo)</span>' +
-         '<span style="display:inline-flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:3px;background:rgba(220,38,38,0.15);border:1px solid #DC2626;"></span> Cant. incompleta</span>' +
+    h += '<div class="inv-review-toolbar">' +
+         '<div class="inv-review-legend">' +
+         '<span><i style="background:rgba(16,185,129,0.35);border-color:#10B981;"></i> Factura</span>' +
+         '<span><i style="background:rgba(245,158,11,0.4);border-color:#F59E0B;"></i> Desde OC (Omitir = queda pendiente en la OC)</span>' +
+         '<span><i style="background:rgba(100,116,139,0.22);border-color:#64748B;"></i> Omitir inventario (se factura, no entra a stock)</span>' +
+         '<span><i style="background:rgba(59,130,246,0.2);border-color:#3B82F6;"></i> Bonificación ($0)</span>' +
+         '<span><i style="background:rgba(220,38,38,0.15);border-color:#DC2626;"></i> Cant. incompleta</span>' +
+         '<span title="Costo factura: total, CxP y asiento. Costo inventario: precio de costo con el que queda el producto; vacío = automático (costo factura con descuento, + IVA en F. Normal).">' +
+         '<b>Costo factura</b> = contabilidad · <b style="color:#7C3AED;">Costo inventario</b> = precio de costo del producto (vacío = automático)</span>' +
+         '</div>' +
          '</div>';
 
     var thStyle = 'position:sticky;top:0;z-index:5;background:#1e3a8a!important;background-color:#1e3a8a!important;color:#fff!important;font-weight:600;font-size:13px;white-space:nowrap;';
@@ -2229,11 +2712,12 @@ function renderInvoiceReview(imp, items) {
          '<th style="' + thStyle + '">EAN</th>' +
          '<th style="' + thStyle + '">Producto en catálogo</th>' +
          '<th style="' + thStyle + '">Cant.</th>' +
-         '<th style="' + thStyle + '">Costo u.</th>' +
+         '<th style="' + thStyle + '" title="Valor unitario de la factura del proveedor: define subtotal, IVA, total, CxP y asiento contable">Costo factura</th>' +
          '<th style="' + thStyle + '">IVA %</th>' +
          '<th style="' + thStyle + '">Dcto %</th>' +
          '<th style="' + thStyle + '">Lote</th>' +
          '<th style="' + thStyle + '">Vence</th>' +
+         '<th style="' + thStyle + '" title="Precio de costo con el que queda el producto en inventario (y valor de la entrada en kardex). Vacío = automático: costo factura con descuento, + IVA en F. Normal">Costo inventario</th>' +
          '<th style="' + thStyle + '">P. venta</th>' +
          '<th style="' + thStyle + '">Total</th>' +
          '<th style="' + thStyle + '"></th>' +
@@ -2251,26 +2735,28 @@ function renderInvoiceReview(imp, items) {
         var bad = it.row_action !== 'skip' && qty <= 0;
         var fromOc = String(it.match_type || '') === 'purchase_order'
             || /^Desde OC\b/i.test(String(it.raw_line || ''));
-        var rowStyle = bad
-            ? 'background:rgba(220,38,38,0.10);'
-            : (isBonus
-                ? 'background:rgba(59,130,246,0.14);'
-                : (fromOc
-                    ? 'background:rgba(245,158,11,0.22);'
-                    : 'background:rgba(16,185,129,0.16);'));
+        var billOnly = it.row_action === 'skip' && !fromOc;
+        if (billOnly) { bad = false; isBonus = false; }
+        var rowStyle = invoiceRowStyle(bad, isBonus, fromOc, billOnly);
         var lineTax = parseFloat(it.tax_rate) || 0;
         if (docKind === 'remission' || isCustomVat) lineTax = 0;
         if (docKind === 'electronic' && !(lineTax > 0)) lineTax = defaultTax;
-        h += '<tr style="' + rowStyle + '" data-vat-in-cost="' + (vatInCost ? '1' : '0') + '" data-from-oc="' + (fromOc ? '1' : '0') + '">';
-        h += '<td style="white-space:nowrap;font-size:12px;font-weight:600;color:' +
-             (bad ? '#DC2626' : (isBonus ? '#1D4ED8' : (fromOc ? '#B45309' : '#047857'))) + ';">' +
-             (bad ? '—' : (isBonus ? 'Bonif.' : (fromOc ? 'OC' : 'Factura'))) + '</td>';
+        h += '<tr style="' + rowStyle + '" data-vat-in-cost="' + (vatInCost ? '1' : '0') + '" data-from-oc="' + (fromOc ? '1' : '0') + '"' +
+             ' data-pid="' + (parseInt(it.matched_product_id, 10) || '') + '"' +
+             ' data-stock="' + (parseInt(it.matched_stock, 10) || 0) + '"' +
+             ' data-cur-cost="' + (parseFloat(it.matched_purchase_price) || 0) + '">';
+        h += '<td class="inv-origin" style="white-space:nowrap;font-size:12px;font-weight:600;color:' +
+             invoiceOriginColor(bad, isBonus, fromOc, billOnly) + ';">' +
+             invoiceOriginLabel(bad, isBonus, fromOc, billOnly) + '</td>';
         h += '<td class="inv-line-no" style="text-align:center;font-weight:700;color:var(--color-text-secondary);white-space:nowrap;">' +
              (idx + 1) + '</td>';
-        h += '<td><select name="' + base + '[row_action]" class="form-control" style="min-width:118px;">' +
+        h += '<td><select name="' + base + '[row_action]" class="form-control" style="min-width:118px;" title="' +
+             (fromOc ? 'Omitir: la línea no está en la factura y queda pendiente en la OC'
+                     : 'Omitir inventario: la línea se factura (total y CxP) pero no entra a stock ni crea producto') + '">' +
              '<option value="add_stock"' + (it.row_action === 'add_stock' ? ' selected' : '') + '>Ingresar</option>' +
              '<option value="create_product"' + (it.row_action === 'create_product' ? ' selected' : '') + '>Crear producto</option>' +
-             '<option value="skip"' + (it.row_action === 'skip' ? ' selected' : '') + '>Omitir</option>' +
+             '<option value="skip"' + (it.row_action === 'skip' ? ' selected' : '') + '>' +
+             (fromOc ? 'Omitir (pendiente OC)' : 'Omitir inventario') + '</option>' +
              '</select>' +
              (!isBonus && it.matched_product_id
                 ? '<button type="button" class="btn btn-sm btn-secondary" style="margin-top:4px;font-size:11px;padding:2px 8px;" ' +
@@ -2290,7 +2776,9 @@ function renderInvoiceReview(imp, items) {
              '</td>';
         h += '<td><input type="number" step="1" min="0" inputmode="numeric" name="' + base + '[quantity]" class="form-control inv-qty" style="min-width:80px;" value="' + qty + '"' + (bad ? ' required' : '') + ' title="Cantidad en enteros"></td>';
         h += '<td><input type="text" inputmode="decimal" name="' + base + '[unit_cost]" class="form-control money-input inv-cost" data-money="1" style="min-width:95px;" value="' + (window.SeriMoney ? SeriMoney.format(cost) : cost) + '"' +
-             (vatInCost ? ' title="Costo con IVA incluido (precio de compra)"' : (isBonus ? ' title="Bonificación: $0 en factura; el inventario usa el costo del producto o de la línea pagada"' : '')) + '></td>';
+             (vatInCost ? ' title="Costo factura con IVA incluido (total, CxP y contabilidad)"'
+                : (isBonus ? ' title="Bonificación: $0 en factura; el inventario usa el costo del producto o de la línea pagada"'
+                    : ' title="Costo unitario de la factura (total, CxP y contabilidad)"')) + '></td>';
         if (taxLocked) {
             h += '<td><input type="number" step="0.01" min="0" name="' + base + '[tax_rate]" class="form-control" style="min-width:70px;" value="' +
                  (isCustomVat ? '0' : lineTax) + '" readonly title="' +
@@ -2302,6 +2790,13 @@ function renderInvoiceReview(imp, items) {
         h += '<td><input type="number" step="1" min="0" max="100" inputmode="numeric" name="' + base + '[discount_pct]" class="form-control inv-disc" style="min-width:70px;" value="' + Math.max(0, Math.min(100, Math.round(parseFloat(it.discount_pct) || 0))) + '" title="Descuento en % (número entero)"></td>';
         h += '<td><input type="text" maxlength="60" name="' + base + '[lot_code]" class="form-control" style="min-width:90px;" value="' + esc(it.lot_code || '') + '"></td>';
         h += '<td><input type="date" name="' + base + '[expiry_date]" class="form-control" style="min-width:130px;" value="' + (it.expiry_date || '') + '"></td>';
+        var invCost = parseFloat(it.inventory_cost) || 0;
+        h += '<td><input type="text" inputmode="decimal" name="' + base + '[inventory_cost]" class="form-control money-input inv-inv-cost" data-money="1" style="min-width:95px;" value="' +
+             (invCost > 0 ? (window.SeriMoney ? SeriMoney.format(invCost) : invCost) : '') + '"' +
+             (it.row_action === 'skip' ? ' disabled' : '') +
+             ' title="Precio de costo con el que queda el producto. Vacío = automático: costo factura con descuento' +
+             (vatInCost ? ' (IVA incluido)' : ' + IVA') + '. No cambia el total ni la contabilidad de la factura.">' +
+             '<div class="inv-invcost-hint" style="font-size:11px;color:var(--color-text-secondary);"></div></td>';
         h += '<td><input type="text" inputmode="decimal" name="' + base + '[sale_price]" class="form-control money-input" data-money="1" style="min-width:95px;" value="' + (it.sale_price != null && it.sale_price !== '' ? (window.SeriMoney ? SeriMoney.format(it.sale_price) : parseFloat(it.sale_price)) : '') + '"></td>';
         h += '<td class="inv-line-total" style="white-space:nowrap;">' + poMoney(total) + '</td>';
         h += '<td style="white-space:nowrap;text-align:center;">' +
@@ -2314,9 +2809,10 @@ function renderInvoiceReview(imp, items) {
     h += '</tbody></table></div>';
     h += '<p id="invLiveStatusNotes" style="margin:10px 0 0;font-size:12px;color:var(--color-text-secondary);">Cambios aplicados al instante</p>';
     h += '<div class="inv-review-foot" style="display:flex;justify-content:flex-end;gap:20px;margin-top:12px;font-weight:600;flex-wrap:wrap;">' +
-         '<span>Subtotal: ' + poMoney(imp.subtotal) + '</span>' +
+         '<span>Total bruto: ' + poMoney(imp.subtotal) + '</span>' +
+         '<span>Sub total: ' + poMoney(imp.subtotal) + '</span>' +
          '<span>IVA: ' + poMoney(imp.tax_total) + '</span>' +
-         '<span>Total: ' + poMoney(imp.total) + '</span></div>';
+         '<span><strong>Valor neto: ' + poMoney(imp.total) + '</strong></span></div>';
 
     document.getElementById('invoiceReviewBody').innerHTML = h;
     var reviewBody = document.getElementById('invoiceReviewBody');
@@ -2333,6 +2829,8 @@ function renderInvoiceReview(imp, items) {
     bindInvoiceProductSearch();
     bindLinkedOrderSelect();
     bindInvoiceProductSelectsLazy();
+    invPickerClose();
+    bindInvoiceProductPicker();
     bindInvoiceLineTotals();
     recalcInvoiceReviewTotals();
     if (window.SeriMoney && typeof SeriMoney.enhanceAll === 'function') {
@@ -2343,6 +2841,7 @@ function renderInvoiceReview(imp, items) {
         reviewWh.onchange = function() { poRemember(reviewWh.value); };
     }
     document.getElementById('invoiceReviewModal').style.display = 'flex';
+    poSyncInvoiceModalScrollLock();
 }
 
 function bulkInvoiceLineTax(rate) {
@@ -2528,6 +3027,9 @@ function renderOcDispositionPanel(linkedOrderId, match) {
 
 function confirmInvoiceReceive() {
     var form = document.getElementById('invoiceReviewForm');
+    if (form) {
+        form.querySelectorAll('details.inv-review-meta').forEach(function(d) { d.open = true; });
+    }
     var wh = form ? form.querySelector('input[name="warehouse_date"]') : null;
     if (wh && !String(wh.value || '').trim()) {
         if (typeof showAlert === 'function') showAlert('Indique la fecha de recepción de bodega', 'warning');
@@ -2563,6 +3065,23 @@ function confirmInvoiceReceive() {
             msg += 'Hay ' + (match.issue_count || 0) + ' diferencia(s) (cantidades, costos o ítems).\n' +
                 '¿Desea ingresar de todas formas con los datos de la factura?';
         }
+    }
+    var billOnlyCount = 0;
+    document.querySelectorAll('#invoiceReviewBody tbody tr').forEach(function(tr) {
+        var act = tr.querySelector('select[name$="[row_action]"]');
+        if (act && act.value === 'skip' && tr.dataset.fromOc !== '1') billOnlyCount++;
+    });
+    if (billOnlyCount > 0) {
+        msg += '\n\n' + billOnlyCount + ' línea(s) en «Omitir inventario»: se facturan (suman al total y a la CxP) '
+            + 'pero no entran a stock ni crean producto.';
+    }
+    var invCostCount = 0;
+    document.querySelectorAll('#invoiceReviewBody input[name$="[inventory_cost]"]').forEach(function(inp) {
+        if (!inp.disabled && invoiceParseMoneyVal(inp.value) > 0.009) invCostCount++;
+    });
+    if (invCostCount > 0) {
+        msg += '\n\n' + invCostCount + ' línea(s) con «Costo inventario» propio: el precio de costo del producto quedará '
+            + 'en ese valor; la factura, la CxP y el asiento usan el «Costo factura».';
     }
     return confirm(msg);
 }
@@ -2607,7 +3126,7 @@ function bindInvoiceLineTotals() {
     body.addEventListener('input', function(e) {
         var t = e.target;
         if (!t || !t.name) return;
-        if (!/\[(quantity|unit_cost|tax_rate|discount_pct|sale_price)\]$/.test(t.name)
+        if (!/\[(quantity|unit_cost|inventory_cost|tax_rate|discount_pct|sale_price)\]$/.test(t.name)
             && t.id !== 'reviewTaxOverrideAmount'
             && !/early_payment_discount_pct|commercial_discount/.test(t.name)) {
             return;
@@ -2631,7 +3150,7 @@ function bindInvoiceLineTotals() {
         if (/\[discount_pct\]$/.test(t.name)) {
             t.value = String(Math.max(0, Math.min(100, Math.round(invoiceParseQty(t.value)))));
         }
-        if (!/\[(quantity|unit_cost|tax_rate|discount_pct|sale_price|row_action)\]$/.test(t.name)
+        if (!/\[(quantity|unit_cost|inventory_cost|tax_rate|discount_pct|sale_price|row_action|matched_product_id)\]$/.test(t.name)
             && t.id !== 'reviewTaxOverrideAmount'
             && !/early_payment_discount_pct|commercial_discount/.test(t.name)) {
             return;
@@ -2641,33 +3160,95 @@ function bindInvoiceLineTotals() {
     body.addEventListener('blur', function(e) {
         var t = e.target;
         if (!t || !t.name) return;
-        if (/\[(unit_cost|sale_price)\]$/.test(t.name) || t.classList.contains('money-input')) {
+        if (/\[(unit_cost|inventory_cost|sale_price)\]$/.test(t.name) || t.classList.contains('money-input')) {
             scheduleRecalc();
         }
     }, true);
 }
 
+function invoiceRowStyle(bad, isBonus, fromOc, billOnly) {
+    if (bad) return 'background:rgba(220,38,38,0.10);';
+    if (billOnly) return 'background:rgba(100,116,139,0.14);';
+    if (isBonus) return 'background:rgba(59,130,246,0.14);';
+    return fromOc ? 'background:rgba(245,158,11,0.22);' : 'background:rgba(16,185,129,0.16);';
+}
+function invoiceOriginColor(bad, isBonus, fromOc, billOnly) {
+    if (bad) return 'var(--dmc-DC2626, #DC2626)';
+    if (billOnly) return 'var(--dmc-475569, #475569)';
+    if (isBonus) return 'var(--dmc-1D4ED8, #1D4ED8)';
+    return fromOc ? 'var(--dmc-B45309, #B45309)' : 'var(--dmc-047857, #047857)';
+}
+function invoiceOriginLabel(bad, isBonus, fromOc, billOnly) {
+    if (bad) return '—';
+    if (billOnly) return 'Sin stock';
+    if (isBonus) return 'Bonif.';
+    return fromOc ? 'OC' : 'Factura';
+}
+/**
+ * Costo inventario = precio de costo con el que queda el producto. Vacío = automático (misma regla del servidor):
+ * costo factura con descuento, + IVA de la línea en F. Normal (o IVA personalizado prorrateado);
+ * bonificación $0 conserva el costo actual.
+ */
+function refreshInvoiceInvCostHint(tr, qty, lineBase, action, taxPct, vatInCost, customVat) {
+    var inp = tr.querySelector('input[name$="[inventory_cost]"]');
+    if (!inp) return;
+    var hint = inp.parentNode.querySelector('.inv-invcost-hint');
+    var skip = action === 'skip';
+    inp.disabled = skip;
+    if (skip) {
+        if (hint) hint.textContent = 'No entra a stock';
+        return;
+    }
+    var pidSel = tr.querySelector('select[name$="[matched_product_id]"]');
+    var sameProduct = !!(pidSel && pidSel.value && String(pidSel.value) === String(tr.dataset.pid || ''));
+    var curCost = sameProduct ? (parseFloat(tr.dataset.curCost) || 0) : 0;
+    var unitNet = qty > 0 ? lineBase / qty : 0;
+    var autoCost = unitNet;
+    if (unitNet > 0 && !vatInCost) {
+        if (customVat) {
+            var sub = parseFloat(window._invReviewLastSubtotal) || 0;
+            var ov = parseFloat(window._invoiceReviewTaxOverride) || 0;
+            if (sub > 0 && ov > 0) autoCost = unitNet * (1 + ov / sub);
+        } else if (taxPct > 0.009) {
+            autoCost = unitNet * (1 + taxPct / 100);
+        }
+    }
+    autoCost = Math.round(autoCost * 100) / 100;
+    if (autoCost <= 0.009 && curCost > 0) autoCost = curCost;
+    inp.placeholder = autoCost > 0 ? (window.SeriMoney ? SeriMoney.format(autoCost) : String(autoCost)) : 'Auto';
+
+    var manual = invoiceParseMoneyVal(inp.value);
+    var effective = manual > 0.009 ? manual : autoCost;
+    if (!hint) return;
+    var th = (window.poCurrency && window.poCurrency.thousands) || '.';
+    var shortMoney = function(v) {
+        return String(Math.round(v)).replace(/\B(?=(\d{3})+(?!\d))/g, th);
+    };
+    if (sameProduct && curCost > 0 && effective > 0) {
+        hint.textContent = 'Actual ' + shortMoney(curCost) + ' → ' + shortMoney(effective);
+        hint.title = 'Precio de costo actual ' + poMoney(curCost) + ' · quedará en ' + poMoney(effective) +
+            (manual > 0.009 ? ' (manual)' : ' (automático: costo factura' + (vatInCost ? '' : ' + IVA') + ')');
+    } else {
+        hint.textContent = manual > 0.009 ? 'Manual' : 'Auto (factura' + (vatInCost ? ')' : ' + IVA)');
+        hint.title = '';
+    }
+}
+
 function refreshInvoiceRowVisual(tr, qty, cost, line, action) {
     if (!tr) return;
     var skip = action === 'skip';
+    var fromOc = tr.dataset.fromOc === '1';
+    var billOnly = skip && !fromOc;
     var isBonus = !skip && qty > 0 && cost <= 0 && line <= 0.009;
     var bad = !skip && qty <= 0;
-    var fromOc = tr.dataset.fromOc === '1';
-    var rowStyle = bad
-        ? 'background:rgba(220,38,38,0.10);'
-        : (isBonus
-            ? 'background:rgba(59,130,246,0.14);'
-            : (fromOc
-                ? 'background:rgba(245,158,11,0.22);'
-                : 'background:rgba(16,185,129,0.16);'));
-    tr.setAttribute('style', rowStyle);
+    tr.setAttribute('style', invoiceRowStyle(bad, isBonus, fromOc, billOnly));
     var originTd = tr.querySelector('td:first-child');
     if (originTd) {
         originTd.style.whiteSpace = 'nowrap';
         originTd.style.fontSize = '12px';
         originTd.style.fontWeight = '600';
-        originTd.style.color = bad ? 'var(--dmc-DC2626, #DC2626)' : (isBonus ? 'var(--dmc-1D4ED8, #1D4ED8)' : (fromOc ? 'var(--dmc-B45309, #B45309)' : 'var(--dmc-047857, #047857)'));
-        originTd.textContent = bad ? '—' : (isBonus ? 'Bonif.' : (fromOc ? 'OC' : 'Factura'));
+        originTd.style.color = invoiceOriginColor(bad, isBonus, fromOc, billOnly);
+        originTd.textContent = invoiceOriginLabel(bad, isBonus, fromOc, billOnly);
     }
     var descCell = tr.querySelector('td input[name$="[description]"]');
     if (descCell && descCell.parentNode) {
@@ -2723,9 +3304,14 @@ function recalcInvoiceReviewTotals() {
         var line = (vatInCost || customVat) ? base : (base * (1 + tax / 100));
         totalTd.textContent = poMoney(line);
         refreshInvoiceRowVisual(tr, qty, cost, line, action);
-        if (action === 'skip') return;
-        if (!(qty > 0)) sinMonto++;
-        if (qty > 0 && cost <= 0 && line <= 0.009) bonifCount++;
+        refreshInvoiceInvCostHint(tr, qty, base, action, tax, vatInCost, customVat);
+        if (action === 'skip') {
+            // Omitir en línea solo-OC: pendiente, fuera de la factura. En línea de factura: suma, sin stock.
+            if (tr.dataset.fromOc === '1') return;
+        } else {
+            if (!(qty > 0)) sinMonto++;
+            if (qty > 0 && cost <= 0 && line <= 0.009) bonifCount++;
+        }
         productDiscTotal += lineDiscAmt;
         if (vatInCost && tax > 0.009) {
             var net = line / (1 + tax / 100);
@@ -2737,6 +3323,7 @@ function recalcInvoiceReviewTotals() {
         }
         grand += line;
     });
+    window._invReviewLastSubtotal = subtotal;
 
     if (customVat) {
         var ovEl = document.getElementById('reviewTaxOverrideAmount');
@@ -2747,33 +3334,28 @@ function recalcInvoiceReviewTotals() {
     }
 
     var form = body.closest('form') || document.getElementById('invoiceReviewForm');
-    var earlyPctEl = form ? form.querySelector('input[name="early_payment_discount_pct"]') : null;
     var comPctEl = form ? form.querySelector('input[name="commercial_discount_pct"]') : null;
     var comAmtEl = form ? form.querySelector('input[name="commercial_discount_amount"]') : null;
-    var earlyPct = earlyPctEl ? Math.max(0, Math.min(100, invoiceParseQty(earlyPctEl.value))) : 0;
-    var comPct = comPctEl ? Math.max(0, Math.min(100, invoiceParseQty(comPctEl.value))) : 0;
+    var comPct = comPctEl ? Math.max(0, Math.min(100, Math.round(invoiceParseQty(comPctEl.value)))) : 0;
     var comAmtIn = comAmtEl ? Math.max(0, invoiceParseMoneyVal(comAmtEl.value)) : 0;
-    var commercialAmt = comAmtIn > 0.009 ? Math.min(comAmtIn, grand) : (grand * comPct / 100);
-    var afterCommercial = Math.max(0, grand - commercialAmt);
-    var earlyAmt = afterCommercial * earlyPct / 100;
-    var payable = Math.max(0, afterCommercial - earlyAmt);
-
-    // Subtotal visible: antes del dcto. por línea (para que el desc. se vea explícito).
-    var displaySubtotal = vatInCost
-        ? subtotal
-        : (subtotal + productDiscTotal);
+    // Orden: Total bruto → dcto. líneas → dcto. comercial → Sub total → IVA → Valor neto.
+    var totalBruto = subtotal + productDiscTotal;
+    var commercialAmt = comAmtIn > 0.009 ? Math.min(comAmtIn, subtotal) : (subtotal * comPct / 100);
+    var subAfterDisc = Math.max(0, subtotal - commercialAmt);
+    var payable = Math.max(0, subAfterDisc + taxTotal);
 
     var foot = body.querySelector('.inv-review-foot');
     if (foot) {
-        foot.innerHTML = '<span>Subtotal: ' + poMoney(displaySubtotal) + '</span>' +
+        foot.innerHTML = '<span>Total bruto: ' + poMoney(totalBruto) + '</span>' +
             (productDiscTotal > 0.009
-                ? '<span style="color:var(--dmc-B45309, #B45309);">Desc. productos: -' + poMoney(productDiscTotal) + '</span>'
+                ? '<span style="color:var(--dmc-B45309, #B45309);">Descuento: -' + poMoney(productDiscTotal) + '</span>'
                 : '') +
+            (commercialAmt > 0.009
+                ? '<span style="color:var(--dmc-B45309, #B45309);">Desc. comercial: -' + poMoney(commercialAmt) + '</span>'
+                : '') +
+            '<span>Sub total: ' + poMoney(subAfterDisc) + '</span>' +
             '<span>IVA' + (vatInCost ? ' (en costo)' : (customVat ? ' (personalizado)' : '')) + ': ' + poMoney(taxTotal) + '</span>' +
-            '<span>Bruto: ' + poMoney(grand) + '</span>' +
-            (commercialAmt > 0.009 ? '<span>Desc. comercial: -' + poMoney(commercialAmt) + '</span>' : '') +
-            (earlyAmt > 0.009 ? '<span>Desc. pronto pago: -' + poMoney(earlyAmt) + '</span>' : '') +
-            '<span><strong>Total: ' + poMoney(payable) + '</strong></span>';
+            '<span><strong>Valor neto: ' + poMoney(payable) + '</strong></span>';
     }
 
     var liveNotes = body.querySelector('#invLiveStatusNotes');
@@ -3192,6 +3774,231 @@ function bindInvoiceProductSelectsLazy() {
     });
 }
 
+/* ---------- Buscador interno de «Producto en catálogo» (revisión de factura) ---------- */
+function invPickerNorm(s) {
+    s = String(s || '').toLowerCase();
+    return s.normalize ? s.normalize('NFD').replace(/[\u0300-\u036f]/g, '') : s;
+}
+function invPickerLabel(p) {
+    return (p.code ? p.code + ' — ' : '') + p.name + (p.barcode ? ' · EAN ' + p.barcode : '');
+}
+function invPickerIndex() {
+    var list = window.poProducts || [];
+    if (!window._invPickerIdx || window._invPickerIdx.length !== list.length) {
+        window._invPickerIdx = list.map(function(p) {
+            return {
+                p: p,
+                code: invPickerNorm(p.code),
+                ean: invPickerNorm(p.barcode),
+                name: invPickerNorm(p.name),
+                all: invPickerNorm([p.code, p.barcode, p.name].filter(Boolean).join(' '))
+            };
+        });
+    }
+    return window._invPickerIdx;
+}
+/** Búsqueda por SKU, EAN o nombre (todas las palabras). Exactos y prefijos primero. */
+function invPickerSearch(q, limit) {
+    var nq = invPickerNorm(q).trim();
+    var words = nq.split(/\s+/).filter(Boolean);
+    if (!words.length) return [];
+    var out = [];
+    invPickerIndex().forEach(function(r) {
+        for (var i = 0; i < words.length; i++) {
+            if (r.all.indexOf(words[i]) === -1) return;
+        }
+        var score = 0;
+        if (r.code === nq || r.ean === nq) score = 100;
+        else if (r.code.indexOf(nq) === 0 || r.ean.indexOf(nq) === 0) score = 60;
+        else if (r.name.indexOf(nq) === 0) score = 40;
+        else if (r.name.indexOf(nq) !== -1) score = 20;
+        out.push({ p: r.p, s: score });
+    });
+    out.sort(function(a, b) { return b.s - a.s || String(a.p.name).localeCompare(String(b.p.name)); });
+    return out.slice(0, limit || 80).map(function(x) { return x.p; });
+}
+/** Sin texto: productos cuyo nombre comparte palabras con la descripción / SKU / EAN de la línea. */
+function invPickerSuggest(tr) {
+    if (!tr) return [];
+    var desc = tr.querySelector('input[name$="[description]"]');
+    var sku = tr.querySelector('input[name$="[supplier_sku]"]');
+    var ean = tr.querySelector('input[name$="[barcode]"]');
+    var exact = [];
+    [ean && ean.value, sku && sku.value].forEach(function(v) {
+        var nv = invPickerNorm(v).trim();
+        if (!nv) return;
+        invPickerIndex().forEach(function(r) {
+            if ((r.ean === nv || r.code === nv) && exact.indexOf(r.p) === -1) exact.push(r.p);
+        });
+    });
+    var tokens = invPickerNorm(desc ? desc.value : '').split(/[^a-z0-9]+/).filter(function(t) { return t.length >= 2; });
+    var scored = [];
+    if (tokens.length) {
+        invPickerIndex().forEach(function(r) {
+            if (exact.indexOf(r.p) !== -1) return;
+            var hits = 0;
+            tokens.forEach(function(t) { if (r.name.indexOf(t) !== -1) hits++; });
+            if (hits > 0) scored.push({ p: r.p, s: hits });
+        });
+        scored.sort(function(a, b) { return b.s - a.s || String(a.p.name).localeCompare(String(b.p.name)); });
+    }
+    return exact.concat(scored.slice(0, 40).map(function(x) { return x.p; }));
+}
+
+function invPickerClose() {
+    var pop = document.getElementById('invProdPicker');
+    if (pop) pop.remove();
+    window._invPickerSelect = null;
+}
+
+function invPickerChoose(select, product) {
+    if (!select) return;
+    var val = product ? String(product.id) : '';
+    if (product) {
+        var opt = null;
+        for (var i = 0; i < select.options.length; i++) {
+            if (select.options[i].value === val) { opt = select.options[i]; break; }
+        }
+        if (!opt) {
+            opt = document.createElement('option');
+            opt.value = val;
+            opt.textContent = invPickerLabel(product);
+            opt.setAttribute('data-cost', product.purchase_price);
+            opt.setAttribute('data-code', product.code || '');
+            opt.setAttribute('data-barcode', product.barcode || '');
+            select.appendChild(opt);
+        }
+    }
+    select.value = val;
+    var tr = select.closest('tr');
+    if (tr) {
+        tr.dataset.pid = val;
+        tr.dataset.curCost = product ? (parseFloat(product.purchase_price) || 0) : 0;
+        var act = tr.querySelector('select[name$="[row_action]"]');
+        if (act && product && act.value === 'create_product') act.value = 'add_stock';
+    }
+    select.dispatchEvent(new Event('input', { bubbles: true }));
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    invPickerClose();
+}
+
+function invPickerOpen(select) {
+    invPickerClose();
+    window._invPickerSelect = select;
+    var tr = select.closest('tr');
+    var pop = document.createElement('div');
+    pop.id = 'invProdPicker';
+    pop.className = 'inv-prod-picker';
+    pop.innerHTML =
+        '<input type="search" class="form-control inv-prod-picker__q" autocomplete="off" placeholder="Buscar por SKU, EAN o nombre…">' +
+        '<div class="inv-prod-picker__hint"></div>' +
+        '<ul class="inv-prod-picker__list" role="listbox"></ul>';
+    document.body.appendChild(pop);
+
+    var r = select.getBoundingClientRect();
+    var width = Math.max(r.width, 440);
+    var left = Math.min(r.left, window.innerWidth - width - 8);
+    pop.style.width = width + 'px';
+    pop.style.left = Math.max(8, left) + 'px';
+    var below = window.innerHeight - r.bottom;
+    if (below < 300 && r.top > below) {
+        pop.style.bottom = (window.innerHeight - r.top + 2) + 'px';
+        pop.style.maxHeight = Math.min(420, r.top - 10) + 'px';
+    } else {
+        pop.style.top = (r.bottom + 2) + 'px';
+        pop.style.maxHeight = Math.min(420, below - 10) + 'px';
+    }
+
+    var q = pop.querySelector('.inv-prod-picker__q');
+    var list = pop.querySelector('.inv-prod-picker__list');
+    var hint = pop.querySelector('.inv-prod-picker__hint');
+    var items = [];
+    var active = -1;
+
+    function setActive(i) {
+        var lis = list.querySelectorAll('li[data-idx]');
+        if (!lis.length) { active = -1; return; }
+        active = Math.max(0, Math.min(lis.length - 1, i));
+        lis.forEach(function(li, k) { li.classList.toggle('is-active', k === active); });
+        lis[active].scrollIntoView({ block: 'nearest' });
+    }
+    function render() {
+        var term = q.value.trim();
+        items = term ? invPickerSearch(term, 80) : invPickerSuggest(tr);
+        var current = select.value;
+        var h = '<li data-clear="1" class="inv-prod-picker__clear">— Sin producto (crear nuevo / elegir después) —</li>';
+        items.forEach(function(p, i) {
+            h += '<li data-idx="' + i + '" role="option"' + (String(p.id) === current ? ' class="is-selected"' : '') + '>' +
+                '<span class="inv-prod-picker__name">' + esc(p.name) + '</span>' +
+                '<span class="inv-prod-picker__meta">' + (p.code ? 'SKU ' + esc(p.code) : '') +
+                (p.barcode ? ' · EAN ' + esc(p.barcode) : '') + '</span></li>';
+        });
+        list.innerHTML = h;
+        if (term) {
+            hint.textContent = items.length ? (items.length >= 80 ? 'Primeros 80 resultados: afine la búsqueda' : items.length + ' resultado(s)') : 'Sin resultados para «' + term + '»';
+        } else {
+            hint.textContent = items.length ? 'Sugeridos según la descripción de la línea · escriba para buscar en todo el catálogo' : 'Escriba SKU, EAN o nombre para buscar';
+        }
+        setActive(items.length ? 0 : -1);
+    }
+
+    q.addEventListener('input', render);
+    q.addEventListener('keydown', function(e) {
+        if (e.key === 'ArrowDown') { e.preventDefault(); setActive(active + 1); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); setActive(active - 1); }
+        else if (e.key === 'Enter') {
+            e.preventDefault();
+            if (active >= 0 && items[active]) invPickerChoose(select, items[active]);
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            invPickerClose();
+        }
+    });
+    list.addEventListener('mousedown', function(e) { e.preventDefault(); });
+    list.addEventListener('click', function(e) {
+        var li = e.target.closest('li');
+        if (!li) return;
+        if (li.dataset.clear === '1') { invPickerChoose(select, null); return; }
+        var p = items[parseInt(li.dataset.idx, 10)];
+        if (p) invPickerChoose(select, p);
+    });
+    render();
+    q.focus();
+}
+
+function bindInvoiceProductPicker() {
+    if (window._invProdPickerBound) return;
+    window._invProdPickerBound = true;
+    var isProductSelect = function(t) {
+        return t && t.tagName === 'SELECT' && /\[matched_product_id\]$/.test(t.name || '')
+            && !!t.closest('#invoiceReviewBody');
+    };
+    document.addEventListener('mousedown', function(e) {
+        var t = e.target;
+        if (isProductSelect(t)) {
+            e.preventDefault();
+            if (window._invPickerSelect === t) { invPickerClose(); return; }
+            invPickerOpen(t);
+            return;
+        }
+        var pop = document.getElementById('invProdPicker');
+        if (pop && !pop.contains(t)) invPickerClose();
+    }, true);
+    document.addEventListener('keydown', function(e) {
+        var t = e.target;
+        if (!isProductSelect(t)) return;
+        if (e.key === 'Enter' || e.key === ' ' || e.key === 'F4' || (e.altKey && e.key === 'ArrowDown')) {
+            e.preventDefault();
+            invPickerOpen(t);
+        }
+    }, true);
+    document.addEventListener('scroll', function(e) {
+        var pop = document.getElementById('invProdPicker');
+        if (pop && !pop.contains(e.target)) invPickerClose();
+    }, true);
+    window.addEventListener('resize', invPickerClose);
+}
+
 function poProductSearchText(p) {
     return [p.code, p.barcode, p.name].filter(Boolean).join(' ').toLowerCase();
 }
@@ -3244,7 +4051,7 @@ function addPoItem(prefill) {
     prefill = prefill || {};
     var wrap = document.createElement('div');
     wrap.className = 'po-item-row';
-    wrap.style.cssText = 'display:grid;grid-template-columns:2.2fr 0.7fr 0.9fr 0.7fr auto;gap:8px;margin-bottom:8px;align-items:end;';
+    wrap.style.cssText = 'display:grid;grid-template-columns:2.2fr 0.6fr 0.9fr 0.6fr 0.9fr auto;gap:8px;margin-bottom:8px;align-items:end;';
     var selectedId = prefill.product_id || '';
     var selectedLabel = '';
     if (selectedId) {
@@ -3264,7 +4071,8 @@ function addPoItem(prefill) {
         '<input type="text" inputmode="decimal" name="unit_cost[]" class="form-control money-input" data-money="1" value="' + (prefill.unit_cost != null ? (window.SeriMoney ? SeriMoney.format(prefill.unit_cost) : prefill.unit_cost) : '0') + '" required></div>' +
         '<div class="form-group" style="margin:0;"><label>IVA % <span class="field-tip" data-tip="Tarifa de IVA descontable estimada. Hereda del producto o de Configuración; se confirma en la recepción/factura." tabindex="0">?</span></label>' +
         '<input type="number" step="0.01" name="tax_rate[]" class="form-control" min="0" value="' + (prefill.tax_rate != null ? prefill.tax_rate : (window.poDefaultTaxRate != null ? window.poDefaultTaxRate : 0)) + '"></div>' +
-        '<button type="button" class="btn btn-sm btn-danger" onclick="this.parentElement.remove()" title="Quitar línea">✕</button>';
+        '<div class="form-group" style="margin:0;"><label>Total línea</label><div class="po-line-total">$ 0</div></div>' +
+        '<button type="button" class="btn btn-sm btn-danger" onclick="this.parentElement.remove();poRecalcTotals();" title="Quitar línea">✕</button>';
     document.getElementById('poItems').appendChild(wrap);
     bindPoRowSearch(wrap);
     if (window.SeriMoney && typeof SeriMoney.enhanceAll === 'function') {
@@ -3273,7 +4081,59 @@ function addPoItem(prefill) {
         var costEl = wrap.querySelector('input[name="unit_cost[]"]');
         if (costEl) SeriMoney.enhance(costEl);
     }
+    poRecalcTotals();
 }
+
+function poParseMoney(v) {
+    if (window.SeriMoney && typeof SeriMoney.parse === 'function') return SeriMoney.parse(v) || 0;
+    var s = String(v == null ? '' : v).trim();
+    if (s.indexOf(',') !== -1) s = s.replace(/\./g, '').replace(',', '.');
+    return parseFloat(s) || 0;
+}
+
+function poFormatMoney(n) {
+    var r = Math.round(n * 100) / 100;
+    return '$ ' + (window.SeriMoney && typeof SeriMoney.format === 'function'
+        ? SeriMoney.format(r)
+        : r.toLocaleString('es-CO', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+}
+
+function poRecalcTotals() {
+    var rows = document.querySelectorAll('#poItems .po-item-row');
+    var subtotal = 0, tax = 0, units = 0;
+    rows.forEach(function(row) {
+        var qtyEl = row.querySelector('input[name="quantity[]"]');
+        var costEl = row.querySelector('input[name="unit_cost[]"]');
+        var taxEl = row.querySelector('input[name="tax_rate[]"]');
+        var qty = qtyEl ? (parseFloat(qtyEl.value) || 0) : 0;
+        var cost = costEl ? poParseMoney(costEl.value) : 0;
+        var rate = taxEl ? (parseFloat(String(taxEl.value).replace(',', '.')) || 0) : 0;
+        var base = Math.round(qty * cost * 100) / 100;
+        var lineTax = Math.round(base * rate) / 100;
+        subtotal += base;
+        tax += lineTax;
+        units += qty;
+        var out = row.querySelector('.po-line-total');
+        if (out) out.textContent = poFormatMoney(base + lineTax);
+    });
+    var setText = function(id, text) {
+        var el = document.getElementById(id);
+        if (el) el.textContent = text;
+    };
+    setText('poTotalSubtotal', poFormatMoney(subtotal));
+    setText('poTotalTax', poFormatMoney(tax));
+    setText('poTotalGrand', poFormatMoney(subtotal + tax));
+    setText('poTotalsCount', rows.length
+        ? '(' + rows.length + (rows.length === 1 ? ' línea' : ' líneas') + ' · ' + units + ' und.)'
+        : '');
+}
+
+(function() {
+    var items = document.getElementById('poItems');
+    if (!items) return;
+    items.addEventListener('input', poRecalcTotals);
+    items.addEventListener('change', poRecalcTotals);
+})();
 
 function bindPoRowSearch(wrap) {
     var hidden = wrap.querySelector('.po-product-id');
@@ -3313,6 +4173,7 @@ function bindPoRowSearch(wrap) {
             taxInput.value = li.getAttribute('data-tax');
         }
         closeList();
+        poRecalcTotals();
     }
 
     input.addEventListener('focus', function() { render(input.value); });
@@ -3339,6 +4200,7 @@ function bindPoRowSearch(wrap) {
                 var taxInput = wrap.querySelector('input[name="tax_rate[]"]');
                 if (taxInput && exact.tax_rate != null) taxInput.value = exact.tax_rate;
                 closeList();
+                poRecalcTotals();
                 return;
             }
             var first = list.querySelector('.combobox-option[data-id]');
@@ -3361,6 +4223,7 @@ function onPoProductChange(sel) {
             costInput.value = window.SeriMoney ? SeriMoney.format(c) : c;
         }
     }
+    poRecalcTotals();
 }
 
 function setPurchaseModalActions(isEdit, status) {
@@ -3407,6 +4270,7 @@ function resetPurchaseModal() {
     var suggest = document.getElementById('poProductSuggest');
     if (suggest) { suggest.hidden = true; suggest.innerHTML = ''; }
     setPurchaseModalActions(false, null);
+    poRecalcTotals();
 }
 
 function editPurchase(id) {
@@ -3513,7 +4377,7 @@ function openReceiveModal(id, number) {
     var due = document.getElementById('receiveDueDate');
     if (due) due.value = '';
     var disc = document.getElementById('receiveEarlyDiscount');
-    if (disc) disc.value = '';
+    if (disc) disc.value = '0';
     var comPct = document.getElementById('receiveCommercialPct');
     if (comPct) comPct.value = '';
     var comAmt = document.getElementById('receiveCommercialAmt');
@@ -3543,13 +4407,109 @@ function syncPayCashSourceUi() {
     }
 }
 
-function openPayModal(id, number, balance, supplier) {
-    document.getElementById('payOrderId').value = id;
-    document.getElementById('payOrderLabel').textContent = 'OC ' + number + (supplier ? ' — ' + supplier : '');
+var payCtx = { total: 0, previous: 0, balance: 0 };
+
+function payMoneyVal(id) {
+    var el = document.getElementById(id);
+    return el ? (poParseMoney(el.value) || 0) : 0;
+}
+
+var payDiscountDriver = 'pct';
+
+function recalcPayTotals(autofillAmount, source) {
+    var invoice = payMoneyVal('payInvoiceValue');
+    var pctEl = document.getElementById('payDiscountPct');
+    var amtEl = document.getElementById('payDiscountAmount');
+    var pct = pctEl ? parseFloat(String(pctEl.value).replace(',', '.')) || 0 : 0;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    var discount;
+    var round2 = function (v) { return Math.round(v * 100) / 100; };
+    if (source === 'discountAmount') {
+        // El usuario escribió el monto: se deriva el %.
+        discount = round2(payMoneyVal('payDiscountAmount'));
+        pct = invoice > 0 ? round2(discount / invoice * 100) : 0;
+        if (pctEl) pctEl.value = pct ? String(pct) : '';
+    } else {
+        // Manda el % (también al cambiar el Valor de Factura, salvo que el último dato haya sido el monto).
+        if (source === 'invoice' && payDiscountDriver === 'amount') {
+            discount = round2(payMoneyVal('payDiscountAmount'));
+            pct = invoice > 0 ? round2(discount / invoice * 100) : 0;
+            if (pctEl) pctEl.value = pct ? String(pct) : '';
+        } else {
+            discount = round2(invoice * pct / 100);
+            if (amtEl) {
+                amtEl.value = window.SeriMoney ? SeriMoney.format(discount) : discount.toFixed(2);
+                if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(amtEl);
+            }
+        }
+    }
+    var previous = payCtx.previous || 0;
+    var payableNow = Math.max(0, round2(invoice - discount - previous));
+
+    var amountEl = document.getElementById('payAmount');
+    if (autofillAmount && amountEl) {
+        amountEl.value = window.SeriMoney ? SeriMoney.format(payableNow) : payableNow.toFixed(2);
+        if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(amountEl);
+    }
+    var amount = payMoneyVal('payAmount');
+    var remaining = round2(invoice - discount - previous - amount);
+
+    var set = function (id, txt) { var n = document.getElementById(id); if (n) n.textContent = txt; };
+    // El saldo pendiente del encabezado también se mueve con el Valor de Factura (y el dcto.).
+    set('payBalanceLabel', 'Saldo pendiente: ' + poMoney(Math.max(0, round2(invoice - discount - previous))));
+    set('paySumInvoice', poMoney(invoice));
+    set('paySumDiscount', '− ' + poMoney(discount));
+    set('paySumPrevious', '− ' + poMoney(previous));
+    set('paySumAmount', '− ' + poMoney(amount));
+    set('paySumRemaining', poMoney(remaining));
+    var remEl = document.getElementById('paySumRemaining');
+    if (remEl) remEl.style.color = remaining < -0.009 ? 'var(--dmc-DC2626, #DC2626)' : '';
+    var err = document.getElementById('payTotalsError');
+    if (err) err.style.display = remaining < -0.009 ? 'block' : 'none';
+    var submit = document.getElementById('paySubmitBtn');
+    if (submit) submit.disabled = remaining < -0.009 || amount <= 0;
+    var discNote = document.getElementById('payDiscountNote');
+    if (discNote) discNote.style.display = discount > 0.009 ? 'inline' : 'none';
+    var hint = document.getElementById('payInvoiceHint');
+    if (hint) {
+        hint.textContent = Math.abs(invoice - (payCtx.total || 0)) > 0.009
+            ? 'Total neto en el sistema: ' + poMoney(payCtx.total || 0) + ' · el saldo se calculará sobre el Valor de Factura indicado.'
+            : 'Coincide con el total neto registrado en el sistema.';
+    }
+    return remaining;
+}
+
+function openPayModal(payload) {
+    if (!payload || !payload.id) return;
+    payCtx = {
+        total: parseFloat(payload.total || 0) || 0,
+        previous: (parseFloat(payload.paid || 0) || 0)
+            + (parseFloat(payload.credited || 0) || 0)
+            + (parseFloat(payload.discounts || 0) || 0),
+        balance: parseFloat(payload.balance || 0) || 0
+    };
+    document.getElementById('payOrderId').value = payload.id;
+    document.getElementById('payOrderLabel').textContent =
+        'OC ' + (payload.number || '') + (payload.supplier ? ' — ' + payload.supplier : '');
     document.getElementById('payBalanceLabel').textContent =
-        'Saldo pendiente: ' + poMoney(balance || 0);
+        'Saldo pendiente: ' + poMoney(payCtx.balance);
+    var invoiceEl = document.getElementById('payInvoiceValue');
+    if (invoiceEl) {
+        var inv = parseFloat(payload.invoiceValue || payload.total || 0) || 0;
+        invoiceEl.value = window.SeriMoney ? SeriMoney.format(inv) : inv.toFixed(2);
+        if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(invoiceEl);
+    }
+    payDiscountDriver = 'pct';
+    var pctEl = document.getElementById('payDiscountPct');
+    if (pctEl) pctEl.value = '';
+    var discAmtEl = document.getElementById('payDiscountAmount');
+    if (discAmtEl) {
+        discAmtEl.value = window.SeriMoney ? SeriMoney.format(0) : '0.00';
+        if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(discAmtEl);
+    }
     var amount = document.getElementById('payAmount');
-    amount.value = window.SeriMoney ? SeriMoney.format(balance || 0) : parseFloat(balance || 0).toFixed(2);
+    amount.value = window.SeriMoney ? SeriMoney.format(payCtx.balance) : payCtx.balance.toFixed(2);
     amount.removeAttribute('max');
     document.getElementById('payDate').value = poToday();
     if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(amount);
@@ -3562,6 +4522,7 @@ function openPayModal(id, number, balance, supplier) {
     var note = document.getElementById('payCashSourceNote');
     if (note) note.value = '';
     syncPayCashSourceUi();
+    recalcPayTotals(false);
     document.getElementById('payModal').style.display = 'flex';
 }
 
@@ -3595,6 +4556,22 @@ document.addEventListener('DOMContentLoaded', function () {
     Array.prototype.forEach.call(document.querySelectorAll('input[name="cash_source"]'), function (el) {
         el.addEventListener('change', syncPayCashSourceUi);
     });
+    var payInvoiceEl = document.getElementById('payInvoiceValue');
+    if (payInvoiceEl) payInvoiceEl.addEventListener('input', function () { recalcPayTotals(true, 'invoice'); });
+    var payPctEl = document.getElementById('payDiscountPct');
+    if (payPctEl) payPctEl.addEventListener('input', function () { payDiscountDriver = 'pct'; recalcPayTotals(true, 'discountPct'); });
+    var payDiscAmtEl = document.getElementById('payDiscountAmount');
+    if (payDiscAmtEl) payDiscAmtEl.addEventListener('input', function () { payDiscountDriver = 'amount'; recalcPayTotals(true, 'discountAmount'); });
+    var payAmountEl = document.getElementById('payAmount');
+    if (payAmountEl) payAmountEl.addEventListener('input', function () { recalcPayTotals(false); });
+    var payForm = document.getElementById('payForm');
+    if (payForm) payForm.addEventListener('submit', function (ev) {
+        if (recalcPayTotals(false) < -0.009) {
+            ev.preventDefault();
+            var err = document.getElementById('payTotalsError');
+            if (err) err.style.display = 'block';
+        }
+    });
     syncPayCashSourceUi();
 });
 
@@ -3604,7 +4581,8 @@ function voidReceivedOrder(id, number, opts) {
     if (!reason) {
         reason = prompt(
             'Anular factura/OC ' + (number || '') + ' por error.\n'
-            + 'Se emitirá NC total (sale stock), asiento inverso y la factura dejará de estar activa.\n'
+            + 'Se revierte el inventario y el asiento contable (no se genera nota crédito).\n'
+            + 'Si se pagó con efectivo del cajón, el dinero vuelve a la caja abierta.\n'
             + 'Si hay abonos, se cancelan y se revierten automáticamente.\n\n'
             + 'Motivo de anulación:',
             'Error de recepción'
@@ -3758,6 +4736,15 @@ function viewPurchase(id) {
             h += '<div><strong>Recepción de bodega:</strong> ' + esc((o.warehouse_date || '—').toString().substr(0,10)) + '</div>';
             h += '<div><strong>Subtotal:</strong> ' + poMoney(o.subtotal) + '</div>';
             h += '<div><strong>IVA:</strong> ' + poMoney(o.tax) + '</div>';
+            var comAmt = parseFloat(o.commercial_discount_amount || 0) || 0;
+            var comPct = parseFloat(o.commercial_discount_pct || 0) || 0;
+            if (comAmt <= 0.009 && comPct > 0.009) {
+                comAmt = Math.round((parseFloat(o.subtotal || 0) || 0) * comPct) / 100;
+            }
+            if (comAmt > 0.009) {
+                h += '<div><strong>Desc. comercial:</strong> −' + poMoney(comAmt)
+                    + (comPct > 0.009 ? ' <small>(' + Math.round(comPct) + '%)</small>' : '') + '</div>';
+            }
             h += '<div><strong>Total:</strong> ' + poMoney(o.total) + '</div>';
             h += '<div><strong>Notas crédito:</strong> ' + poMoney(o.credit_total) + '</div>';
             h += '<div><strong>Neto:</strong> ' + poMoney(Math.max(0, parseFloat(o.total || 0) - parseFloat(o.credit_total || 0))) + '</div>';
@@ -3812,7 +4799,11 @@ function viewPurchase(id) {
                         h += '—';
                     }
                     h += '</td>';
-                    h += '<td>' + poMoney(p.amount) + '</td></tr>';
+                    h += '<td>' + poMoney(p.amount);
+                    if (parseFloat(p.discount_amount || 0) > 0.009) {
+                        h += '<div style="font-size:11px;color:var(--dmc-B45309, #B45309);">Dcto. pronto pago −' + poMoney(p.discount_amount) + '</div>';
+                    }
+                    h += '</td></tr>';
                 });
                 h += '</tbody></table>';
             }
@@ -3994,6 +4985,7 @@ function addOrBumpPoProduct(product) {
     if (found) {
         var qtyInput = found.querySelector('input[name="quantity[]"]');
         if (qtyInput) qtyInput.value = String((parseInt(qtyInput.value, 10) || 0) + 1);
+        poRecalcTotals();
         showAlert(product.name + ': cantidad +1', 'success');
         return;
     }

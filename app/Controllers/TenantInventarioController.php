@@ -594,9 +594,7 @@ class TenantInventarioController extends TenantController
 
         // Compras modernas (OC / facturas de proveedor), no el legado `purchases`.
         $purchases = [];
-        try {
-            $purchases = $this->query(
-                "SELECT poi.id, poi.quantity, poi.received_qty, poi.unit_cost, poi.tax_rate,
+        $purchaseSql = "SELECT poi.id, poi.quantity, poi.received_qty, poi.unit_cost, %s poi.tax_rate,
                         poi.product_name, poi.lot_code, poi.expiry_date,
                         po.id AS purchase_order_id, po.order_number, po.invoice_number,
                         po.invoice_date, po.warehouse_date, po.received_at, po.status,
@@ -606,12 +604,19 @@ class TenantInventarioController extends TenantController
                  LEFT JOIN suppliers su ON su.id = po.supplier_id
                  WHERE poi.product_id = ?
                  ORDER BY COALESCE(po.received_at, po.warehouse_date, po.created_at) DESC, po.id DESC
-                 LIMIT 30",
-                [$id]
-            )->fetchAll();
+                 LIMIT 30";
+        try {
+            $purchases = $this->query(sprintf($purchaseSql, 'poi.inventory_cost,'), [$id])->fetchAll();
         } catch (\Throwable $e) {
-            $purchases = [];
+            try {
+                $purchases = $this->query(sprintf($purchaseSql, ''), [$id])->fetchAll();
+            } catch (\Throwable $e2) {
+                $purchases = [];
+            }
         }
+
+        $costSummary = $this->productCostSummary((int)$id, $product);
+        $costHistory = $this->productCostHistoryRows((int)$id);
 
         // Si hay OC recibida sin fila en stock_movements, exponerla como hito sintético.
         $knownPoRefs = [];
@@ -694,6 +699,8 @@ class TenantInventarioController extends TenantController
             'movements' => $movements,
             'lastSales' => $lastSales,
             'purchases' => $purchases,
+            'cost_summary' => $costSummary,
+            'cost_history' => $costHistory,
             'lots' => $lots,
             'suppliers' => $productSuppliers,
             'stock_debts' => $this->stock->openDebtsForProduct($id),
@@ -879,6 +886,186 @@ class TenantInventarioController extends TenantController
     }
 
     /** Etiqueta corta de origen para el modal de detalle del producto. */
+    /**
+     * Costos del producto para la ficha: promedio ponderado vigente (purchase_price),
+     * último costo de entrada por compra y promedio de compras (histórico y 90 días).
+     * Excluye entradas de OC anuladas.
+     *
+     * @param array<string,mixed> $product
+     * @return array<string,mixed>
+     */
+    private function productCostSummary(int $productId, array $product): array
+    {
+        $avg = round((float)($product['purchase_price'] ?? 0), 2);
+        $stock = (int)($product['stock'] ?? 0);
+        $out = [
+            'avg_cost' => $avg,
+            'stock_value' => round(max(0, $stock) * $avg, 2),
+            'last_cost' => null,
+            'last_cost_date' => null,
+            'last_cost_ref' => null,
+            'purchase_avg' => null,
+            'purchase_units' => 0,
+            'purchase_count' => 0,
+            'purchase_min' => null,
+            'purchase_max' => null,
+            'purchase_avg_90' => null,
+            'purchase_units_90' => 0,
+        ];
+
+        $where = "sm.product_id = ?
+                  AND sm.type = 'in'
+                  AND sm.reference_type IN ('purchase_order', 'purchase')
+                  AND sm.quantity > 0
+                  AND COALESCE(sm.unit_cost, 0) > 0
+                  AND (sm.reference_type <> 'purchase_order' OR COALESCE(po.status, '') <> 'cancelled')";
+
+        try {
+            $agg = $this->query(
+                "SELECT COUNT(*) AS n,
+                        SUM(sm.quantity) AS units,
+                        SUM(sm.quantity * sm.unit_cost) AS value,
+                        MIN(sm.unit_cost) AS min_cost,
+                        MAX(sm.unit_cost) AS max_cost,
+                        SUM(CASE WHEN COALESCE(sm.movement_date, DATE(sm.created_at)) >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)
+                                 THEN sm.quantity ELSE 0 END) AS units_90,
+                        SUM(CASE WHEN COALESCE(sm.movement_date, DATE(sm.created_at)) >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)
+                                 THEN sm.quantity * sm.unit_cost ELSE 0 END) AS value_90
+                 FROM stock_movements sm
+                 LEFT JOIN purchase_orders po ON po.id = sm.reference_id AND sm.reference_type = 'purchase_order'
+                 WHERE {$where}",
+                [$productId]
+            )->fetch();
+            if ($agg && (int)$agg['units'] > 0) {
+                $out['purchase_count'] = (int)$agg['n'];
+                $out['purchase_units'] = (int)$agg['units'];
+                $out['purchase_avg'] = round((float)$agg['value'] / (int)$agg['units'], 2);
+                $out['purchase_min'] = round((float)$agg['min_cost'], 2);
+                $out['purchase_max'] = round((float)$agg['max_cost'], 2);
+                if ((int)$agg['units_90'] > 0) {
+                    $out['purchase_units_90'] = (int)$agg['units_90'];
+                    $out['purchase_avg_90'] = round((float)$agg['value_90'] / (int)$agg['units_90'], 2);
+                }
+            }
+
+            $last = $this->query(
+                "SELECT sm.unit_cost, COALESCE(sm.movement_date, DATE(sm.created_at)) AS d,
+                        po.order_number, po.invoice_number
+                 FROM stock_movements sm
+                 LEFT JOIN purchase_orders po ON po.id = sm.reference_id AND sm.reference_type = 'purchase_order'
+                 WHERE {$where}
+                 ORDER BY COALESCE(sm.movement_date, DATE(sm.created_at)) DESC, sm.id DESC
+                 LIMIT 1",
+                [$productId]
+            )->fetch();
+            if ($last) {
+                $out['last_cost'] = round((float)$last['unit_cost'], 2);
+                $out['last_cost_date'] = (string)$last['d'];
+                $ref = trim((string)($last['order_number'] ?? ''));
+                $inv = trim((string)($last['invoice_number'] ?? ''));
+                $out['last_cost_ref'] = trim($ref . ($inv !== '' ? ' / Fact. ' . $inv : '')) ?: null;
+            }
+        } catch (\Throwable $e) {
+            // Ficha sin resumen de compras si la consulta falla.
+        }
+
+        return $out;
+    }
+
+    /**
+     * Historial de precio de costo: filas registradas (costo anterior → nuevo) y, para compras
+     * previas al registro, las entradas de compra del kardex (solo costo de entrada).
+     *
+     * @return list<array<string,mixed>>
+     */
+    private function productCostHistoryRows(int $productId): array
+    {
+        $rows = [];
+        $knownMovements = [];
+        $oldestLogged = null;
+        foreach (\SoftNova\Services\ProductCostHistory::forProduct($this->db, $productId, 150) as $h) {
+            if (!empty($h['movement_id'])) {
+                $knownMovements[(int)$h['movement_id']] = true;
+            }
+            $created = (string)($h['created_at'] ?? '');
+            if ($created !== '' && ($oldestLogged === null || $created < $oldestLogged)) {
+                $oldestLogged = $created;
+            }
+            $rows[] = [
+                'date' => (string)($h['effective_date'] ?: substr($created, 0, 10)),
+                'at' => $created,
+                'source' => (string)($h['source'] ?? ''),
+                'qty' => $h['qty'] !== null ? (int)$h['qty'] : null,
+                'unit_cost_in' => $h['unit_cost_in'] !== null ? (float)$h['unit_cost_in'] : null,
+                'old_cost' => $h['old_cost'] !== null ? (float)$h['old_cost'] : null,
+                'new_cost' => (float)$h['new_cost'],
+                'stock_after' => $h['stock_after'] !== null ? (int)$h['stock_after'] : null,
+                'ref' => trim((string)($h['order_number'] ?? '') . (!empty($h['invoice_number']) ? ' / Fact. ' . $h['invoice_number'] : '')),
+                'supplier' => (string)($h['supplier_name'] ?? ''),
+                'note' => (string)($h['note'] ?? ''),
+                'user' => (string)($h['user_name'] ?? ''),
+                'logged' => 1,
+            ];
+        }
+
+        try {
+            $params = [$productId];
+            $extra = '';
+            if ($oldestLogged !== null) {
+                $extra = ' AND sm.created_at < ?';
+                $params[] = $oldestLogged;
+            }
+            $legacy = $this->query(
+                "SELECT sm.id, sm.quantity, sm.unit_cost, sm.stock_after, sm.created_at,
+                        COALESCE(sm.movement_date, DATE(sm.created_at)) AS d,
+                        po.order_number, po.invoice_number, su.name AS supplier_name, u.name AS user_name
+                 FROM stock_movements sm
+                 LEFT JOIN purchase_orders po ON po.id = sm.reference_id AND sm.reference_type = 'purchase_order'
+                 LEFT JOIN suppliers su ON su.id = COALESCE(po.supplier_id, sm.supplier_id)
+                 LEFT JOIN users u ON u.id = sm.user_id
+                 WHERE sm.product_id = ?
+                   AND sm.type = 'in'
+                   AND sm.reference_type IN ('purchase_order', 'purchase')
+                   AND sm.quantity > 0
+                   AND COALESCE(sm.unit_cost, 0) > 0
+                   AND (sm.reference_type <> 'purchase_order' OR COALESCE(po.status, '') <> 'cancelled')
+                   {$extra}
+                 ORDER BY sm.created_at DESC, sm.id DESC
+                 LIMIT 150",
+                $params
+            )->fetchAll();
+            foreach ($legacy as $m) {
+                if (isset($knownMovements[(int)$m['id']])) {
+                    continue;
+                }
+                $rows[] = [
+                    'date' => (string)$m['d'],
+                    'at' => (string)$m['created_at'],
+                    'source' => 'purchase',
+                    'qty' => (int)$m['quantity'],
+                    'unit_cost_in' => (float)$m['unit_cost'],
+                    'old_cost' => null,
+                    'new_cost' => null,
+                    'stock_after' => $m['stock_after'] !== null ? (int)$m['stock_after'] : null,
+                    'ref' => trim((string)($m['order_number'] ?? '') . (!empty($m['invoice_number']) ? ' / Fact. ' . $m['invoice_number'] : '')),
+                    'supplier' => (string)($m['supplier_name'] ?? ''),
+                    'note' => '',
+                    'user' => (string)($m['user_name'] ?? ''),
+                    'logged' => 0,
+                ];
+            }
+        } catch (\Throwable $e) {
+            // Solo historial registrado.
+        }
+
+        usort($rows, static function ($a, $b) {
+            $c = strcmp((string)$b['date'], (string)$a['date']);
+            return $c !== 0 ? $c : strcmp((string)$b['at'], (string)$a['at']);
+        });
+
+        return array_slice($rows, 0, 150);
+    }
+
     private function movementOriginLabel(array $m): string
     {
         $ref = (string)($m['reference_type'] ?? '');
@@ -1581,6 +1768,19 @@ class TenantInventarioController extends TenantController
         $sql .= " WHERE id = ?";
         $params[] = $id;
         $this->query($sql, $params);
+
+        $oldCostVal = round((float)($oldProduct['purchase_price'] ?? 0), 2);
+        $newCostVal = round(max(0, \SoftNova\Core\parse_money($this->request->post('purchase_price', 0))), 2);
+        if (abs($newCostVal - $oldCostVal) > 0.009) {
+            \SoftNova\Services\ProductCostHistory::record($this->db, (int)$id, $oldCostVal, $newCostVal, [
+                'source' => 'manual',
+                'reference_type' => 'product_edit',
+                'reference_id' => (int)$id,
+                'stock_before' => $oldStock,
+                'stock_after' => $oldStock,
+                'note' => 'Edición manual del precio de costo',
+            ]);
+        }
         
         $wasTracking = !empty($oldProduct['track_lots']);
         $nowTracking = $productType === 'product' && $lotInput['track_lots'];

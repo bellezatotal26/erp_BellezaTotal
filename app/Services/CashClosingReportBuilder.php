@@ -271,14 +271,61 @@ class CashClosingReportBuilder
             $add('Descuentos', 'i', htmlspecialchars($fmt($disc)), '', 'color:#B45309;');
         }
 
-        if ($otherCash > 0.009) {
-            $add('Otros ingresos en efectivo', '+', htmlspecialchars($fmt($otherCash)), '', 'color:#059669;');
+        $refunds = min($otherCash, max(0.0, (float)($totals['purchase_refunds_cash'] ?? 0)));
+        $purchases = min($expenses, max(0.0, (float)($totals['purchases_cash'] ?? 0)));
+        $ncCashRefunds = min($expenses, max(0.0, (float)($totals['sale_credit_refunds_cash'] ?? 0)));
+        $ncDocTotal = max(0.0, (float)($totals['sale_credit_notes_total'] ?? 0));
+        $ncDocCount = (int)($totals['sale_credit_notes_count'] ?? 0);
+        $ncNumbers = trim((string)($totals['sale_credit_note_numbers'] ?? ''));
+
+        if ($refunds > 0.009) {
+            $add(
+                'Reintegro compras anuladas <span style="color:#64748B;font-size:10px;">(efectivo vuelve al cajón)</span>',
+                '+',
+                htmlspecialchars($fmt($refunds)),
+                '',
+                'color:#059669;'
+            );
+        }
+        if ($otherCash - $refunds > 0.009) {
+            $add('Otros ingresos en efectivo', '+', htmlspecialchars($fmt($otherCash - $refunds)), '', 'color:#059669;');
         }
 
-        $add('Gastos efectivo (cajón)', '-', htmlspecialchars($fmt($expenses)), '', 'color:#DC2626;font-weight:600;');
+        if ($purchases > 0.009) {
+            $add(
+                'Compras a proveedores <span style="color:#64748B;font-size:10px;">(OC / abonos en efectivo)</span>',
+                '-',
+                htmlspecialchars($fmt($purchases)),
+                '',
+                'color:#DC2626;font-weight:600;'
+            );
+        }
+        if ($ncCashRefunds > 0.009 || $ncDocCount > 0) {
+            $ncLabel = 'Reembolsos NC venta'
+                . ($ncDocCount > 0 ? ' <span style="color:#64748B;font-size:10px;">(' . $ncDocCount . ')</span>' : '')
+                . ' <span style="color:#64748B;font-size:10px;">(efectivo sale del cajón)</span>';
+            if ($ncNumbers !== '') {
+                $ncLabel .= '<br><span style="color:#64748B;font-size:10px;">' . htmlspecialchars($ncNumbers) . '</span>';
+            }
+            if ($ncDocTotal > 0.009 && abs($ncDocTotal - $ncCashRefunds) > 0.02) {
+                $ncLabel .= '<br><span style="color:#64748B;font-size:10px;">Total NC documental '
+                    . htmlspecialchars($fmt($ncDocTotal))
+                    . ' (incluye CxC / transferencia)</span>';
+            }
+            $add(
+                $ncLabel,
+                '-',
+                htmlspecialchars($fmt($ncCashRefunds)),
+                '#FFF7ED',
+                'color:#C2410C;font-weight:700;'
+            );
+        }
+        $otherExpenses = max(0.0, round($expenses - $purchases - $ncCashRefunds, 2));
+        $add('Gastos efectivo (cajón)', '-', htmlspecialchars($fmt($otherExpenses)), '', 'color:#DC2626;font-weight:600;');
 
         $enCajaHint = $expenses > 0.009
-            ? 'Base de caja + efectivo de ventas − gastos'
+            ? 'Base de caja + efectivo de ventas − '
+                . (($purchases > 0.009 || $ncCashRefunds > 0.009) ? 'compras, NC y gastos' : 'gastos')
             : 'Base de caja + efectivo de ventas';
         $rows .= '<tr style="background:#2563EB;">'
             . '<td style="padding:9px 8px;color:#fff;font-weight:700;font-size:13px;">= En caja (esperado)'
@@ -459,6 +506,8 @@ class CashClosingReportBuilder
         $discountCount = 0;
         $discountSum = 0.0;
         $changeCount = 0;
+        $ncCount = 0;
+        $ncSum = 0.0;
         $noteStyle = 'display:block;margin-top:2px;font-size:10px;';
 
         foreach ($sales as $sale) {
@@ -481,6 +530,29 @@ class CashClosingReportBuilder
                     . '</span>';
                 $flags[] = 'Desc.';
                 $bg = '#FFFBEB';
+            }
+
+            $ncTot = round((float)($sale['credit_note_total'] ?? 0), 2);
+            if ($ncTot > 0.009) {
+                $ncCount++;
+                $ncSum += $ncTot;
+                $saleTot = round((float)($sale['total'] ?? 0), 2);
+                $ncFull = $ncTot >= ($saleTot - 0.02);
+                $ncNums = trim((string)($sale['credit_note_numbers'] ?? ''));
+                $notes .= '<span style="' . $noteStyle . 'color:#C2410C;">'
+                    . ($ncFull ? 'Devuelta (NC)' : 'Con nota de crédito')
+                    . ': −' . htmlspecialchars($fmt($ncTot))
+                    . ($ncNums !== '' ? ' · ' . htmlspecialchars($ncNums) : '')
+                    . ' · neto ' . htmlspecialchars($fmt(max(0.0, $saleTot - $ncTot)))
+                    . '</span>';
+                $flags[] = $ncFull ? 'Devuelta' : 'NC';
+                $bg = $bg === '' ? '#FFF7ED' : $bg;
+            }
+
+            $saleObs = SalesDocumentService::displayNotes((string)($sale['notes'] ?? ''));
+            if ($saleObs !== '') {
+                $notes .= '<span style="' . $noteStyle . 'color:#475569;">Obs.: '
+                    . htmlspecialchars($saleObs) . '</span>';
             }
 
             foreach (($sale['payment_changes'] ?? []) as $ch) {
@@ -513,6 +585,7 @@ class CashClosingReportBuilder
             }
             $flags = array_values(array_unique($flags));
 
+            $saleUser = trim((string)($sale['user_name'] ?? ''));
             $rows[] = [
                 'ts' => (string)($sale['sale_date'] ?? ''),
                 'sort' => strtotime((string)($sale['sale_date'] ?? 'now')) ?: 0,
@@ -522,6 +595,7 @@ class CashClosingReportBuilder
                     (string)($sale['invoice_number'] ?? ('#' . ($sale['id'] ?? '')))
                     . ' · '
                     . (string)($sale['customer_name'] ?? 'Público general')
+                    . ($saleUser !== '' ? ' · por ' . $saleUser : '')
                 ),
                 'notes_html' => $notes,
                 'bg' => $bg,
@@ -538,18 +612,25 @@ class CashClosingReportBuilder
                 continue; // ya aparece como venta
             }
             $isIncome = (($mov['type'] ?? '') === 'income');
+            $isNc = $rt === 'sale_credit_note';
+            $detalle = trim((string)($mov['origin_label'] ?? ''));
+            if ($detalle === '') {
+                $detalle = trim((string)($mov['description'] ?? ''));
+            }
+            if (!empty($mov['user_name'])) {
+                $detalle = trim($detalle . ' · ' . $mov['user_name']);
+            }
             $rows[] = [
                 'ts' => (string)($mov['created_at'] ?? ''),
                 'sort' => strtotime((string)($mov['created_at'] ?? 'now')) ?: 0,
-                'tipo' => $isIncome ? 'Ingreso' : 'Egreso',
-                'detalle' => trim(
-                    (string)($mov['description'] ?? '')
-                    . (!empty($mov['user_name']) ? ' · ' . $mov['user_name'] : '')
-                ),
+                'tipo' => $isNc ? 'NC venta' : ($isIncome ? 'Ingreso' : 'Egreso'),
+                'flags' => $isNc ? ['NC'] : [],
+                'detalle' => $detalle,
+                'bg' => $isNc ? '#FFF7ED' : '',
                 'medio' => $isIncome ? 'Caja' : 'Caja',
                 'amount' => (float)($mov['amount'] ?? 0),
                 'sign' => $isIncome ? '+' : '−',
-                'color' => $isIncome ? '#059669' : '#DC2626',
+                'color' => $isNc ? '#C2410C' : ($isIncome ? '#059669' : '#DC2626'),
             ];
         }
 
@@ -565,8 +646,11 @@ class CashClosingReportBuilder
             $tipo = htmlspecialchars($r['tipo']);
             foreach (($r['flags'] ?? []) as $flag) {
                 $isDisc = $flag === 'Desc.';
+                $isNcFlag = $flag === 'NC' || $flag === 'Devuelta';
                 $tipo .= '<br><span style="display:inline-block;margin-top:2px;padding:1px 4px;border-radius:3px;font-size:9px;font-weight:700;'
-                    . ($isDisc ? 'background:#FEF3C7;color:#92400E;' : 'background:#DBEAFE;color:#1E40AF;') . '">'
+                    . ($isDisc
+                        ? 'background:#FEF3C7;color:#92400E;'
+                        : ($isNcFlag ? 'background:#FFEDD5;color:#9A3412;' : 'background:#DBEAFE;color:#1E40AF;')) . '">'
                     . htmlspecialchars($flag) . '</span>';
             }
             $body .= '<tr' . (!empty($r['bg']) ? ' style="background:' . $r['bg'] . ';"' : '') . '>'
@@ -581,7 +665,7 @@ class CashClosingReportBuilder
         }
 
         $summary = '';
-        if ($discountCount > 0 || $changeCount > 0) {
+        if ($discountCount > 0 || $changeCount > 0 || $ncCount > 0) {
             $parts = [];
             if ($discountCount > 0) {
                 $parts[] = '<span style="color:#92400E;"><strong>' . $discountCount . '</strong> venta'
@@ -590,6 +674,10 @@ class CashClosingReportBuilder
             if ($changeCount > 0) {
                 $parts[] = '<span style="color:#1E40AF;"><strong>' . $changeCount . '</strong> cambio'
                     . ($changeCount === 1 ? '' : 's') . ' de medio de pago</span>';
+            }
+            if ($ncCount > 0) {
+                $parts[] = '<span style="color:#9A3412;"><strong>' . $ncCount . '</strong> venta'
+                    . ($ncCount === 1 ? '' : 's') . ' con NC / devolución (' . htmlspecialchars($fmt($ncSum)) . ')</span>';
             }
             $summary = '<p style="margin:0 0 6px;font-size:11px;">' . implode(' &nbsp;·&nbsp; ', $parts) . '</p>';
         }

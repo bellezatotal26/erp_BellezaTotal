@@ -143,13 +143,70 @@ class SalesCreditNoteService
             [$saleId]
         )->fetchAll();
 
-        $sale['credited_total'] = (float)$this->query(
-            "SELECT COALESCE(SUM(total), 0) FROM sale_credit_notes
-             WHERE sale_id = ? AND status = 'posted'",
-            [$saleId]
-        )->fetchColumn();
+        $sale['credited_total'] = $this->postedCreditTotal($saleId);
 
         return $sale;
+    }
+
+    /** Suma de NC posted de una venta (0 si la tabla aún no existe). */
+    public function postedCreditTotal(int $saleId): float
+    {
+        if ($saleId <= 0) {
+            return 0.0;
+        }
+        try {
+            return round((float)$this->query(
+                "SELECT COALESCE(SUM(total), 0) FROM sale_credit_notes
+                 WHERE sale_id = ? AND status = 'posted'",
+                [$saleId]
+            )->fetchColumn(), 2);
+        } catch (\Throwable $e) {
+            return 0.0;
+        }
+    }
+
+    /**
+     * Saldos de venta considerando NC posted.
+     * balance = max(0, total − NC − pagos).
+     *
+     * @return array{credited:float,paid:float,net_total:float,balance:float,sale_total:float}
+     */
+    public function saleBalances(int $saleId): array
+    {
+        $sale = $this->query(
+            "SELECT s.id, s.total,
+                    COALESCE(p.paid_amount, 0) AS paid_amount
+             FROM sales s
+             LEFT JOIN (
+                SELECT sale_id, COALESCE(SUM(amount), 0) AS paid_amount
+                FROM sale_payments
+                GROUP BY sale_id
+             ) p ON p.sale_id = s.id
+             WHERE s.id = ?",
+            [$saleId]
+        )->fetch();
+        if (!$sale) {
+            return [
+                'credited' => 0.0,
+                'paid' => 0.0,
+                'net_total' => 0.0,
+                'balance' => 0.0,
+                'sale_total' => 0.0,
+            ];
+        }
+        $saleTotal = round((float)$sale['total'], 2);
+        $paid = round((float)$sale['paid_amount'], 2);
+        $credited = $this->postedCreditTotal($saleId);
+        $netTotal = max(0.0, round($saleTotal - $credited, 2));
+        $balance = max(0.0, round($netTotal - $paid, 2));
+
+        return [
+            'credited' => $credited,
+            'paid' => $paid,
+            'net_total' => $netTotal,
+            'balance' => $balance,
+            'sale_total' => $saleTotal,
+        ];
     }
 
     /**
@@ -445,6 +502,14 @@ class SalesCreditNoteService
                 }
             }
 
+            // H1: bloquear NC con reembolso en efectivo si no hay caja abierta (antes del commit).
+            $allocationPreview = $this->allocateRefund($creditNoteId);
+            if (round((float)($allocationPreview['cash'] ?? 0), 2) > 0.009) {
+                (new CashService($this->db))->assertOpenSessionForCash(
+                    'emitir una nota de crédito con reembolso en efectivo'
+                );
+            }
+
             $this->db->commit();
         } catch (\Throwable $e) {
             if ($this->db->inTransaction()) {
@@ -506,11 +571,14 @@ class SalesCreditNoteService
             ];
         }
         if ($forced === 'cash') {
+            // No egresar del cajón más efectivo del cobrado en la venta.
+            $toCash = min($ncTotal, $cashAvailable);
+            $toTransfer = max(0.0, round($ncTotal - $toCash, 2));
             return [
                 'receivable' => 0.0,
-                'cash' => $ncTotal,
-                'transfer' => 0.0,
-                'method' => 'cash',
+                'cash' => round($toCash, 2),
+                'transfer' => $toTransfer,
+                'method' => $toTransfer > 0.009 ? ($toCash > 0.009 ? 'mixed' : 'transfer') : 'cash',
             ];
         }
         if ($forced === 'transfer') {
@@ -571,31 +639,18 @@ class SalesCreditNoteService
     /** Reduce el saldo de CxC considerando NC emitidas. */
     public function syncReceivable(int $saleId): void
     {
-        $sale = $this->query(
-            "SELECT s.id, s.total, s.payment_status, s.status,
-                    COALESCE(p.paid_amount, 0) AS paid_amount
-             FROM sales s
-             LEFT JOIN (
-                SELECT sale_id, COALESCE(SUM(amount), 0) AS paid_amount
-                FROM sale_payments
-                GROUP BY sale_id
-             ) p ON p.sale_id = s.id
-             WHERE s.id = ?",
+        $status = (string)$this->query(
+            "SELECT COALESCE(status, '') FROM sales WHERE id = ?",
             [$saleId]
-        )->fetch();
-        if (!$sale || ($sale['status'] ?? '') === 'cancelled') {
+        )->fetchColumn();
+        if ($status === '' || $status === 'cancelled') {
             return;
         }
 
-        $credited = (float)$this->query(
-            "SELECT COALESCE(SUM(total), 0) FROM sale_credit_notes
-             WHERE sale_id = ? AND status = 'posted'",
-            [$saleId]
-        )->fetchColumn();
-
-        $netTotal = max(0, round((float)$sale['total'] - $credited, 2));
-        $paid = round((float)$sale['paid_amount'], 2);
-        $balance = max(0, round($netTotal - $paid, 2));
+        $bal = $this->saleBalances($saleId);
+        $netTotal = (float)$bal['net_total'];
+        $paid = (float)$bal['paid'];
+        $balance = (float)$bal['balance'];
 
         try {
             (new ReceivableService($this->db))->applyPayment($saleId, min($paid, $netTotal), $netTotal);

@@ -5,6 +5,7 @@ namespace SoftNova\Controllers;
 use SoftNova\Core\TenantController;
 use SoftNova\Core\TenantMiddleware;
 use SoftNova\Services\ConsignmentService;
+use SoftNova\Services\LoanTraceService;
 use SoftNova\Services\ProductLoan;
 use SoftNova\Services\StockService;
 
@@ -71,10 +72,36 @@ class TenantPrestamosController extends TenantController
             $this->createReturnProduct();
             return;
         }
+        if ($action === 'history' && $this->request->method() === 'GET') {
+            $history = (new LoanTraceService($this->db))->history((int)$this->request->get('id', 0));
+            $this->json($history
+                ? ['success' => true] + $history
+                : ['success' => false, 'message' => 'Préstamo no encontrado']);
+            return;
+        }
+
+        $tab = $this->request->get('tab') === 'traza' ? 'traza' : 'loans';
+        $filters = LoanTraceService::normalizeFilters($_GET, $tab === 'traza' ? 'all' : 'pending');
+        $trace = new LoanTraceService($this->db);
+        $loans = [];
+        $receivedLoans = [];
+        $loansTotal = 0;
+        $movements = ['rows' => [], 'total' => 0];
+        if ($tab === 'traza') {
+            $movements = $trace->movements($filters, 500);
+        } else {
+            $list = $trace->listLoans($filters, 400);
+            $loansTotal = $list['total'];
+            foreach ($list['rows'] as $row) {
+                if ((string)$row['source'] === ProductLoan::SOURCE_RECEIVED) {
+                    $receivedLoans[] = $row;
+                } else {
+                    $loans[] = $row;
+                }
+            }
+        }
 
         $alert = $this->stock->negativeStockAlertReport(60);
-        $loans = $this->stock->listOpenLoans(250);
-        $receivedLoans = $this->stock->listOpenReceivedLoans(250);
         $canCreate = TenantMiddleware::canDo('create', 'prestamos');
         $canEdit = TenantMiddleware::canDo('edit', 'prestamos');
 
@@ -115,6 +142,12 @@ class TenantPrestamosController extends TenantController
         $this->view('tenant.prestamos', $this->tenantViewData([
             'loans' => $loans,
             'receivedLoans' => $receivedLoans,
+            'loansTotal' => $loansTotal,
+            'movements' => $movements,
+            'tab' => $tab,
+            'filters' => $filters,
+            'filterOptions' => $trace->filterOptions(),
+            'loanSummary' => $trace->summary(),
             'stockAlert' => $alert,
             'products' => $products,
             'canCreate' => $canCreate,

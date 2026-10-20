@@ -3442,32 +3442,65 @@ a.stat-card-link:hover {
     overflow: hidden;
     width: 100%;
 }
-/* Revisión de factura → inventario: grande y centrado */
+/* Revisión de factura → inventario: pantalla completa para revisar muchas líneas */
 #invoiceReviewModal.modal-overlay {
-    align-items: center;
-    justify-content: center;
-    padding: 16px 12px;
+    align-items: stretch;
+    justify-content: stretch;
+    padding: 0;
+    overscroll-behavior: contain;
+    /* Por encima del banner sticky "MODO CAJA DE ARENA" (z-index 9999) */
+    z-index: 11000;
+}
+#invoiceUploadModal.modal-overlay {
+    overscroll-behavior: contain;
+    z-index: 11000;
 }
 #invoiceReviewModal .invoice-review-shell,
 .invoice-review-shell {
-    width: min(1560px, 96vw);
-    max-width: 96vw;
-    max-height: min(92vh, 980px);
-    height: auto;
-    margin: auto;
+    width: 100%;
+    max-width: 100%;
+    height: 100%;
+    max-height: 100%;
+    margin: 0;
+    border-radius: 0;
+    padding: 14px 18px 12px;
+    box-sizing: border-box;
+}
+#invoiceReviewModal .invoice-shell-modal {
+    max-height: 100%;
+    height: 100%;
+}
+#invoiceReviewModal .modal-header {
+    margin-bottom: 10px;
+    padding-bottom: 10px;
+    flex-shrink: 0;
+}
+#invoiceReviewModal .modal-header h3 {
+    font-size: 22px;
+}
+#invoiceReviewModal .modal-header button {
+    font-size: 42px;
+    width: 48px;
+    height: 48px;
+    line-height: 1;
+    border-radius: 10px;
 }
 #invoiceReviewModal .invoice-shell-body {
     display: flex;
     flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
 }
 #invoiceReviewModal .invoice-review-table-wrap {
     flex: 1 1 auto;
-    max-height: min(62vh, 580px);
-    min-height: 280px;
+    max-height: none;
+    min-height: 240px;
     overflow: auto;
     border: 1px solid var(--color-border, #e5e7eb);
     border-radius: 8px;
     -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    touch-action: pan-y;
 }
 #invoiceReviewModal .invoice-review-table {
     width: 100%;
@@ -3496,13 +3529,147 @@ a.stat-card-link:hover {
     .invoice-review-shell {
         width: 100%;
         max-width: 100%;
-        max-height: 92vh;
-        height: auto;
+        height: 100%;
+        max-height: 100%;
+        padding: 10px 10px 8px;
     }
     #invoiceReviewModal .invoice-review-table-wrap {
-        max-height: 50vh;
-        min-height: 200px;
+        max-height: none;
+        min-height: 180px;
     }
+    #invoiceReviewModal .modal-header button {
+        font-size: 38px;
+        width: 44px;
+        height: 44px;
+    }
+}
+
+/* Revisión de factura: datos plegables, leyenda compacta y tabla densa */
+#invoiceReviewModal .inv-review-meta {
+    border: 1px solid var(--color-border, #e5e7eb);
+    border-radius: 8px;
+    padding: 0 12px;
+    margin: 0 0 12px;
+}
+#invoiceReviewModal .inv-review-meta > summary {
+    cursor: pointer;
+    padding: 9px 0;
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    flex-wrap: wrap;
+    list-style: none;
+}
+#invoiceReviewModal .inv-review-meta > summary::-webkit-details-marker { display: none; }
+#invoiceReviewModal .inv-review-meta > summary::before {
+    content: '▸';
+    font-size: 12px;
+    color: var(--color-text-secondary);
+    transition: transform .15s;
+}
+#invoiceReviewModal .inv-review-meta[open] > summary::before { transform: rotate(90deg); }
+#invoiceReviewModal .inv-review-meta__title { font-weight: 600; font-size: 14px; }
+#invoiceReviewModal .inv-review-meta__hint { font-size: 12px; color: var(--color-text-secondary); }
+#invoiceReviewModal .inv-review-meta[open] > summary { border-bottom: 1px solid var(--color-border, #e5e7eb); margin-bottom: 12px; }
+#invoiceReviewModal .inv-review-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px 14px;
+    flex-wrap: wrap;
+    margin: 0 0 8px;
+}
+#invoiceReviewModal .inv-review-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    font-size: 11.5px;
+    color: var(--color-text-secondary);
+}
+#invoiceReviewModal .inv-review-legend span { display: inline-flex; align-items: center; gap: 5px; }
+#invoiceReviewModal .inv-review-legend i {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    border: 1px solid;
+    display: inline-block;
+}
+.inv-prod-picker {
+    position: fixed;
+    z-index: 20000;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-card, #fff);
+    color: var(--color-text-primary, #0f172a);
+    border: 1px solid var(--color-border, #cbd5e1);
+    border-radius: 10px;
+    box-shadow: 0 12px 32px rgba(15, 23, 42, .25);
+    padding: 8px;
+    min-height: 160px;
+}
+.inv-prod-picker__q { height: 36px; font-size: 14px; flex: 0 0 auto; }
+.inv-prod-picker__hint { font-size: 11px; color: var(--color-text-secondary, #64748b); margin: 5px 2px; flex: 0 0 auto; }
+.inv-prod-picker__list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1 1 auto; }
+.inv-prod-picker__list li {
+    padding: 6px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    line-height: 1.25;
+}
+.inv-prod-picker__list li:hover,
+.inv-prod-picker__list li.is-active { background: rgba(59, 130, 246, .14); }
+.inv-prod-picker__list li.is-selected { box-shadow: inset 3px 0 0 #1e3a8a; font-weight: 600; }
+.inv-prod-picker__name { font-size: 13px; }
+.inv-prod-picker__meta { font-size: 11px; color: var(--color-text-secondary, #64748b); font-family: ui-monospace, Consolas, monospace; }
+.inv-prod-picker__clear { font-size: 12px; color: var(--color-text-secondary, #64748b); font-style: italic; }
+
+#invoiceReviewModal .invoice-review-table td { padding: 4px 6px; vertical-align: middle; }
+#invoiceReviewModal .invoice-review-table thead th { padding: 7px 6px; font-size: 12px !important; }
+#invoiceReviewModal .invoice-review-table .form-control {
+    min-width: 0 !important;
+    height: 32px;
+    min-height: 0;
+    padding: 4px 7px;
+    font-size: 13px;
+    border-radius: 6px;
+}
+#invoiceReviewModal .invoice-review-table select.form-control { padding-right: 22px; }
+#invoiceReviewModal .invoice-review-table select[name$="[row_action]"] { width: 128px; }
+#invoiceReviewModal .invoice-review-table input[name$="[description]"] { width: 190px; }
+#invoiceReviewModal .invoice-review-table input[name$="[supplier_sku]"],
+#invoiceReviewModal .invoice-review-table input[name$="[barcode]"] { width: 130px !important; }
+#invoiceReviewModal .invoice-review-table select[name$="[matched_product_id]"] { width: 210px; }
+#invoiceReviewModal .invoice-review-table input[name$="[quantity]"] { width: 64px; }
+#invoiceReviewModal .invoice-review-table input[name$="[unit_cost]"],
+#invoiceReviewModal .invoice-review-table input[name$="[inventory_cost]"],
+#invoiceReviewModal .invoice-review-table input[name$="[sale_price]"] { width: 100px; }
+#invoiceReviewModal .invoice-review-table input[name$="[inventory_cost]"] { border-style: dashed; }
+#invoiceReviewModal .invoice-review-table input[name$="[inventory_cost]"]:not(:placeholder-shown) { border-style: solid; border-color: #7C3AED; }
+#invoiceReviewModal .invoice-review-table input[name$="[inventory_cost]"]:disabled { opacity: .45; }
+#invoiceReviewModal .invoice-review-table .inv-invcost-hint { max-width: 140px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#invoiceReviewModal .invoice-review-table input[name$="[tax_rate]"] { width: 60px; }
+#invoiceReviewModal .invoice-review-table input[name$="[discount_pct]"] { width: 56px; }
+#invoiceReviewModal .invoice-review-table input[name$="[lot_code]"] { width: 84px; }
+#invoiceReviewModal .invoice-review-table input[name$="[expiry_date]"] { width: 132px; }
+#invoiceReviewModal .invoice-review-table td > div { font-size: 10.5px !important; line-height: 1.25; margin-top: 2px; }
+#invoiceReviewModal .invoice-review-table td .btn-sm { padding: 3px 8px !important; font-size: 11px !important; }
+
+/* Pantallas bajas: mantiene pantalla completa; compacta cabecera/pie */
+@media (max-height: 800px) {
+    #invoiceReviewModal .invoice-review-shell,
+    .invoice-review-shell { padding: 10px 12px 8px; }
+    #invoiceReviewModal .invoice-shell-modal .modal-header,
+    #invoiceReviewModal .modal-header { margin-bottom: 6px; padding-bottom: 6px; }
+    #invoiceReviewModal .modal-header h3 { font-size: 18px; }
+    #invoiceReviewModal .invoice-shell-footer { margin-top: 8px; padding-top: 8px; }
+    #invoiceReviewBody > .card { padding: 8px 10px !important; margin-bottom: 10px !important; }
+    #invoiceReviewBody > p { margin-bottom: 6px !important; font-size: 12px !important; }
+}
+@media (max-width: 700px) {
+    #invoiceReviewModal .invoice-shell-footer { flex-wrap: wrap; }
+    #invoiceReviewModal .invoice-shell-footer .btn { flex: 1 1 auto; }
 }
 .invoice-shell-modal .modal-header {
     flex-shrink: 0;
@@ -3524,6 +3691,8 @@ a.stat-card-link:hover {
     padding-right: 4px;
     padding-bottom: 8px;
     -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    touch-action: pan-y;
 }
 .invoice-shell-footer {
     flex-shrink: 0;
@@ -5454,4 +5623,44 @@ body.dark-mode hr {
 body.dark-mode .card,
 body.dark-mode .stat-card {
     border-color: #334155;
+}
+
+/* Contabilidad › Comisiones: datáfono con subsecciones débito/crédito */
+.gateway-dataphone-box {
+    border: 1px solid var(--color-border, #E2E8F0);
+    border-left: 4px solid var(--color-primary, #0D7C4A);
+    border-radius: 10px;
+    padding: 12px 14px;
+    background: var(--bg-card, #fff);
+}
+.gateway-dataphone-box__head {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-bottom: 8px;
+}
+.gateway-dataphone-box__head small,
+.gateway-dataphone-box__example {
+    color: var(--color-text-secondary, #64748B);
+    font-size: 12px;
+}
+.gateway-dataphone-box__subs {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px;
+    margin: 4px 0 8px 18px;
+}
+.gateway-dataphone-box__sub {
+    border: 1px dashed var(--color-border, #CBD5E1);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+.gateway-dataphone-box__sub-title {
+    display: block;
+    font-weight: 600;
+    font-size: 13px;
+    margin-bottom: 4px;
+}
+.gateway-dataphone-box__example {
+    display: block;
 }

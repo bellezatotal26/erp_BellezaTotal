@@ -1,6 +1,6 @@
 <?php
 /**
- * Encabezado ordenable.
+ * Encabezado ordenable (A→Z / menor→mayor y Z→A / mayor→menor).
  * Vars: $label, $column, $filters (sort/dir/query), $baseUrl
  */
 $label = $label ?? '';
@@ -14,12 +14,18 @@ $query = $filters['query'] ?? [];
 $query['sort'] = $column;
 $query['dir'] = $nextDir;
 unset($query['page']);
-$href = $baseUrl . '?' . http_build_query($query);
-$arrow = '';
+$href = $baseUrl . (str_contains($baseUrl, '?') ? '&' : '?') . http_build_query($query);
+$tip = 'Clic: A→Z / menor→mayor · otro clic: Z→A / mayor→menor';
+$arrowHtml = '<span class="sortable-th__arrow" style="opacity:.35;" aria-hidden="true"> ↕</span>';
 if ($currentSort === $column) {
-    $arrow = $currentDir === 'asc' ? ' ↑' : ' ↓';
+    $arrowHtml = '<span class="sortable-th__arrow" aria-hidden="true">'
+        . ($currentDir === 'asc' ? ' ↑' : ' ↓')
+        . '</span>';
+    $tip = $currentDir === 'asc'
+        ? 'Orden actual: A→Z / menor→mayor. Clic para invertir.'
+        : 'Orden actual: Z→A / mayor→menor. Clic para invertir.';
 }
 ?>
-<a href="<?php echo htmlspecialchars($href); ?>" style="color:inherit;text-decoration:none;white-space:nowrap;" title="Ordenar por <?php echo htmlspecialchars($label); ?>">
-    <?php echo htmlspecialchars($label); ?><?php echo $arrow; ?>
+<a href="<?php echo htmlspecialchars($href); ?>" class="sortable-th" style="color:inherit;text-decoration:none;white-space:nowrap;" title="<?php echo htmlspecialchars($tip); ?>">
+    <?php echo htmlspecialchars($label); ?><?php echo $arrowHtml; ?>
 </a>

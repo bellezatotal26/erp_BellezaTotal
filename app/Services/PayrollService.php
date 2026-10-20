@@ -50,6 +50,8 @@ class PayrollService
             'payroll_commission_account' => '510518',
             'vacation_expense_account' => '510539',
             'vacation_payable_account' => '261015',
+            'cesantias_interest_payable_account' => '261010',
+            'payroll_cash_account' => '110510',
         ];
 
         $keys = array_keys($defaults);
@@ -95,6 +97,7 @@ class PayrollService
         'cesantias_interest_rate' => '12',
         'prima_rate' => '8.33',
         'vacation_rate' => '4.17',
+        'prestaciones_include_transport' => '1',
         'payroll_monthly_hours' => '210',
         'max_weekly_hours' => '42',
         'max_daily_hours' => '8',
@@ -106,6 +109,26 @@ class PayrollService
         'dominical_rate' => '90',
         'overtime_dom_day_rate' => '115',
         'overtime_dom_night_rate' => '165',
+    ];
+
+    /** Tipos de pago de pasivos laborales. */
+    public const LIABILITY_KINDS = [
+        'pila' => 'seguridad social y parafiscales (PILA)',
+        'benefits' => 'prestaciones sociales',
+    ];
+
+    /** Conceptos pagables: cuenta de pasivo (setting + defecto) y grupo de pago. */
+    public const LIABILITY_CONCEPTS = [
+        'health' => ['label' => 'Salud (EPS)', 'setting' => 'health_payable_account', 'default' => '237005', 'kind' => 'pila'],
+        'pension' => ['label' => 'Pensión', 'setting' => 'pension_payable_account', 'default' => '238030', 'kind' => 'pila'],
+        'arl' => ['label' => 'ARL', 'setting' => 'arl_payable_account', 'default' => '237010', 'kind' => 'pila'],
+        'caja' => ['label' => 'Caja de compensación', 'setting' => 'caja_payable_account', 'default' => '237006', 'kind' => 'pila'],
+        'sena' => ['label' => 'SENA', 'setting' => 'sena_payable_account', 'default' => '237008', 'kind' => 'pila'],
+        'icbf' => ['label' => 'ICBF', 'setting' => 'icbf_payable_account', 'default' => '237007', 'kind' => 'pila'],
+        'cesantias' => ['label' => 'Cesantías (consignación al fondo)', 'setting' => 'cesantias_payable_account', 'default' => '261005', 'kind' => 'benefits'],
+        'cesantias_interest' => ['label' => 'Intereses sobre cesantías', 'setting' => 'cesantias_interest_payable_account', 'default' => '261010', 'kind' => 'benefits'],
+        'vacation' => ['label' => 'Vacaciones pagadas', 'setting' => 'vacation_payable_account', 'default' => '261015', 'kind' => 'benefits'],
+        'salaries' => ['label' => 'Salarios por pagar (neto pendiente)', 'setting' => 'payroll_payable_account', 'default' => '250505', 'kind' => 'benefits'],
     ];
 
     /** Rango permitido por parámetro editable: [mín, máx]. */
@@ -125,6 +148,7 @@ class PayrollService
         'cesantias_interest_rate' => [0, 100],
         'prima_rate' => [0, 100],
         'vacation_rate' => [0, 100],
+        'prestaciones_include_transport' => [0, 1],
         'payroll_monthly_hours' => [1, 400],
         'max_weekly_hours' => [1, 80],
         'max_daily_hours' => [1, 24],
@@ -171,6 +195,7 @@ class PayrollService
             'night_start_hour' => 'Inicio nocturno', 'night_end_hour' => 'Fin nocturno',
             'cesantias_rate' => 'Cesantías', 'cesantias_interest_rate' => 'Intereses sobre cesantías',
             'prima_rate' => 'Prima de servicios', 'vacation_rate' => 'Vacaciones',
+            'prestaciones_include_transport' => 'Auxilio en base de prestaciones',
         ];
         $clean = [];
         foreach (self::PARAM_RANGES as $key => [$min, $max]) {
@@ -298,6 +323,8 @@ class PayrollService
             ['510518', 'Comisiones', 'expense', 'debit'],
             ['510539', 'Vacaciones', 'expense', 'debit'],
             ['261015', 'Vacaciones consolidadas', 'liability', 'credit'],
+            ['261010', 'Intereses sobre cesantías por pagar', 'liability', 'credit'],
+            ['110510', 'Caja menor (pagos de nómina en efectivo)', 'asset', 'debit'],
         ];
         $codes = array_column($accounts, 0);
         $existing = $this->query(
@@ -836,22 +863,29 @@ class PayrollService
             $incapPay = round(($daily * $fullDays) + ($daily * $partialDays * $rate / 100), 2);
         }
 
+        $transportEligible = !empty($employee['has_transport_aid']) && $salary <= ($p['smmlv'] * 2);
         $transport = 0.0;
-        if (!empty($employee['has_transport_aid']) && $salary <= ($p['smmlv'] * 2) && $workedDays > 0) {
+        if ($transportEligible && $workedDays > 0) {
             $transport = round(((float)$p['transport_aid'] / 30) * $workedDays, 2);
+        }
+
+        // Prima y cesantías incluyen el auxilio de transporte mensual (Ley 1 de 1963, art. 7); vacaciones no.
+        $prestBase = $salary;
+        if ($transportEligible && !empty($p['prestaciones_include_transport'])) {
+            $prestBase += (float)$p['transport_aid'];
         }
 
         $prima = 0.0;
         if (!empty($options['include_prima'])) {
             // Prima de servicios del semestre: % mensual de Provisiones × 6 meses (8,33 % → medio salario).
-            $prima = round($salary * self::provisionFraction((float)$p['prima_rate']) * 6, 2);
+            $prima = round($prestBase * self::provisionFraction((float)$p['prima_rate']) * 6, 2);
         }
 
         $cesantias = 0.0;
         $cesInterest = 0.0;
         if (!empty($options['include_cesantias'])) {
-            // Provisión mensual: salario × % cesantías; intereses = % anual sobre la provisión ÷ 12.
-            $cesantias = round($salary * self::provisionFraction((float)$p['cesantias_rate']), 2);
+            // Provisión mensual: base × % cesantías; intereses = % anual sobre la provisión ÷ 12.
+            $cesantias = round($prestBase * self::provisionFraction((float)$p['cesantias_rate']), 2);
             $cesInterest = round($cesantias * (float)$p['cesantias_interest_rate'] / 100 / 12, 2);
         }
 
@@ -1343,26 +1377,39 @@ class PayrollService
             throw new \RuntimeException('Neto a pagar inválido');
         }
 
+        // Antes de la TX: ExpenseCategoryService ejecuta DDL (COMMIT implícito en MySQL).
+        $categoryId = (new ExpenseCategoryService($this->db))->systemCategoryId(ExpenseCategoryService::PAYROLL_CODE);
+        $accounting = new AccountingService($this->db);
+        $totals = $accounting->payrollRunTotals($runId);
+        $companyCost = $totals['company_cost'] > 0 ? $totals['company_cost'] : $net;
+        $accrualDate = AccountingService::payrollAccrualDate($run);
+
         $this->db->beginTransaction();
         try {
-            $accounting = new AccountingService($this->db);
             $entryId = $accounting->postPayrollRun($runId, true);
 
             $this->query(
                 "INSERT INTO expenses
-                    (description, amount, category, expense_date, payment_method, notes, user_id)
-                 VALUES (?,?,?,?,?,?,?)",
+                    (description, amount, category, category_id, expense_date, payment_method, notes, user_id)
+                 VALUES (?,?,?,?,?,?,?,?)",
                 [
-                    'Nómina ' . $run['period_label'],
-                    $net,
-                    'payroll',
-                    $run['pay_date'],
+                    'Nómina ' . $run['period_label'] . ' (costo total empresa)',
+                    $companyCost,
+                    ExpenseCategoryService::PAYROLL_CODE,
+                    $categoryId > 0 ? $categoryId : null,
+                    $accrualDate,
                     $run['payment_method'] ?: 'transfer',
                     'Liquidación ' . $run['run_number'] . ' · asiento contable #' . $entryId
-                        . ' · bruto ' . $run['gross_total']
-                        . ' · aportes emp. ' . $run['employer_total']
-                        . ' · parafiscales ' . ($run['parafiscal_total'] ?? 0)
-                        . ' · no descuenta cajón POS',
+                        . ' · neto pagado ' . number_format($net, 2, '.', '')
+                        . ' · devengado ' . $run['gross_total']
+                        . ' · aportes emp. ' . number_format($totals['employer_cost'], 2, '.', '')
+                        . ' · provisiones ' . number_format(
+                            $totals['cesantias'] + $totals['cesantias_interest'] + $totals['vacation'],
+                            2,
+                            '.',
+                            ''
+                        )
+                        . ' · gestionar desde Nómina · no descuenta cajón POS',
                     $run['user_id'] ?? ($_SESSION['tenant_user_id'] ?? null),
                 ]
             );
@@ -1381,6 +1428,8 @@ class PayrollService
                 'accounting_entry_id' => $entryId,
                 'run_number' => (string)$run['run_number'],
                 'net_total' => $net,
+                'company_cost' => $companyCost,
+                'accrual_date' => $accrualDate,
             ];
         } catch (\Throwable $e) {
             if ($this->db->inTransaction()) {
@@ -1397,8 +1446,260 @@ class PayrollService
             throw new \RuntimeException('Liquidación no encontrada');
         }
         if (($run['status'] ?? '') === 'paid') {
-            throw new \RuntimeException('No se puede cancelar una nómina ya pagada.');
+            throw new \RuntimeException('No se puede cancelar una nómina ya pagada. Use «Anular pago» primero.');
         }
         $this->query("UPDATE payroll_runs SET status='cancelled' WHERE id=?", [$runId]);
+    }
+
+    /**
+     * Anula una nómina pagada: revierte sus asientos, anula el gasto vinculado y la deja en borrador
+     * para corregirla y volver a pagarla (o cancelarla).
+     *
+     * @return array{run_number:string,reversals:list<int>,expense_id:int}
+     */
+    public function cancelPaidRun(int $runId, string $reason): array
+    {
+        $reason = trim($reason);
+        if (strlen($reason) < 5) {
+            throw new \InvalidArgumentException('Indique el motivo de la anulación (mínimo 5 caracteres)');
+        }
+        $accounting = new AccountingService($this->db);
+
+        $this->db->beginTransaction();
+        try {
+            $run = $this->query('SELECT * FROM payroll_runs WHERE id=? FOR UPDATE', [$runId])->fetch();
+            if (!$run) {
+                throw new \RuntimeException('Liquidación no encontrada');
+            }
+            if (!in_array(($run['status'] ?? ''), ['paid', 'posted'], true)) {
+                throw new \RuntimeException('Solo se puede anular el pago de una nómina pagada');
+            }
+
+            $reversals = $accounting->reversePayrollRun($runId, 'Nómina anulada: ' . $reason);
+
+            $expenseId = (int)($run['expense_id'] ?? 0);
+            if ($expenseId > 0) {
+                try {
+                    $this->query(
+                        "UPDATE expenses SET status = 'cancelled', cancelled_at = NOW()
+                         WHERE id = ? AND COALESCE(status, 'active') <> 'cancelled'",
+                        [$expenseId]
+                    );
+                } catch (\Throwable $e) {
+                    $this->query(
+                        "UPDATE expenses
+                         SET notes = CONCAT(IFNULL(notes,''), IF(notes IS NULL OR notes='', '', ' | '), '[ANULADO ', ?, ']')
+                         WHERE id = ?",
+                        [date('Y-m-d H:i'), $expenseId]
+                    );
+                }
+            }
+
+            $note = '[Pago anulado ' . date('d/m/Y H:i') . ': ' . mb_substr($reason, 0, 200) . ']';
+            $this->query(
+                "UPDATE payroll_runs
+                 SET status = 'draft', expense_id = NULL,
+                     notes = CONCAT(IFNULL(notes,''), IF(notes IS NULL OR notes='', '', ' '), ?)
+                 WHERE id = ?",
+                [$note, $runId]
+            );
+            $this->db->commit();
+
+            return [
+                'run_number' => (string)$run['run_number'],
+                'reversals' => $reversals,
+                'expense_id' => $expenseId,
+            ];
+        } catch (\Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
+    }
+
+    /** Cuenta contable de un concepto de pasivo laboral según parámetros. */
+    public function liabilityAccount(string $concept): string
+    {
+        $def = self::LIABILITY_CONCEPTS[$concept] ?? null;
+        if (!$def) {
+            throw new \InvalidArgumentException('Concepto de pago inválido');
+        }
+        $params = $this->params();
+        $code = trim((string)($params[$def['setting']] ?? ''));
+        return $code !== '' ? $code : $def['default'];
+    }
+
+    /**
+     * Saldos pendientes por concepto (libro contable) + lo causado en nómina y lo pagado aquí.
+     *
+     * @return list<array{concept:string,label:string,kind:string,account:string,balance:float}>
+     */
+    public function liabilitySummary(): array
+    {
+        $accounts = [];
+        foreach (array_keys(self::LIABILITY_CONCEPTS) as $concept) {
+            $accounts[$concept] = $this->liabilityAccount($concept);
+        }
+        $balances = (new AccountingService($this->db))->liabilityBalances(array_values($accounts));
+        $out = [];
+        foreach (self::LIABILITY_CONCEPTS as $concept => $def) {
+            $code = $accounts[$concept];
+            $out[] = [
+                'concept' => $concept,
+                'label' => $def['label'],
+                'kind' => $def['kind'],
+                'account' => $code,
+                'balance' => (float)($balances[$code] ?? 0),
+            ];
+        }
+        return $out;
+    }
+
+    /** @return list<array<string,mixed>> */
+    public function liabilityPayments(int $limit = 50): array
+    {
+        $rows = $this->query(
+            'SELECT p.*, ae.entry_number
+             FROM payroll_liability_payments p
+             LEFT JOIN accounting_entries ae ON ae.id = p.entry_id
+             ORDER BY p.payment_date DESC, p.id DESC
+             LIMIT ' . max(1, min(500, $limit))
+        )->fetchAll();
+        if (!$rows) {
+            return [];
+        }
+        $ids = array_map(static fn ($r) => (int)$r['id'], $rows);
+        $lines = $this->query(
+            'SELECT payment_id, concept, account_code, amount FROM payroll_liability_payment_lines
+             WHERE payment_id IN (' . implode(',', array_fill(0, count($ids), '?')) . ') ORDER BY id',
+            $ids
+        )->fetchAll();
+        $byPayment = [];
+        foreach ($lines as $l) {
+            $byPayment[(int)$l['payment_id']][] = $l;
+        }
+        foreach ($rows as &$r) {
+            $r['lines'] = $byPayment[(int)$r['id']] ?? [];
+        }
+        unset($r);
+        return $rows;
+    }
+
+    /**
+     * Registra un pago de pasivos laborales y su asiento (pasivo contra banco/caja de nómina).
+     *
+     * @param array{payment_date?:string,kind?:string,payment_method?:string,reference?:string,notes?:string,amounts?:array} $data
+     * @return array{id:int,entry_id:int,total:float}
+     */
+    public function createLiabilityPayment(array $data, ?int $userId = null): array
+    {
+        $date = trim((string)($data['payment_date'] ?? ''));
+        $dt = \DateTimeImmutable::createFromFormat('Y-m-d', $date);
+        if (!$dt || $dt->format('Y-m-d') !== $date) {
+            throw new \InvalidArgumentException('Fecha de pago inválida');
+        }
+        if ($date > date('Y-m-d')) {
+            throw new \InvalidArgumentException('La fecha de pago no puede ser futura');
+        }
+        $kind = (string)($data['kind'] ?? 'pila');
+        if (!isset(self::LIABILITY_KINDS[$kind])) {
+            throw new \InvalidArgumentException('Tipo de pago inválido');
+        }
+        $method = PaymentMethodCatalog::normalize((string)($data['payment_method'] ?? 'transfer'));
+        $reference = mb_substr(trim((string)($data['reference'] ?? '')), 0, 120);
+        $notes = mb_substr(trim((string)($data['notes'] ?? '')), 0, 255);
+
+        $amounts = is_array($data['amounts'] ?? null) ? $data['amounts'] : [];
+        $lines = [];
+        $total = 0.0;
+        foreach (self::LIABILITY_CONCEPTS as $concept => $def) {
+            if ($def['kind'] !== $kind || !array_key_exists($concept, $amounts) || is_array($amounts[$concept])) {
+                continue;
+            }
+            $raw = trim((string)$amounts[$concept]);
+            if ($raw === '') {
+                continue;
+            }
+            $amount = round(\SoftNova\Core\parse_money($raw), 2);
+            if ($amount < 0 || $amount > 10000000000) {
+                throw new \InvalidArgumentException($def['label'] . ': valor inválido');
+            }
+            if ($amount <= 0) {
+                continue;
+            }
+            $lines[] = [$concept, $this->liabilityAccount($concept), $amount];
+            $total += $amount;
+        }
+        $total = round($total, 2);
+        if (!$lines || $total <= 0) {
+            throw new \InvalidArgumentException('Digite al menos un valor a pagar');
+        }
+
+        $accounting = new AccountingService($this->db);
+        $accounting->assertPeriodOpen($date);
+
+        $this->db->beginTransaction();
+        try {
+            $this->query(
+                "INSERT INTO payroll_liability_payments
+                    (payment_date, kind, payment_method, total, reference, notes, status, user_id)
+                 VALUES (?,?,?,?,?,?,'active',?)",
+                [$date, $kind, $method, $total, $reference ?: null, $notes ?: null, $userId]
+            );
+            $paymentId = (int)$this->db->lastInsertId();
+            $ins = $this->db->prepare(
+                'INSERT INTO payroll_liability_payment_lines (payment_id, concept, account_code, amount) VALUES (?,?,?,?)'
+            );
+            foreach ($lines as [$concept, $code, $amount]) {
+                $ins->execute([$paymentId, $concept, $code, $amount]);
+            }
+            $entryId = $accounting->postPayrollLiabilityPayment($paymentId);
+            $this->query('UPDATE payroll_liability_payments SET entry_id=? WHERE id=?', [$entryId, $paymentId]);
+            $this->db->commit();
+            return ['id' => $paymentId, 'entry_id' => $entryId, 'total' => $total];
+        } catch (\Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
+    }
+
+    /** Anula un pago de pasivos: reversa contable y queda en historial. */
+    public function cancelLiabilityPayment(int $paymentId, string $reason): array
+    {
+        $reason = trim($reason);
+        if (strlen($reason) < 5) {
+            throw new \InvalidArgumentException('Indique el motivo de la anulación (mínimo 5 caracteres)');
+        }
+        $accounting = new AccountingService($this->db);
+        $this->db->beginTransaction();
+        try {
+            $payment = $this->query(
+                'SELECT * FROM payroll_liability_payments WHERE id=? FOR UPDATE',
+                [$paymentId]
+            )->fetch();
+            if (!$payment) {
+                throw new \RuntimeException('Pago no encontrado');
+            }
+            if (($payment['status'] ?? '') === 'cancelled') {
+                throw new \RuntimeException('Este pago ya está anulado');
+            }
+            $reversalId = $accounting->reverseSource('payroll_payment', $paymentId, 'Pago de nómina anulado: ' . $reason);
+            $this->query(
+                "UPDATE payroll_liability_payments
+                 SET status='cancelled', cancel_reason=?, cancelled_at=NOW()
+                 WHERE id=?",
+                [mb_substr($reason, 0, 255), $paymentId]
+            );
+            $this->db->commit();
+            return ['total' => (float)$payment['total'], 'reversal_id' => (int)$reversalId];
+        } catch (\Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
     }
 }
