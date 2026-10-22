@@ -279,6 +279,17 @@ class BankingService
                 . " ORDER BY FIELD(b.kind, 'bank', 'wallet', 'gateway'), b.id"
         )->fetchAll();
         $mapped = $this->collectionMap();
+        $pending = [];
+        try {
+            foreach ($this->query(
+                "SELECT bank_account_id, COUNT(*) cnt, COALESCE(SUM(amount), 0) total
+                 FROM bank_statement_lines WHERE status = 'pending' GROUP BY bank_account_id"
+            )->fetchAll() as $p) {
+                $pending[(int)$p['bank_account_id']] = $p;
+            }
+        } catch (\Throwable $e) {
+            $pending = [];
+        }
         foreach ($rows as &$r) {
             $r['balance'] = $this->bookBalance((string)$r['account_code']);
             $r['kind_label'] = self::KINDS[$r['kind']] ?? $r['kind'];
@@ -287,6 +298,8 @@ class BankingService
                 'SELECT MAX(period_to) FROM bank_statements WHERE bank_account_id = ?',
                 [(int)$r['id']]
             )->fetchColumn() ?: null;
+            $r['pending_count'] = (int)($pending[(int)$r['id']]['cnt'] ?? 0);
+            $r['pending_sum'] = round((float)($pending[(int)$r['id']]['total'] ?? 0), 2);
         }
         unset($r);
         return $rows;
@@ -591,6 +604,35 @@ class BankingService
             $opening = round($closing - array_sum(array_column($rows, 'amount')), 2);
         }
 
+        // Continuidad con el extracto anterior: huecos, solapes o salto de saldo.
+        $continuity = '';
+        try {
+            $prev = $this->query(
+                'SELECT period_from, period_to, closing_balance FROM bank_statements
+                 WHERE bank_account_id = ? ORDER BY period_to DESC, id DESC LIMIT 1',
+                [$bankAccountId]
+            )->fetch();
+        } catch (\Throwable $e) {
+            $prev = null;
+        }
+        if ($prev) {
+            $money = static fn (float $v) => number_format($v, 2, ',', '.');
+            if ($opening !== null && $prev['closing_balance'] !== null
+                && abs($opening - (float)$prev['closing_balance']) > 0.01
+            ) {
+                $continuity = 'El saldo inicial de este extracto (' . $money($opening)
+                    . ') no coincide con el cierre del extracto anterior (' . $money((float)$prev['closing_balance'])
+                    . '): pueden faltar movimientos entre periodos.';
+            } elseif ($from > date('Y-m-d', strtotime((string)$prev['period_to'] . ' +1 day'))) {
+                $continuity = 'Hay un hueco de fechas: el extracto anterior llega hasta '
+                    . date('d/m/Y', strtotime((string)$prev['period_to'])) . ' y este empieza el '
+                    . date('d/m/Y', strtotime($from)) . '.';
+            } elseif ($from <= (string)$prev['period_to'] && $to >= (string)$prev['period_from']) {
+                $continuity = 'El periodo se solapa con el extracto anterior (' . date('d/m/Y', strtotime((string)$prev['period_from']))
+                    . ' – ' . date('d/m/Y', strtotime((string)$prev['period_to'])) . '); los movimientos repetidos se omiten.';
+            }
+        }
+
         $this->db->beginTransaction();
         try {
             $this->query(
@@ -650,6 +692,7 @@ class BankingService
             'skipped' => $skipped,
             'matched' => $matched,
             'columns' => $labels,
+            'continuity' => $continuity,
         ];
     }
 
@@ -851,14 +894,14 @@ class BankingService
         }
         $this->releaseStaleMatches((int)$account['id']);
         $lines = $this->query(
-            "SELECT id, line_date, amount FROM bank_statement_lines
+            "SELECT id, line_date, amount, reference FROM bank_statement_lines
              WHERE statement_id = ? AND status = 'pending' ORDER BY line_date, id",
             [$statementId]
         )->fetchAll();
         $used = [];
         $matched = 0;
         foreach ($lines as $line) {
-            $cands = $this->bookCandidates($account, (string)$line['line_date'], (float)$line['amount'], self::MATCH_WINDOW_DAYS, 10);
+            $cands = $this->bookCandidates($account, (string)$line['line_date'], (float)$line['amount'], self::MATCH_WINDOW_DAYS, 10, (string)($line['reference'] ?? ''));
             foreach ($cands as $c) {
                 if (isset($used[(int)$c['line_id']])) {
                     continue;
@@ -878,17 +921,29 @@ class BankingService
 
     /**
      * Líneas del libro de la cuenta aún sin cruzar con el mismo valor (débito = entrada al banco).
+     * Si el extracto trae referencia, los asientos que la mencionan (número, descripción o
+     * tercero) van primero: evita falsos cruces cuando hay varios valores iguales.
      *
      * @return list<array<string,mixed>>
      */
-    public function bookCandidates(array $account, string $date, float $amount, int $windowDays, int $limit = 8): array
+    public function bookCandidates(array $account, string $date, float $amount, int $windowDays, int $limit = 8, string $reference = ''): array
     {
         $field = $amount > 0 ? 'l.debit' : 'l.credit';
         $other = $amount > 0 ? 'l.credit' : 'l.debit';
+        $reference = trim($reference);
+        $refSql = '0 AS ref_match';
+        $refOrder = '';
+        $refParams = [];
+        if (strlen($reference) >= 4) {
+            $like = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $reference) . '%';
+            $refSql = "(CASE WHEN e.entry_number = ? OR e.description LIKE ? OR l.description LIKE ? OR l.third_party_name LIKE ? THEN 1 ELSE 0 END) AS ref_match";
+            $refOrder = 'ref_match DESC, ';
+            $refParams = [$reference, $like, $like, $like];
+        }
         return $this->query(
             "SELECT l.id line_id, e.id entry_id, e.entry_number, e.entry_date, e.description entry_description,
                     e.source_type, l.description, l.third_party_name, ({$field}) amount,
-                    ABS(DATEDIFF(e.entry_date, ?)) days_off
+                    ABS(DATEDIFF(e.entry_date, ?)) days_off, {$refSql}
              FROM accounting_lines l
              JOIN accounting_accounts a ON a.id = l.account_id
              JOIN accounting_entries e ON e.id = l.entry_id
@@ -900,9 +955,9 @@ class BankingService
                                WHERE bl.accounting_line_id = l.id AND bl.status = 'matched')
                AND NOT EXISTS (SELECT 1 FROM bank_postings bp
                                WHERE bp.entry_id = e.id AND bp.bank_account_id = ?)
-             ORDER BY days_off, e.entry_date, l.id
+             ORDER BY {$refOrder}days_off, e.entry_date, l.id
              LIMIT " . max(1, min(50, $limit)),
-            [$date, (string)$account['account_code'], abs($amount), $date, $date, (int)$account['id']]
+            array_merge([$date], $refParams, [(string)$account['account_code'], abs($amount), $date, $date, (int)$account['id']])
         )->fetchAll();
     }
 
@@ -913,7 +968,7 @@ class BankingService
             throw new \RuntimeException('El movimiento ya no está pendiente');
         }
         $account = $this->account((int)$line['bank_account_id']);
-        $cands = $this->bookCandidates($account, (string)$line['line_date'], (float)$line['amount'], 45, 50);
+        $cands = $this->bookCandidates($account, (string)$line['line_date'], (float)$line['amount'], 45, 50, (string)($line['reference'] ?? ''));
         foreach ($cands as $c) {
             if ((int)$c['line_id'] === $accountingLineId) {
                 $this->query(

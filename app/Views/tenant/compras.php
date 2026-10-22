@@ -268,7 +268,8 @@ $canEditBudget = \SoftNova\Core\TenantMiddleware::isManagement();
     <a href="<?php echo $comprasBase; ?>?action=notas_credito" class="btn btn-secondary">Notas de crédito</a>
     <a href="<?php echo $comprasBase; ?>?action=reposicion" class="btn btn-secondary">Panel de reposición</a>
 </div>
-<?php if (is_array($purchaseBudget)): ?>
+<?php // Semáforo de compras: SOLO visible para administrador y gerencia. ?>
+<?php if (is_array($purchaseBudget) && $canEditBudget): ?>
 <?php
 $pb = $purchaseBudget;
 $pbLevel = (string)$pb['level'];
@@ -1191,11 +1192,11 @@ function openPurchaseLimitModal() {
                     <option value="card">Tarjeta (111005)</option>
                 </select>
             </div>
-            <div id="payCashSourceWrap" class="form-group" style="display:none;">
+            <div id="payCashSourceWrap" class="form-group" style="display:none;border-radius:10px;transition:background .2s,border-color .2s;">
                 <label>Origen del efectivo * <span class="field-tip" data-tip="Caja: descuenta el cajón de la sesión abierta (110505). Otro: no toca la caja; indique de dónde salió el dinero." tabindex="0">?</span></label>
                 <div style="display:flex;flex-wrap:wrap;gap:14px;margin:6px 0 8px;">
                     <label style="display:flex;align-items:center;gap:6px;font-weight:500;cursor:pointer;">
-                        <input type="radio" name="cash_source" id="payCashDrawer" value="drawer" checked>
+                        <input type="radio" name="cash_source" id="payCashDrawer" value="drawer">
                         Caja (descuenta del cajón)
                     </label>
                     <label style="display:flex;align-items:center;gap:6px;font-weight:500;cursor:pointer;">
@@ -1203,6 +1204,9 @@ function openPurchaseLimitModal() {
                         Otro (no descuenta de caja)
                     </label>
                 </div>
+                <p id="payCashOriginWarn" style="display:none;font-size:12.5px;font-weight:600;color:var(--dmc-B45309, #B45309);margin:0 0 8px;">
+                    ⚠ Elija el origen del efectivo para poder guardar: si fue de caja elija «Caja»; si salió de otro fondo elija «Otro». No viene marcado a propósito, porque de este dato depende el saldo del cajón.
+                </p>
                 <p id="payCashDrawerHint" style="font-size:12px;color:var(--color-text-secondary);margin:0 0 8px;">
                     El abono en efectivo se registra como egreso en la caja abierta.
                 </p>
@@ -1254,6 +1258,85 @@ function openPurchaseLimitModal() {
 </div>
 
 <?php if ($canEdit): ?>
+<!-- Modal corrección: el efectivo del abono no salió del cajón -->
+<div id="fixCashModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:480px;">
+        <div class="modal-header">
+            <h3>Corregir origen del efectivo</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('fixCashModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=fix_payment_cash_source" data-ajax="true">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="payment_id" id="fixCashPaymentId">
+            <p id="fixCashLabel" style="font-weight:600;margin-bottom:8px;"></p>
+            <p style="font-size:13px;color:var(--color-text-secondary);margin-top:0;">
+                Este abono quedó como <strong>efectivo del cajón</strong>, pero el dinero salió de otro origen.
+                Al corregir: el cajón recibe un <strong>ingreso de corrección</strong> por el mismo valor,
+                el asiento se reversa y se re-emite con crédito a <strong>bancos (111005)</strong>,
+                y el abono queda marcado como «efectivo fuera del cajón». Queda registro en auditoría.
+            </p>
+            <div class="form-group">
+                <label for="fixCashSourceNote">¿De dónde salió el efectivo? *</label>
+                <textarea name="cash_source_note" id="fixCashSourceNote" class="form-control" rows="2" required minlength="5"
+                          placeholder="Ej: caja fuerte, retiro bancario, fondos del dueño…" maxlength="255"></textarea>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('fixCashModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-primary">Corregir origen</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal corrección: descuento pronto pago mal registrado en un abono -->
+<div id="fixDiscountModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:480px;">
+        <div class="modal-header">
+            <h3>Corregir dcto. pronto pago</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('fixDiscountModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=fix_payment_discount" data-ajax="true" id="fixDiscountForm">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="payment_id" id="fixDiscountPaymentId">
+            <p id="fixDiscountLabel" style="font-weight:600;margin-bottom:8px;"></p>
+            <p style="font-size:13px;color:var(--color-text-secondary);margin-top:0;">
+                Solo cambia el <strong>descuento pronto pago</strong>: el monto pagado y la caja
+                <strong>no se tocan</strong>. El asiento del abono se reversa y se re-emite con el
+                ingreso por descuentos (421040) corregido, el saldo de la factura se recalcula
+                y queda registro en auditoría.
+            </p>
+            <div class="form-group">
+                <label>Valor de Factura (base del descuento)</label>
+                <input type="text" id="fixDiscountInvoice" class="form-control" readonly tabindex="-1">
+            </div>
+            <div class="form-group">
+                <label>Nuevo dcto. pronto pago *</label>
+                <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                    <div class="po-pct-wrap">
+                        <input type="number" step="0.01" min="0" max="100" inputmode="decimal" name="discount_pct" id="fixDiscountPct" class="form-control" placeholder="0">
+                        <span class="po-pct-affix">%</span>
+                    </div>
+                    <span style="color:var(--color-text-secondary);font-weight:600;">=</span>
+                    <div style="flex:1;min-width:150px;">
+                        <input type="text" inputmode="decimal" name="discount_amount" id="fixDiscountAmount" class="form-control money-input" data-money="1" placeholder="$ 0">
+                    </div>
+                </div>
+                <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">Escriba el % o el monto; el otro valor se calcula automáticamente. Use $ 0 si el descuento no debió existir.</small>
+            </div>
+            <p id="fixDiscountPreview" style="font-size:13px;margin:0 0 10px;"></p>
+            <div class="form-group">
+                <label for="fixDiscountReason">Motivo de la corrección *</label>
+                <textarea name="reason" id="fixDiscountReason" class="form-control" rows="2" required minlength="5"
+                          placeholder="Ej: se digitó 10% y el proveedor autorizó 5%…" maxlength="255"></textarea>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('fixDiscountModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-primary" id="fixDiscountSubmitBtn">Corregir descuento</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <div class="modal-overlay" id="poEmailModal" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:440px;">
         <div class="modal-header">
@@ -1668,8 +1751,8 @@ function openPurchaseLimitModal() {
 </div>
 
 <!-- Alta rápida de proveedor (por encima de cargar factura / revisión) -->
-<div id="quickSupplierModal" class="modal-overlay" style="display:none;z-index:11100;">
-    <div class="modal-content neumorphic" style="max-width:520px;max-height:85vh;overflow-y:auto;position:relative;z-index:11101;">
+<div id="quickSupplierModal" class="modal-overlay" style="display:none;z-index:12000;">
+    <div class="modal-content neumorphic" style="max-width:520px;max-height:85vh;overflow-y:auto;position:relative;z-index:12001;">
         <div class="modal-header">
             <h3>Nuevo proveedor</h3>
             <button type="button" class="modal-close" onclick="closeQuickSupplierModal()">&times;</button>
@@ -1893,6 +1976,7 @@ window.poDefaultTaxRate = <?php echo json_encode((float)($defaultTaxRate ?? 0));
 window.comprasBase = <?php echo json_encode($comprasBase); ?>;
 var comprasBase = window.comprasBase;
 window.poDetailUrl = '<?php echo $viewInstance->route('app/compras'); ?>?action=detail';
+window.poCanEdit = <?php echo !empty($canEdit) ? 'true' : 'false'; ?>;
 window.poWarehouseKey = 'seri_last_warehouse_date';
 window.poInvoicePreviewUrl = '<?php echo $viewInstance->route('app/compras'); ?>?action=invoice_preview';
 window.poInvoiceAddLineUrl = '<?php echo $viewInstance->route('app/compras'); ?>?action=invoice_add_line';
@@ -2364,11 +2448,11 @@ function openQuickSupplierModal(target) {
     if (form) form.reset();
     var modal = document.getElementById('quickSupplierModal');
     if (!modal) return;
-    // Asegura que quede por encima del modal de factura (base 1300) y de la revisión.
+    // Por encima de cargar factura y de la revisión (ambos z-index 11000 en CSS).
     if (modal.parentNode !== document.body) {
         document.body.appendChild(modal);
     }
-    modal.style.zIndex = '1400';
+    modal.style.zIndex = '12000';
     modal.style.display = 'flex';
     setTimeout(function() {
         var n = document.getElementById('qsName');
@@ -4392,18 +4476,58 @@ function syncPayCashSourceUi() {
     var drawerHint = document.getElementById('payCashDrawerHint');
     var note = document.getElementById('payCashSourceNote');
     var otherRadio = document.getElementById('payCashOther');
+    var drawerRadio = document.getElementById('payCashDrawer');
+    var warn = document.getElementById('payCashOriginWarn');
     if (!method || !wrap) return;
     var isCash = String(method.value || '') === 'cash';
     wrap.style.display = isCash ? '' : 'none';
     var isOther = isCash && otherRadio && otherRadio.checked;
+    var isDrawer = isCash && drawerRadio && drawerRadio.checked;
+    var noneChosen = isCash && !isOther && !isDrawer;
     if (otherWrap) otherWrap.style.display = isOther ? '' : 'none';
-    if (drawerHint) drawerHint.style.display = (isCash && !isOther) ? '' : 'none';
+    if (drawerHint) drawerHint.style.display = isDrawer ? '' : 'none';
+    if (warn) warn.style.display = noneChosen ? '' : 'none';
+    // Resaltado: mientras no se elija el origen, la sección se marca en ámbar.
+    if (noneChosen) {
+        wrap.style.background = 'rgba(245, 158, 11, 0.10)';
+        wrap.style.border = '1px solid var(--dmc-B45309, #B45309)';
+        wrap.style.padding = '10px 12px';
+    } else {
+        wrap.style.background = '';
+        wrap.style.border = '';
+        wrap.style.padding = '';
+    }
     if (note) {
         if (isOther) note.setAttribute('required', 'required');
         else {
             note.removeAttribute('required');
             note.value = '';
         }
+    }
+    syncPaySubmitState();
+}
+
+function syncPaySubmitState() {
+    var method = document.getElementById('payMethod');
+    var submit = document.getElementById('paySubmitBtn');
+    if (!method || !submit) return;
+    var isCash = String(method.value || '') === 'cash';
+    if (!isCash) {
+        // Si el bloqueo venía del origen del efectivo, se libera al cambiar de medio.
+        if (submit.title) {
+            submit.title = '';
+            recalcPayTotals(false);
+        }
+        return;
+    }
+    var chosen = document.querySelector('input[name="cash_source"]:checked');
+    if (!chosen) {
+        submit.disabled = true;
+        submit.title = 'Primero elija el origen del efectivo (Caja u Otro)';
+    } else if (!submit.disabled || submit.title) {
+        // Solo rehabilita si el bloqueo era por el origen (recalc manda en el resto).
+        submit.title = '';
+        recalcPayTotals(false);
     }
 }
 
@@ -4471,6 +4595,7 @@ function recalcPayTotals(autofillAmount, source) {
     if (submit) submit.disabled = remaining < -0.009 || amount <= 0;
     var discNote = document.getElementById('payDiscountNote');
     if (discNote) discNote.style.display = discount > 0.009 ? 'inline' : 'none';
+    if (typeof syncPaySubmitState === 'function') syncPaySubmitState();
     var hint = document.getElementById('payInvoiceHint');
     if (hint) {
         hint.textContent = Math.abs(invoice - (payCtx.total || 0)) > 0.009
@@ -4517,13 +4642,101 @@ function openPayModal(payload) {
     if (receipt) receipt.value = '';
     var method = document.getElementById('payMethod');
     if (method) method.value = 'cash';
+    // Sin origen preseleccionado: el usuario debe elegir Caja u Otro.
     var drawer = document.getElementById('payCashDrawer');
-    if (drawer) drawer.checked = true;
+    if (drawer) drawer.checked = false;
+    var other = document.getElementById('payCashOther');
+    if (other) other.checked = false;
     var note = document.getElementById('payCashSourceNote');
     if (note) note.value = '';
     syncPayCashSourceUi();
     recalcPayTotals(false);
     document.getElementById('payModal').style.display = 'flex';
+}
+
+function openFixCashSourceModal(paymentId, amount, orderNumber) {
+    document.getElementById('purchaseDetailModal').style.display = 'none';
+    document.getElementById('fixCashPaymentId').value = paymentId;
+    document.getElementById('fixCashLabel').textContent =
+        'Abono #' + paymentId + (orderNumber ? ' · OC ' + orderNumber : '') + ' · ' + poMoney(amount || 0);
+    var note = document.getElementById('fixCashSourceNote');
+    if (note) note.value = '';
+    document.getElementById('fixCashModal').style.display = 'flex';
+}
+
+var fixDiscountCtx = { base: 0, old: 0 };
+
+function recalcFixDiscount(source) {
+    var round2 = function (v) { return Math.round(v * 100) / 100; };
+    var pctEl = document.getElementById('fixDiscountPct');
+    var amtEl = document.getElementById('fixDiscountAmount');
+    var base = fixDiscountCtx.base || 0;
+    var pct = pctEl ? parseFloat(String(pctEl.value).replace(',', '.')) || 0 : 0;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    var discount;
+    if (source === 'amount') {
+        discount = round2(payMoneyVal('fixDiscountAmount'));
+        pct = base > 0 ? round2(discount / base * 100) : 0;
+        if (pctEl) pctEl.value = pct ? String(pct) : '';
+    } else {
+        discount = base > 0 ? round2(base * pct / 100) : round2(payMoneyVal('fixDiscountAmount'));
+        if (amtEl) {
+            amtEl.value = window.SeriMoney ? SeriMoney.format(discount) : discount.toFixed(2);
+            if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(amtEl);
+        }
+    }
+    var diff = round2(fixDiscountCtx.old - discount);
+    var preview = document.getElementById('fixDiscountPreview');
+    if (preview) {
+        if (Math.abs(diff) <= 0.009) {
+            preview.textContent = 'Sin cambios: el nuevo descuento es igual al actual (' + poMoney(fixDiscountCtx.old) + ').';
+            preview.style.color = 'var(--dmc-DC2626, #DC2626)';
+        } else if (diff > 0) {
+            preview.textContent = 'Al bajar el descuento, el saldo pendiente de la factura aumenta en ' + poMoney(diff) + ' (quedará por pagar esa diferencia).';
+            preview.style.color = 'var(--color-text-secondary)';
+        } else {
+            preview.textContent = 'Al subir el descuento, el saldo pendiente de la factura disminuye en ' + poMoney(-diff) + '.';
+            preview.style.color = 'var(--color-text-secondary)';
+        }
+    }
+    var submit = document.getElementById('fixDiscountSubmitBtn');
+    if (submit) submit.disabled = Math.abs(diff) <= 0.009 || discount < 0;
+    return discount;
+}
+
+function openFixDiscountModal(paymentId, amount, discountAmount, discountPct, invoiceValue, orderNumber) {
+    document.getElementById('purchaseDetailModal').style.display = 'none';
+    var base = parseFloat(invoiceValue) || 0;
+    if (base <= 0 && parseFloat(discountPct) > 0 && parseFloat(discountAmount) > 0) {
+        base = Math.round((parseFloat(discountAmount) / parseFloat(discountPct) * 100) * 100) / 100;
+    }
+    if (base <= 0) base = (parseFloat(amount) || 0) + (parseFloat(discountAmount) || 0);
+    fixDiscountCtx = { base: base, old: parseFloat(discountAmount) || 0 };
+    document.getElementById('fixDiscountPaymentId').value = paymentId;
+    document.getElementById('fixDiscountLabel').textContent =
+        'Abono #' + paymentId + (orderNumber ? ' · OC ' + orderNumber : '')
+        + ' · Pagado ' + poMoney(amount || 0)
+        + ' · Dcto. actual ' + poMoney(discountAmount || 0);
+    var invEl = document.getElementById('fixDiscountInvoice');
+    if (invEl) invEl.value = poMoney(base);
+    var pctEl = document.getElementById('fixDiscountPct');
+    if (pctEl) pctEl.value = parseFloat(discountPct) ? String(parseFloat(discountPct)) : '';
+    var amtEl = document.getElementById('fixDiscountAmount');
+    if (amtEl) {
+        amtEl.value = window.SeriMoney ? SeriMoney.format(parseFloat(discountAmount) || 0) : (parseFloat(discountAmount) || 0).toFixed(2);
+        if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(amtEl);
+    }
+    var reason = document.getElementById('fixDiscountReason');
+    if (reason) reason.value = '';
+    recalcFixDiscount('pct');
+    // recalc con % precargado cambia el monto al exacto según base; mostrar el monto real guardado.
+    if (amtEl) {
+        amtEl.value = window.SeriMoney ? SeriMoney.format(parseFloat(discountAmount) || 0) : (parseFloat(discountAmount) || 0).toFixed(2);
+        if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(amtEl);
+    }
+    recalcFixDiscount('amount');
+    document.getElementById('fixDiscountModal').style.display = 'flex';
 }
 
 function openObservationsModal(payload) {
@@ -4564,8 +4777,29 @@ document.addEventListener('DOMContentLoaded', function () {
     if (payDiscAmtEl) payDiscAmtEl.addEventListener('input', function () { payDiscountDriver = 'amount'; recalcPayTotals(true, 'discountAmount'); });
     var payAmountEl = document.getElementById('payAmount');
     if (payAmountEl) payAmountEl.addEventListener('input', function () { recalcPayTotals(false); });
+    var fixPctEl = document.getElementById('fixDiscountPct');
+    if (fixPctEl) fixPctEl.addEventListener('input', function () { recalcFixDiscount('pct'); });
+    var fixAmtEl = document.getElementById('fixDiscountAmount');
+    if (fixAmtEl) fixAmtEl.addEventListener('input', function () { recalcFixDiscount('amount'); });
+    var fixForm = document.getElementById('fixDiscountForm');
+    if (fixForm) fixForm.addEventListener('submit', function (ev) {
+        var d = recalcFixDiscount('amount');
+        if (Math.abs((fixDiscountCtx.old || 0) - d) <= 0.009) ev.preventDefault();
+    });
     var payForm = document.getElementById('payForm');
     if (payForm) payForm.addEventListener('submit', function (ev) {
+        var methodEl = document.getElementById('payMethod');
+        if (methodEl && String(methodEl.value || '') === 'cash'
+            && !document.querySelector('input[name="cash_source"]:checked')) {
+            ev.preventDefault();
+            syncPayCashSourceUi();
+            var wrapEl = document.getElementById('payCashSourceWrap');
+            if (wrapEl) wrapEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            var msg = 'Debe elegir el origen del efectivo (Caja u Otro) para registrar el abono.';
+            if (typeof showAlert === 'function') showAlert(msg, 'warning');
+            else alert(msg);
+            return;
+        }
         if (recalcPayTotals(false) < -0.009) {
             ev.preventDefault();
             var err = document.getElementById('payTotalsError');
@@ -4784,9 +5018,22 @@ function viewPurchase(id) {
                 h += '<table><thead><tr><th>Fecha</th><th>Medio</th><th>Estado</th><th>Referencia</th><th>Asiento</th><th>Comprobante</th><th>Valor</th></tr></thead><tbody>';
                 payments.forEach(function(p) {
                     var paySt = String(p.status || 'applied');
+                    var isCashPay = String(p.payment_method || '') === 'cash';
+                    // Origen del efectivo SOLO es cajón con cash_from_drawer = 1 explícito.
+                    var drawerFlag = (p.cash_from_drawer == null || p.cash_from_drawer === '')
+                        ? null : parseInt(p.cash_from_drawer, 10);
+                    if (p.cash_origin) drawerFlag = p.cash_origin === 'drawer' ? 1 : (p.cash_origin === 'other' ? 0 : null);
+                    var fromDrawer = drawerFlag === 1;
+                    var methodLabel = p.payment_method_label || p.payment_method || '';
                     h += '<tr' + (paySt === 'cancelled' ? ' style="opacity:0.7;"' : '') + '>';
                     h += '<td>' + esc((p.payment_date || '').substr(0,10)) + '</td>';
-                    h += '<td>' + esc(p.payment_method || '') + '</td>';
+                    h += '<td>' + esc(methodLabel);
+                    if (isCashPay) {
+                        var originLabel = p.cash_origin_label || (fromDrawer ? 'Del cajón' : (drawerFlag === 0 ? 'Otro fondo' : 'Origen no registrado'));
+                        h += '<div style="font-size:11px;color:var(--color-text-secondary);">' + esc(originLabel)
+                            + (drawerFlag === 0 && p.cash_source_note ? ': ' + esc(p.cash_source_note) : '') + '</div>';
+                    }
+                    h += '</td>';
                     h += '<td>' + (paySt === 'cancelled'
                         ? '<span class="badge badge-danger">Cancelado</span>'
                         : esc(paySt)) + '</td>';
@@ -4802,6 +5049,12 @@ function viewPurchase(id) {
                     h += '<td>' + poMoney(p.amount);
                     if (parseFloat(p.discount_amount || 0) > 0.009) {
                         h += '<div style="font-size:11px;color:var(--dmc-B45309, #B45309);">Dcto. pronto pago −' + poMoney(p.discount_amount) + '</div>';
+                    }
+                    if (paySt !== 'cancelled' && window.poCanEdit) {
+                        h += '<div style="margin-top:4px;"><button type="button" class="btn btn-sm btn-secondary" title="El dcto. pronto pago quedó mal: corrige el % o el monto, reversa y re-emite el asiento (421040) y recalcula el saldo. El monto pagado y la caja no se tocan" onclick="openFixDiscountModal(' + p.id + ', ' + (parseFloat(p.amount) || 0) + ', ' + (parseFloat(p.discount_amount) || 0) + ', ' + (parseFloat(p.discount_pct) || 0) + ', ' + (parseFloat(p.invoice_value) || 0) + ', \'' + esc(o.order_number || '').replace(/'/g, '') + '\')">Corregir dcto.</button></div>';
+                    }
+                    if (isCashPay && paySt !== 'cancelled' && fromDrawer && window.poCanEdit) {
+                        h += '<div style="margin-top:4px;"><button type="button" class="btn btn-sm btn-secondary" title="El efectivo NO salió del cajón: corrige el origen, reintegra la caja y re-emite el asiento por bancos" onclick="openFixCashSourceModal(' + p.id + ', ' + (parseFloat(p.amount) || 0) + ', \'' + esc(o.order_number || '').replace(/'/g, '') + '\')">No fue de caja</button></div>';
                     }
                     h += '</td></tr>';
                 });
@@ -4849,6 +5102,9 @@ function viewPurchase(id) {
                     + poMoney(Math.abs(parseFloat(o.balance))) + '</p>';
             } else if (o.status === 'received') {
                 h += '<p style="margin-top:10px;font-weight:600;color:#10B981;">Orden sin saldo pendiente</p>';
+            }
+            if (o.payment_mode_label) {
+                h += '<p style="margin-top:6px;font-size:13px;"><strong>Medio de pago:</strong> ' + esc(o.payment_mode_label) + '</p>';
             }
             if (o.status === 'received' && !isVoided) {
                 h += '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">'

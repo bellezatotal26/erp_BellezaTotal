@@ -1860,12 +1860,282 @@ class PurchasingService
     }
 
     /**
+     * Corrección de backend: el abono se registró como efectivo DEL CAJÓN pero
+     * en realidad fue efectivo de otro origen. Devuelve el dinero al cajón
+     * (movimiento compensatorio en la misma sesión si sigue abierta), marca el
+     * abono como fuera del cajón y deja la contabilidad lista para re-emitir el
+     * asiento con crédito a bancos (lo hace el controlador).
+     *
+     * @return array{payment_id:int,amount:float,order_number:string,accounting_entry_id:int,cash_note:string}
+     */
+    public function correctSupplierPaymentCashSource(int $paymentId, string $sourceNote): array
+    {
+        SupplyChainSchema::ensure($this->db);
+        $sourceNote = substr(trim($sourceNote), 0, 255);
+        if (mb_strlen($sourceNote) < 5) {
+            throw new \InvalidArgumentException('Indique de dónde salió el efectivo (mín. 5 caracteres).');
+        }
+        $payment = $this->query(
+            "SELECT sp.*, po.order_number, s.name supplier_name
+             FROM supplier_payments sp
+             LEFT JOIN purchase_orders po ON po.id = sp.purchase_order_id
+             LEFT JOIN suppliers s ON s.id = sp.supplier_id
+             WHERE sp.id = ?",
+            [$paymentId]
+        )->fetch();
+        if (!$payment) {
+            throw new \RuntimeException('Abono a proveedor no encontrado');
+        }
+        if (($payment['status'] ?? 'applied') === 'cancelled') {
+            throw new \RuntimeException('El abono está cancelado; no se puede corregir.');
+        }
+        if (!PaymentMethodCatalog::affectsCash((string)($payment['payment_method'] ?? ''))) {
+            throw new \RuntimeException('Solo aplica a abonos en efectivo.');
+        }
+        if (!array_key_exists('cash_from_drawer', $payment)) {
+            throw new \RuntimeException('Esta instalación aún no registra el origen del efectivo del abono.');
+        }
+        if ((int)$payment['cash_from_drawer'] === 0) {
+            throw new \RuntimeException('Este abono ya figura como efectivo fuera del cajón.');
+        }
+        $amount = round((float)$payment['amount'], 2);
+        $orderNumber = (string)($payment['order_number'] ?? '');
+
+        // Egreso original en el cajón (si lo hubo).
+        $movement = null;
+        try {
+            $movement = $this->query(
+                "SELECT cm.id, cm.cash_session_id, cs.status session_status
+                 FROM cash_movements cm
+                 JOIN cash_sessions cs ON cs.id = cm.cash_session_id
+                 WHERE cm.reference_type = 'supplier_payment' AND cm.reference_id = ? AND cm.type = 'expense'
+                 ORDER BY cm.id DESC LIMIT 1",
+                [$paymentId]
+            )->fetch() ?: null;
+        } catch (\Throwable $e) {
+            $movement = null;
+        }
+        $cashNote = 'El abono no tenía egreso registrado en el cajón.';
+        if ($movement) {
+            if ((string)($movement['session_status'] ?? '') !== 'open') {
+                throw new \RuntimeException(
+                    'La caja de ese movimiento ya está cerrada. Por seguridad no se corrige automáticamente; '
+                    . 'haga el ajuste con un movimiento manual de caja y el reverso contable, o contacte al administrador.'
+                );
+            }
+            if ($this->hasCashMovementRef('supplier_payment_cashfix', $paymentId)) {
+                throw new \RuntimeException('Este abono ya tiene corrección de caja.');
+            }
+            $cash = new CashService($this->db);
+            $ok = $cash->registerMovement(
+                $amount,
+                'Corrección abono proveedor' . ($orderNumber !== '' ? ' OC ' . $orderNumber : '')
+                    . ' · el efectivo NO salió del cajón',
+                'income',
+                'supplier_payment_cashfix',
+                $paymentId,
+                (int)$movement['cash_session_id']
+            );
+            if (!$ok) {
+                throw new \RuntimeException('No se pudo registrar el reintegro en la caja abierta.');
+            }
+            $cashNote = 'El dinero se reintegró al cajón con un ingreso de corrección.';
+        }
+
+        $notes = trim((string)($payment['notes'] ?? ''));
+        $tag = 'Corrección: efectivo fuera del cajón (' . $sourceNote . ')';
+        $notes = substr($notes !== '' ? ($notes . ' · ' . $tag) : $tag, 0, 255);
+        $this->query(
+            "UPDATE supplier_payments SET cash_from_drawer = 0, cash_source_note = ?, notes = ? WHERE id = ?",
+            [$sourceNote, $notes, $paymentId]
+        );
+
+        TenantAuditService::safeLog(
+            $this->db,
+            'payment',
+            'compras',
+            'Corrección origen efectivo abono #' . $paymentId
+                . ($orderNumber !== '' ? ' OC ' . $orderNumber : '')
+                . ' · monto=' . number_format($amount, 0, '.', '') . ' · origen: ' . $sourceNote,
+            'supplier_payment',
+            $paymentId,
+            ['cash_from_drawer' => 0, 'cash_source_note' => $sourceNote]
+        );
+
+        return [
+            'payment_id' => $paymentId,
+            'amount' => $amount,
+            'order_number' => $orderNumber,
+            'accounting_entry_id' => (int)($payment['accounting_entry_id'] ?? 0),
+            'cash_note' => $cashNote,
+        ];
+    }
+
+    /**
+     * Corrección de backend: el dcto. pronto pago de un abono se registró mal.
+     * Actualiza descuento (% y monto) del abono, recalcula el estado de pago de
+     * la orden y deja la contabilidad lista para reversar y re-emitir el asiento
+     * (lo hace el controlador, igual que la corrección de origen del efectivo).
+     * El monto pagado NO cambia: la caja no se toca.
+     *
+     * @return array{payment_id:int,order_id:int,order_number:string,amount:float,old_discount:float,new_discount:float,discount_pct:float,invoice_value:float,balance:float,accounting_entry_id:int}
+     */
+    public function correctSupplierPaymentDiscount(
+        int $paymentId,
+        ?float $newDiscountAmount,
+        ?float $newDiscountPct,
+        string $reason
+    ): array {
+        SupplyChainSchema::ensure($this->db);
+        $reason = substr(trim($reason), 0, 255);
+        if (mb_strlen($reason) < 5) {
+            throw new \InvalidArgumentException('Indique el motivo de la corrección (mín. 5 caracteres).');
+        }
+        $payment = $this->query(
+            "SELECT sp.*, po.order_number, po.total order_total, po.supplier_invoice_value order_invoice_value
+             FROM supplier_payments sp
+             LEFT JOIN purchase_orders po ON po.id = sp.purchase_order_id
+             WHERE sp.id = ?",
+            [$paymentId]
+        )->fetch();
+        if (!$payment) {
+            throw new \RuntimeException('Abono a proveedor no encontrado');
+        }
+        if (($payment['status'] ?? 'applied') === 'cancelled') {
+            throw new \RuntimeException('El abono está cancelado; no se puede corregir.');
+        }
+        if (!array_key_exists('discount_amount', $payment) || !array_key_exists('discount_pct', $payment)) {
+            throw new \RuntimeException('Esta instalación aún no registra el descuento pronto pago del abono.');
+        }
+        $orderId = (int)($payment['purchase_order_id'] ?? 0);
+        if ($orderId <= 0) {
+            throw new \RuntimeException('El abono no está asociado a una orden de compra.');
+        }
+
+        $oldDiscount = round((float)($payment['discount_amount'] ?? 0), 2);
+        $amount = round((float)($payment['amount'] ?? 0), 2);
+        $orderNumber = (string)($payment['order_number'] ?? '');
+
+        // Base autoritativa de la CxP y tope del descuento: lo ya pagado + NC +
+        // descuentos de OTROS abonos no puede superar la base; este descuento
+        // solo puede ocupar el espacio restante.
+        $row = $this->query(
+            "SELECT COALESCE(NULLIF(po.supplier_invoice_value, 0), po.total) base_total,
+                    COALESCE((
+                        SELECT SUM(sp2.amount) FROM supplier_payments sp2
+                        WHERE sp2.purchase_order_id = po.id AND sp2.status = 'applied'
+                    ), 0) paid,
+                    COALESCE((
+                        SELECT SUM(sp2.discount_amount) FROM supplier_payments sp2
+                        WHERE sp2.purchase_order_id = po.id AND sp2.status = 'applied' AND sp2.id <> ?
+                    ), 0) other_discounted,
+                    COALESCE((
+                        SELECT SUM(cn.total) FROM purchase_credit_notes cn
+                        WHERE cn.purchase_order_id = po.id AND cn.status = 'posted'
+                    ), 0) credited
+             FROM purchase_orders po
+             WHERE po.id = ?",
+            [$paymentId, $orderId]
+        )->fetch();
+        $base = $row ? round((float)$row['base_total'], 2) : 0.0;
+        if ($base <= 0.009) {
+            $base = round((float)($payment['invoice_value'] ?? 0), 2);
+        }
+        if ($base <= 0.009) {
+            $base = round($amount + $oldDiscount, 2);
+        }
+
+        if ($newDiscountAmount !== null) {
+            $newDiscount = round(max(0.0, $newDiscountAmount), 2);
+            $discountPct = $base > 0 ? round($newDiscount / $base * 100, 2) : 0.0;
+        } elseif ($newDiscountPct !== null) {
+            $discountPct = max(0.0, min(100.0, round($newDiscountPct, 2)));
+            $newDiscount = round($base * ($discountPct / 100), 2);
+        } else {
+            throw new \InvalidArgumentException('Indique el nuevo descuento pronto pago (porcentaje o monto).');
+        }
+
+        if (abs($newDiscount - $oldDiscount) <= 0.009) {
+            throw new \RuntimeException(
+                'El nuevo descuento es igual al actual (' . number_format($oldDiscount, 2, ',', '.') . '). No hay nada que corregir.'
+            );
+        }
+
+        if ($row) {
+            $maxDiscount = round(
+                (float)$row['base_total'] - (float)$row['paid'] - (float)$row['credited'] - (float)$row['other_discounted'],
+                2
+            );
+            if ($newDiscount - $maxDiscount > 0.009) {
+                throw new \InvalidArgumentException(
+                    'El descuento supera lo permitido para esta factura. Máximo posible: '
+                    . number_format(max(0.0, $maxDiscount), 2, ',', '.')
+                    . ' (Valor de Factura − abonos − notas de crédito − otros descuentos).'
+                );
+            }
+        }
+
+        $notes = trim((string)($payment['notes'] ?? ''));
+        $tag = 'Corrección dcto. pronto pago: $' . number_format($oldDiscount, 2, '.', '')
+            . ' → $' . number_format($newDiscount, 2, '.', '') . ' (' . $reason . ')';
+        $notes = substr($notes !== '' ? ($notes . ' · ' . $tag) : $tag, 0, 255);
+        $this->query(
+            "UPDATE supplier_payments SET discount_amount = ?, discount_pct = ?, notes = ?
+             WHERE id = ? AND status = 'applied'",
+            [$newDiscount, $discountPct, $notes, $paymentId]
+        );
+
+        $status = $this->refreshPaymentStatus($orderId);
+
+        TenantAuditService::safeLog(
+            $this->db,
+            'payment',
+            'compras',
+            'Corrección dcto. pronto pago abono #' . $paymentId
+                . ($orderNumber !== '' ? ' OC ' . $orderNumber : '')
+                . ' · dcto=' . number_format($oldDiscount, 0, '.', '')
+                . '→' . number_format($newDiscount, 0, '.', '')
+                . ' · motivo: ' . $reason,
+            'supplier_payment',
+            $paymentId,
+            [
+                'old_discount' => $oldDiscount,
+                'new_discount' => $newDiscount,
+                'discount_pct' => $discountPct,
+                'balance' => $status['balance'],
+            ]
+        );
+
+        return [
+            'payment_id' => $paymentId,
+            'order_id' => $orderId,
+            'order_number' => $orderNumber,
+            'amount' => $amount,
+            'old_discount' => $oldDiscount,
+            'new_discount' => $newDiscount,
+            'discount_pct' => $discountPct,
+            'invoice_value' => $base,
+            'balance' => $status['balance'],
+            'accounting_entry_id' => (int)($payment['accounting_entry_id'] ?? 0),
+        ];
+    }
+
+    /** Limpia el asiento asociado para que Contabilidad pueda re-emitir el abono corregido. */
+    public function clearSupplierPaymentAccountingEntry(int $paymentId): void
+    {
+        $this->query(
+            "UPDATE supplier_payments SET accounting_entry_id = NULL WHERE id = ?",
+            [$paymentId]
+        );
+    }
+
+    /**
      * Devuelve a caja el egreso de un abono a proveedor (tras cancelarlo en anulación).
      */
     public function syncCashReverseForSupplierPayment(int $paymentId): string
     {
         $payment = $this->query(
-            "SELECT sp.id, sp.amount, sp.payment_method, sp.status,
+            "SELECT sp.id, sp.amount, sp.payment_method, sp.status, sp.cash_from_drawer,
                     po.order_number, s.name supplier_name
              FROM supplier_payments sp
              LEFT JOIN purchase_orders po ON po.id = sp.purchase_order_id
@@ -1874,6 +2144,10 @@ class PurchasingService
             [$paymentId]
         )->fetch();
         if (!$payment || ($payment['status'] ?? '') !== 'cancelled') {
+            return '';
+        }
+        // Si el efectivo no salió del cajón (o ya se corrigió), no hay nada que reintegrar.
+        if (array_key_exists('cash_from_drawer', $payment) && (int)$payment['cash_from_drawer'] === 0) {
             return '';
         }
         if (!PaymentMethodCatalog::affectsCash((string)($payment['payment_method'] ?? ''))) {
@@ -2239,6 +2513,7 @@ class PurchasingService
     {
         $row = $this->query(
             "SELECT COALESCE(NULLIF(po.supplier_invoice_value, 0), po.total) base_total,
+                    po.total order_total, po.payment_mode,
                     COALESCE((
                         SELECT SUM(sp.amount) FROM supplier_payments sp
                         WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
@@ -2257,6 +2532,15 @@ class PurchasingService
         )->fetch();
         if (!$row) {
             return 0.0;
+        }
+        // Contado (efectivo/transferencia/tarjeta): se pagó completo al recibir,
+        // sin abonos. Misma fórmula que refreshPaymentStatus() para que el
+        // detalle y el listado de facturas muestren el mismo saldo.
+        if ((string)($row['payment_mode'] ?? 'payable') !== 'payable') {
+            $total = round((float)($row['order_total'] ?? $row['base_total']), 2);
+            $credited = round((float)$row['credited'], 2);
+            $paidEffective = max(0.0, round($total - $credited, 2));
+            return round($total - $paidEffective - $credited, 2);
         }
         return round(
             (float)$row['base_total'] - (float)$row['paid'] - (float)$row['discounted'] - (float)$row['credited'],
@@ -2340,7 +2624,7 @@ class PurchasingService
     public function orderPayments(int $orderId): array
     {
         try {
-            return $this->query(
+            $rows = $this->query(
                 "SELECT sp.*, u.name created_by_name, e.entry_number accounting_entry_number
                  FROM supplier_payments sp
                  LEFT JOIN users u ON u.id = sp.created_by
@@ -2352,6 +2636,29 @@ class PurchasingService
         } catch (\Throwable $e) {
             return [];
         }
+        // Etiquetas legibles para la UI: medio elegido y, si fue efectivo,
+        // si salió del cajón o de otro fondo. El origen SOLO es 'drawer' con
+        // cash_from_drawer = 1 explícito; vacío/sin dato queda 'unknown'.
+        foreach ($rows as &$p) {
+            $method = (string)($p['payment_method'] ?? '');
+            $p['payment_method_label'] = PaymentMethodCatalog::label($method, $this->db);
+            $p['cash_origin'] = '';
+            $p['cash_origin_label'] = '';
+            if (PaymentMethodCatalog::affectsCash($method)) {
+                if (array_key_exists('cash_from_drawer', $p) && $p['cash_from_drawer'] !== null && $p['cash_from_drawer'] !== '') {
+                    $p['cash_origin'] = (int)$p['cash_from_drawer'] === 1 ? 'drawer' : 'other';
+                } else {
+                    $p['cash_origin'] = 'unknown';
+                }
+                $p['cash_origin_label'] = match ($p['cash_origin']) {
+                    'drawer' => 'Del cajón',
+                    'other' => 'Otro fondo',
+                    default => 'Origen no registrado',
+                };
+            }
+        }
+        unset($p);
+        return $rows;
     }
 
     /** @return array<string,mixed>|null */
@@ -3247,10 +3554,19 @@ class PurchasingService
      * Listado para trazabilidad de facturas/OC en Contabilidad.
      * @return list<array<string,mixed>>
      */
-    public function listInvoiceTrace(string $from, string $to, string $q = '', int $limit = 80): array
+    public function listInvoiceTrace(string $from, string $to, string $q = '', int $limit = 80, string $sort = 'date', string $dir = 'desc'): array
     {
         $this->ensureSchema();
         $limit = max(1, min(200, $limit));
+        $sortMap = [
+            'oc' => 'po.order_number',
+            'supplier' => 's.name',
+            'date' => 'COALESCE(po.invoice_date, po.warehouse_date, po.order_date, po.created_at)',
+            'total' => 'po.total',
+            'status' => 'po.status',
+        ];
+        $sortSql = $sortMap[$sort] ?? $sortMap['date'];
+        $dirSql = strtolower($dir) === 'asc' ? 'ASC' : 'DESC';
         $params = [$from, $to];
         $where = "DATE(COALESCE(po.invoice_date, po.warehouse_date, po.order_date, po.created_at)) BETWEEN ? AND ?
                   AND (po.status = 'received' OR (po.status = 'cancelled' AND (
@@ -3282,7 +3598,7 @@ class PurchasingService
              LEFT JOIN suppliers s ON s.id = po.supplier_id
              LEFT JOIN accounting_entries e ON e.id = po.accounting_entry_id
              WHERE {$where}
-             ORDER BY COALESCE(po.invoice_date, po.warehouse_date, po.order_date) DESC, po.id DESC
+             ORDER BY {$sortSql} {$dirSql}, po.id {$dirSql}
              LIMIT ?",
             $params
         )->fetchAll();
@@ -3543,7 +3859,10 @@ class PurchasingService
                 'Fecha límite de pago / cuentas por pagar'
             );
         }
-        if ($whDateOnly !== '' && $whDateOnly !== '0000-00-00') {
+        // Solo si aún no hay recepción: si la mercancía ya se recibió, el evento
+        // «Mercancía recibida» ya trae la fecha de bodega y este duplicaría.
+        if ($whDateOnly !== '' && $whDateOnly !== '0000-00-00'
+            && empty($order['received_at']) && ($order['status'] ?? '') !== 'received') {
             $push(
                 $events,
                 $whDateOnly,
@@ -3595,6 +3914,35 @@ class PurchasingService
             );
         }
 
+        // Medio de pago elegido: en compras a crédito se ve en cada abono; en
+        // las de contado vive en payment_mode de la orden y se muestra aquí.
+        $payMode = (string)($order['payment_mode'] ?? 'payable');
+        $payModeLabels = [
+            'cash' => 'Efectivo · sale del cajón (110505)',
+            'transfer' => 'Transferencia · bancos (111005)',
+            'card' => 'Tarjeta · bancos (111005)',
+            'payable' => 'Crédito · cuenta por pagar (220505), se paga con abonos',
+        ];
+        $order['payment_mode_label'] = $payModeLabels[$payMode] ?? $payMode;
+        if (in_array($payMode, ['cash', 'transfer', 'card'], true)
+            && ($order['status'] ?? '') === 'received'
+            && (float)($order['total'] ?? 0) > 0.009) {
+            $push(
+                $events,
+                (string)($order['received_at'] ?? $order['warehouse_date'] ?? $createdAt),
+                'payment',
+                'Pago de contado al recibir',
+                trim(
+                    $payModeLabels[$payMode]
+                    . (!empty($order['accounting_entry_number'])
+                        ? ' · Asiento ' . $order['accounting_entry_number']
+                        : (!empty($order['accounting_entry_id']) ? ' · Asiento #' . $order['accounting_entry_id'] : ''))
+                ),
+                (float)($order['total'] ?? 0),
+                ['payment_mode' => $payMode]
+            );
+        }
+
         try {
             $stock = $this->query(
                 "SELECT movement_date, created_at, type, quantity, notes, reference_type, reference_id
@@ -3612,14 +3960,19 @@ class PurchasingService
                 $label = match ($refType) {
                     'purchase_credit_note' => 'Salida por nota de crédito / devolución',
                     'purchase_cancel' => 'Reverso inventario (anulación)',
-                    default => 'Movimiento de inventario',
+                    default => ((string)($sm['type'] ?? '') === 'out'
+                        ? 'Salida de inventario'
+                        : 'Entrada de inventario'),
                 };
                 $push(
                     $events,
                     (string)($sm['movement_date'] ?? $sm['created_at']),
                     'stock',
                     $label,
-                    trim(($sm['type'] ?? '') . ' · cant. ' . (int)($sm['quantity'] ?? 0) . ' ' . ($sm['notes'] ?? ''))
+                    trim(
+                        'Cantidad: ' . (int)($sm['quantity'] ?? 0) . ' ud.'
+                        . (trim((string)($sm['notes'] ?? '')) !== '' ? ' · ' . trim((string)$sm['notes']) : '')
+                    )
                 );
             }
         } catch (\Throwable $e) {
@@ -3627,17 +3980,28 @@ class PurchasingService
 
         foreach ($this->orderPayments($orderId) as $p) {
             $payStatus = (string)($p['status'] ?? 'applied');
+            // Medio elegido al pagar y, si fue efectivo, su origen (cajón u otro fondo).
+            $payDetailParts = [(string)($p['payment_method_label'] ?? ($p['payment_method'] ?? ''))];
+            if (($p['cash_origin'] ?? '') !== '') {
+                $originTxt = (string)($p['cash_origin_label'] ?? '');
+                if (($p['cash_origin'] ?? '') === 'other' && trim((string)($p['cash_source_note'] ?? '')) !== '') {
+                    $originTxt .= ': ' . trim((string)$p['cash_source_note']);
+                }
+                if ($originTxt !== '') {
+                    $payDetailParts[] = $originTxt;
+                }
+            }
+            if (trim((string)($p['reference'] ?? '')) !== '') {
+                $payDetailParts[] = 'Ref. ' . trim((string)$p['reference']);
+            }
             if ($payStatus === 'cancelled') {
+                $payDetailParts[] = (string)($p['notes'] ?? '');
                 $push(
                     $events,
                     (string)($p['updated_at'] ?? $p['payment_date'] ?? $p['created_at'] ?? ''),
                     'payment_void',
                     'Abono cancelado (anulación)',
-                    trim(
-                        ($p['payment_method'] ?? '')
-                        . ' ' . ($p['reference'] ?? '')
-                        . ' · ' . ($p['notes'] ?? '')
-                    ),
+                    trim(implode(' · ', array_filter($payDetailParts, static fn($s) => trim((string)$s) !== ''))),
                     (float)($p['amount'] ?? 0),
                     ['payment_id' => (int)($p['id'] ?? 0)]
                 );
@@ -3646,12 +4010,19 @@ class PurchasingService
             if ($payStatus !== '' && $payStatus !== 'applied') {
                 continue;
             }
+            if (!empty($p['accounting_entry_number'])) {
+                $payDetailParts[] = 'Asiento ' . $p['accounting_entry_number'];
+            }
+            $payDiscount = round((float)($p['discount_amount'] ?? 0), 2);
+            if ($payDiscount > 0.009) {
+                $payDetailParts[] = 'Dcto. pronto pago −$' . number_format($payDiscount, 2, ',', '.');
+            }
             $push(
                 $events,
                 (string)($p['payment_date'] ?? $p['created_at'] ?? ''),
                 'payment',
                 'Abono a proveedor',
-                trim(($p['payment_method'] ?? '') . ' ' . ($p['reference'] ?? '') . ' · ' . ($p['accounting_entry_number'] ?? '')),
+                trim(implode(' · ', array_filter($payDetailParts, static fn($s) => trim((string)$s) !== ''))),
                 (float)($p['amount'] ?? 0),
                 ['payment_id' => (int)($p['id'] ?? 0)]
             );

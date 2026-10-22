@@ -286,6 +286,12 @@ class TenantInventarioController extends TenantController
         $stockFilter = (string)$this->request->get('stock_state', '');
         $channelFilter = (string)$this->request->get('channel', '');
         $locationFilter = trim((string)$this->request->get('location', ''));
+        // Utilidad hasta % (sobre costo, la misma que muestra el listado): igual o menor.
+        $marginMaxRaw = trim((string)$this->request->get('margin_max', ''));
+        $marginMax = null;
+        if ($marginMaxRaw !== '' && is_numeric(str_replace(',', '.', $marginMaxRaw))) {
+            $marginMax = max(-100.0, min(10000.0, (float)str_replace(',', '.', $marginMaxRaw)));
+        }
         $perPageOptions = [20, 50, 100, 200];
         $perPage = (int)$this->request->get('per_page', 20);
         if (!in_array($perPage, $perPageOptions, true)) {
@@ -327,6 +333,12 @@ class TenantInventarioController extends TenantController
         if ($locationFilter !== '') {
             $where[] = "p.location = ?";
             $params[] = $locationFilter;
+        }
+        if ($marginMax !== null) {
+            // Sin precio de compra no hay % calculable: quedan fuera.
+            $where[] = "p.purchase_price > 0
+                AND ((COALESCE(p.sale_price, 0) - p.purchase_price) / p.purchase_price * 100) <= ?";
+            $params[] = $marginMax;
         }
         if ($filters['q'] !== '') {
             $search = \SoftNova\Core\multi_term_like_clause($filters['q'], [
@@ -447,6 +459,7 @@ class TenantInventarioController extends TenantController
             'stock_state' => in_array($stockFilter, ['low', 'out'], true) ? $stockFilter : null,
             'channel' => $channelFilter !== '' ? $channelFilter : null,
             'location' => $locationFilter !== '' ? $locationFilter : null,
+            'margin_max' => $marginMax !== null ? $marginMax : null,
             'per_page' => $perPage !== 20 ? $perPage : null,
         ], static fn($v) => $v !== null && $v !== '');
         $filters['query'] = array_merge($filters['query'], $extraQuery);
@@ -502,6 +515,7 @@ class TenantInventarioController extends TenantController
             'stockFilter' => $stockFilter,
             'channelFilter' => $channelFilter,
             'locationFilter' => $locationFilter,
+            'marginMaxFilter' => $marginMax,
             'locationOptions' => $locationOptions,
             'filters' => $filters,
             'pagination' => $pagination,
@@ -2424,6 +2438,16 @@ class TenantInventarioController extends TenantController
         return 'uploads/products/' . $filename;
     }
     
+    /** Utilidad hasta % pedida por GET (sobre costo), o null si no aplica. */
+    private function marginMaxFromRequest(): ?float
+    {
+        $raw = trim((string)$this->request->get('margin_max', ''));
+        if ($raw === '' || !is_numeric(str_replace(',', '.', $raw))) {
+            return null;
+        }
+        return max(-100.0, min(10000.0, (float)str_replace(',', '.', $raw)));
+    }
+
     private function exportProducts(): void
     {
         $filters = $this->listFilters([
@@ -2441,6 +2465,7 @@ class TenantInventarioController extends TenantController
         $categoryFilter = (int)$this->request->get('category_id', 0);
         $stockFilter = (string)$this->request->get('stock_state', '');
         $locationFilter = trim((string)$this->request->get('location', ''));
+        $marginMax = $this->marginMaxFromRequest();
 
         try {
             (new \SoftNova\Services\ConsignmentService($this->db))->ensureSchema();
@@ -2465,6 +2490,11 @@ class TenantInventarioController extends TenantController
         if ($locationFilter !== '') {
             $where[] = "p.location = ?";
             $params[] = $locationFilter;
+        }
+        if ($marginMax !== null) {
+            $where[] = "p.purchase_price > 0
+                AND ((COALESCE(p.sale_price, 0) - p.purchase_price) / p.purchase_price * 100) <= ?";
+            $params[] = $marginMax;
         }
         if ($filters['q'] !== '') {
             $search = \SoftNova\Core\multi_term_like_clause($filters['q'], [
@@ -2550,6 +2580,7 @@ class TenantInventarioController extends TenantController
         $categoryFilter = (int)$this->request->get('category_id', 0);
         $stockFilter = (string)$this->request->get('stock_state', '');
         $locationFilter = trim((string)$this->request->get('location', ''));
+        $marginMax = $this->marginMaxFromRequest();
 
         $where = ["p.status = 'active'", "p.product_type = 'product'"];
         $params = [];
@@ -2569,6 +2600,11 @@ class TenantInventarioController extends TenantController
         if ($locationFilter !== '') {
             $where[] = "p.location = ?";
             $params[] = $locationFilter;
+        }
+        if ($marginMax !== null) {
+            $where[] = "p.purchase_price > 0
+                AND ((COALESCE(p.sale_price, 0) - p.purchase_price) / p.purchase_price * 100) <= ?";
+            $params[] = $marginMax;
         }
         if ($filters['q'] !== '') {
             $search = \SoftNova\Core\multi_term_like_clause($filters['q'], [

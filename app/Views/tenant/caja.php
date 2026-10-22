@@ -2197,9 +2197,18 @@ $cajaBase = $viewInstance->route('app/caja');
                 movHtml += '</tbody></table></div></div>';
             }
 
+            var closingObsHtml = '';
+            if (d.closing_notes) {
+                closingObsHtml = '<div style="margin:0 0 12px;padding:10px 12px;border:1px solid var(--dmc-FDE68A, #FDE68A);background:var(--dmb-FFFBEB, #FFFBEB);border-radius:8px;">'
+                    + '<div style="font-size:11px;font-weight:700;letter-spacing:.02em;color:var(--dmc-92400E, #92400E);">OBSERVACIÓN DE CIERRE</div>'
+                    + '<div style="font-size:13px;line-height:1.45;margin-top:3px;">'
+                    + cajaEsc(d.closing_notes).replace(/\n/g, '<br>') + '</div></div>';
+            }
+
             if (body) {
                 body.innerHTML = '<p style="margin:0 0 12px;font-size:13px;color:var(--color-text-secondary);">'
                     + 'Abierta por ' + cajaEsc(d.user_name) + ' · ' + cajaEsc(d.opening_date) + ' → ' + cajaEsc(d.closing_date) + '</p>'
+                    + closingObsHtml
                     + kpi('FACTURADO + BASE', cajaEsc(sa.ventas_totales_con_base_fmt || sa.total_fmt), '#2563EB',
                         ' <span style="font-weight:500;font-size:11px;opacity:.9;">ventas del día + apertura</span>')
                     + marginToggle

@@ -14,6 +14,7 @@ class CashService
         'expense_cancel',
         'purchase_credit_note',
         'supplier_payment_cancel',
+        'supplier_payment_cashfix',
         'purchase_order_cancel',
     ];
 
@@ -21,6 +22,7 @@ class CashService
     public const PURCHASE_REVERSAL_TYPES = [
         'purchase_credit_note',
         'supplier_payment_cancel',
+        'supplier_payment_cashfix',
         'purchase_order_cancel',
     ];
 
@@ -274,7 +276,7 @@ class CashService
                                  AND o.type = 'expense'
                                  AND (
                                     (r.reference_type = 'expense_cancel' AND o.reference_type = 'expense' AND o.reference_id = r.reference_id)
-                                    OR (r.reference_type = 'supplier_payment_cancel' AND o.reference_type = 'supplier_payment' AND o.reference_id = r.reference_id)
+                                    OR (r.reference_type IN ('supplier_payment_cancel', 'supplier_payment_cashfix') AND o.reference_type = 'supplier_payment' AND o.reference_id = r.reference_id)
                                     OR (r.reference_type = 'purchase_order_cancel' AND o.reference_type = 'purchase_order' AND o.reference_id = r.reference_id)
                                     OR (r.reference_type = 'purchase_credit_note' AND o.reference_type = 'purchase_order'
                                         AND o.reference_id = (SELECT cn.purchase_order_id FROM purchase_credit_notes cn WHERE cn.id = r.reference_id))

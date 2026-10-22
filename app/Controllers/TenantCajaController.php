@@ -1899,6 +1899,7 @@ class TenantCajaController extends TenantController
             'success' => true,
             'session_id' => $id,
             'can_view_margin' => $isAdmin,
+            'closing_notes' => \SoftNova\Services\CashClosingReportBuilder::closingObservation($session),
             'movements' => $movPayload,
             'by_user' => $byUserPayload,
             'user_name' => (string)($session['user_name'] ?? ''),
@@ -2061,6 +2062,10 @@ class TenantCajaController extends TenantController
                 if ($ncNumsMail !== '') {
                     $body .= "NC: {$ncNumsMail}\n";
                 }
+            }
+            $closingObs = \SoftNova\Services\CashClosingReportBuilder::closingObservation($session);
+            if ($closingObs !== '') {
+                $body .= "Observación de cierre: " . $closingObs . "\n";
             }
             $body .= "Adjunto encontrará el PDF del cierre.\n";
 
@@ -2443,6 +2448,11 @@ class TenantCajaController extends TenantController
         if (isset($totals['difference']) && abs((float)$totals['difference']) >= 0.01) {
             $diff = (float)$totals['difference'];
             $lines[] = ($diff < 0 ? 'Faltante: ' : 'Sobrante: ') . $this->formatMoney(abs($diff));
+        }
+        $closingObs = \SoftNova\Services\CashClosingReportBuilder::closingObservation($session);
+        if ($closingObs !== '') {
+            $lines[] = '';
+            $lines[] = '*Observación de cierre:* ' . $closingObs;
         }
         $lines[] = '';
         $lines[] = 'PDF: ' . rtrim((string)config('app.url', ''), '/') . '/app/caja?action=pdf&id=' . $id;
@@ -3379,7 +3389,7 @@ class TenantCajaController extends TenantController
                  LEFT JOIN users u ON u.id = cm.user_id
                  WHERE cm.cash_session_id IN ({$in})
                    AND cm.reference_type IN ('purchase_order', 'supplier_payment', 'purchase_credit_note',
-                                             'purchase_order_cancel', 'supplier_payment_cancel')",
+                                             'purchase_order_cancel', 'supplier_payment_cancel', 'supplier_payment_cashfix')",
                 $sessionIds
             )->fetchAll() ?: [];
         } catch (\Throwable $e) {
@@ -3431,6 +3441,7 @@ class TenantCajaController extends TenantController
         $reverseOf = [
             'expense_cancel' => 'expense',
             'supplier_payment_cancel' => 'supplier_payment',
+            'supplier_payment_cashfix' => 'supplier_payment',
             'purchase_order_cancel' => 'purchase_order',
         ];
 
@@ -3677,8 +3688,12 @@ class TenantCajaController extends TenantController
                 continue;
             }
 
-            if ($rt === 'supplier_payment' || $rt === 'supplier_payment_cancel') {
-                $mov['origin_label'] = ($rt === 'supplier_payment_cancel' ? 'Reverso abono #' : 'Abono proveedor #') . $rid;
+            if ($rt === 'supplier_payment' || $rt === 'supplier_payment_cancel' || $rt === 'supplier_payment_cashfix') {
+                $mov['origin_label'] = match ($rt) {
+                    'supplier_payment_cancel' => 'Reverso abono #' . $rid,
+                    'supplier_payment_cashfix' => 'Corrección abono #' . $rid,
+                    default => 'Abono proveedor #' . $rid,
+                };
                 $mov['origin_url'] = base_url('/app/compras?action=facturas');
                 continue;
             }

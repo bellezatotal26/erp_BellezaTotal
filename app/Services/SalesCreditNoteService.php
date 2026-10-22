@@ -244,6 +244,18 @@ class SalesCreditNoteService
             error_log('NC consign schema: ' . $e->getMessage());
         }
 
+        // Igual con lotes / cadena de suministro: StockService::increase() puede
+        // construir LotService dentro de la TX y su ensure() ejecuta CREATE TABLE.
+        // Si ese DDL corre con la TX abierta, MySQL confirma todo en silencio y el
+        // commit() final falla con «There is no active transaction» (la NC sí
+        // quedaba guardada pero la pantalla reportaba error). Se calienta antes.
+        try {
+            SupplyChainSchema::ensure($this->db);
+            $stock->lots();
+        } catch (\Throwable $e) {
+            error_log('NC lotes schema: ' . $e->getMessage());
+        }
+
         $this->db->beginTransaction();
         try {
             try {
@@ -510,7 +522,12 @@ class SalesCreditNoteService
                 );
             }
 
-            $this->db->commit();
+            // Solo confirmar si la TX sigue activa: si algo la cerró antes
+            // (p. ej. un commit implícito), el trabajo ya quedó persistido y
+            // reportar error sería falso (la NC existe).
+            if ($this->db->inTransaction()) {
+                $this->db->commit();
+            }
         } catch (\Throwable $e) {
             if ($this->db->inTransaction()) {
                 $this->db->rollBack();

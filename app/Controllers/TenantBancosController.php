@@ -56,6 +56,11 @@ class TenantBancosController extends TenantController
             return;
         }
 
+        if ($action === 'export_recon') {
+            $this->exportRecon();
+            return;
+        }
+
         $tab = (string)$this->request->get('tab', 'cuentas');
         if (!in_array($tab, ['cuentas', 'conciliacion', 'bold'], true)) {
             $tab = 'cuentas';
@@ -100,6 +105,53 @@ class TenantBancosController extends TenantController
         $this->view('tenant.bancos', $this->tenantViewData($data));
     }
 
+    /** Descarga Excel de la conciliación: resumen + extracto sin cruzar + libros sin banco. */
+    private function exportRecon(): void
+    {
+        $statementId = (int)$this->request->get('statement_id', 0);
+        try {
+            $recon = $this->banking->reconciliation($statementId);
+            $account = $recon['account'];
+            $rows = [];
+            $rows[] = ['RESUMEN', (string)$recon['to'], 'Cuenta: ' . (string)($account['name'] ?? '') . ' (' . (string)($account['account_code'] ?? '') . ')', '', null, ''];
+            $rows[] = ['RESUMEN', '', 'Saldo según banco', '', $recon['bank_balance'], ''];
+            $rows[] = ['RESUMEN', '', 'Saldo en libros', '', (float)$recon['book_balance'], ''];
+            $rows[] = ['RESUMEN', '', 'Extracto sin registrar (neto)', '', (float)$recon['pending_sum'], ''];
+            $rows[] = ['RESUMEN', '', 'Libros que el banco no muestra (neto)', '', (float)$recon['outstanding_sum'], ''];
+            $rows[] = ['RESUMEN', '', 'Diferencia por conciliar', '', $recon['difference'], ''];
+            foreach ($this->banking->statementLines($statementId, 'pending') as $l) {
+                $rows[] = [
+                    'Extracto sin cruzar',
+                    (string)$l['line_date'],
+                    (string)($l['description'] ?? ''),
+                    (string)($l['reference'] ?? ''),
+                    (float)$l['amount'],
+                    'Sin cruzar',
+                ];
+            }
+            foreach ($recon['outstanding'] as $o) {
+                $net = round((float)($o['debit'] ?? 0) - (float)($o['credit'] ?? 0), 2);
+                $rows[] = [
+                    'Libros sin banco',
+                    (string)($o['entry_date'] ?? ''),
+                    (string)(($o['entry_number'] ?? '') . ' · ' . ($o['description'] ?? '') . (($o['third_party_name'] ?? '') !== '' ? ' · ' . $o['third_party_name'] : '')),
+                    (string)($o['entry_number'] ?? ''),
+                    $net,
+                    'Sin banco',
+                ];
+            }
+            \SoftNova\Services\SimpleXlsxWriter::download(
+                'conciliacion_' . preg_replace('/\D/', '', (string)($account['account_code'] ?? 'banco'))
+                    . '_' . $statementId . '_' . date('Ymd_His') . '.xlsx',
+                ['Tipo', 'Fecha', 'Descripción', 'Referencia', 'Valor', 'Estado'],
+                $rows,
+                [4 => 'currency']
+            );
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), self::BASE . '?tab=conciliacion&statement_id=' . $statementId);
+        }
+    }
+
     /** @param list<array<string,mixed>> $accounts */
     private function reconciliationData(array $accounts): array
     {
@@ -139,7 +191,7 @@ class TenantBancosController extends TenantController
                     continue;
                 }
                 $count++;
-                $cands = $this->banking->bookCandidates($account, (string)$l['line_date'], (float)$l['amount'], 15, 5);
+                $cands = $this->banking->bookCandidates($account, (string)$l['line_date'], (float)$l['amount'], 15, 5, (string)($l['reference'] ?? ''));
                 if ($cands) {
                     $out['candidates'][(int)$l['id']] = $cands;
                 }
@@ -296,6 +348,9 @@ class TenantBancosController extends TenantController
             }
             if ($result['skipped'] > 0) {
                 $msg .= ', ' . $result['skipped'] . ' fila(s) sin fecha o valor';
+            }
+            if (!empty($result['continuity'])) {
+                $msg .= ' ⚠ ' . $result['continuity'];
             }
             $msg .= '. Columnas usadas: ' . $this->columnsText($result['columns']);
             $this->respond(true, $msg, self::BASE . '?tab=conciliacion&statement_id=' . (int)$result['statement_id']);

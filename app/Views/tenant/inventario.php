@@ -18,6 +18,7 @@ $locationOptions = $locationOptions ?? [];
 $needBarcode = true;
 $pageScripts = ['inventario.js'];
 $channelFilter = $channelFilter ?? '';
+$marginMaxFilter = $marginMaxFilter ?? null;
 $catalogStatuses = $catalogStatuses ?? [];
 $mlOAuthRedirect = $mlOAuthRedirect ?? '';
 $filters = $filters ?? ['q' => '', 'sort' => 'name', 'dir' => 'asc', 'query' => []];
@@ -250,12 +251,14 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
             <input type="text" name="q" id="invSearchQ" value="<?php echo htmlspecialchars($filters['q'] ?? ''); ?>" class="form-control" placeholder="Nombre, SKU o EAN… busca al escribir (SKU, EAN, nombre)" autocomplete="off">
         </div>
         <div class="form-group" style="margin:0;">
-            <label style="font-size:12px;">Tipo</label>
-            <select name="type" class="form-control" style="width:auto;">
-                <option value="">Todos</option>
-                <option value="product" <?php echo $typeFilter === 'product' ? 'selected' : ''; ?>>Productos</option>
-                <option value="service" <?php echo $typeFilter === 'service' ? 'selected' : ''; ?>>Servicios</option>
-            </select>
+            <label style="font-size:12px;" title="Muestra productos con utilidad igual o menor al % digitado. % sobre el costo: (venta − compra) ÷ compra × 100. Los productos sin precio de compra quedan fuera.">Utilidad hasta %</label>
+            <input type="number" name="margin_max" step="0.1" min="-100" max="10000"
+                   value="<?php echo $marginMaxFilter !== null ? htmlspecialchars(rtrim(rtrim(number_format((float)$marginMaxFilter, 2, '.', ''), '0'), '.')) : ''; ?>"
+                   class="form-control" style="width:120px;" placeholder="Ej: 30"
+                   title="Muestra productos con utilidad igual o menor al % digitado. % sobre el costo: (venta − compra) ÷ compra × 100. Los productos sin precio de compra quedan fuera.">
+            <?php if ($marginMaxFilter !== null): ?>
+                <small style="display:block;color:#6b7280;margin-top:2px;">hasta <?php echo htmlspecialchars(number_format((float)$marginMaxFilter, 1, ',', '.')); ?>%</small>
+            <?php endif; ?>
         </div>
         <div class="form-group" style="margin:0;">
             <label style="font-size:12px;">Estado</label>
@@ -284,7 +287,7 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                 <option value="out" <?php echo $stockFilter === 'out' ? 'selected' : ''; ?>>Agotado</option>
             </select>
         </div>
-        <details class="inv-more-filters">
+        <details class="inv-more-filters" <?php echo (($typeFilter ?? '') !== '' || ($channelFilter ?? '') !== '' || ($locationFilter ?? '') !== '') ? 'open' : ''; ?>>
             <summary class="btn btn-secondary">Más filtros</summary>
             <div class="inv-more-filters-panel">
                 <div class="form-group" style="margin:0;">
@@ -307,6 +310,14 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                         <?php foreach (\SoftNova\Core\product_channels() as $ck => $cl): ?>
                             <option value="<?php echo htmlspecialchars($ck); ?>" <?php echo $channelFilter === $ck ? 'selected' : ''; ?>><?php echo htmlspecialchars($cl); ?></option>
                         <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label style="font-size:12px;">Tipo</label>
+                    <select name="type" class="form-control">
+                        <option value="">Todos</option>
+                        <option value="product" <?php echo $typeFilter === 'product' ? 'selected' : ''; ?>>Productos</option>
+                        <option value="service" <?php echo $typeFilter === 'service' ? 'selected' : ''; ?>>Servicios</option>
                     </select>
                 </div>
             </div>

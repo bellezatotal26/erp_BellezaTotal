@@ -11,6 +11,7 @@ $products = $products ?? [];
 $customers = $customers ?? [];
 $currency = $currency ?? ['symbol' => '$', 'decimals' => 0];
 $canCreateSale = \SoftNova\Core\TenantMiddleware::canDo('create', 'ventas');
+$canViewSalesSummary = \SoftNova\Core\TenantMiddleware::isManagement();
 $canDeleteSale = \SoftNova\Core\TenantMiddleware::canDo('delete', 'ventas');
 $canExportSale = \SoftNova\Core\TenantMiddleware::canDo('export', 'ventas');
 $canEditPaymentMethod = $canCreateSale || \SoftNova\Core\TenantMiddleware::canDo('edit', 'ventas');
@@ -121,6 +122,8 @@ $sumPresetUrl = static function (string $from, string $to) use ($ventasBase, $su
     return $ventasBase . '?' . http_build_query($sumKeep + ['sum_from' => $from, 'sum_to' => $to]);
 };
 ?>
+<?php // Resumen de ventas + medios de pago: SOLO visible para administrador y gerencia. ?>
+<?php if ($canViewSalesSummary): ?>
 <div class="card neumorphic" style="margin-bottom:14px;">
     <div class="card-body" style="padding:10px 16px;">
         <form method="GET" action="<?php echo $ventasBase; ?>" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;">
@@ -207,6 +210,7 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
     </div>
     <?php endif; ?>
 </details>
+<?php endif; ?>
 <style>
 .sales-pay-summary { margin-bottom: 18px; padding: 0; overflow: hidden; }
 .sales-pay-summary__head {

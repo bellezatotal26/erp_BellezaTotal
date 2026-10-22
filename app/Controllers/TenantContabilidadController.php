@@ -97,6 +97,11 @@ class TenantContabilidadController extends TenantController
         $purchaseSummary = ['cnt' => 0, 'total' => 0.0];
         $invoiceTraceOrders = [];
         $invoiceTraceQ = trim((string)$this->request->get('q', ''));
+        $invoiceTraceSort = (string)$this->request->get('trace_sort', 'date');
+        if (!in_array($invoiceTraceSort, ['oc', 'supplier', 'date', 'total', 'status'], true)) {
+            $invoiceTraceSort = 'date';
+        }
+        $invoiceTraceDir = strtolower((string)$this->request->get('trace_dir', 'desc')) === 'asc' ? 'asc' : 'desc';
         $needsPurchaseSummary = in_array($tab, ['dashboard', 'compras'], true);
         try {
             $purchasing = new \SoftNova\Services\PurchasingService($this->db);
@@ -111,7 +116,7 @@ class TenantContabilidadController extends TenantController
                 )->fetch() ?: ['cnt'=>0,'total'=>0];
             }
             if ($tab === 'invoice-trace') {
-                $invoiceTraceOrders = $purchasing->listInvoiceTrace($from, $to, $invoiceTraceQ, 100);
+                $invoiceTraceOrders = $purchasing->listInvoiceTrace($from, $to, $invoiceTraceQ, 100, $invoiceTraceSort, $invoiceTraceDir);
             }
         } catch (\Throwable $e) {
             // schema aún no migrado
@@ -332,6 +337,8 @@ class TenantContabilidadController extends TenantController
             'traceMovements' => $trace['rows'],
             'invoiceTraceOrders' => $invoiceTraceOrders,
             'invoiceTraceQ' => $invoiceTraceQ,
+            'invoiceTraceSort' => $invoiceTraceSort,
+            'invoiceTraceDir' => $invoiceTraceDir,
             'accountAudit' => $accountAudit,
             'reconciliation' => $reconciliation,
             'pendingSync' => $pendingSync,
@@ -753,9 +760,14 @@ class TenantContabilidadController extends TenantController
 
         if ($report === 'invoice-trace') {
             $q = trim((string)$this->request->get('q', ''));
+            $exSort = (string)$this->request->get('trace_sort', 'date');
+            if (!in_array($exSort, ['oc', 'supplier', 'date', 'total', 'status'], true)) {
+                $exSort = 'date';
+            }
+            $exDir = strtolower((string)$this->request->get('trace_dir', 'desc')) === 'asc' ? 'asc' : 'desc';
             $purchasing = new \SoftNova\Services\PurchasingService($this->db);
             $rows = [];
-            foreach ($purchasing->listInvoiceTrace($from, $to, $q, 500) as $o) {
+            foreach ($purchasing->listInvoiceTrace($from, $to, $q, 500, $exSort, $exDir) as $o) {
                 $balance = round(
                     (float)$o['total']
                     - (float)($o['paid_total'] ?? 0)

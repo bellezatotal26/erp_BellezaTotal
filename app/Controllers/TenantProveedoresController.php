@@ -4,9 +4,22 @@ namespace SoftNova\Controllers;
 
 use SoftNova\Core\TenantController;
 use SoftNova\Core\TenantMiddleware;
+use SoftNova\Services\TenantAuditService;
 
 class TenantProveedoresController extends TenantController
 {
+    /** Relaciones que se pueden trasladar a otro proveedor al fusionar/eliminar. */
+    private const REL_LABELS = [
+        'orders' => 'OC / facturas de compra',
+        'payments' => 'Abonos a proveedor',
+        'credit_notes' => 'Notas crédito de compra',
+        'imports' => 'Facturas leídas (borradores)',
+        'products' => 'Productos vinculados',
+        'lots' => 'Lotes de inventario',
+        'expenses' => 'Gastos',
+        'accounting' => 'Líneas de asientos contables',
+        'consignors' => 'Vínculo de consignación',
+    ];
     public function __construct()
     {
         parent::__construct();
@@ -76,9 +89,27 @@ class TenantProveedoresController extends TenantController
              LIMIT {$pagination['perPage']} OFFSET {$pagination['offset']}",
             $params
         )->fetchAll();
-        
+
+        // Relaciones por proveedor de la página (para el aviso al eliminar/fusionar)
+        // y catálogo completo de destinos posibles para trasladarlas.
+        $relBySupplier = $this->relationCountsFor(array_map(static fn($s) => (int)$s['id'], $suppliers));
+        foreach ($suppliers as &$sRow) {
+            $sRow['relations'] = $relBySupplier[(int)$sRow['id']] ?? [];
+        }
+        unset($sRow);
+        try {
+            $supplierOptions = $this->query(
+                "SELECT id, name, document_type, document_number FROM suppliers
+                 WHERE status = 'active' ORDER BY name ASC"
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $supplierOptions = [];
+        }
+
         $this->view('tenant.proveedores', $this->tenantViewData([
             'suppliers' => $suppliers,
+            'supplierOptions' => $supplierOptions,
+            'relationLabels' => self::REL_LABELS,
             'pagination' => $pagination,
             'perPageOptions' => $per['options'],
             'qFilter' => $q,
@@ -193,24 +224,262 @@ class TenantProveedoresController extends TenantController
         return null;
     }
     
+    /**
+     * Conteo de relaciones por proveedor (solo claves con registros).
+     *
+     * @param list<int> $supplierIds
+     * @return array<int,array<string,int>>
+     */
+    private function relationCountsFor(array $supplierIds): array
+    {
+        $supplierIds = array_values(array_unique(array_filter(array_map('intval', $supplierIds))));
+        if ($supplierIds === []) {
+            return [];
+        }
+        $in = implode(',', $supplierIds);
+        $specs = [
+            'orders' => "SELECT supplier_id AS k, COUNT(*) AS c FROM purchase_orders WHERE supplier_id IN ({$in}) GROUP BY supplier_id",
+            'payments' => "SELECT supplier_id AS k, COUNT(*) AS c FROM supplier_payments WHERE supplier_id IN ({$in}) GROUP BY supplier_id",
+            'credit_notes' => "SELECT supplier_id AS k, COUNT(*) AS c FROM purchase_credit_notes WHERE supplier_id IN ({$in}) GROUP BY supplier_id",
+            'imports' => "SELECT supplier_id AS k, COUNT(*) AS c FROM purchase_invoice_imports WHERE supplier_id IN ({$in}) GROUP BY supplier_id",
+            'products' => "SELECT supplier_id AS k, COUNT(*) AS c FROM product_suppliers WHERE supplier_id IN ({$in}) GROUP BY supplier_id",
+            'lots' => "SELECT supplier_id AS k, COUNT(*) AS c FROM product_lots WHERE supplier_id IN ({$in}) GROUP BY supplier_id",
+            'expenses' => "SELECT supplier_id AS k, COUNT(*) AS c FROM expenses WHERE supplier_id IN ({$in}) GROUP BY supplier_id",
+            'accounting' => "SELECT third_party_id AS k, COUNT(*) AS c FROM accounting_lines WHERE third_party_type = 'supplier' AND third_party_id IN ({$in}) GROUP BY third_party_id",
+            'consignors' => "SELECT supplier_id AS k, COUNT(*) AS c FROM consignors WHERE supplier_id IN ({$in}) GROUP BY supplier_id",
+        ];
+        $out = [];
+        foreach ($specs as $key => $sql) {
+            try {
+                foreach ($this->query($sql)->fetchAll() as $row) {
+                    $sid = (int)($row['k'] ?? 0);
+                    $c = (int)($row['c'] ?? 0);
+                    if ($sid > 0 && $c > 0) {
+                        $out[$sid][$key] = $c;
+                    }
+                }
+            } catch (\Throwable $e) {
+                // Tabla inexistente en esta instalación: se omite.
+            }
+        }
+        return $out;
+    }
+
+    /** Texto corto: «3 OC / facturas de compra, 2 Abonos a proveedor». */
+    private function relationsText(array $counts): string
+    {
+        $parts = [];
+        foreach (self::REL_LABELS as $key => $label) {
+            $c = (int)($counts[$key] ?? 0);
+            if ($c > 0) {
+                $parts[] = $c . ' ' . $label;
+            }
+        }
+        return implode(', ', $parts);
+    }
+
     private function delete(): void
     {
         if (!$this->validateCsrfOrFail('/app/proveedores')) {
             return;
         }
         $id = (int)$this->request->post('id');
+        $targetId = (int)$this->request->post('target_supplier_id', 0);
         if ($id <= 0) {
             $this->respond(false, 'Proveedor invalido', '/app/proveedores');
             return;
         }
-        
+
+        $source = $this->query(
+            "SELECT id, name, status FROM suppliers WHERE id = ?",
+            [$id]
+        )->fetch();
+        if (!$source || ($source['status'] ?? '') !== 'active') {
+            $this->respond(false, 'El proveedor no existe o ya fue eliminado', '/app/proveedores');
+            return;
+        }
+
+        $counts = $this->relationCountsFor([$id])[$id] ?? [];
+        $total = array_sum($counts);
+
+        // Con relaciones y sin destino no se elimina: quedarían huérfanas.
+        if ($total > 0 && $targetId <= 0) {
+            $this->respond(
+                false,
+                '«' . $source['name'] . '» tiene relaciones en el sistema (' . $this->relationsText($counts)
+                    . '). Elija el proveedor destino para trasladarlas y luego eliminarlo.',
+                '/app/proveedores'
+            );
+            return;
+        }
+
+        if ($targetId > 0) {
+            if ($targetId === $id) {
+                $this->respond(false, 'El proveedor destino debe ser otro distinto al que se elimina', '/app/proveedores');
+                return;
+            }
+            $target = $this->query(
+                "SELECT id, name, status FROM suppliers WHERE id = ?",
+                [$targetId]
+            )->fetch();
+            if (!$target || ($target['status'] ?? '') !== 'active') {
+                $this->respond(false, 'El proveedor destino no existe o está inactivo', '/app/proveedores');
+                return;
+            }
+
+            try {
+                $moved = $this->mergeSupplierRelations($id, $targetId, (string)$target['name'], $counts);
+            } catch (\Throwable $e) {
+                $this->respond(false, 'No se pudieron trasladar las relaciones: ' . $e->getMessage(), '/app/proveedores');
+                return;
+            }
+
+            TenantAuditService::safeLog(
+                $this->db,
+                'delete',
+                'proveedores',
+                'Proveedor fusionado y eliminado: «' . $source['name'] . '» (#' . $id . ') → «'
+                    . $target['name'] . '» (#' . $targetId . ') · ' . $this->relationsText($counts),
+                'supplier',
+                $id,
+                ['target_supplier_id' => $targetId, 'relations' => $counts, 'moved' => $moved]
+            );
+
+            $this->respond(
+                true,
+                'Proveedor «' . $source['name'] . '» eliminado. Se trasladaron ' . $moved
+                    . ' relación(es) a «' . $target['name'] . '» (' . $this->relationsText($counts) . ').',
+                '/app/proveedores'
+            );
+            return;
+        }
+
         $stmt = $this->query("UPDATE suppliers SET status = 'inactive' WHERE id = ?", [$id]);
         if ($stmt->rowCount() < 1) {
             $this->respond(false, 'No se pudo eliminar el proveedor', '/app/proveedores');
             return;
         }
-        
+
+        TenantAuditService::safeLog(
+            $this->db,
+            'delete',
+            'proveedores',
+            'Proveedor eliminado sin relaciones: «' . $source['name'] . '» (#' . $id . ')',
+            'supplier',
+            $id,
+            []
+        );
+
         $this->respond(true, 'Proveedor eliminado', '/app/proveedores');
+    }
+
+    /**
+     * Traslada TODAS las relaciones del proveedor origen al destino y da de
+     * baja el origen (baja lógica, como el resto del sistema). En transacción:
+     * o se mueve todo o no se mueve nada.
+     *
+     * @param array<string,int> $counts Conteo previo (solo informativo)
+     * @return int Total de filas actualizadas
+     */
+    private function mergeSupplierRelations(int $sourceId, int $targetId, string $targetName, array $counts): int
+    {
+        $ownTx = !$this->db->inTransaction();
+        if ($ownTx) {
+            $this->db->beginTransaction();
+        }
+        $moved = 0;
+        try {
+            $simpleTables = [
+                'purchase_orders',
+                'supplier_payments',
+                'purchase_credit_notes',
+                'purchase_invoice_imports',
+                'product_lots',
+                'expenses',
+            ];
+            foreach ($simpleTables as $table) {
+                try {
+                    $stmt = $this->query(
+                        "UPDATE {$table} SET supplier_id = ? WHERE supplier_id = ?",
+                        [$targetId, $sourceId]
+                    );
+                    $moved += $stmt->rowCount();
+                } catch (\Throwable $e) {
+                    // Tabla inexistente en esta instalación: se omite.
+                }
+            }
+
+            // Productos vinculados: UNIQUE(product_id, supplier_id). Si el destino
+            // ya tiene el producto, se conserva el vínculo del destino.
+            try {
+                $stmt = $this->query(
+                    "DELETE FROM product_suppliers
+                     WHERE supplier_id = ?
+                       AND product_id IN (
+                           SELECT product_id FROM (
+                               SELECT product_id FROM product_suppliers WHERE supplier_id = ?
+                           ) dup
+                       )",
+                    [$sourceId, $targetId]
+                );
+                $moved += $stmt->rowCount();
+                $stmt = $this->query(
+                    "UPDATE product_suppliers SET supplier_id = ? WHERE supplier_id = ?",
+                    [$targetId, $sourceId]
+                );
+                $moved += $stmt->rowCount();
+            } catch (\Throwable $e) {
+                // Tabla inexistente: se omite.
+            }
+
+            // Tercero en asientos contables ya emitidos (duplicado = misma empresa).
+            try {
+                $stmt = $this->query(
+                    "UPDATE accounting_lines
+                     SET third_party_id = ?, third_party_name = ?
+                     WHERE third_party_type = 'supplier' AND third_party_id = ?",
+                    [$targetId, $targetName, $sourceId]
+                );
+                $moved += $stmt->rowCount();
+            } catch (\Throwable $e) {
+                // Sin contabilidad: se omite.
+            }
+
+            // Consignación es 1 a 1 con el proveedor: solo se mueve si el destino no tiene una.
+            try {
+                $hasTarget = (int)$this->query(
+                    "SELECT COUNT(*) FROM consignors WHERE supplier_id = ?",
+                    [$targetId]
+                )->fetchColumn();
+                if ($hasTarget === 0) {
+                    $stmt = $this->query(
+                        "UPDATE consignors SET supplier_id = ? WHERE supplier_id = ?",
+                        [$targetId, $sourceId]
+                    );
+                    $moved += $stmt->rowCount();
+                }
+            } catch (\Throwable $e) {
+                // Sin módulo de consignación: se omite.
+            }
+
+            $stmt = $this->query(
+                "UPDATE suppliers SET status = 'inactive' WHERE id = ? AND status = 'active'",
+                [$sourceId]
+            );
+            if ($stmt->rowCount() < 1) {
+                throw new \RuntimeException('El proveedor ya no estaba activo');
+            }
+
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->commit();
+            }
+        } catch (\Throwable $e) {
+            if ($ownTx && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
+        return $moved;
     }
     
     private function exportSuppliers(): void

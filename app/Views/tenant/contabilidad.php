@@ -73,6 +73,8 @@ $tabs = [
 ];
 $invoiceTraceOrders = $invoiceTraceOrders ?? [];
 $invoiceTraceQ = $invoiceTraceQ ?? '';
+$invoiceTraceSort = $invoiceTraceSort ?? 'date';
+$invoiceTraceDir = $invoiceTraceDir ?? 'desc';
 $vatBook = $vatBook ?? null;
 $salesBook = $salesBook ?? null;
 $generalLedger = $generalLedger ?? ['rows' => [], 'totals' => [], 'balanced' => [], 'mode' => 'subaccounts'];
@@ -218,6 +220,8 @@ foreach ($accounts as $account) {
                     <label>Buscar</label>
                     <input class="form-control" type="search" name="q" value="<?php echo htmlspecialchars($invoiceTraceQ); ?>" placeholder="OC, factura o proveedor">
                 </div>
+                <input type="hidden" name="trace_sort" value="<?php echo htmlspecialchars($invoiceTraceSort); ?>">
+                <input type="hidden" name="trace_dir" value="<?php echo htmlspecialchars($invoiceTraceDir); ?>">
             <?php endif; ?>
             <button class="btn btn-primary" type="submit">Aplicar</button>
         </form>
@@ -1698,7 +1702,7 @@ foreach ($accounts as $account) {
             <h3 style="margin:0;">Trazabilidad de facturas de compra</h3>
             <?php if ($canExport): ?>
             <a class="btn btn-sm btn-secondary"
-               href="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=export&report=invoice-trace&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>&q=<?php echo urlencode($invoiceTraceQ); ?>">
+               href="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=export&report=invoice-trace&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>&q=<?php echo urlencode($invoiceTraceQ); ?>&trace_sort=<?php echo urlencode($invoiceTraceSort); ?>&trace_dir=<?php echo urlencode($invoiceTraceDir); ?>">
                 Exportar CSV
             </a>
             <?php endif; ?>
@@ -1713,13 +1717,29 @@ foreach ($accounts as $account) {
                 <div class="invoice-trace-layout">
                     <div class="table-container">
                         <table>
+                            <?php
+                            $traceTh = static function (string $key, string $label) use ($viewInstance, $dateFrom, $dateTo, $invoiceTraceQ, $invoiceTraceSort, $invoiceTraceDir): string {
+                                $active = $invoiceTraceSort === $key;
+                                $nextDir = $active && $invoiceTraceDir === 'asc' ? 'desc' : 'asc';
+                                $url = $viewInstance->route('app/contabilidad')
+                                    . '?tab=invoice-trace&from=' . urlencode($dateFrom) . '&to=' . urlencode($dateTo)
+                                    . '&q=' . urlencode($invoiceTraceQ)
+                                    . '&trace_sort=' . urlencode($key) . '&trace_dir=' . $nextDir;
+                                $arrow = $active ? ($invoiceTraceDir === 'asc' ? ' ▲' : ' ▼') : ' ⇅';
+                                $title = $active
+                                    ? ($invoiceTraceDir === 'asc' ? 'Ascendente · clic para descendente' : 'Descendente · clic para ascendente')
+                                    : 'Clic para ordenar ascendente';
+                                return '<a href="' . htmlspecialchars($url) . '" title="' . htmlspecialchars($title) . '" style="color:inherit;text-decoration:none;white-space:nowrap;">'
+                                    . htmlspecialchars($label) . $arrow . '</a>';
+                            };
+                            ?>
                             <thead>
                                 <tr>
-                                    <th>OC / Factura</th>
-                                    <th>Proveedor</th>
-                                    <th>Fechas</th>
-                                    <th>Total</th>
-                                    <th>Estado</th>
+                                    <th><?php echo $traceTh('oc', 'OC / Factura'); ?></th>
+                                    <th><?php echo $traceTh('supplier', 'Proveedor'); ?></th>
+                                    <th><?php echo $traceTh('date', 'Fechas'); ?></th>
+                                    <th><?php echo $traceTh('total', 'Total'); ?></th>
+                                    <th><?php echo $traceTh('status', 'Estado'); ?></th>
                                     <th></th>
                                 </tr>
                             </thead>

@@ -73,6 +73,16 @@ class TenantComprasController extends TenantController
             $this->pay();
             return;
         }
+        if ($action === 'fix_payment_cash_source' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('compras', 'edit');
+            $this->fixPaymentCashSource();
+            return;
+        }
+        if ($action === 'fix_payment_discount' && $this->request->method() === 'POST') {
+            TenantMiddleware::authorize('compras', 'edit');
+            $this->fixPaymentDiscount();
+            return;
+        }
         if ($action === 'purchase_limit' && $this->request->method() === 'POST') {
             $this->savePurchaseLimit();
             return;
@@ -1977,6 +1987,156 @@ class TenantComprasController extends TenantController
     }
 
     /**
+     * Corrección: el abono quedó como efectivo del cajón pero fue de otro origen.
+     * Reintegra el cajón, reversa el asiento y lo re-emite con crédito a bancos.
+     */
+    private function fixPaymentCashSource(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/compras?action=facturas')) {
+            return;
+        }
+        $paymentId = (int)$this->request->post('payment_id', 0);
+        $sourceNote = trim((string)$this->request->post('cash_source_note', ''));
+        try {
+            $result = $this->purchasing->correctSupplierPaymentCashSource($paymentId, $sourceNote);
+
+            $accountingNote = '';
+            if (($result['accounting_entry_id'] ?? 0) > 0) {
+                $reversed = false;
+                try {
+                    $this->accounting->reverseSource(
+                        'supplier_payment',
+                        $paymentId,
+                        'Corrección abono #' . $paymentId . ': el efectivo no salió del cajón'
+                    );
+                    $reversed = true;
+                } catch (\Throwable $e) {
+                    error_log('Reverso corrección abono #' . $paymentId . ': ' . $e->getMessage());
+                    $this->accounting->enqueuePending(
+                        'reverse_source',
+                        'supplier_payment',
+                        $paymentId,
+                        $e->getMessage(),
+                        ['reason' => 'Corrección abono #' . $paymentId . ': el efectivo no salió del cajón']
+                    );
+                }
+                if ($reversed) {
+                    try {
+                        $this->purchasing->clearSupplierPaymentAccountingEntry($paymentId);
+                        $this->accounting->postSupplierPayment($paymentId);
+                        $accountingNote = ' Asiento re-emitido con crédito a bancos (111005).';
+                    } catch (\Throwable $e) {
+                        error_log('Re-emisión corrección abono #' . $paymentId . ': ' . $e->getMessage());
+                        $this->accounting->enqueuePending(
+                            'post_supplier_payment',
+                            'supplier_payment',
+                            $paymentId,
+                            $e->getMessage()
+                        );
+                        $accountingNote = ' Asiento pendiente: use «Sincronizar» en Contabilidad.';
+                    }
+                } else {
+                    $accountingNote = ' Reverso contable pendiente: use «Sincronizar» en Contabilidad.';
+                }
+            }
+
+            $this->respond(
+                true,
+                'Origen del efectivo corregido en el abono #' . $paymentId
+                    . (($result['order_number'] ?? '') !== '' ? ' (OC ' . $result['order_number'] . ')' : '')
+                    . ' por ' . $this->formatMoney((float)($result['amount'] ?? 0)) . '. '
+                    . ($result['cash_note'] ?? '') . $accountingNote,
+                '/app/compras?action=facturas'
+            );
+        } catch (\Throwable $e) {
+            $this->respond(false, $this->clientErrorMessage($e, 'No se pudo corregir el origen del efectivo'), '/app/compras?action=facturas');
+        }
+    }
+
+    /**
+     * Corrección: el dcto. pronto pago de un abono se registró mal.
+     * Actualiza el descuento, reversa el asiento y lo re-emite (421040 ajustado).
+     * El monto pagado no cambia: la caja no se toca.
+     */
+    private function fixPaymentDiscount(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/compras?action=facturas')) {
+            return;
+        }
+        $paymentId = (int)$this->request->post('payment_id', 0);
+        $pctRaw = trim((string)$this->request->post('discount_pct', ''));
+        $pct = $pctRaw !== ''
+            ? max(0.0, min(100.0, (float)str_replace(',', '.', $pctRaw)))
+            : null;
+        $amountRaw = trim((string)$this->request->post('discount_amount', ''));
+        $discountAmount = $amountRaw !== '' ? \SoftNova\Core\parse_money($amountRaw) : null;
+        $reason = trim((string)$this->request->post('reason', ''));
+        try {
+            $result = $this->purchasing->correctSupplierPaymentDiscount(
+                $paymentId,
+                $discountAmount,
+                $pct,
+                $reason
+            );
+
+            $accountingNote = '';
+            if (($result['accounting_entry_id'] ?? 0) > 0) {
+                $reversed = false;
+                try {
+                    $this->accounting->reverseSource(
+                        'supplier_payment',
+                        $paymentId,
+                        'Corrección dcto. pronto pago abono #' . $paymentId . ': $'
+                            . number_format((float)$result['old_discount'], 2, '.', '')
+                            . ' → $' . number_format((float)$result['new_discount'], 2, '.', '')
+                    );
+                    $reversed = true;
+                } catch (\Throwable $e) {
+                    error_log('Reverso corrección dcto. abono #' . $paymentId . ': ' . $e->getMessage());
+                    $this->accounting->enqueuePending(
+                        'reverse_source',
+                        'supplier_payment',
+                        $paymentId,
+                        $e->getMessage(),
+                        ['reason' => 'Corrección dcto. pronto pago abono #' . $paymentId]
+                    );
+                }
+                if ($reversed) {
+                    try {
+                        $this->purchasing->clearSupplierPaymentAccountingEntry($paymentId);
+                        $this->accounting->postSupplierPayment($paymentId);
+                        $accountingNote = ' Asiento re-emitido con el descuento corregido (ingreso 421040 ajustado).';
+                    } catch (\Throwable $e) {
+                        error_log('Re-emisión corrección dcto. abono #' . $paymentId . ': ' . $e->getMessage());
+                        $this->accounting->enqueuePending(
+                            'post_supplier_payment',
+                            'supplier_payment',
+                            $paymentId,
+                            $e->getMessage()
+                        );
+                        $accountingNote = ' Asiento pendiente: use «Sincronizar» en Contabilidad.';
+                    }
+                } else {
+                    $accountingNote = ' Reverso contable pendiente: use «Sincronizar» en Contabilidad.';
+                }
+            }
+
+            $this->respond(
+                true,
+                'Dcto. pronto pago del abono #' . $paymentId
+                    . (($result['order_number'] ?? '') !== '' ? ' (OC ' . $result['order_number'] . ')' : '')
+                    . ' corregido: ' . $this->formatMoney((float)$result['old_discount'])
+                    . ' → ' . $this->formatMoney((float)$result['new_discount'])
+                    . '. Saldo pendiente de la factura: ' . $this->formatMoney((float)$result['balance'])
+                    . '.' . $accountingNote,
+                '/app/compras?action=facturas'
+            );
+        } catch (\Throwable $e) {
+            $this->respond(false, $this->clientErrorMessage($e, 'No se pudo corregir el descuento'), '/app/compras?action=facturas');
+        }
+    }
+
+    /**
      * Abono a proveedor: descarga la cuenta por pagar y genera su asiento.
      */
     private function pay(): void
@@ -1994,7 +2154,17 @@ class TenantComprasController extends TenantController
         $method = trim((string)$this->request->post('payment_method', 'cash'));
         $reference = trim((string)$this->request->post('reference', ''));
         $notes = trim((string)$this->request->post('notes', ''));
-        $cashSource = strtolower(trim((string)$this->request->post('cash_source', 'drawer')));
+        $cashSource = strtolower(trim((string)$this->request->post('cash_source', '')));
+        // Sin origen explícito NO se asume cajón: es la fuente de errores al abonar.
+        if (PaymentMethodCatalog::affectsCash(PaymentMethodCatalog::normalize($method))
+            && $cashSource !== 'drawer' && $cashSource !== 'other') {
+            $this->respond(
+                false,
+                'Debe indicar el origen del efectivo (Caja u Otro) para registrar el abono.',
+                '/app/compras?action=facturas'
+            );
+            return;
+        }
         $cashFromDrawer = $cashSource !== 'other';
         $cashSourceNote = trim((string)$this->request->post('cash_source_note', ''));
 

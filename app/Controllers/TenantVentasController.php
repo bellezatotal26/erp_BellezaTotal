@@ -108,6 +108,11 @@ class TenantVentasController extends TenantController
         }
         if (($action === 'summary_csv' || $action === 'summary_pdf') && $this->request->method() === 'GET') {
             TenantMiddleware::authorize('ventas', 'export');
+            // Resumen de ventas y medios de pago: solo administrador o gerencia.
+            if (!TenantMiddleware::isManagement()) {
+                $this->respond(false, 'Solo el administrador o gerencia pueden ver el resumen de ventas', '/app/ventas');
+                return;
+            }
             $this->exportSalesSummary($action === 'summary_pdf' ? 'pdf' : 'csv');
             return;
         }

@@ -141,7 +141,7 @@ $isEdit = (int)$form['id'] > 0;
             <div class="bk-empty">Aún no hay cuentas. Cree la primera con el formulario de abajo.</div>
         <?php else: ?>
         <div class="table-container"><table>
-            <thead><tr><th>Nombre</th><th>Tipo</th><th>Entidad / número</th><th>Cuenta contable</th><th class="bk-amount">Saldo en libros</th><th>Recibe cobros de</th><th>Último extracto</th><th>Estado</th><th></th></tr></thead>
+            <thead><tr><th>Nombre</th><th>Tipo</th><th>Entidad / número</th><th>Cuenta contable</th><th class="bk-amount">Saldo en libros</th><th>Recibe cobros de</th><th>Último extracto</th><th>Por conciliar</th><th>Estado</th><th></th></tr></thead>
             <tbody>
             <?php foreach ($accounts as $a): ?>
                 <tr>
@@ -152,8 +152,9 @@ $isEdit = (int)$form['id'] > 0;
                     <td class="bk-amount"><?php echo bkMoney((float)$a['balance'], $currency); ?></td>
                     <td><?php if ($a['methods']): foreach ($a['methods'] as $m): ?><span class="bk-chip"><?php echo $h($methodOptions[$m] ?? $m); ?></span><?php endforeach; else: ?><span class="bk-note">—</span><?php endif; ?></td>
                     <td><?php echo $a['kind'] === 'gateway' ? '<span class="bk-note">N/A</span>' : bkDate($a['last_statement']); ?></td>
+                    <td><?php if ($a['kind'] === 'gateway'): ?><span class="bk-note">N/A</span><?php elseif ((int)($a['pending_count'] ?? 0) > 0): ?><span class="bk-chip warn"><?php echo (int)$a['pending_count']; ?> mov. · <?php echo bkMoney((float)($a['pending_sum'] ?? 0), $currency); ?></span><?php else: ?><span class="bk-chip ok">Al día</span><?php endif; ?></td>
                     <td><span class="badge <?php echo (int)$a['is_active'] === 1 ? 'badge-success' : 'badge-warning'; ?>"><?php echo (int)$a['is_active'] === 1 ? 'Activa' : 'Inactiva'; ?></span></td>
-                    <td><?php if ($canEdit): ?><a class="btn btn-sm btn-secondary" href="<?php echo $base; ?>?tab=cuentas&amp;edit=<?php echo (int)$a['id']; ?>#bkAccountForm">Editar</a><?php endif; ?></td>
+                    <td style="white-space:nowrap;"><?php if ($a['kind'] !== 'gateway'): ?><a class="btn btn-sm btn-primary" href="<?php echo $base; ?>?tab=conciliacion&amp;bank_id=<?php echo (int)$a['id']; ?>">Conciliar</a> <?php endif; ?><?php if ($canEdit): ?><a class="btn btn-sm btn-secondary" href="<?php echo $base; ?>?tab=cuentas&amp;edit=<?php echo (int)$a['id']; ?>#bkAccountForm">Editar</a><?php endif; ?></td>
                 </tr>
             <?php endforeach; ?>
             </tbody>
@@ -373,6 +374,7 @@ $otherBanks = array_values(array_filter($bankOnly, static fn ($b) => (int)$b['id
         <?php endif; ?>
 
         <div class="bk-toolbar">
+            <a class="btn btn-secondary" href="<?php echo $base; ?>?action=export_recon&amp;statement_id=<?php echo $sid; ?>">Descargar conciliación (Excel)</a>
             <?php if ($canEdit): ?>
             <form method="POST" action="<?php echo $base; ?>?action=auto_match" class="bk-inline">
                 <?php echo \SoftNova\Core\csrf_field(); ?><input type="hidden" name="statement_id" value="<?php echo $sid; ?>">

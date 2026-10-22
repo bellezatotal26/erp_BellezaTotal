@@ -10,6 +10,8 @@ $qFilter = $qFilter ?? '';
 $documentTypeFilter = $documentTypeFilter ?? '';
 $allyFilter = $allyFilter ?? '';
 $listQuery = $listQuery ?? [];
+$supplierOptions = $supplierOptions ?? [];
+$relationLabels = $relationLabels ?? [];
 $proveedoresBase = $viewInstance->route('app/proveedores');
 ?>
 <?php echo flashMessage(); ?>
@@ -102,10 +104,7 @@ $proveedoresBase = $viewInstance->route('app/proveedores');
                             <?php endif; ?>
                             <div style="margin-top:12px;display:flex;gap:6px;">
                                 <button onclick='openModal(<?php echo htmlspecialchars(json_encode($s)); ?>)' class="btn btn-sm btn-secondary" title="Editar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg> Editar</button>
-                                <form method="POST" action="<?php echo $proveedoresBase; ?>?action=delete" style="display:inline;" data-ajax="true">
-                                    <?php echo \SoftNova\Core\csrf_field(); ?><input type="hidden" name="id" value="<?php echo (int)$s['id']; ?>">
-                                    <button type="submit" data-confirm="Eliminar este proveedor?" class="btn btn-sm btn-danger" title="Eliminar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
-                                </form>
+                                <button type="button" onclick='openDeleteSupplierModal(<?php echo htmlspecialchars(json_encode(['id' => (int)$s['id'], 'name' => (string)$s['name'], 'relations' => $s['relations'] ?? []], JSON_UNESCAPED_UNICODE)); ?>)' class="btn btn-sm btn-danger" title="Eliminar (si tiene movimientos, se trasladan a otro proveedor)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></button>
                             </div>
                         </div>
                     </div>
@@ -173,10 +172,7 @@ $proveedoresBase = $viewInstance->route('app/proveedores');
                             </td>
                             <td style="text-align:right;white-space:nowrap;">
                                 <button type="button" onclick='openModal(<?php echo htmlspecialchars(json_encode($s)); ?>)' class="btn btn-sm btn-secondary" title="Editar">Editar</button>
-                                <form method="POST" action="<?php echo $proveedoresBase; ?>?action=delete" style="display:inline;" data-ajax="true">
-                                    <?php echo \SoftNova\Core\csrf_field(); ?><input type="hidden" name="id" value="<?php echo (int)$s['id']; ?>">
-                                    <button type="submit" data-confirm="Eliminar este proveedor?" class="btn btn-sm btn-danger" title="Eliminar">Eliminar</button>
-                                </form>
+                                <button type="button" onclick='openDeleteSupplierModal(<?php echo htmlspecialchars(json_encode(['id' => (int)$s['id'], 'name' => (string)$s['name'], 'relations' => $s['relations'] ?? []], JSON_UNESCAPED_UNICODE)); ?>)' class="btn btn-sm btn-danger" title="Eliminar (si tiene movimientos, se trasladan a otro proveedor)">Eliminar</button>
                             </td>
                         </tr>
                     <?php endforeach; ?>
@@ -222,6 +218,105 @@ $proveedoresBase = $viewInstance->route('app/proveedores');
         </form>
     </div>
 </div>
+
+<!-- Modal eliminar / fusionar proveedor duplicado -->
+<div id="deleteSupplierModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:520px;">
+        <div class="modal-header">
+            <h3>Eliminar proveedor</h3>
+            <button type="button" class="modal-close" onclick="closeDeleteSupplierModal()">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $proveedoresBase; ?>?action=delete" data-ajax="true" id="deleteSupplierForm">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="id" id="delSupId">
+            <p id="delSupName" style="font-weight:600;margin:0 0 8px;"></p>
+            <p id="delSupRelations" style="font-size:13px;color:var(--color-text-secondary);margin:0 0 12px;"></p>
+            <div class="form-group">
+                <label for="delSupTarget">Proveedor destino (el que queda) <span class="field-tip" data-tip="Las OC, facturas, abonos, notas crédito, productos vinculados y demás movimientos del proveedor eliminado pasan a este proveedor. Úselo cuando se creó un duplicado: elija aquí el proveedor correcto.">?</span></label>
+                <select name="target_supplier_id" id="delSupTarget" class="form-control"></select>
+                <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">
+                    Si el proveedor tiene movimientos, el destino es obligatorio: nada queda huérfano.
+                    El proveedor eliminado queda inactivo (baja lógica) y todo su historial pasa al destino.
+                </small>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeDeleteSupplierModal()">Cancelar</button>
+                <button type="submit" class="btn btn-danger" id="delSupSubmit">Eliminar</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+window.supplierTargets = <?php echo json_encode(array_map(static function ($o) {
+    return [
+        'id' => (int)$o['id'],
+        'name' => (string)$o['name'],
+        'doc' => trim((string)($o['document_type'] ?? '') . ': ' . (string)($o['document_number'] ?? ''), ': '),
+    ];
+}, $supplierOptions), JSON_UNESCAPED_UNICODE); ?>;
+window.supplierRelationLabels = <?php echo json_encode($relationLabels, JSON_UNESCAPED_UNICODE); ?>;
+
+var delSupRelationsTotal = 0;
+
+function openDeleteSupplierModal(data) {
+    if (!data || !data.id) return;
+    document.getElementById('delSupId').value = data.id;
+    document.getElementById('delSupName').textContent = '«' + (data.name || '') + '»';
+    var rel = data.relations || {};
+    var labels = window.supplierRelationLabels || {};
+    var parts = [];
+    delSupRelationsTotal = 0;
+    Object.keys(labels).forEach(function (k) {
+        var c = parseInt(rel[k] || 0, 10) || 0;
+        if (c > 0) { parts.push(c + ' ' + labels[k]); delSupRelationsTotal += c; }
+    });
+    var relEl = document.getElementById('delSupRelations');
+    var submit = document.getElementById('delSupSubmit');
+    var target = document.getElementById('delSupTarget');
+    target.innerHTML = '';
+    var ph = document.createElement('option');
+    ph.value = '';
+    ph.textContent = delSupRelationsTotal > 0 ? '— Elija el proveedor que queda —' : '— Sin traslado (no tiene movimientos) —';
+    target.appendChild(ph);
+    (window.supplierTargets || []).forEach(function (o) {
+        if (parseInt(o.id, 10) === parseInt(data.id, 10)) return;
+        var opt = document.createElement('option');
+        opt.value = o.id;
+        opt.textContent = o.name + (o.doc ? ' · ' + o.doc : '');
+        target.appendChild(opt);
+    });
+    if (delSupRelationsTotal > 0) {
+        relEl.innerHTML = 'Este proveedor <strong>sí tiene movimientos</strong>: ' + parts.join(', ')
+            + '.<br>Se trasladarán al proveedor destino que elija y luego el duplicado se eliminará.';
+        target.setAttribute('required', 'required');
+        submit.textContent = 'Trasladar y eliminar';
+    } else {
+        relEl.textContent = 'Este proveedor no tiene OC, facturas, abonos ni otros movimientos: se puede eliminar directamente. Si igual quiere fusionarlo con otro, elija el destino.';
+        target.removeAttribute('required');
+        submit.textContent = 'Eliminar proveedor';
+    }
+    document.getElementById('deleteSupplierModal').style.display = 'flex';
+}
+
+function closeDeleteSupplierModal() {
+    document.getElementById('deleteSupplierModal').style.display = 'none';
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+    var form = document.getElementById('deleteSupplierForm');
+    if (!form) return;
+    form.addEventListener('submit', function (ev) {
+        var target = document.getElementById('delSupTarget');
+        if (delSupRelationsTotal > 0 && !(target && target.value)) {
+            ev.preventDefault();
+            var msg = 'Este proveedor tiene movimientos: elija el proveedor destino para trasladarlos antes de eliminarlo.';
+            if (typeof showAlert === 'function') showAlert(msg, 'warning');
+            else alert(msg);
+        }
+    });
+});
+</script>
 
 <style>
 .prov-catalog--list .prov-products-grid { display: none !important; }

@@ -355,7 +355,36 @@ class CashClosingReportBuilder
             . $rows
             . '</table>';
 
+        $observation = self::closingObservation($session);
+        if ($observation !== '') {
+            $html .= '<div style="margin-top:10px;padding:10px 12px;border:1px solid #FDE68A;background:#FFFBEB;border-radius:6px;">'
+                . '<div style="font-size:11px;font-weight:700;color:#92400E;letter-spacing:0.02em;">OBSERVACIÓN DE CIERRE</div>'
+                . '<div style="font-size:12px;color:#78350F;line-height:1.45;margin-top:3px;">'
+                . nl2br(htmlspecialchars($observation)) . '</div></div>';
+        }
+
         return $html;
+    }
+
+    /**
+     * Observación que el usuario escribió en «Notas de cierre» al cerrar la caja.
+     * Las notas de la sesión guardan apertura + «Cierre: …» + alertas automáticas;
+     * aquí se extrae solo lo del usuario ('' si cerró sin observación).
+     */
+    public static function closingObservation(array $session): string
+    {
+        $notes = str_replace("\r\n", "\n", (string)($session['notes'] ?? ''));
+        $pos = strpos($notes, 'Cierre: ');
+        if ($pos === false) {
+            return '';
+        }
+        $obs = substr($notes, $pos + 8);
+        $cut = strpos($obs, "\nStock negativo / pendiente:");
+        if ($cut !== false) {
+            $obs = substr($obs, 0, $cut);
+        }
+        $obs = trim($obs);
+        return ($obs === '' || $obs === 'Cierre manual') ? '' : $obs;
     }
 
     /**
