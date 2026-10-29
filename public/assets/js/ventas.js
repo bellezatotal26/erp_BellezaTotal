@@ -808,6 +808,16 @@ function viewDetail(id) {
             h += '<div><strong>Domicilio (empresa):</strong> ' + moneyVal(deliveryCo) + '</div>';
         }
         h += '<div><strong>Total:</strong> <span style="color:#10B981;font-size:18px;">' + moneyVal(s.total) + '</span></div>';
+        var bal = d.balances || {};
+        var paidAmt = parseFloat(bal.paid != null ? bal.paid : 0) || 0;
+        var creditAmt = parseFloat(bal.credited != null ? bal.credited : 0) || 0;
+        var netAmt = parseFloat(bal.net_total != null ? bal.net_total : s.total) || 0;
+        var dueAmt = parseFloat(bal.balance != null ? bal.balance : 0) || 0;
+        h += '<div><strong>Pagado:</strong> ' + moneyVal(paidAmt) + '</div>';
+        if (creditAmt > 0.009) {
+            h += '<div><strong>NC:</strong> ' + moneyVal(creditAmt) + ' · <strong>Neto:</strong> ' + moneyVal(netAmt) + '</div>';
+        }
+        h += '<div><strong>Saldo pendiente:</strong> <span style="color:' + (dueAmt > 0.009 ? '#B45309' : '#059669') + ';font-weight:700;">' + moneyVal(dueAmt) + '</span></div>';
         var cashRecv = parseFloat(s.cash_received || 0);
         var cashChange = parseFloat(s.cash_change || 0);
         if (cashRecv > 0.009) {
@@ -845,6 +855,13 @@ function viewDetail(id) {
                 h += '<tr><td>' + (p.payment_date || '').substr(0, 16) + '</td><td>' + moneyVal(p.amount) + '</td><td>' + esc(ventasPayMethodLabel(p.payment_method)) + '</td><td>' + esc(p.notes || '') + '</td></tr>';
             });
             h += '</tbody></table>';
+        } else if (dueAmt > 0.009) {
+            h += '<p style="margin:8px 0;font-size:13px;color:var(--color-text-secondary);">Aún no hay abonos registrados.</p>';
+        }
+        if (d.can_abonar || dueAmt > 0.009) {
+            h += '<div style="margin-top:10px;">' +
+                '<button type="button" class="btn btn-sm btn-success" onclick="document.getElementById(\'saleDetailModal\').style.display=\'none\';openPaymentModal(' +
+                s.id + ',' + (parseFloat(s.total) || 0) + ',' + paidAmt + ',' + creditAmt + ')">Registrar abono</button></div>';
         }
         var changes = d.payment_changes || [];
         if (changes.length > 0) {

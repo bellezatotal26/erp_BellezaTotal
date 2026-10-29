@@ -114,6 +114,13 @@ class StockService
         } catch (\Throwable $e) {
             // ignore
         }
+        // Historial append-only (fecha + usuario). Backfill desde products.notes.
+        try {
+            ProductNotesHistory::ensure($this->db);
+            ProductNotesHistory::backfillFromLegacy($this->db);
+        } catch (\Throwable $e) {
+            // ignore
+        }
 
         // Deuda de inventario por ventas sin stock / préstamos.
         try {

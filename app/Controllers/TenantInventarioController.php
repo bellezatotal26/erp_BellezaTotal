@@ -123,6 +123,10 @@ class TenantInventarioController extends TenantController
             $this->detail();
             return;
         }
+        if ($action === 'product_notes' && $this->request->method() === 'GET') {
+            $this->productNotes();
+            return;
+        }
         if ($action === 'edit_movement_date' && $this->request->method() === 'POST') {
             TenantMiddleware::authorize('inventario', 'edit');
             $this->editMovementDate();
@@ -263,6 +267,11 @@ class TenantInventarioController extends TenantController
         if ($action === 'traceability_pdf' && $this->request->method() === 'GET') {
             TenantMiddleware::authorize('inventario', 'export');
             $this->traceabilityPdf();
+            return;
+        }
+        if ($action === 'traceability_export' && $this->request->method() === 'GET') {
+            TenantMiddleware::authorize('inventario', 'export');
+            $this->traceabilityExport();
             return;
         }
         
@@ -708,6 +717,8 @@ class TenantInventarioController extends TenantController
             $productSuppliers = [];
         }
 
+        $notesHistory = \SoftNova\Services\ProductNotesHistory::listForProduct($this->db, $id);
+
         $this->json([
             'product' => $product,
             'movements' => $movements,
@@ -715,10 +726,30 @@ class TenantInventarioController extends TenantController
             'purchases' => $purchases,
             'cost_summary' => $costSummary,
             'cost_history' => $costHistory,
+            'notes_history' => $notesHistory,
             'lots' => $lots,
             'suppliers' => $productSuppliers,
             'stock_debts' => $this->stock->openDebtsForProduct($id),
             'channel_label' => \SoftNova\Core\product_channel_label((string)($product['source_channel'] ?? 'manual')),
+        ]);
+    }
+
+    /** Historial de notas internas (edición / detalle ligero). */
+    private function productNotes(): void
+    {
+        $id = (int)$this->request->get('id');
+        if ($id <= 0) {
+            $this->json(['success' => false, 'message' => 'Producto no válido', 'notes' => []]);
+            return;
+        }
+        $exists = $this->query('SELECT id FROM products WHERE id = ? LIMIT 1', [$id])->fetchColumn();
+        if (!$exists) {
+            $this->json(['success' => false, 'message' => 'Producto no encontrado', 'notes' => []]);
+            return;
+        }
+        $this->json([
+            'success' => true,
+            'notes' => \SoftNova\Services\ProductNotesHistory::listForProduct($this->db, $id),
         ]);
     }
 
@@ -1602,6 +1633,16 @@ class TenantInventarioController extends TenantController
         }
         
         $newId = (int)$this->db->lastInsertId();
+
+        $createNote = trim((string)$this->request->post('notes', ''));
+        if ($createNote !== '') {
+            \SoftNova\Services\ProductNotesHistory::add(
+                $this->db,
+                $newId,
+                $createNote,
+                isset($_SESSION['tenant_user_id']) ? (int)$_SESSION['tenant_user_id'] : null
+            );
+        }
         
         if ($stock > 0 && $productType === 'product') {
             $unitCost = \SoftNova\Core\parse_money($this->request->post('purchase_price', 0));
@@ -1749,7 +1790,10 @@ class TenantInventarioController extends TenantController
         $this->ensureWholesalePriceColumn();
         $wholesale = round(max(0, \SoftNova\Core\parse_money($this->request->post('wholesale_price', 0))), 2);
         $taxRate = $this->resolveProductTaxRateFromRequest();
-        $sql = "UPDATE products SET code = ?, barcode = ?, name = ?, product_type = ?, description = ?, notes = ?, category_id = ?,
+        // Nota nueva (append-only): si viene vacía no se toca el histórico ni products.notes.
+        $newNote = trim((string)$this->request->post('notes', ''));
+
+        $sql = "UPDATE products SET code = ?, barcode = ?, name = ?, product_type = ?, description = ?, category_id = ?,
                 purchase_price = ?, sale_price = ?, tax_rate = ?, wholesale_price = ?, stock = ?, min_stock = ?, unit = ?, status = ?,
                 track_lots = ?, expiry_alert_days = ?, max_stock = ?, location = ?";
         $params = [
@@ -1758,7 +1802,6 @@ class TenantInventarioController extends TenantController
             $name,
             $productType,
             $this->request->post('description'),
-            trim((string)$this->request->post('notes', '')) ?: null,
             $this->request->post('category_id') ?: null,
             round(max(0, \SoftNova\Core\parse_money($this->request->post('purchase_price', 0))), 2),
             round(max(0, \SoftNova\Core\parse_money($this->request->post('sale_price', 0))), 2),
@@ -1774,6 +1817,11 @@ class TenantInventarioController extends TenantController
             $this->maxStockInput(),
             $location,
         ];
+
+        if ($newNote !== '') {
+            $sql .= ', notes = ?';
+            $params[] = $newNote;
+        }
         
         if ($image) {
             $sql .= ", image = ?";
@@ -1782,6 +1830,15 @@ class TenantInventarioController extends TenantController
         $sql .= " WHERE id = ?";
         $params[] = $id;
         $this->query($sql, $params);
+
+        if ($newNote !== '') {
+            \SoftNova\Services\ProductNotesHistory::add(
+                $this->db,
+                $id,
+                $newNote,
+                isset($_SESSION['tenant_user_id']) ? (int)$_SESSION['tenant_user_id'] : null
+            );
+        }
 
         $oldCostVal = round((float)($oldProduct['purchase_price'] ?? 0), 2);
         $newCostVal = round(max(0, \SoftNova\Core\parse_money($this->request->post('purchase_price', 0))), 2);
@@ -2230,6 +2287,16 @@ class TenantInventarioController extends TenantController
             (new AccountingService($this->db))->postStockMovement($movementId);
         } catch (\Throwable $e) {
             error_log('Contabilidad movimiento inventario ' . $movementId . ': ' . $e->getMessage());
+            try {
+                (new AccountingService($this->db))->enqueuePending(
+                    'post_stock_movement',
+                    'stock_movement',
+                    $movementId,
+                    $e->getMessage()
+                );
+            } catch (\Throwable $e2) {
+                error_log('accounting_pending inventario ' . $movementId . ': ' . $e2->getMessage());
+            }
         }
     }
     
@@ -2884,16 +2951,7 @@ class TenantInventarioController extends TenantController
     private function traceabilityPdf(): void
     {
         try {
-            $filters = [
-                'q' => trim((string)$this->request->get('q', '')),
-                'type' => trim((string)$this->request->get('type', '')),
-                'reference_type' => trim((string)$this->request->get('reference_type', '')),
-                'from' => trim((string)$this->request->get('from', '')),
-                'to' => trim((string)$this->request->get('to', '')),
-                'product_id' => (int)$this->request->get('product_id', 0) ?: null,
-                'location' => trim((string)$this->request->get('location', '')),
-                'category_id' => (int)$this->request->get('category_id', 0) ?: null,
-            ];
+            $filters = $this->traceabilityExportFilters();
             $result = $this->stock->listMovements($filters, 5000, 0);
             $rows = \SoftNova\Services\StockService::attachPurchaseTaxInfo($this->db, $result['rows'] ?? []);
             $pdf = new \SoftNova\Services\PdfService($this->companySettings(), $this->getCurrency());
@@ -2906,6 +2964,78 @@ class TenantInventarioController extends TenantController
             echo "No se pudo generar el PDF de trazabilidad.\n" . $e->getMessage();
             exit;
         }
+    }
+
+    /** Exporta movimientos de trazabilidad a Excel, respetando los mismos filtros de pantalla. */
+    private function traceabilityExport(): void
+    {
+        try {
+            $filters = $this->traceabilityExportFilters();
+            $result = $this->stock->listMovements($filters, 10000, 0);
+            $rows = \SoftNova\Services\StockService::attachPurchaseTaxInfo($this->db, $result['rows'] ?? []);
+
+            $typeLabels = [
+                'in' => 'Entrada',
+                'out' => 'Salida',
+                'adjustment' => 'Ajuste',
+            ];
+            $exportRows = [];
+            foreach ($rows as $r) {
+                $movAt = (string)($r['movement_date'] ?? $r['created_at'] ?? '');
+                $exportRows[] = [
+                    $movAt !== '' ? substr($movAt, 0, 19) : '',
+                    $typeLabels[(string)($r['type'] ?? '')] ?? (string)($r['type'] ?? ''),
+                    (string)($r['product_code'] ?? $r['code'] ?? ''),
+                    (string)($r['barcode'] ?? ''),
+                    (string)($r['product_name'] ?? $r['name'] ?? ''),
+                    (float)($r['quantity'] ?? 0),
+                    (string)($r['reference_type'] ?? ''),
+                    (string)($r['reference_code'] ?? (($r['reference_id'] ?? '') !== '' && ($r['reference_id'] ?? null) !== null ? ('#' . $r['reference_id']) : '')),
+                    (string)($r['notes'] ?? ''),
+                    (string)($r['user_name'] ?? ''),
+                    isset($r['unit_cost']) ? (float)$r['unit_cost'] : '',
+                ];
+            }
+
+            $suffix = '';
+            if (($filters['from'] ?? '') !== '' || ($filters['to'] ?? '') !== '') {
+                $suffix = '_' . ($filters['from'] !== '' ? $filters['from'] : 'inicio')
+                    . '_' . ($filters['to'] !== '' ? $filters['to'] : 'hoy');
+            }
+            \SoftNova\Services\SimpleXlsxWriter::download(
+                'trazabilidad_movimientos' . $suffix . '_' . date('Ymd_His') . '.xlsx',
+                [
+                    'Fecha', 'Tipo', 'SKU', 'EAN', 'Producto', 'Cantidad',
+                    'Origen', 'Referencia', 'Notas', 'Usuario', 'Costo unit.',
+                ],
+                $exportRows,
+                [
+                    5 => 'qty',
+                    10 => 'currency',
+                ]
+            );
+        } catch (\Throwable $e) {
+            error_log('traceabilityExport: ' . $e->getMessage());
+            http_response_code(500);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo "No se pudo exportar la trazabilidad.\n" . $e->getMessage();
+            exit;
+        }
+    }
+
+    /** @return array{q:string,type:string,reference_type:string,from:string,to:string,product_id:?int,location:string,category_id:?int} */
+    private function traceabilityExportFilters(): array
+    {
+        return [
+            'q' => trim((string)$this->request->get('q', '')),
+            'type' => trim((string)$this->request->get('type', '')),
+            'reference_type' => trim((string)$this->request->get('reference_type', '')),
+            'from' => $this->normalizeTraceDate((string)$this->request->get('from', '')),
+            'to' => $this->normalizeTraceDate((string)$this->request->get('to', '')),
+            'product_id' => (int)$this->request->get('product_id', 0) ?: null,
+            'location' => trim((string)$this->request->get('location', '')),
+            'category_id' => (int)$this->request->get('category_id', 0) ?: null,
+        ];
     }
 
     /** @return string|null */

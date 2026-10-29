@@ -16,6 +16,16 @@ class AccountingService
         $this->seedChartOfAccounts();
     }
 
+    /**
+     * Prepara tablas/semilla fuera de cualquier transacción.
+     * Obligatorio antes de beginTransaction() en flujos que luego contabilizan.
+     */
+    public static function warm(\PDO $db): void
+    {
+        $svc = new self($db);
+        unset($svc);
+    }
+
     private function query(string $sql, array $params = []): \PDOStatement
     {
         $stmt = $this->db->prepare($sql);
@@ -31,6 +41,14 @@ class AccountingService
         self::$schemaDone ??= new \WeakMap();
         if (isset(self::$schemaDone[$this->db])) {
             return;
+        }
+
+        // MySQL: CREATE/ALTER hacen COMMIT implícito — nunca mid-TX.
+        if ($this->db->inTransaction()) {
+            throw new \RuntimeException(
+                'El esquema contable no estaba listo dentro de una transacción. '
+                . 'Llame AccountingService::warm($db) antes de beginTransaction().'
+            );
         }
 
         $this->db->exec(
@@ -243,6 +261,7 @@ class AccountingService
             'cash_overage_account' => '429595',
             'cash_manual_income_account' => '429595',
             'cash_manual_expense_account' => '519595',
+            'retained_earnings_account' => '360505',
         ];
         $stmt = $this->db->prepare(
             "INSERT IGNORE INTO accounting_settings (setting_key, setting_value) VALUES (?, ?)"
@@ -677,31 +696,33 @@ class AccountingService
         if (!$dateObject || $dateObject->format('Y-m-d') !== $date) {
             throw new \InvalidArgumentException('Fecha contable inválida');
         }
-        // Si el periodo del documento está cerrado, reubicar a un periodo abierto
-        // (mismo criterio que reverseSource / sync histórico).
-        $date = $this->resolvePostingDate($date);
+        // Periodo cerrado: bloquear (sin re-fechar silenciosamente a otro mes).
+        $this->assertPeriodOpen($date);
 
         $normalized = [];
-        $totalDebit = 0.0;
-        $totalCredit = 0.0;
+        $totalDebitCents = 0;
+        $totalCreditCents = 0;
         foreach ($lines as $line) {
-            $debit = round(max(0, (float)($line['debit'] ?? 0)), 2);
-            $credit = round(max(0, (float)($line['credit'] ?? 0)), 2);
-            if (($debit > 0 && $credit > 0) || ($debit <= 0 && $credit <= 0)) {
+            // Importes en centavos enteros para evitar drift de float.
+            $debitCents = (int)round(max(0, (float)($line['debit'] ?? 0)) * 100);
+            $creditCents = (int)round(max(0, (float)($line['credit'] ?? 0)) * 100);
+            if (($debitCents > 0 && $creditCents > 0) || ($debitCents <= 0 && $creditCents <= 0)) {
                 throw new \InvalidArgumentException('Cada línea debe tener solo débito o crédito');
             }
 
+            $debit = $debitCents / 100;
+            $credit = $creditCents / 100;
             $accountId = $this->accountId((string)($line['account_code'] ?? ''));
             $normalized[] = array_merge($line, [
                 'account_id' => $accountId,
                 'debit' => $debit,
                 'credit' => $credit,
             ]);
-            $totalDebit += $debit;
-            $totalCredit += $credit;
+            $totalDebitCents += $debitCents;
+            $totalCreditCents += $creditCents;
         }
 
-        if (count($normalized) < 2 || abs($totalDebit - $totalCredit) > 0.009) {
+        if (count($normalized) < 2 || $totalDebitCents !== $totalCreditCents) {
             throw new \InvalidArgumentException('El comprobante no está balanceado');
         }
 
@@ -2026,6 +2047,7 @@ class AccountingService
                         $sourceId,
                         (string)($meta['reason'] ?? 'Reintento de reversión de venta')
                     ),
+                    'post_stock_movement' => $this->postStockMovement($sourceId),
                     default => throw new \RuntimeException('Acción pendiente desconocida: ' . $action),
                 };
                 $this->query(
@@ -2132,43 +2154,68 @@ class AccountingService
     }
 
     /** Cuenta operaciones históricas aún sin asiento contable. */
-    public function pendingSyncCount(): int
+    /**
+     * @param bool $quick true = solo ventas/abonos/gastos/cola (rápido para dashboard).
+     *                    false = incluye orígenes históricos (compras, stock, caja…).
+     */
+    public function pendingSyncCount(bool $quick = false): int
     {
-        $pendingSales = (int)$this->query(
-            "SELECT COUNT(*) FROM sales s
-             LEFT JOIN accounting_entries e
-               ON e.source_type = 'sale' AND e.source_id = s.id AND e.source_event = 'created'
-             WHERE s.status != 'cancelled' AND e.id IS NULL"
-        )->fetchColumn();
-        $pendingPayments = (int)$this->query(
-            "SELECT COUNT(*) FROM sale_payments p
-             JOIN sales s ON s.id = p.sale_id AND s.status != 'cancelled'
-             JOIN accounting_entries se
-               ON se.source_type = 'sale' AND se.source_id = s.id AND se.source_event = 'created'
-             LEFT JOIN accounting_entries pe
-               ON pe.source_type = 'sale_payment' AND pe.source_id = p.id AND pe.source_event = 'created'
-             WHERE pe.id IS NULL"
-        )->fetchColumn();
-        $pendingExpenses = (int)$this->query(
-            "SELECT COUNT(*) FROM expenses x
-             LEFT JOIN accounting_entries e
-               ON e.source_type = 'expense' AND e.source_id = x.id AND e.source_event = 'created'
-             WHERE e.id IS NULL
-               AND COALESCE(x.status, 'active') <> 'cancelled'
-               AND COALESCE(x.payment_method, '') <> 'inventory_loss'
-               AND COALESCE(x.category, '') <> 'payroll'
-               AND COALESCE(x.notes, '') NOT LIKE '%[salida_inventario:%'
-               AND COALESCE(x.notes, '') NOT LIKE '%asiento contable #%'"
-        )->fetchColumn();
+        $pendingSales = 0;
+        $pendingPayments = 0;
+        $pendingExpenses = 0;
+        // En modo quick: tope por origen (evita COUNT full-table que tumba /app/contabilidad).
+        $capSql = $quick ? ' LIMIT 501' : '';
+        try {
+            $pendingSales = (int)$this->query(
+                "SELECT COUNT(*) FROM (
+                    SELECT s.id FROM sales s
+                    LEFT JOIN accounting_entries e
+                      ON e.source_type = 'sale' AND e.source_id = s.id AND e.source_event = 'created'
+                    WHERE s.status != 'cancelled' AND e.id IS NULL
+                    {$capSql}
+                 ) t"
+            )->fetchColumn();
+            $pendingPayments = (int)$this->query(
+                "SELECT COUNT(*) FROM (
+                    SELECT p.id FROM sale_payments p
+                    JOIN sales s ON s.id = p.sale_id AND s.status != 'cancelled'
+                    INNER JOIN accounting_entries se
+                      ON se.source_type = 'sale' AND se.source_id = s.id AND se.source_event = 'created'
+                    LEFT JOIN accounting_entries pe
+                      ON pe.source_type = 'sale_payment' AND pe.source_id = p.id AND pe.source_event = 'created'
+                    WHERE pe.id IS NULL
+                    {$capSql}
+                 ) t"
+            )->fetchColumn();
+            $pendingExpenses = (int)$this->query(
+                "SELECT COUNT(*) FROM (
+                    SELECT x.id FROM expenses x
+                    LEFT JOIN accounting_entries e
+                      ON e.source_type = 'expense' AND e.source_id = x.id AND e.source_event = 'created'
+                    WHERE COALESCE(x.status, 'active') <> 'cancelled'
+                      AND COALESCE(x.payment_method, '') <> 'inventory_loss'
+                      AND COALESCE(x.category, '') <> 'payroll'
+                      AND COALESCE(x.notes, '') NOT LIKE '%[salida_inventario:%'
+                      AND COALESCE(x.notes, '') NOT LIKE '%asiento contable #%'
+                      AND e.id IS NULL
+                    {$capSql}
+                 ) t"
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            error_log('pendingSyncCount core: ' . $e->getMessage());
+        }
 
         $pendingOthers = 0;
-        foreach ($this->historicalSyncSources() as $source) {
-            try {
-                $pendingOthers += (int)$this->query(
-                    'SELECT COUNT(*) FROM (' . $source['sql'] . ') pending'
-                )->fetchColumn();
-            } catch (\Throwable $e) {
-                // Origen no disponible en esta instalación.
+        if (!$quick) {
+            foreach ($this->historicalSyncSources() as $source) {
+                try {
+                    // Tope por origen: evita COUNT enorme que tumba el request.
+                    $pendingOthers += (int)$this->query(
+                        'SELECT COUNT(*) FROM (' . $source['sql'] . ' LIMIT 501) pending'
+                    )->fetchColumn();
+                } catch (\Throwable $e) {
+                    // Origen no disponible en esta instalación.
+                }
             }
         }
 
@@ -2261,7 +2308,15 @@ class AccountingService
             ];
         }
 
-        $postingDate = $this->resolvePostingDate($preferredDate ?? date('Y-m-d'), (string)$entry['entry_date']);
+        // Misma fecha del original si el periodo sigue abierto; si no, exigir reapertura
+        // (no mover silenciosamente a otro mes).
+        $postingDate = $this->resolveOpenPostingDate(
+            $preferredDate,
+            (string)$entry['entry_date'],
+            'No se puede revertir el comprobante ' . $entry['entry_number']
+            . ': el periodo está cerrado. Reabra el periodo en Contabilidad → Periodos '
+            . 'o registre un ajuste manual con referencia al documento.'
+        );
 
         $ownTx = !$this->db->inTransaction();
         if ($ownTx) {
@@ -2342,7 +2397,12 @@ class AccountingService
             ];
         }
 
-        $postingDate = $this->resolvePostingDate((string)$entry['entry_date'], date('Y-m-d'));
+        $postingDate = $this->resolveOpenPostingDate(
+            (string)$entry['entry_date'],
+            date('Y-m-d'),
+            'No se puede anular el comprobante ' . $entry['entry_number']
+            . ': el periodo está cerrado. Reabra el periodo o use un ajuste en un mes abierto.'
+        );
 
         $ownTx = !$this->db->inTransaction();
         if ($ownTx) {
@@ -2653,7 +2713,8 @@ class AccountingService
             $params[] = $like;
         }
 
-        // Solo asientos posted + reversed: el original anulado y su reversión se anulan entre sí.
+        // Solo asientos posted + reversed.
+        // Pares void OC mismo día: anti-join a un set materializado (evita NOT EXISTS correlacionado por línea).
         $rows = $this->query(
             "SELECT a.id, a.code, a.name, a.account_type, a.nature,
                     COALESCE(SUM(CASE WHEN e.entry_date < ? AND e.status IN ('posted','reversed')
@@ -2667,7 +2728,21 @@ class AccountingService
              FROM accounting_accounts a
              LEFT JOIN accounting_lines l ON l.account_id = a.id
              LEFT JOIN accounting_entries e ON e.id = l.entry_id
-             WHERE 1=1 {$typeSql} {$qSql}
+             LEFT JOIN (
+                    SELECT vx.id AS eid
+                    FROM accounting_entries vx
+                    JOIN accounting_entries ox ON ox.id = vx.reversal_of_id
+                    WHERE LEFT(vx.source_event, 5) = 'void_'
+                      AND vx.entry_date = ox.entry_date
+                    UNION
+                    SELECT ox.id AS eid
+                    FROM accounting_entries vx
+                    JOIN accounting_entries ox ON ox.id = vx.reversal_of_id
+                    WHERE LEFT(vx.source_event, 5) = 'void_'
+                      AND vx.entry_date = ox.entry_date
+             ) void_pairs ON void_pairs.eid = e.id
+             WHERE void_pairs.eid IS NULL
+               {$typeSql} {$qSql}
              GROUP BY a.id, a.code, a.name, a.account_type, a.nature
              ORDER BY a.code",
             $params
@@ -3828,9 +3903,12 @@ class AccountingService
         ];
     }
 
-    public function financialStatements(string $from, string $to): array
+    /**
+     * @param list<array<string,mixed>>|null $trialRows Filas ya calculadas (evita 2.º trialBalance).
+     */
+    public function financialStatements(string $from, string $to, ?array $trialRows = null): array
     {
-        $rows = $this->trialBalanceRows($from, $to);
+        $rows = $trialRows ?? $this->trialBalanceRows($from, $to);
         $result = [
             'assets' => [], 'liabilities' => [], 'equity' => [],
             'revenue' => [], 'expenses' => [],
@@ -3877,13 +3955,182 @@ class AccountingService
             $result['totals']['equity'] + $result['prior_profit'] + $result['profit'],
             2
         );
+
+        // Desglose por origen en cuentas «cajón» (519595 / 539595) para el estado de resultados.
+        $bucketCodes = [];
+        foreach ($result['expenses'] as $ex) {
+            $code = (string)($ex['code'] ?? '');
+            if (in_array($code, ['519595', '539595'], true) && abs((float)($ex['display_balance'] ?? 0)) >= 0.01) {
+                $bucketCodes[] = $code;
+            }
+        }
+        if ($bucketCodes !== []) {
+            try {
+                $originsByCode = $this->expenseBucketOriginBreakdown($from, $to, $bucketCodes);
+                foreach ($result['expenses'] as &$ex) {
+                    $code = (string)($ex['code'] ?? '');
+                    if (isset($originsByCode[$code])) {
+                        $ex['origins'] = $originsByCode[$code]['origins'];
+                    }
+                }
+                unset($ex);
+            } catch (\Throwable $e) {
+                error_log('expenseBucketOriginBreakdown: ' . $e->getMessage());
+            }
+        }
+
         return $result;
+    }
+
+    /**
+     * Desglosa el movimiento del periodo de cuentas cajón (p. ej. 519595, 539595)
+     * por origen del asiento (gasto, inventario, compra sin stock, caja, arqueo…).
+     *
+     * @param list<string> $codes
+     * @return array<string, array{code:string,total:float,origins:list<array<string,mixed>>}>
+     */
+    public function expenseBucketOriginBreakdown(string $from, string $to, array $codes = ['519595', '539595']): array
+    {
+        $codes = array_values(array_unique(array_filter(array_map(
+            static fn($c) => preg_replace('/[^0-9A-Za-z]/', '', (string)$c) ?? '',
+            $codes
+        ))));
+        if ($codes === []) {
+            return [];
+        }
+
+        $ph = implode(',', array_fill(0, count($codes), '?'));
+        $rows = $this->query(
+            "SELECT a.code,
+                    COALESCE(NULLIF(TRIM(e.source_type), ''), 'manual') AS source_type,
+                    COUNT(DISTINCT e.id) AS entries,
+                    ROUND(COALESCE(SUM(l.debit - l.credit), 0), 2) AS net
+             FROM accounting_lines l
+             JOIN accounting_entries e ON e.id = l.entry_id
+             JOIN accounting_accounts a ON a.id = l.account_id
+             WHERE a.code IN ({$ph})
+               AND e.entry_date BETWEEN ? AND ?
+               AND e.status IN ('posted', 'reversed')
+             GROUP BY a.code, COALESCE(NULLIF(TRIM(e.source_type), ''), 'manual')
+             HAVING ABS(ROUND(COALESCE(SUM(l.debit - l.credit), 0), 2)) >= 0.01
+             ORDER BY a.code, net DESC",
+            array_merge($codes, [$from, $to])
+        )->fetchAll();
+
+        $out = [];
+        foreach ($codes as $code) {
+            $out[$code] = ['code' => $code, 'total' => 0.0, 'origins' => []];
+        }
+
+        foreach ($rows as $row) {
+            $code = (string)$row['code'];
+            $source = (string)$row['source_type'];
+            $net = round((float)$row['net'], 2);
+            $entries = (int)$row['entries'];
+            $origin = [
+                'source_type' => $source,
+                'label' => $this->expenseBucketOriginLabel($code, $source),
+                'entries' => $entries,
+                'amount' => $net,
+                'categories' => [],
+            ];
+            if ($source === 'expense') {
+                $origin['categories'] = $this->expenseOriginCategories($code, $from, $to);
+            }
+            $out[$code]['origins'][] = $origin;
+            $out[$code]['total'] = round($out[$code]['total'] + $net, 2);
+        }
+
+        return $out;
+    }
+
+    /** Etiqueta legible del origen según la cuenta cajón. */
+    private function expenseBucketOriginLabel(string $accountCode, string $sourceType): string
+    {
+        if ($accountCode === '539595') {
+            return match ($sourceType) {
+                'cash_session' => 'Faltantes de arqueo de caja',
+                'expense' => 'Gastos financieros / otros (módulo Gastos)',
+                'manual' => 'Asientos manuales',
+                default => self::sourceLabel($sourceType),
+            };
+        }
+
+        return match ($sourceType) {
+            'expense' => 'Gastos registrados (módulo Gastos)',
+            'stock_movement' => 'Mermas / salidas de inventario',
+            'purchase_order', 'purchase' => 'Compras sin inventario (muestras / externas)',
+            'cash_movement' => 'Egresos manuales de caja',
+            'cash_session' => 'Ajustes de arqueo de caja',
+            'manual' => 'Asientos manuales',
+            default => self::sourceLabel($sourceType),
+        };
+    }
+
+    /**
+     * Subdesglose de asientos origen=expense por categoría del gasto.
+     *
+     * @return list<array{label:string,entries:int,amount:float}>
+     */
+    private function expenseOriginCategories(string $accountCode, string $from, string $to): array
+    {
+        try {
+            $rows = $this->query(
+                "SELECT COALESCE(
+                            NULLIF(TRIM(ec.name), ''),
+                            NULLIF(TRIM(x.category), ''),
+                            'Sin categoría'
+                        ) AS cat_label,
+                        COUNT(DISTINCT e.id) AS entries,
+                        ROUND(COALESCE(SUM(l.debit - l.credit), 0), 2) AS net
+                 FROM accounting_lines l
+                 JOIN accounting_entries e ON e.id = l.entry_id
+                 JOIN accounting_accounts a ON a.id = l.account_id
+                 LEFT JOIN expenses x ON x.id = e.source_id
+                 LEFT JOIN expense_categories ec ON ec.id = x.category_id
+                 WHERE a.code = ?
+                   AND e.source_type = 'expense'
+                   AND e.entry_date BETWEEN ? AND ?
+                   AND e.status IN ('posted', 'reversed')
+                 GROUP BY cat_label
+                 HAVING ABS(ROUND(COALESCE(SUM(l.debit - l.credit), 0), 2)) >= 0.01
+                 ORDER BY net DESC
+                 LIMIT 40",
+                [$accountCode, $from, $to]
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($rows as $r) {
+            $out[] = [
+                'label' => (string)$r['cat_label'],
+                'entries' => (int)$r['entries'],
+                'amount' => round((float)$r['net'], 2),
+            ];
+        }
+        return $out;
     }
 
     public function closePeriod(int $year, int $month, bool $close, ?string $notes = null): void
     {
         if ($year < 2000 || $month < 1 || $month > 12) {
             throw new \InvalidArgumentException('Periodo inválido');
+        }
+        if ($close) {
+            $queue = $this->pendingQueueCount();
+            if ($queue > 0) {
+                throw new \InvalidArgumentException(
+                    "Hay {$queue} asiento(s) en cola de reintento. Sincronice Contabilidad antes de cerrar el periodo."
+                );
+            }
+            $sync = $this->pendingSyncCount();
+            if ($sync > 0) {
+                throw new \InvalidArgumentException(
+                    "Hay {$sync} operación(es) sin comprobante. Ejecute «Sincronizar operaciones» antes de cerrar el periodo."
+                );
+            }
         }
         $this->query(
             "INSERT INTO accounting_periods (year, month, status, closed_at, closed_by, notes)
@@ -3898,6 +4145,113 @@ class AccountingService
                 $close ? ($_SESSION['tenant_user_id'] ?? null) : null,
                 $notes,
             ]
+        );
+    }
+
+    /**
+     * Cierre de resultado del ejercicio: traspasa ingresos/gastos a 360505 (Utilidad del ejercicio).
+     * Idempotente por año. Requiere 31/12 del año en periodo abierto.
+     */
+    public function closeFiscalYear(int $year, ?string $notes = null): int
+    {
+        if ($year < 2000 || $year > 2100) {
+            throw new \InvalidArgumentException('Año inválido');
+        }
+        $from = sprintf('%04d-01-01', $year);
+        $to = sprintf('%04d-12-31', $year);
+        $this->assertPeriodOpen($to);
+
+        $queue = $this->pendingQueueCount();
+        if ($queue > 0) {
+            throw new \InvalidArgumentException(
+                "Hay {$queue} asiento(s) en cola. Sincronice antes del cierre anual."
+            );
+        }
+
+        $equityCode = $this->setting('retained_earnings_account', '360505');
+        $voidExcl = $this->voidedPairExclusionSql('e');
+        $rows = $this->query(
+            "SELECT a.code, a.name, a.account_type, a.nature,
+                    ROUND(COALESCE(SUM(l.debit - l.credit), 0), 2) AS balance
+             FROM accounting_accounts a
+             JOIN accounting_lines l ON l.account_id = a.id
+             JOIN accounting_entries e ON e.id = l.entry_id
+                  AND e.status IN ('posted', 'reversed')
+                  AND e.entry_date BETWEEN ? AND ?
+                  AND {$voidExcl}
+             WHERE a.account_type IN ('revenue', 'expense')
+             GROUP BY a.id, a.code, a.name, a.account_type, a.nature
+             HAVING ABS(ROUND(COALESCE(SUM(l.debit - l.credit), 0), 2)) > 0.009
+             ORDER BY a.code",
+            [$from, $to]
+        )->fetchAll();
+
+        if ($rows === []) {
+            throw new \InvalidArgumentException(
+                "No hay movimientos de ingreso/gasto en {$year} para cerrar."
+            );
+        }
+
+        $lines = [];
+        $netDebitCents = 0;
+        foreach ($rows as $row) {
+            $bal = round((float)$row['balance'], 2);
+            $balCents = (int)round($bal * 100);
+            if ($balCents === 0) {
+                continue;
+            }
+            // Saldo débito-crédito: positivo = net débito → acreditar para cerrar; negativo = net crédito → debitar.
+            if ($balCents > 0) {
+                $lines[] = [
+                    'account_code' => (string)$row['code'],
+                    'debit' => 0,
+                    'credit' => $balCents / 100,
+                    'description' => 'Cierre ' . $year . ' · ' . $row['name'],
+                ];
+                $netDebitCents -= $balCents;
+            } else {
+                $abs = abs($balCents);
+                $lines[] = [
+                    'account_code' => (string)$row['code'],
+                    'debit' => $abs / 100,
+                    'credit' => 0,
+                    'description' => 'Cierre ' . $year . ' · ' . $row['name'],
+                ];
+                $netDebitCents += $abs;
+            }
+        }
+
+        if ($lines === []) {
+            throw new \InvalidArgumentException("No hay saldos de resultado a cerrar en {$year}.");
+        }
+
+        // Contrapartida a utilidad del ejercicio (equilibra el asiento).
+        if ($netDebitCents > 0) {
+            $lines[] = [
+                'account_code' => $equityCode,
+                'debit' => 0,
+                'credit' => $netDebitCents / 100,
+                'description' => 'Utilidad del ejercicio ' . $year,
+            ];
+        } elseif ($netDebitCents < 0) {
+            $lines[] = [
+                'account_code' => $equityCode,
+                'debit' => abs($netDebitCents) / 100,
+                'credit' => 0,
+                'description' => 'Pérdida del ejercicio ' . $year,
+            ];
+        }
+
+        $desc = 'Cierre de resultado ' . $year
+            . ($notes ? (': ' . trim($notes)) : '');
+
+        return $this->postEntry(
+            $to,
+            $desc,
+            $lines,
+            'fiscal_close',
+            $year,
+            'year_close'
         );
     }
 
@@ -3935,10 +4289,10 @@ class AccountingService
     }
 
     /**
-     * Fecha de contabilización cuando el periodo preferido está cerrado:
-     * usa hoy si está abierto; si no, el primer día del siguiente periodo abierto.
+     * Elige la primera fecha candidata cuyo periodo esté abierto.
+     * No inventa un mes futuro: si todas están cerradas, lanza con $failMessage.
      */
-    private function resolvePostingDate(string $preferred, ?string $fallback = null): string
+    private function resolveOpenPostingDate(?string $preferred, ?string $fallback, string $failMessage): string
     {
         foreach ([$preferred, $fallback] as $candidate) {
             if (!is_string($candidate) || $candidate === '') {
@@ -3952,31 +4306,54 @@ class AccountingService
                 return $candidate;
             }
         }
+        throw new \InvalidArgumentException($failMessage);
+    }
 
-        $start = $preferred;
-        $dtPreferred = \DateTimeImmutable::createFromFormat('Y-m-d', $preferred);
-        if (!$dtPreferred || $dtPreferred->format('Y-m-d') !== $preferred) {
-            $start = date('Y-m-d');
-            $dtPreferred = new \DateTimeImmutable($start);
+    /**
+     * Auditoría de integridad del libro: asientos desbalanceados o líneas bilaterales.
+     *
+     * @return array{unbalanced:list<array<string,mixed>>,bad_lines:int,ok:bool}
+     */
+    public function auditEntryIntegrity(int $limit = 50): array
+    {
+        $limit = max(1, min(200, $limit));
+        $unbalanced = [];
+        $badLines = 0;
+        try {
+            // Solo asientos recientes (1 año): full-scan histórico tumba el dashboard.
+            $unbalanced = $this->query(
+                "SELECT e.id, e.entry_number, e.entry_date, e.status, e.source_type, e.source_id,
+                        ROUND(SUM(l.debit), 2) AS total_debit,
+                        ROUND(SUM(l.credit), 2) AS total_credit,
+                        ROUND(SUM(l.debit) - SUM(l.credit), 2) AS diff
+                 FROM accounting_entries e
+                 JOIN accounting_lines l ON l.entry_id = e.id
+                 WHERE e.entry_date >= DATE_SUB(CURDATE(), INTERVAL 366 DAY)
+                 GROUP BY e.id, e.entry_number, e.entry_date, e.status, e.source_type, e.source_id
+                 HAVING ABS(SUM(l.debit) - SUM(l.credit)) > 0.009
+                 ORDER BY e.entry_date DESC, e.id DESC
+                 LIMIT {$limit}"
+            )->fetchAll();
+            // Solo muestreo: COUNT full de líneas malas puede tardar minutos.
+            $badLines = (int)$this->query(
+                "SELECT COUNT(*) FROM (
+                    SELECT l.id FROM accounting_lines l
+                    JOIN accounting_entries e ON e.id = l.entry_id
+                    WHERE e.entry_date >= DATE_SUB(CURDATE(), INTERVAL 366 DAY)
+                      AND ((l.debit > 0.009 AND l.credit > 0.009)
+                        OR (l.debit <= 0.009 AND l.credit <= 0.009))
+                    LIMIT 501
+                 ) bad"
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            return ['unbalanced' => [], 'bad_lines' => 0, 'ok' => true, 'error' => $e->getMessage()];
         }
 
-        $cursor = $dtPreferred->modify('first day of this month');
-        for ($i = 0; $i < 48; $i++) {
-            $candidate = $cursor->format('Y-m-d');
-            if (!$this->isPeriodClosed($candidate)) {
-                // Si el mes abierto es el actual, preferir hoy (no el día 1).
-                $today = date('Y-m-d');
-                if ($cursor->format('Y-m') === date('Y-m') && !$this->isPeriodClosed($today)) {
-                    return $today;
-                }
-                return $candidate;
-            }
-            $cursor = $cursor->modify('first day of next month');
-        }
-
-        throw new \RuntimeException(
-            'No hay periodo contable abierto para registrar el asiento. Abra un periodo en Contabilidad.'
-        );
+        return [
+            'unbalanced' => $unbalanced,
+            'bad_lines' => $badLines,
+            'ok' => $unbalanced === [] && $badLines === 0,
+        ];
     }
 
     private function nextEntryNumber(string $date): string

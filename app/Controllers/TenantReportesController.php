@@ -263,7 +263,11 @@ class TenantReportesController extends TenantController
             'lowStockProducts' => [],
             'productTrend' => [],
             'paymentMethods' => [],
-            'salesSummary' => ['by_method' => [], 'collected' => 0.0, 'pending' => 0.0, 'total' => 0.0, 'count' => 0, 'discount' => 0.0],
+            'salesSummary' => [
+                'by_method' => [], 'collected' => 0.0, 'pending' => 0.0, 'total' => 0.0, 'count' => 0, 'discount' => 0.0,
+                'cash_other_payable' => ['amount' => 0.0, 'count' => 0],
+            ],
+            'purchasesLiquidity' => $this->emptyPurchasesLiquidity(),
             'marginByChannel' => [],
             'dataphoneRecon' => [
                 'sales_total' => 0, 'expected_total' => 0, 'recorded_total' => 0, 'gap' => 0,
@@ -275,6 +279,145 @@ class TenantReportesController extends TenantController
             'inventoryByMonth' => [],
             'inventorySalesByMonth' => [],
         ];
+    }
+
+    /**
+     * @return array{
+     *   cash_other_amount:float,cash_other_count:int,
+     *   payable_total:float,payable_count:int,payable_overdue:float,payable_overdue_count:int,
+     *   sales_collected:float,sales_pending:float,sales_partial_count:int,
+     *   purchase_commercial_disc:float,cxp_payment_disc:float,
+     *   drawer_expense_total:float,drawer_expense_origins:list<array{code:string,source:string,net:float,entries:int}>
+     * }
+     */
+    private function emptyPurchasesLiquidity(): array
+    {
+        return [
+            'cash_other_amount' => 0.0,
+            'cash_other_count' => 0,
+            'payable_total' => 0.0,
+            'payable_count' => 0,
+            'payable_overdue' => 0.0,
+            'payable_overdue_count' => 0,
+            'sales_collected' => 0.0,
+            'sales_pending' => 0.0,
+            'sales_partial_count' => 0,
+            'purchase_commercial_disc' => 0.0,
+            'cxp_payment_disc' => 0.0,
+            'drawer_expense_total' => 0.0,
+            'drawer_expense_origins' => [],
+        ];
+    }
+
+    /**
+     * Snapshot compras/CxP + cobros + gastos cajón del periodo (para panel Reportes).
+     *
+     * @param array<string,mixed> $salesSummary
+     * @return array<string,mixed>
+     */
+    private function buildPurchasesLiquidity(string $from, string $to, array $salesSummary): array
+    {
+        $out = $this->emptyPurchasesLiquidity();
+        $cashOther = $salesSummary['cash_other_payable'] ?? ['amount' => 0.0, 'count' => 0];
+        $out['cash_other_amount'] = round((float)($cashOther['amount'] ?? 0), 2);
+        $out['cash_other_count'] = (int)($cashOther['count'] ?? 0);
+        $out['sales_collected'] = round((float)($salesSummary['collected'] ?? 0), 2);
+        $out['sales_pending'] = round((float)($salesSummary['pending'] ?? 0), 2);
+
+        try {
+            $purchasing = new \SoftNova\Services\PurchasingService($this->db);
+            $out['payable_total'] = round((float)$purchasing->payableTotal(), 2);
+            $overdueRows = $purchasing->payableOrders(300, 'overdue');
+            $out['payable_overdue_count'] = count($overdueRows);
+            $overdueSum = 0.0;
+            foreach ($overdueRows as $row) {
+                $base = !empty($row['supplier_invoice_value'])
+                    ? (float)$row['supplier_invoice_value']
+                    : (float)($row['total'] ?? 0);
+                $saldo = $base
+                    - (float)($row['paid_amount'] ?? 0)
+                    - (float)($row['credit_amount'] ?? 0)
+                    - (float)($row['discount_amount'] ?? 0);
+                if ($saldo > 0.009) {
+                    $overdueSum += $saldo;
+                }
+            }
+            $out['payable_overdue'] = round($overdueSum, 2);
+            $openRows = $purchasing->payableOrders(300, '');
+            $out['payable_count'] = count($openRows);
+        } catch (\Throwable $e) {
+            // Compras aún no migrado / sin permisos de esquema.
+        }
+
+        try {
+            $out['sales_partial_count'] = (int)$this->query(
+                "SELECT COUNT(*) FROM sales
+                 WHERE COALESCE(status, '') <> 'cancelled'
+                   AND payment_status = 'partial'
+                   AND sale_date BETWEEN ? AND ?",
+                [$from . ' 00:00:00', $to . ' 23:59:59']
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            $out['sales_partial_count'] = 0;
+        }
+
+        try {
+            $out['purchase_commercial_disc'] = round((float)$this->query(
+                "SELECT COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(commercial_discount_amount, 0) > 0.009 THEN commercial_discount_amount
+                        WHEN COALESCE(commercial_discount_pct, 0) > 0.009
+                            THEN ROUND(COALESCE(subtotal, 0) * commercial_discount_pct / 100, 2)
+                        ELSE 0
+                    END
+                 ), 0)
+                 FROM purchase_orders
+                 WHERE status = 'received'
+                   AND COALESCE(warehouse_date, order_date, invoice_date) BETWEEN ? AND ?",
+                [$from, $to]
+            )->fetchColumn(), 2);
+        } catch (\Throwable $e) {
+            $out['purchase_commercial_disc'] = 0.0;
+        }
+
+        try {
+            $out['cxp_payment_disc'] = round((float)$this->query(
+                "SELECT COALESCE(SUM(discount_amount), 0)
+                 FROM supplier_payments
+                 WHERE status = 'applied'
+                   AND payment_date BETWEEN ? AND ?",
+                [$from, $to]
+            )->fetchColumn(), 2);
+        } catch (\Throwable $e) {
+            $out['cxp_payment_disc'] = 0.0;
+        }
+
+        try {
+            $accounting = new \SoftNova\Services\AccountingService($this->db);
+            $buckets = $accounting->expenseBucketOriginBreakdown($from, $to, ['519595', '539595']);
+            $origins = [];
+            $total = 0.0;
+            foreach ($buckets as $code => $bucket) {
+                $total += (float)($bucket['total'] ?? 0);
+                foreach (($bucket['origins'] ?? []) as $origin) {
+                    $net = round((float)($origin['amount'] ?? $origin['net'] ?? 0), 2);
+                    $origins[] = [
+                        'code' => (string)$code,
+                        'source' => (string)($origin['source_type'] ?? $origin['source'] ?? 'manual'),
+                        'label' => (string)($origin['label'] ?? $origin['source_type'] ?? 'manual'),
+                        'net' => $net,
+                        'entries' => (int)($origin['entries'] ?? 0),
+                    ];
+                }
+            }
+            usort($origins, static fn(array $a, array $b) => $b['net'] <=> $a['net']);
+            $out['drawer_expense_total'] = round($total, 2);
+            $out['drawer_expense_origins'] = array_slice($origins, 0, 6);
+        } catch (\Throwable $e) {
+            // Contabilidad no disponible.
+        }
+
+        return $out;
     }
 
     private function defaultReceivablesAging(): array
@@ -667,7 +810,10 @@ class TenantReportesController extends TenantController
 
         $salesSummary = $this->tryBlock(
             fn () => \SoftNova\Services\SalesPeriodSummary::build($this->db, $dateFrom, $dateTo),
-            ['by_method' => [], 'collected' => 0.0, 'pending' => 0.0, 'total' => 0.0, 'count' => 0, 'discount' => 0.0],
+            [
+                'by_method' => [], 'collected' => 0.0, 'pending' => 0.0, 'total' => 0.0, 'count' => 0, 'discount' => 0.0,
+                'cash_other_payable' => ['amount' => 0.0, 'count' => 0],
+            ],
             'salesSummary'
         );
         $paymentMethods = [];
@@ -679,6 +825,11 @@ class TenantReportesController extends TenantController
                 'total' => $pm['amount'],
             ];
         }
+        $purchasesLiquidity = $this->tryBlock(
+            fn () => $this->buildPurchasesLiquidity($dateFrom, $dateTo, $salesSummary),
+            $this->emptyPurchasesLiquidity(),
+            'purchasesLiquidity'
+        );
 
         if ($reportsFull) {
             $prevRange = [$prevFrom, $prevTo];
@@ -830,6 +981,7 @@ class TenantReportesController extends TenantController
             'productTrend' => $productTrend,
             'paymentMethods' => $paymentMethods,
             'salesSummary' => $salesSummary,
+            'purchasesLiquidity' => $purchasesLiquidity,
             'marginByChannel' => $marginByChannel,
             'dataphoneRecon' => $dataphoneRecon,
             'expenseBreakdown' => $expenseBreakdown,

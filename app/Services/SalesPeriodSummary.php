@@ -13,7 +13,8 @@ final class SalesPeriodSummary
      * @return array{
      *   from:string,to:string,count:int,total:float,discount:float,
      *   by_method:list<array{method:string,label:string,amount:float,count:int}>,
-     *   collected:float,pending:float
+     *   collected:float,pending:float,
+     *   cash_other_payable:array{amount:float,count:int}
      * }
      */
     public static function build(\PDO $db, string $from, string $to): array
@@ -27,9 +28,13 @@ final class SalesPeriodSummary
             'by_method' => [],
             'collected' => 0.0,
             'pending' => 0.0,
+            'cash_other_payable' => ['amount' => 0.0, 'count' => 0],
         ];
         $range = [$from . ' 00:00:00', $to . ' 23:59:59'];
         $active = "COALESCE(s.status, '') <> 'cancelled' AND s.sale_date BETWEEN ? AND ?";
+
+        // Abonos a proveedores en efectivo desde «otro fondo» (no salieron del cajón).
+        $out['cash_other_payable'] = self::cashOtherPayableTotals($db, $from, $to);
 
         foreach ([
             "SELECT COUNT(*) c, COALESCE(SUM(s.total), 0) t, COALESCE(SUM(s.discount), 0) d FROM sales s WHERE {$active}",
@@ -119,6 +124,55 @@ final class SalesPeriodSummary
         $out['collected'] = round($collected, 2);
         $out['pending'] = round(max(0, $out['total'] - $collected), 2);
         return $out;
+    }
+
+    /**
+     * Pagos de facturas/CxP en efectivo que NO salieron del cajón (cash_from_drawer = 0).
+     * Fallback: notas «Efectivo fuera del cajón» (abonos antiguos / columna faltante).
+     *
+     * @return array{amount:float,count:int}
+     */
+    public static function cashOtherPayableTotals(\PDO $db, string $from, string $to): array
+    {
+        $empty = ['amount' => 0.0, 'count' => 0];
+        $queries = [
+            "SELECT COUNT(*) AS c, COALESCE(SUM(sp.amount), 0) AS a
+             FROM supplier_payments sp
+             WHERE sp.status = 'applied'
+               AND sp.payment_method = 'cash'
+               AND sp.cash_from_drawer = 0
+               AND sp.payment_date BETWEEN ? AND ?",
+            // Legado sin columna o con flag vacío pero nota de origen.
+            "SELECT COUNT(*) AS c, COALESCE(SUM(sp.amount), 0) AS a
+             FROM supplier_payments sp
+             WHERE sp.status = 'applied'
+               AND sp.payment_method = 'cash'
+               AND sp.payment_date BETWEEN ? AND ?
+               AND (
+                    COALESCE(sp.notes, '') LIKE '%Efectivo fuera del cajón%'
+                    OR TRIM(COALESCE(sp.cash_source_note, '')) <> ''
+               )",
+            "SELECT COUNT(*) AS c, COALESCE(SUM(sp.amount), 0) AS a
+             FROM supplier_payments sp
+             WHERE sp.status = 'applied'
+               AND sp.payment_method = 'cash'
+               AND sp.payment_date BETWEEN ? AND ?
+               AND COALESCE(sp.notes, '') LIKE '%Efectivo fuera del cajón%'",
+        ];
+        foreach ($queries as $sql) {
+            try {
+                $st = $db->prepare($sql);
+                $st->execute([$from, $to]);
+                $row = $st->fetch(\PDO::FETCH_ASSOC) ?: [];
+                return [
+                    'amount' => round((float)($row['a'] ?? 0), 2),
+                    'count' => (int)($row['c'] ?? 0),
+                ];
+            } catch (\Throwable $e) {
+                continue;
+            }
+        }
+        return $empty;
     }
 
     /**

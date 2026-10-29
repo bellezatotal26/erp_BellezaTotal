@@ -845,7 +845,7 @@ if ($paginationTotal > 0):
 
 <!-- Modal Producto -->
 <div id="productModal" class="modal-overlay" style="display:none;">
-    <div class="modal-content neumorphic" style="max-width:600px;max-height:85vh;overflow-y:auto;">
+    <div class="modal-content neumorphic" id="productModalContent" style="max-width:600px;max-height:85vh;overflow-y:auto;">
         <div class="modal-header">
             <h3 id="modalTitle">Nuevo Producto</h3>
             <button onclick="closeInvModal()" class="modal-close">&times;</button>
@@ -1025,9 +1025,21 @@ if ($paginationTotal > 0):
                 <label>Descripción <span class="field-tip" data-tip="Detalle comercial del producto o servicio.">?</span></label>
                 <textarea name="description" id="prodDesc" rows="2" class="form-control"></textarea>
             </div>
-            <div class="form-group">
-                <label>Notas internas <span class="field-tip" data-tip="Anotaciones operativas editables en cualquier momento (ubicación especial, acuerdos, recordatorios).">?</span></label>
-                <textarea name="notes" id="prodNotes" rows="2" class="form-control" placeholder="Ej: Se vende a veces a crédito, revisar con bodega…"></textarea>
+            <div id="prodNotesSection" style="display:grid;grid-template-columns:1fr;gap:12px;margin-top:4px;">
+                <div class="form-group" style="margin:0;">
+                    <label id="prodNotesLabel">Notas internas <span class="field-tip" data-tip="Al crear o editar, cada texto se agrega al histórico con fecha y usuario. No sobrescribe notas anteriores.">?</span></label>
+                    <textarea name="notes" id="prodNotes" rows="3" class="form-control" maxlength="4000" placeholder="Ej: Se vende a veces a crédito, revisar con bodega…"></textarea>
+                    <p id="prodNotesHint" style="margin:6px 0 0;font-size:11px;color:var(--color-text-secondary);">Quedará como nota inicial del producto.</p>
+                </div>
+                <div id="prodNotesHistoryWrap" class="form-group" style="display:none;margin:0;">
+                    <label style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;">
+                        <span>Historial de notas</span>
+                        <span id="prodNotesHistoryCount" style="font-weight:400;font-size:11px;color:var(--color-text-secondary);"></span>
+                    </label>
+                    <div id="prodNotesHistory" style="max-height:200px;overflow:auto;border:1px solid var(--color-border);border-radius:10px;background:var(--bg-input);padding:8px 10px;font-size:12px;">
+                        <p style="margin:0;color:var(--color-text-secondary);">Sin notas aún</p>
+                    </div>
+                </div>
             </div>
             <div class="form-group">
                 <label>Imagen <span class="field-tip" data-tip="Foto opcional para identificar el producto en el catálogo.">?</span></label>
@@ -1548,6 +1560,7 @@ if ($paginationTotal > 0):
     window.invRouteCreate = '<?php echo $viewInstance->route('app/inventario'); ?>?action=create';
     window.invRouteEdit = '<?php echo $viewInstance->route('app/inventario'); ?>?action=edit';
     window.invRouteDetail = '<?php echo $viewInstance->route('app/inventario'); ?>?action=detail';
+    window.invRouteProductNotes = '<?php echo $viewInstance->route('app/inventario'); ?>?action=product_notes';
     window.invRouteBase = '<?php echo $viewInstance->route('app/inventario'); ?>';
     window.invRouteGenerateBarcode = '<?php echo $viewInstance->route('app/inventario'); ?>?action=generate_barcode';
     window.invRouteGenerateSku = '<?php echo $viewInstance->route('app/inventario'); ?>?action=generate_sku';

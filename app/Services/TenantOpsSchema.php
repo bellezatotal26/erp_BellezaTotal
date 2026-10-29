@@ -99,6 +99,13 @@ class TenantOpsSchema
         self::paymentMethodToVarchar($db, 'expenses');
 
         self::ensurePayrollSchema($db);
+
+        // Contabilidad: DDL fuera de TX de negocio (warm idempotente por PDO).
+        try {
+            AccountingService::warm($db);
+        } catch (\Throwable $e) {
+            error_log('TenantOpsSchema AccountingService::warm: ' . $e->getMessage());
+        }
     }
 
     private static function ensurePayrollSchema(\PDO $db): void

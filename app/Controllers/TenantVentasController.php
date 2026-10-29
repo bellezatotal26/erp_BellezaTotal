@@ -201,6 +201,8 @@ class TenantVentasController extends TenantController
                 $params
             )->fetchAll();
         }
+        $this->ensurePaymentStatusEnum();
+        $sales = $this->hydrateSalePaymentBalances($sales);
         
         [$sumFrom, $sumTo] = $this->salesSummaryRange();
         $salesSummary = \SoftNova\Services\SalesPeriodSummary::build($this->db, $sumFrom, $sumTo);
@@ -439,16 +441,53 @@ class TenantVentasController extends TenantController
             }
         }
         $payments = $this->query(
-            "SELECT * FROM sale_payments WHERE sale_id = ? ORDER BY payment_date DESC",
+            "SELECT * FROM sale_payments WHERE sale_id = ? ORDER BY payment_date DESC, id DESC",
             [$id]
         )->fetchAll();
 
         $creditNotes = [];
+        $balances = [
+            'credited' => 0.0,
+            'paid' => 0.0,
+            'net_total' => round((float)($sale['total'] ?? 0), 2),
+            'balance' => round((float)($sale['total'] ?? 0), 2),
+            'sale_total' => round((float)($sale['total'] ?? 0), 2),
+        ];
         try {
-            $creditNotes = (new \SoftNova\Services\SalesCreditNoteService($this->db))
-                ->getSaleForCredit($id)['credit_notes'] ?? [];
+            $ncSvc = new \SoftNova\Services\SalesCreditNoteService($this->db);
+            $creditNotes = $ncSvc->getSaleForCredit($id)['credit_notes'] ?? [];
+            $balances = $ncSvc->saleBalances($id);
+            // Repara estado si hay saldo pero quedó marcada como pagada.
+            if (($sale['status'] ?? '') !== 'cancelled') {
+                $bal = (float)$balances['balance'];
+                $paid = (float)$balances['paid'];
+                $expected = $bal <= 0.009 ? 'paid' : ($paid > 0.009 ? 'partial' : 'pending');
+                if ((string)($sale['payment_status'] ?? '') !== $expected) {
+                    $this->ensurePaymentStatusEnum();
+                    if ($expected === 'paid') {
+                        $this->query(
+                            "UPDATE sales SET payment_status = 'paid', status = 'completed'
+                             WHERE id = ? AND COALESCE(status, '') <> 'cancelled'",
+                            [$id]
+                        );
+                    } else {
+                        $this->query(
+                            "UPDATE sales SET payment_status = ?
+                             WHERE id = ? AND COALESCE(status, '') <> 'cancelled'",
+                            [$expected, $id]
+                        );
+                    }
+                    $sale['payment_status'] = $expected;
+                }
+            }
         } catch (\Throwable $e) {
             $creditNotes = [];
+            $paidSum = 0.0;
+            foreach ($payments as $p) {
+                $paidSum += (float)($p['amount'] ?? 0);
+            }
+            $balances['paid'] = round($paidSum, 2);
+            $balances['balance'] = max(0.0, round($balances['sale_total'] - $paidSum, 2));
         }
 
         $paymentChanges = [];
@@ -470,6 +509,8 @@ class TenantVentasController extends TenantController
             'payments' => $payments,
             'credit_notes' => $creditNotes,
             'payment_changes' => $paymentChanges,
+            'balances' => $balances,
+            'can_abonar' => (($sale['status'] ?? '') !== 'cancelled') && ((float)$balances['balance'] > 0.009),
             'profit' => $this->saleProfitSummary($sale),
         ]);
     }
@@ -798,6 +839,7 @@ class TenantVentasController extends TenantController
      */
     private function ensureSaleRuntimeSchema(): void
     {
+        $this->ensurePaymentStatusEnum();
         try {
             new SalesDocumentService($this->db);
         } catch (\Throwable $e) {
@@ -825,6 +867,88 @@ class TenantVentasController extends TenantController
         } catch (\Throwable $e) {
             error_log('ensureSaleRuntimeSchema accounting: ' . $e->getMessage());
         }
+        try {
+            // NC: CREATE TABLE en el constructor; si se instancia dentro de una TX
+            // de abono/venta, MySQL confirma en silencio y falla el commit().
+            new \SoftNova\Services\SalesCreditNoteService($this->db);
+        } catch (\Throwable $e) {
+            error_log('ensureSaleRuntimeSchema credit_notes: ' . $e->getMessage());
+        }
+    }
+
+    /** Asegura ENUM payment_status con 'partial' (abonos a crédito). */
+    private function ensurePaymentStatusEnum(): void
+    {
+        static $done = false;
+        if ($done) {
+            return;
+        }
+        $done = true;
+        try {
+            $col = $this->query("SHOW COLUMNS FROM sales LIKE 'payment_status'")->fetch();
+            $type = strtolower((string)($col['Type'] ?? ''));
+            if ($type !== '' && !str_contains($type, 'partial')) {
+                $this->db->exec(
+                    "ALTER TABLE sales
+                     MODIFY COLUMN payment_status ENUM('paid','pending','partial') NOT NULL DEFAULT 'paid'"
+                );
+            }
+        } catch (\Throwable $e) {
+            error_log('ensurePaymentStatusEnum: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Corrige payment_status según abonos reales (evita perder el botón Abonar).
+     *
+     * @param list<array<string,mixed>> $sales
+     * @return list<array<string,mixed>>
+     */
+    private function hydrateSalePaymentBalances(array $sales): array
+    {
+        foreach ($sales as &$sale) {
+            $total = round((float)($sale['total'] ?? 0), 2);
+            $paid = round((float)($sale['paid_amount'] ?? 0), 2);
+            $credited = round((float)($sale['credit_note_total'] ?? 0), 2);
+            $net = max(0.0, round($total - $credited, 2));
+            $balance = max(0.0, round($net - $paid, 2));
+            $sale['net_total'] = $net;
+            $sale['balance_due'] = $balance;
+
+            $status = (string)($sale['payment_status'] ?? '');
+            $cancelled = (($sale['status'] ?? '') === 'cancelled');
+            if ($cancelled) {
+                continue;
+            }
+
+            $expected = $balance <= 0.009
+                ? 'paid'
+                : ($paid > 0.009 ? 'partial' : 'pending');
+
+            if ($status !== $expected) {
+                $sale['payment_status'] = $expected;
+                // Persistir reparación (p. ej. ENUM viejo o abono que marcó paid por error).
+                try {
+                    if ($expected === 'paid') {
+                        $this->query(
+                            "UPDATE sales SET payment_status = 'paid', status = 'completed'
+                             WHERE id = ? AND COALESCE(status, '') <> 'cancelled'",
+                            [(int)$sale['id']]
+                        );
+                    } else {
+                        $this->query(
+                            "UPDATE sales SET payment_status = ?
+                             WHERE id = ? AND COALESCE(status, '') <> 'cancelled'",
+                            [$expected, (int)$sale['id']]
+                        );
+                    }
+                } catch (\Throwable $e) {
+                    // No bloquear el listado.
+                }
+            }
+        }
+        unset($sale);
+        return $sales;
     }
 
     private function createSale(): void
@@ -1933,32 +2057,42 @@ class TenantVentasController extends TenantController
         }
         
         try {
+            // DDL ANTES de la TX: el constructor de SalesCreditNoteService hace
+            // CREATE TABLE IF NOT EXISTS. En MySQL eso es COMMIT implícito y, si
+            // corre con la TX abierta, el commit() final falla con
+            // «There is no active transaction» (el abono sí queda guardado).
+            $this->ensurePaymentStatusEnum();
+            $ncSvc = new \SoftNova\Services\SalesCreditNoteService($this->db);
+
             $this->db->beginTransaction();
-            
+
+            // Criterio = saldo real, no solo payment_status (si quedó mal en 'paid', aún se puede abonar).
             $sale = $this->query(
                 "SELECT * FROM sales
-                 WHERE id = ? AND payment_status IN ('pending', 'partial')
-                   AND COALESCE(status, '') <> 'cancelled'
+                 WHERE id = ? AND COALESCE(status, '') <> 'cancelled'
                  FOR UPDATE",
                 [$saleId]
             )->fetch();
-            
+
             if (!$sale) {
-                $this->db->rollBack();
-                $this->respond(false, 'Venta no encontrada, cancelada o ya esta pagada', '/app/ventas');
+                if ($this->db->inTransaction()) {
+                    $this->db->rollBack();
+                }
+                $this->respond(false, 'Venta no encontrada o cancelada', '/app/ventas');
                 return;
             }
 
             // Saldo = total − NC posted − pagos (misma regla que syncReceivable).
-            $ncSvc = new \SoftNova\Services\SalesCreditNoteService($this->db);
             $balances = $ncSvc->saleBalances($saleId);
             $alreadyPaid = (float)$balances['paid'];
             $netTotal = (float)$balances['net_total'];
             $balance = (float)$balances['balance'];
 
             if ($balance <= 0.009) {
-                $this->db->rollBack();
-                // Mantener estado coherente si quedó pagada por NC.
+                if ($this->db->inTransaction()) {
+                    $this->db->rollBack();
+                }
+                // Mantener estado coherente si quedó pagada por NC o abonos previos.
                 try {
                     $ncSvc->syncReceivable($saleId);
                 } catch (\Throwable $e) {
@@ -1968,7 +2102,9 @@ class TenantVentasController extends TenantController
             }
 
             if ($amount > $balance + 0.009) {
-                $this->db->rollBack();
+                if ($this->db->inTransaction()) {
+                    $this->db->rollBack();
+                }
                 $this->respond(false, 'El abono no puede superar el saldo pendiente (' . $this->formatMoney($balance) . ')', '/app/ventas');
                 return;
             }
@@ -1983,7 +2119,7 @@ class TenantVentasController extends TenantController
             $paymentId = (int)$this->db->lastInsertId();
 
             $totalPaid = round($alreadyPaid + $amount, 2);
-            $remaining = round($netTotal - $totalPaid, 2);
+            $remaining = max(0.0, round($netTotal - $totalPaid, 2));
 
             if ($remaining <= 0.009) {
                 $this->query(
@@ -1991,7 +2127,7 @@ class TenantVentasController extends TenantController
                      WHERE id = ? AND COALESCE(status, '') <> 'cancelled'",
                     [$saleId]
                 );
-                $remaining = 0;
+                $remaining = 0.0;
             } else {
                 $this->query(
                     "UPDATE sales SET payment_status = 'partial'
@@ -2000,7 +2136,20 @@ class TenantVentasController extends TenantController
                 );
             }
 
-            $this->db->commit();
+            if ($this->db->inTransaction()) {
+                $this->db->commit();
+            }
+
+            // Fuente de verdad post-commit (estado + CxC).
+            try {
+                $ncSvc->syncReceivable($saleId);
+                $balancesAfter = $ncSvc->saleBalances($saleId);
+                $remaining = (float)$balancesAfter['balance'];
+                $totalPaid = (float)$balancesAfter['paid'];
+                $netTotal = (float)$balancesAfter['net_total'];
+            } catch (\Throwable $e) {
+                error_log('syncReceivable abono ' . $saleId . ': ' . $e->getMessage());
+            }
 
             // Contabilización fuera de la transacción: un periodo cerrado no debe
             // impedir registrar el abono.
@@ -2709,6 +2858,15 @@ class TenantVentasController extends TenantController
         }
         if ((float)$summary['pending'] > 0.009) {
             $rows[] = ['Por cobrar (crédito)', '', $money((float)$summary['pending']), $pct((float)$summary['pending'])];
+        }
+        $cashOther = $summary['cash_other_payable'] ?? ['amount' => 0, 'count' => 0];
+        if ((float)($cashOther['amount'] ?? 0) > 0.009) {
+            $rows[] = [
+                'Efectivo fuera de caja (pagos factura)',
+                (int)($cashOther['count'] ?? 0),
+                $money((float)$cashOther['amount']),
+                '',
+            ];
         }
         $rows[] = ['Total facturado', (int)$summary['count'], $money($total), '100'];
         if ((float)$summary['discount'] > 0.009) {

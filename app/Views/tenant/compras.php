@@ -832,27 +832,30 @@ function openPurchaseLimitModal() {
                                 }
                             ?>>
                                 <?php if ($dueDate): ?>
-                                    <?php echo date('d/m/Y', strtotime((string)$dueDate)); ?>
+                                    <div><?php echo date('d/m/Y', strtotime((string)$dueDate)); ?>
                                     <?php if ($dueOverdue): ?>
                                         <small>(<?php echo $daysOver; ?> d)</small>
                                     <?php elseif ($dueSoon && $daysOver === 0): ?>
                                         <small>(hoy)</small>
                                     <?php elseif ($dueSoon): ?>
                                         <small>(<?php echo abs($daysOver); ?> d)</small>
-                                    <?php endif; ?>
+                                    <?php endif; ?></div>
                                 <?php else: ?>
-                                    —
+                                    <div>—</div>
+                                <?php endif; ?>
+                                <?php if (!empty($o['invoice_due_date'])): ?>
+                                    <div style="font-size:11px;color:var(--color-text-secondary);font-weight:400;">Fact: <?php echo date('d/m/Y', strtotime((string)$o['invoice_due_date'])); ?></div>
                                 <?php endif; ?>
                             </td>
                             <td><?php echo htmlspecialchars($o['supplier_name'] ?? '—'); ?></td>
                             <td style="font-weight:600;"><?php echo fmtC((float)$o['total'], $currency); ?></td>
                             <td style="color:<?php echo $comDiscAmt > 0.009 ? 'var(--dmc-B45309, #B45309)' : 'inherit'; ?>;"
-                                title="<?php echo $comDiscPct > 0.009 ? htmlspecialchars((string)(int)round($comDiscPct) . '% comercial') : 'Descuento comercial'; ?>">
+                                title="<?php echo $comDiscPct > 0.009 ? htmlspecialchars(rtrim(rtrim(number_format($comDiscPct, 2, '.', ''), '0'), '.') . '% comercial') : 'Descuento comercial'; ?>">
                                 <?php
                                 if ($comDiscAmt > 0.009) {
                                     echo '−' . fmtC($comDiscAmt, $currency);
                                     if ($comDiscPct > 0.009) {
-                                        echo '<div style="font-size:11px;opacity:.8;">' . (int)round($comDiscPct) . '%</div>';
+                                        echo '<div style="font-size:11px;opacity:.8;">' . htmlspecialchars(rtrim(rtrim(number_format($comDiscPct, 2, ',', ''), '0'), ',')) . '%</div>';
                                     }
                                 } else {
                                     echo '—';
@@ -1075,15 +1078,23 @@ function openPurchaseLimitModal() {
                     <input type="text" name="invoice_number" class="form-control" placeholder="FV-001">
                 </div>
                 <div class="form-group" style="margin:0;">
-                    <label>Vencimiento de pago <span class="field-tip" data-tip="Fecha límite para pagar al proveedor (CxP). Se usa en filtros de vencidas / por vencer." tabindex="0">?</span></label>
+                    <label>Vence en factura <span class="field-tip" data-tip="Fecha de vencimiento impresa en la factura del proveedor (referencia). No mueve el semáforo CxP." tabindex="0">?</span></label>
+                    <input type="date" name="invoice_due_date" id="receiveInvoiceDueDate" class="form-control">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>Días de plazo <span class="field-tip" data-tip="Días desde la recepción en bodega para calcular Vence pago (CxP). Ej: bodega 10/10 + 30 → 09/11. Si está vacío, CxP = Vence en factura." tabindex="0">?</span></label>
+                    <input type="number" name="payment_term_days" id="receivePaymentTermDays" class="form-control" min="0" max="3650" step="1" placeholder="Ej: 30" title="Calcula Vence pago = bodega + días">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>Vence pago (CxP) <span class="field-tip" data-tip="Fecha operativa: bodega + días de plazo. Sin plazo = igual a Vence en factura. Es la que usan filtros vencidas / por vencer." tabindex="0">?</span></label>
                     <input type="date" name="due_date" id="receiveDueDate" class="form-control">
                 </div>
                 <input type="hidden" name="early_payment_discount_pct" id="receiveEarlyDiscount" value="0">
                 <div class="form-group" style="margin:0;grid-column:1/-1;">
-                    <label>Desc. comercial <span class="field-tip" data-tip="Descuento general sobre el subtotal (antes de IVA). Indique % entero (0–100) o monto $; si hay monto, manda el $." tabindex="0">?</span></label>
+                    <label>Desc. comercial <span class="field-tip" data-tip="Descuento general sobre el subtotal (antes de IVA). Indique % con hasta 2 decimales (0–100) o monto $; si hay monto, manda el $." tabindex="0">?</span></label>
                     <div class="po-com-disc-fields">
                         <div class="po-pct-wrap">
-                            <input type="number" step="1" min="0" max="100" inputmode="numeric" name="commercial_discount_pct" id="receiveCommercialPct" class="form-control" value="" placeholder="0" title="Porcentaje entero" oninput="poClampCommercialPct(this)">
+                            <input type="number" step="0.01" min="0" max="100" inputmode="decimal" name="commercial_discount_pct" id="receiveCommercialPct" class="form-control" value="" placeholder="0" title="Porcentaje con hasta 2 decimales" oninput="poClampCommercialPct(this)">
                             <span class="po-pct-affix">%</span>
                         </div>
                         <input type="text" inputmode="decimal" name="commercial_discount_amount" id="receiveCommercialAmt" class="form-control money-input" data-money="1" value="" placeholder="$ monto" autocomplete="off">
@@ -1404,7 +1415,8 @@ function openPurchaseLimitModal() {
                     <th><button type="button" class="pay-sort" data-pay-sort="oc" title="Clic: A→Z · otro clic: Z→A">OC <span class="pay-sort__arrow">↕</span></button></th>
                     <th><button type="button" class="pay-sort" data-pay-sort="supplier" title="Clic: A→Z · otro clic: Z→A">Proveedor <span class="pay-sort__arrow">↕</span></button></th>
                     <th><button type="button" class="pay-sort" data-pay-sort="invoice" title="Clic: A→Z · otro clic: Z→A">Factura <span class="pay-sort__arrow">↕</span></button></th>
-                    <th><button type="button" class="pay-sort" data-pay-sort="due" title="Clic: más antigua→reciente · otro clic: inversa">Vence <span class="pay-sort__arrow">↕</span></button></th>
+                    <th><button type="button" class="pay-sort" data-pay-sort="due" title="Clic: más antigua→reciente · otro clic: inversa. Fecha operativa CxP (bodega + plazo)">Vence pago <span class="pay-sort__arrow">↕</span></button></th>
+                    <th><button type="button" class="pay-sort" data-pay-sort="invoice_due" title="Clic: más antigua→reciente · otro clic: inversa. Fecha impresa en la factura del proveedor">Vence factura <span class="pay-sort__arrow">↕</span></button></th>
                     <th><button type="button" class="pay-sort" data-pay-sort="total" title="Clic: menor→mayor · otro clic: mayor→menor">Total <span class="pay-sort__arrow">↕</span></button></th>
                     <th><button type="button" class="pay-sort" data-pay-sort="paid" title="Clic: menor→mayor · otro clic: mayor→menor">Abonado <span class="pay-sort__arrow">↕</span></button></th>
                     <th><button type="button" class="pay-sort" data-pay-sort="balance" title="Clic: menor→mayor · otro clic: mayor→menor">Saldo <span class="pay-sort__arrow">↕</span></button></th>
@@ -1440,8 +1452,11 @@ function openPurchaseLimitModal() {
                     <td data-v="<?php echo htmlspecialchars($p['supplier_name'] ?? '', ENT_QUOTES); ?>"><?php echo htmlspecialchars($p['supplier_name'] ?? '—'); ?></td>
                     <td data-v="<?php echo htmlspecialchars($p['invoice_number'] ?? '', ENT_QUOTES); ?>"><?php echo htmlspecialchars($p['invoice_number'] ?? '—'); ?></td>
                     <td data-v="<?php echo $p['due_date'] ? date('Y-m-d', strtotime($p['due_date'])) : ''; ?>"<?php echo $overdue ? ' style="color:var(--dmc-DC2626, #DC2626);font-weight:600;"' : ''; ?>>
-                        <?php echo $p['due_date'] ? date('d/m/Y', strtotime($p['due_date'])) : '—'; ?>
-                        <?php echo $overdue ? ' (' . (int)$p['days_overdue'] . ' d)' : ''; ?>
+                        <?php echo $p['due_date'] ? date('d/m/Y', strtotime($p['due_date'])) : '—'; ?><?php echo $overdue ? ' (' . (int)$p['days_overdue'] . ' d)' : ''; ?>
+                    </td>
+                    <td data-v="<?php echo !empty($p['invoice_due_date']) ? date('Y-m-d', strtotime((string)$p['invoice_due_date'])) : ''; ?>"
+                        title="Fecha de vencimiento impresa en la factura del proveedor">
+                        <?php echo !empty($p['invoice_due_date']) ? date('d/m/Y', strtotime((string)$p['invoice_due_date'])) : '—'; ?>
                     </td>
                     <td data-v="<?php echo (float)$p['total']; ?>"><?php echo fmtC((float)$p['total'], $currency); ?></td>
                     <td data-v="<?php echo (float)$p['paid_amount']; ?>" style="color:#10B981;"><?php echo fmtC((float)$p['paid_amount'], $currency); ?></td>
@@ -1457,7 +1472,7 @@ function openPurchaseLimitModal() {
                 </tr>
             <?php endforeach; ?>
                 <tr id="payablesEmpty" style="display:none;">
-                    <td colspan="8" style="text-align:center;color:var(--color-text-secondary);padding:18px;">Sin cuentas por pagar para ese filtro.</td>
+                    <td colspan="9" style="text-align:center;color:var(--color-text-secondary);padding:18px;">Sin cuentas por pagar para ese filtro.</td>
                 </tr>
             </tbody>
         </table></div>
@@ -1473,7 +1488,7 @@ function openPurchaseLimitModal() {
     var search = document.getElementById('payablesSearch');
     var dueSel = document.getElementById('payablesDue');
     var summary = document.getElementById('payablesSummary');
-    var colIdx = { oc: 0, supplier: 1, invoice: 2, due: 3, total: 4, paid: 5, balance: 6 };
+    var colIdx = { oc: 0, supplier: 1, invoice: 2, due: 3, invoice_due: 4, total: 5, paid: 6, balance: 7 };
     var sortKey = 'due';
     var sortDir = 1;
 
@@ -1493,7 +1508,7 @@ function openPurchaseLimitModal() {
             var va = cellVal(a, sortKey), vb = cellVal(b, sortKey), cmp = 0;
             if (sortKey === 'total' || sortKey === 'paid' || sortKey === 'balance') {
                 cmp = (parseFloat(va) || 0) - (parseFloat(vb) || 0);
-            } else if (sortKey === 'due') {
+            } else if (sortKey === 'due' || sortKey === 'invoice_due') {
                 cmp = String(va || '9999-12-31').localeCompare(String(vb || '9999-12-31'));
             } else {
                 cmp = norm(va).localeCompare(norm(vb), 'es');
@@ -1644,11 +1659,19 @@ function openPurchaseLimitModal() {
                             <input type="date" name="invoice_date" id="uploadInvoiceDate" class="form-control" value="<?php echo date('Y-m-d'); ?>">
                         </div>
                         <div class="form-group" style="margin:0;">
-                            <label>Vencimiento de pago <span class="field-tip" data-tip="Fecha límite de CxP. Alimenta filtros de vencidas / por vencer en Facturas." tabindex="0">?</span></label>
+                            <label>Vence en factura <span class="field-tip" data-tip="Fecha de vencimiento impresa en la factura del proveedor (referencia)." tabindex="0">?</span></label>
+                            <input type="date" name="invoice_due_date" id="uploadInvoiceDueDate" class="form-control">
+                        </div>
+                        <div class="form-group" style="margin:0;">
+                            <label>Días de plazo <span class="field-tip" data-tip="Días desde la recepción en bodega para calcular Vence pago (CxP). Si está vacío, CxP = Vence en factura." tabindex="0">?</span></label>
+                            <input type="number" name="payment_term_days" id="uploadPaymentTermDays" class="form-control" min="0" max="3650" step="1" placeholder="Ej: 30">
+                        </div>
+                        <div class="form-group" style="margin:0;">
+                            <label>Vence pago (CxP) <span class="field-tip" data-tip="Fecha operativa: bodega + días de plazo. Sin plazo = igual a Vence en factura. Alimenta filtros vencidas / por vencer." tabindex="0">?</span></label>
                             <input type="date" name="due_date" id="uploadDueDate" class="form-control">
                         </div>
                         <div class="form-group" style="margin:0;">
-                            <label>Recepción de bodega * <span class="field-tip" data-tip="Fecha real de ingreso a inventario y del asiento contable. Puede ser distinta a la fecha de factura (p. ej. si la mercancía llegó otro día)." tabindex="0">?</span></label>
+                            <label>Recepción de bodega * <span class="field-tip" data-tip="Fecha real de ingreso a inventario y del asiento contable. Puede ser posterior a la fecha de factura, pero no anterior." tabindex="0">?</span></label>
                             <input type="date" name="warehouse_date" id="uploadWarehouseDate" class="form-control" required value="<?php echo date('Y-m-d'); ?>">
                         </div>
                     </div>
@@ -1663,15 +1686,15 @@ function openPurchaseLimitModal() {
                     </div>
                     <input type="hidden" name="early_payment_discount_pct" value="0">
                     <div class="form-group">
-                        <label>Desc. comercial <span class="field-tip" data-tip="Descuento general de la factura sobre el subtotal (antes de IVA). Indique % entero (0–100) o monto $; si hay monto, manda el $." tabindex="0">?</span></label>
+                        <label>Desc. comercial <span class="field-tip" data-tip="Descuento general de la factura sobre el subtotal (antes de IVA). Indique % con hasta 2 decimales (0–100) o monto $; si hay monto, manda el $." tabindex="0">?</span></label>
                         <div class="po-com-disc-fields">
                             <div class="po-pct-wrap">
-                                <input type="number" step="1" min="0" max="100" inputmode="numeric" name="commercial_discount_pct" class="form-control" value="" placeholder="0" title="Porcentaje entero" oninput="poClampCommercialPct(this)">
+                                <input type="number" step="0.01" min="0" max="100" inputmode="decimal" name="commercial_discount_pct" class="form-control" value="" placeholder="0" title="Porcentaje con hasta 2 decimales" oninput="poClampCommercialPct(this)">
                                 <span class="po-pct-affix">%</span>
                             </div>
                             <input type="text" inputmode="decimal" name="commercial_discount_amount" class="form-control money-input" data-money="1" value="" placeholder="$ monto" autocomplete="off">
                         </div>
-                        <small style="color:var(--color-text-secondary);">Siempre aplica. Use % entero o $ (si llena $, prevalece el monto).</small>
+                        <small style="color:var(--color-text-secondary);">Siempre aplica. Use % (hasta 2 decimales) o $ (si llena $, prevalece el monto).</small>
                     </div>
                     <div class="form-group">
                         <label>Cruce con OC <span class="field-tip" data-tip="Órdenes de compra abiertas del proveedor elegido. Al seleccionarla se cruza con la factura entrante (cantidades y costos) antes de ingresar al inventario." tabindex="0">?</span></label>
@@ -1969,9 +1992,11 @@ window.poProducts = <?php echo json_encode(array_map(static function ($p) {
         'barcode' => $p['barcode'] ?? '',
         'name' => $p['name'],
         'purchase_price' => (float)$p['purchase_price'],
+        'sale_price' => (float)($p['sale_price'] ?? 0),
         'tax_rate' => (float)($p['tax_rate'] ?? 0),
     ];
 }, $products), JSON_UNESCAPED_UNICODE); ?>;
+window.poMarginWarnPct = 10;
 window.poDefaultTaxRate = <?php echo json_encode((float)($defaultTaxRate ?? 0)); ?>;
 window.comprasBase = <?php echo json_encode($comprasBase); ?>;
 var comprasBase = window.comprasBase;
@@ -2135,15 +2160,103 @@ function setSupplierCombobox(hiddenId, searchId, supplierId) {
     input.value = found ? found.name : ('#' + id);
 }
 
-/** Desc. comercial %: solo enteros 0–100. */
+/** Desc. comercial %: 0–100 con hasta 2 decimales. */
 function poClampCommercialPct(el) {
     if (!el) return;
     if (el.value === '' || el.value === '-') return;
-    var n = Math.round(parseFloat(String(el.value).replace(',', '.')) || 0);
+    var n = parseFloat(String(el.value).replace(',', '.'));
+    if (!isFinite(n)) return;
     if (n < 0) n = 0;
     if (n > 100) n = 100;
-    if (String(n) !== String(el.value)) el.value = String(n);
+    n = Math.round(n * 100) / 100;
+    var out = String(n);
+    if (out !== String(el.value)) el.value = out;
 }
+
+/** Suma días a una fecha ISO Y-m-d. */
+function poAddDaysIso(iso, days) {
+    var d = new Date(String(iso) + 'T12:00:00');
+    if (isNaN(d.getTime())) return '';
+    d.setDate(d.getDate() + (parseInt(days, 10) || 0));
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+/**
+ * Vence pago (CxP):
+ * - Con días de plazo → recepción bodega + días
+ * - Sin días → igual a «Vence en factura»
+ */
+function poSyncDueDates(whEl, daysEl, dueEl, invDueEl) {
+    if (!dueEl) return;
+    var daysRaw = daysEl ? String(daysEl.value || '').trim() : '';
+    var days = parseInt(daysRaw, 10);
+    var hasDays = daysRaw !== '' && isFinite(days) && days >= 0;
+    if (hasDays) {
+        var wh = whEl ? String(whEl.value || '').trim() : '';
+        if (wh && /^\d{4}-\d{2}-\d{2}$/.test(wh)) {
+            dueEl.value = poAddDaysIso(wh, days);
+        }
+        return;
+    }
+    var invDue = invDueEl ? String(invDueEl.value || '').trim() : '';
+    if (invDue && /^\d{4}-\d{2}-\d{2}$/.test(invDue)) {
+        dueEl.value = invDue;
+    }
+}
+
+/** Recepción de bodega no puede ser anterior a la fecha de factura. */
+function poEnsureWarehouseNotBeforeInvoice(invDateEl, whEl, opts) {
+    opts = opts || {};
+    if (!invDateEl || !whEl) return true;
+    var inv = String(invDateEl.value || '').trim();
+    var wh = String(whEl.value || '').trim();
+    if (!inv || !wh || !/^\d{4}-\d{2}-\d{2}$/.test(inv) || !/^\d{4}-\d{2}-\d{2}$/.test(wh)) return true;
+    if (wh >= inv) return true;
+    whEl.value = inv;
+    if (!opts.silent && typeof showAlert === 'function') {
+        var nice = inv.split('-').reverse().join('/');
+        showAlert('La recepción de bodega no puede ser anterior a la fecha de factura. Se ajustó a ' + nice + '.', 'warning');
+    }
+    return false;
+}
+
+function poBindDueCalc(whId, daysId, dueId, invDueId, invDateId) {
+    var wh = document.getElementById(whId);
+    var days = document.getElementById(daysId);
+    var due = document.getElementById(dueId);
+    var invDue = invDueId ? document.getElementById(invDueId) : null;
+    var invDate = invDateId ? document.getElementById(invDateId) : null;
+    if (!due) return;
+    var run = function() {
+        poEnsureWarehouseNotBeforeInvoice(invDate, wh, { silent: true });
+        poSyncDueDates(wh, days, due, invDue);
+    };
+    if (days) {
+        days.addEventListener('input', run);
+        days.addEventListener('change', run);
+    }
+    if (wh) {
+        wh.addEventListener('change', function() {
+            poEnsureWarehouseNotBeforeInvoice(invDate, wh);
+            poSyncDueDates(wh, days, due, invDue);
+        });
+    }
+    if (invDue) {
+        invDue.addEventListener('change', run);
+        invDue.addEventListener('input', run);
+    }
+    if (invDate) {
+        invDate.addEventListener('change', function() {
+            poEnsureWarehouseNotBeforeInvoice(invDate, wh);
+            poSyncDueDates(wh, days, due, invDue);
+        });
+    }
+    run();
+}
+document.addEventListener('DOMContentLoaded', function() {
+    poBindDueCalc('receiveWarehouseDate', 'receivePaymentTermDays', 'receiveDueDate', 'receiveInvoiceDueDate', 'receiveInvoiceDate');
+    poBindDueCalc('uploadWarehouseDate', 'uploadPaymentTermDays', 'uploadDueDate', 'uploadInvoiceDueDate', 'uploadInvoiceDate');
+});
 
 /** Evita scroll chaining: al llegar al final del modal no sigue el fondo. */
 function poLockPageScroll(lock) {
@@ -2358,6 +2471,10 @@ function validateInvoiceUploadMeta() {
     if (wh && !String(wh.value || '').trim()) {
         if (typeof showAlert === 'function') showAlert('Indique la fecha de recepción de bodega', 'warning');
         if (wh.focus) wh.focus();
+        return false;
+    }
+    var invDate = form.querySelector('input[name="invoice_date"]');
+    if (wh && invDate && !poEnsureWarehouseNotBeforeInvoice(invDate, wh)) {
         return false;
     }
     if (wh && wh.value) poRemember(wh.value);
@@ -2638,32 +2755,34 @@ function renderInvoiceReview(imp, items) {
         } else if (docKind === 'remission') {
             h += '<small style="color:var(--color-text-secondary);">Remisión: productos exentos (IVA 0%).</small>';
         } else if (docKind === 'standard' && isCustomVat) {
-            h += '<small style="color:var(--color-text-secondary);">F. Normal: IVA personalizado (monto exacto de la factura → Contabilidad 240802).</small>';
+            /* Barra compacta de IVA $ a la derecha; sin texto largo. */
         } else if (docKind === 'standard') {
             h += '<small style="color:var(--color-text-secondary);">F. Normal: ajuste IVA por producto. ' +
                  (applyVatMode === 1
                     ? 'Preferencia inicial: con IVA.'
                     : 'Preferencia inicial: sin IVA.') +
                  '</small>';
-            h += '<span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;">' +
+            h += '<span id="reviewVatBulkBtns" style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;">' +
                  '<button type="button" class="btn btn-sm btn-secondary" onclick="bulkInvoiceLineTax(' + defaultTax + ')">IVA ' + defaultTax + '% a todos</button>' +
-                 '<button type="button" class="btn btn-sm btn-secondary" onclick="bulkInvoiceLineTax(0)">Quitar IVA (0%)</button>' +
+                 '<button type="button" class="btn btn-sm btn-secondary" onclick="enableInvoiceReviewCustomVat()" title="Indicar el IVA exacto impreso en la factura (se prorratea a las líneas)">IVA personalizado ($)</button>' +
+                 '<button type="button" class="btn btn-sm btn-secondary" onclick="bulkInvoiceLineTax(0)" title="Dejar todas las líneas sin IVA (%)">Exento 0%</button>' +
                  '</span>';
         }
+        h += '<input type="hidden" name="apply_product_vat" id="reviewApplyProductVat" value="' +
+             (isCustomVat ? '2' : String(applyVatMode)) + '">';
+        h += '<div id="reviewCustomVatPanel" style="margin-left:auto;">';
+        if (isCustomVat) {
+            var ovFmt = window._invoiceReviewTaxOverride > 0
+                ? window._invoiceReviewTaxOverride
+                : (parseFloat(imp.tax_override_amount) || 0);
+            h += buildInvoiceReviewCustomVatHtml(ovFmt, tip);
+        }
         h += '</div>';
-    }
-
-    if (isCustomVat) {
-        var ovFmt = window._invoiceReviewTaxOverride > 0
-            ? window._invoiceReviewTaxOverride
-            : (parseFloat(imp.tax_override_amount) || 0);
-        h += '<div class="form-group" style="margin:0 0 14px;padding:12px;border:1px solid #F59E0B;border-radius:8px;background:rgba(245,158,11,0.08);">' +
-             '<label style="font-weight:600;">IVA personalizado de la factura ($) *' + tip('Monto exacto de IVA impreso en la factura. Se contabiliza en 240802 y se prorratea a las líneas al ingresar al inventario.') + '</label>' +
-             '<input type="text" inputmode="decimal" name="tax_override_amount" id="reviewTaxOverrideAmount" class="form-control money-input" data-money="1" style="max-width:280px;" value="' +
-             esc(window.SeriMoney ? SeriMoney.format(ovFmt) : ovFmt) +
-             '" oninput="recalcInvoiceReviewTotals()" required autocomplete="off">' +
-             '<small style="display:block;margin-top:6px;color:var(--color-text-secondary);">Las líneas quedan a costo neto; el % por producto no aplica. Al confirmar, el IVA se reparte por peso de subtotal.</small>' +
-             '</div>';
+        h += '</div>';
+    } else {
+        h += '<input type="hidden" name="apply_product_vat" id="reviewApplyProductVat" value="' +
+             String(applyVatMode) + '">';
+        h += '<div id="reviewCustomVatPanel"></div>';
     }
 
     var metaSummary = [];
@@ -2693,20 +2812,28 @@ function renderInvoiceReview(imp, items) {
     h += renderOcDispositionPanel(imp.linked_order_id || '', window._invoiceOrderMatch);
     h += '<div class="form-group" style="margin:0;"><label>N.º factura' + tip('Consecutivo del proveedor. Identifica el documento en Facturas y PDF.') + '</label>' +
          '<input type="text" name="invoice_number" class="form-control" maxlength="80" value="' + esc(imp.invoice_number || '') + '"></div>';
+    // Legado: si no hay invoice_due_date, el impreso estaba en due_date (campo que ahora es CxP).
+    var reviewInvDue = poIsoDate(imp.invoice_due_date) || poIsoDate(imp.due_date) || '';
+    var reviewCxpDue = reviewInvDue; // sin días de plazo → CxP = vence factura (poBindDueCalc recalcula si hay días)
     h += '<div class="form-group" style="margin:0;"><label>Fecha factura' + tip('Fecha impresa en la factura del proveedor.') + '</label>' +
-         '<input type="date" name="invoice_date" class="form-control" value="' + esc(poIsoDate(imp.invoice_date)) + '"></div>';
-    h += '<div class="form-group" style="margin:0;"><label>Vencimiento pago' + tip('Fecha límite de CxP. Alimenta alertas de vencidas / por vencer.') + '</label>' +
-         '<input type="date" name="due_date" class="form-control" value="' + esc(poIsoDate(imp.due_date)) + '"></div>';
-    h += '<div class="form-group" style="margin:0;"><label>Recepción de bodega *' + tip('Fecha real de ingreso a inventario y del asiento contable. Puede diferir de la fecha de factura.') + '</label>' +
-         '<input type="date" name="warehouse_date" class="form-control" value="' + esc(poDefaultWarehouseDate(imp)) + '" required></div>';
+         '<input type="date" name="invoice_date" id="reviewInvoiceDate" class="form-control" value="' + esc(poIsoDate(imp.invoice_date)) + '"></div>';
+    h += '<div class="form-group" style="margin:0;"><label>Vence en factura' + tip('Fecha de vencimiento impresa en la factura del proveedor (referencia). No mueve el semáforo CxP.') + '</label>' +
+         '<input type="date" name="invoice_due_date" id="reviewInvoiceDueDate" class="form-control" value="' + esc(reviewInvDue) + '"></div>';
+    h += '<div class="form-group" style="margin:0;"><label>Días de plazo' + tip('Días desde la recepción en bodega para calcular Vence pago (CxP). Si está vacío, CxP = Vence en factura.') + '</label>' +
+         '<input type="number" name="payment_term_days" id="reviewPaymentTermDays" class="form-control" min="0" max="3650" step="1" placeholder="Ej: 30"></div>';
+    h += '<div class="form-group" style="margin:0;"><label>Vence pago (CxP)' + tip('Fecha operativa: bodega + días de plazo. Sin plazo = igual a Vence en factura. Alimenta alertas de vencidas / por vencer.') + '</label>' +
+         '<input type="date" name="due_date" id="reviewDueDate" class="form-control" value="' + esc(reviewCxpDue) + '"></div>';
+    h += '<div class="form-group" style="margin:0;"><label>Recepción de bodega *' + tip('Fecha real de ingreso a inventario y del asiento contable. No puede ser anterior a la fecha de factura.') + '</label>' +
+         '<input type="date" name="warehouse_date" id="reviewWarehouseDate" class="form-control" value="' + esc(poDefaultWarehouseDate(imp)) + '" required></div>';
     h += '<input type="hidden" name="early_payment_discount_pct" value="0">';
-    var comPctVal = Math.max(0, Math.min(100, Math.round(parseFloat(imp.commercial_discount_pct) || 0)));
-    h += '<div class="form-group" style="margin:0;grid-column:1/-1;"><label>Desc. comercial' + tip('Descuento general sobre el subtotal (antes de IVA). Indique % entero (0–100) o monto $; si hay monto, manda el $.') + '</label>' +
+    var comPctRaw = parseFloat(String(imp.commercial_discount_pct != null ? imp.commercial_discount_pct : '').toString().replace(',', '.')) || 0;
+    var comPctVal = Math.max(0, Math.min(100, Math.round(comPctRaw * 100) / 100));
+    h += '<div class="form-group" style="margin:0;grid-column:1/-1;"><label>Desc. comercial' + tip('Descuento general sobre el subtotal (antes de IVA). Indique % con hasta 2 decimales (0–100) o monto $; si hay monto, manda el $.') + '</label>' +
          '<div class="po-com-disc-fields">' +
          '<div class="po-pct-wrap">' +
-         '<input type="number" step="1" min="0" max="100" inputmode="numeric" name="commercial_discount_pct" class="form-control" value="' +
+         '<input type="number" step="0.01" min="0" max="100" inputmode="decimal" name="commercial_discount_pct" class="form-control" value="' +
          comPctVal +
-         '" placeholder="0" title="Porcentaje entero" oninput="poClampCommercialPct(this);recalcInvoiceReviewTotals()">' +
+         '" placeholder="0" title="Porcentaje con hasta 2 decimales" oninput="poClampCommercialPct(this);recalcInvoiceReviewTotals()">' +
          '<span class="po-pct-affix">%</span></div>' +
          '<input type="text" inputmode="decimal" name="commercial_discount_amount" class="form-control money-input" data-money="1" value="' +
          esc(window.SeriMoney
@@ -2802,13 +2929,17 @@ function renderInvoiceReview(imp, items) {
          '<th style="' + thStyle + '">Lote</th>' +
          '<th style="' + thStyle + '">Vence</th>' +
          '<th style="' + thStyle + '" title="Precio de costo con el que queda el producto en inventario (y valor de la entrada en kardex). Vacío = automático: costo factura con descuento, + IVA en F. Normal">Costo inventario</th>' +
-         '<th style="' + thStyle + '">P. venta</th>' +
+         '<th style="' + thStyle + '" title="Precio de venta del catálogo (se autocompleta al emparejar). Se compara con el costo para alertar margen bajo o pérdida.">P. venta</th>' +
          '<th style="' + thStyle + '">Total</th>' +
          '<th style="' + thStyle + '"></th>' +
          '</tr></thead><tbody>';
 
     var matchLabels = { ean: 'EAN', supplier_sku: 'SKU proveedor', code: 'Código', name: 'Nombre', manual: 'Manual', purchase_order: 'OC' };
     var vatInCost = docKind === 'electronic';
+
+    h += '<tr data-meta-row="1"><td colspan="17" style="padding:8px 10px;background:rgba(148,163,184,.08);border-bottom:1px solid var(--color-border,#e5e7eb);">' +
+         '<div id="invMarginSummary" style="font-size:13px;color:var(--color-text-secondary);">Revisando márgenes costo vs P. venta…</div>' +
+         '</td></tr>';
 
     items.forEach(function(it, idx) {
         var base = 'items[' + it.id + ']';
@@ -2871,7 +3002,7 @@ function renderInvoiceReview(imp, items) {
         } else {
             h += '<td><input type="number" step="0.01" min="0" name="' + base + '[tax_rate]" class="form-control" style="min-width:70px;" value="' + lineTax + '" title="IVA del producto (editable)"></td>';
         }
-        h += '<td><input type="number" step="1" min="0" max="100" inputmode="numeric" name="' + base + '[discount_pct]" class="form-control inv-disc" style="min-width:70px;" value="' + Math.max(0, Math.min(100, Math.round(parseFloat(it.discount_pct) || 0))) + '" title="Descuento en % (número entero)"></td>';
+        h += '<td><input type="number" step="0.01" min="0" max="100" inputmode="decimal" name="' + base + '[discount_pct]" class="form-control inv-disc" style="min-width:70px;" value="' + Math.max(0, Math.min(100, Math.round((parseFloat(String(it.discount_pct || 0).toString().replace(',', '.')) || 0) * 100) / 100)) + '" title="Descuento en % (hasta 2 decimales)"></td>';
         h += '<td><input type="text" maxlength="60" name="' + base + '[lot_code]" class="form-control" style="min-width:90px;" value="' + esc(it.lot_code || '') + '"></td>';
         h += '<td><input type="date" name="' + base + '[expiry_date]" class="form-control" style="min-width:130px;" value="' + (it.expiry_date || '') + '"></td>';
         var invCost = parseFloat(it.inventory_cost) || 0;
@@ -2881,7 +3012,13 @@ function renderInvoiceReview(imp, items) {
              ' title="Precio de costo con el que queda el producto. Vacío = automático: costo factura con descuento' +
              (vatInCost ? ' (IVA incluido)' : ' + IVA') + '. No cambia el total ni la contabilidad de la factura.">' +
              '<div class="inv-invcost-hint" style="font-size:11px;color:var(--color-text-secondary);"></div></td>';
-        h += '<td><input type="text" inputmode="decimal" name="' + base + '[sale_price]" class="form-control money-input" data-money="1" style="min-width:95px;" value="' + (it.sale_price != null && it.sale_price !== '' ? (window.SeriMoney ? SeriMoney.format(it.sale_price) : parseFloat(it.sale_price)) : '') + '"></td>';
+        var saleVal = parseFloat(it.sale_price) || 0;
+        if (saleVal <= 0.009) saleVal = parseFloat(it.matched_sale_price) || 0;
+        h += '<td><input type="text" inputmode="decimal" name="' + base + '[sale_price]" class="form-control money-input inv-sale" data-money="1" style="min-width:95px;" value="' +
+             (saleVal > 0.009 ? (window.SeriMoney ? SeriMoney.format(saleVal) : saleVal) : '') + '"' +
+             (saleVal > 0.009 && (it.sale_price_from_catalog || !(parseFloat(it.sale_price) > 0.009)) ? ' data-from-catalog="1"' : '') +
+             ' title="Precio de venta. Si hay producto emparejado y el archivo no trae PVP, se toma del catálogo.">' +
+             '<div class="inv-margin-hint" style="font-size:11px;margin-top:2px;line-height:1.3;"></div></td>';
         h += '<td class="inv-line-total" style="white-space:nowrap;">' + poMoney(total) + '</td>';
         h += '<td style="white-space:nowrap;text-align:center;">' +
              '<button type="button" class="btn btn-sm btn-danger" style="padding:4px 10px;font-size:12px;" ' +
@@ -2924,6 +3061,7 @@ function renderInvoiceReview(imp, items) {
     if (reviewWh) {
         reviewWh.onchange = function() { poRemember(reviewWh.value); };
     }
+    poBindDueCalc('reviewWarehouseDate', 'reviewPaymentTermDays', 'reviewDueDate', 'reviewInvoiceDueDate', 'reviewInvoiceDate');
     document.getElementById('invoiceReviewModal').style.display = 'flex';
     poSyncInvoiceModalScrollLock();
 }
@@ -2931,11 +3069,165 @@ function renderInvoiceReview(imp, items) {
 function bulkInvoiceLineTax(rate) {
     var body = document.getElementById('invoiceReviewBody');
     if (!body) return;
+    if (window._invoiceReviewCustomVat) {
+        if (typeof showAlert === 'function') {
+            showAlert('Modo IVA personalizado activo: el monto exacto manda sobre el % por línea. Use «Volver a IVA por %» si necesita tasas.', 'info');
+        }
+        return;
+    }
     rate = Math.max(0, parseFloat(rate) || 0);
     body.querySelectorAll('input[name$="[tax_rate]"]').forEach(function(inp) {
         if (inp.readOnly) return;
         inp.value = String(rate);
     });
+    if (typeof recalcInvoiceReviewTotals === 'function') recalcInvoiceReviewTotals();
+}
+
+/** Barra compacta de IVA personalizado (monto exacto) en el modal de confirmación. */
+function buildInvoiceReviewCustomVatHtml(amount, tipFn) {
+    tipFn = tipFn || function(t) {
+        return ' <span class="field-tip" data-tip="' + esc(t) + '" tabindex="0">?</span>';
+    };
+    var amt = Math.max(0, parseFloat(amount) || 0);
+    return '<div class="inv-review-custom-vat" title="IVA impreso en la factura → 240802 (prorrateo por subtotal al confirmar)">' +
+        '<label for="reviewTaxOverrideAmount">IVA $' +
+        tipFn('Monto exacto de IVA de la factura. Se contabiliza en 240802 y se prorratea a las líneas al confirmar.') +
+        '</label>' +
+        '<input type="text" inputmode="decimal" name="tax_override_amount" id="reviewTaxOverrideAmount" class="form-control money-input" data-money="1" value="' +
+        esc(window.SeriMoney ? SeriMoney.format(amt) : amt) +
+        '" oninput="recalcInvoiceReviewTotals()" required autocomplete="off" placeholder="0,00">' +
+        '<button type="button" class="btn btn-sm btn-primary" id="reviewCustomVatSaveBtn" onclick="saveInvoiceReviewCustomVat()">Guardar</button>' +
+        '<button type="button" class="btn btn-sm btn-secondary" onclick="disableInvoiceReviewCustomVat()" title="Volver a editar IVA % por línea">Por %</button>' +
+        '</div>';
+}
+
+/** Guarda el monto de IVA personalizado en el borrador de la importación. */
+function saveInvoiceReviewCustomVat() {
+    var ovEl = document.getElementById('reviewTaxOverrideAmount');
+    var ov = ovEl ? invoiceParseMoneyVal(ovEl.value) : 0;
+    if (!(ov >= 0.01)) {
+        if (typeof showAlert === 'function') showAlert('Indique el IVA personalizado (monto mayor a 0)', 'warning');
+        if (ovEl && ovEl.focus) ovEl.focus();
+        return;
+    }
+    window._invoiceReviewCustomVat = true;
+    window._invoiceReviewTaxOverride = ov;
+    var modeEl = document.getElementById('reviewApplyProductVat');
+    if (modeEl) modeEl.value = '2';
+
+    var btn = document.getElementById('reviewCustomVatSaveBtn');
+    var prev = btn ? btn.textContent : '';
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '…';
+    }
+    if (typeof recalcInvoiceReviewTotals === 'function') recalcInvoiceReviewTotals();
+
+    persistInvoiceReviewDraft()
+    .then(function(d) {
+        if (typeof showAlert === 'function') {
+            showAlert((d && d.message) ? d.message : 'IVA personalizado guardado', 'success');
+        }
+    })
+    .catch(function(err) {
+        if (typeof showAlert === 'function') {
+            showAlert(err.message || 'No se pudo guardar el IVA', 'error');
+        }
+    })
+    .finally(function() {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = prev || 'Guardar';
+        }
+    });
+}
+
+/**
+ * Activa IVA personalizado (monto exacto) desde el modal de confirmación.
+ * Equivale a elegir «IVA personalizado» al cargar la factura.
+ */
+function enableInvoiceReviewCustomVat(presetAmount) {
+    var body = document.getElementById('invoiceReviewBody');
+    if (!body) return;
+
+    window._invoiceReviewCustomVat = true;
+    var prev = parseFloat(window._invoiceReviewTaxOverride) || 0;
+    var amt = presetAmount != null ? Math.max(0, parseFloat(presetAmount) || 0) : prev;
+    if (!(amt > 0)) {
+        // Si había IVA por % en líneas, sugerir ese total como punto de partida.
+        var suggested = 0;
+        body.querySelectorAll('tbody tr').forEach(function(tr) {
+            var qtyEl = tr.querySelector('input[name$="[quantity]"]');
+            var costEl = tr.querySelector('input[name$="[unit_cost]"]');
+            var discEl = tr.querySelector('input[name$="[discount_pct]"]');
+            var taxEl = tr.querySelector('input[name$="[tax_rate]"]');
+            var act = tr.querySelector('select[name$="[row_action]"]');
+            if (act && act.value === 'skip' && tr.dataset.fromOc === '1') return;
+            var qty = qtyEl ? invoiceParseQty(qtyEl.value) : 0;
+            var cost = costEl ? invoiceParseMoneyVal(costEl.value) : 0;
+            var disc = discEl ? Math.max(0, Math.min(100, invoiceParseQty(discEl.value))) : 0;
+            var tax = taxEl ? invoiceParseQty(taxEl.value) : 0;
+            var base = qty * cost * (1 - disc / 100);
+            suggested += base * (tax / 100);
+        });
+        amt = Math.round(suggested * 100) / 100;
+    }
+    window._invoiceReviewTaxOverride = amt;
+
+    var modeEl = document.getElementById('reviewApplyProductVat');
+    if (modeEl) modeEl.value = '2';
+
+    var panel = document.getElementById('reviewCustomVatPanel');
+    if (panel) {
+        panel.innerHTML = buildInvoiceReviewCustomVatHtml(amt);
+        if (window.SeriMoney && typeof SeriMoney.enhanceAll === 'function') {
+            SeriMoney.enhanceAll(panel);
+        }
+    }
+
+    var bulk = document.getElementById('reviewVatBulkBtns');
+    if (bulk) bulk.style.display = 'none';
+
+    body.querySelectorAll('input[name$="[tax_rate]"]').forEach(function(inp) {
+        inp.value = '0';
+        inp.readOnly = true;
+        inp.title = 'IVA personalizado a nivel factura (no por %)';
+    });
+
+    if (typeof recalcInvoiceReviewTotals === 'function') recalcInvoiceReviewTotals();
+
+    var ovEl = document.getElementById('reviewTaxOverrideAmount');
+    if (ovEl && ovEl.focus) {
+        try { ovEl.focus(); ovEl.select && ovEl.select(); } catch (e) {}
+    }
+}
+
+/** Vuelve al modo IVA por % en cada línea (F. Normal). */
+function disableInvoiceReviewCustomVat() {
+    var body = document.getElementById('invoiceReviewBody');
+    if (!body) return;
+
+    window._invoiceReviewCustomVat = false;
+    window._invoiceReviewTaxOverride = 0;
+
+    var modeEl = document.getElementById('reviewApplyProductVat');
+    if (modeEl) modeEl.value = '1';
+
+    var panel = document.getElementById('reviewCustomVatPanel');
+    if (panel) panel.innerHTML = '';
+
+    var bulk = document.getElementById('reviewVatBulkBtns');
+    if (bulk) bulk.style.display = 'flex';
+
+    var defaultTax = (window.poDefaultTaxRate != null ? parseFloat(window.poDefaultTaxRate) : 0) || 0;
+    body.querySelectorAll('input[name$="[tax_rate]"]').forEach(function(inp) {
+        inp.readOnly = false;
+        inp.title = 'IVA del producto (editable)';
+        if (!(parseFloat(inp.value) > 0) && defaultTax > 0) {
+            inp.value = String(defaultTax);
+        }
+    });
+
     if (typeof recalcInvoiceReviewTotals === 'function') recalcInvoiceReviewTotals();
 }
 
@@ -3120,6 +3412,17 @@ function confirmInvoiceReceive() {
         if (wh.focus) wh.focus();
         return false;
     }
+    var invDateEl = form ? form.querySelector('input[name="invoice_date"]') : null;
+    if (wh && invDateEl && !poEnsureWarehouseNotBeforeInvoice(invDateEl, wh)) {
+        return false;
+    }
+    // Recalcular CxP antes de enviar (bodega+días o = vence factura).
+    poSyncDueDates(
+        document.getElementById('reviewWarehouseDate'),
+        document.getElementById('reviewPaymentTermDays'),
+        document.getElementById('reviewDueDate'),
+        document.getElementById('reviewInvoiceDueDate')
+    );
     if (wh && wh.value) poRemember(wh.value);
 
     if (window._invoiceReviewCustomVat) {
@@ -3223,6 +3526,9 @@ function bindInvoiceLineTotals() {
                 }
             }
         }
+        if (/\[sale_price\]$/.test(t.name)) {
+            t.dataset.fromCatalog = '0';
+        }
         scheduleRecalc();
     });
     body.addEventListener('change', function(e) {
@@ -3232,7 +3538,29 @@ function bindInvoiceLineTotals() {
             t.value = String(invoiceParseIntQty(t.value));
         }
         if (/\[discount_pct\]$/.test(t.name)) {
-            t.value = String(Math.max(0, Math.min(100, Math.round(invoiceParseQty(t.value)))));
+            var dPct = Math.max(0, Math.min(100, Math.round(invoiceParseQty(t.value) * 100) / 100));
+            t.value = String(dPct);
+        }
+        if (/\[matched_product_id\]$/.test(t.name)) {
+            var trMatch = t.closest('tr');
+            var pid = parseInt(t.value, 10) || 0;
+            var product = null;
+            if (pid) {
+                product = (window.poProducts || []).find(function(x) { return parseInt(x.id, 10) === pid; }) || null;
+                if (!product) {
+                    var opt = t.options[t.selectedIndex];
+                    product = {
+                        id: pid,
+                        purchase_price: opt ? (parseFloat(opt.getAttribute('data-cost')) || 0) : 0,
+                        sale_price: opt ? (parseFloat(opt.getAttribute('data-sale')) || 0) : 0
+                    };
+                }
+            }
+            if (trMatch) {
+                trMatch.dataset.pid = pid ? String(pid) : '';
+                trMatch.dataset.curCost = product ? (parseFloat(product.purchase_price) || 0) : 0;
+                applyCatalogSaleToInvoiceRow(trMatch, product);
+            }
         }
         if (!/\[(quantity|unit_cost|inventory_cost|tax_rate|discount_pct|sale_price|row_action|matched_product_id)\]$/.test(t.name)
             && t.id !== 'reviewTaxOverrideAmount'
@@ -3275,13 +3603,13 @@ function invoiceOriginLabel(bad, isBonus, fromOc, billOnly) {
  */
 function refreshInvoiceInvCostHint(tr, qty, lineBase, action, taxPct, vatInCost, customVat) {
     var inp = tr.querySelector('input[name$="[inventory_cost]"]');
-    if (!inp) return;
+    if (!inp) return 0;
     var hint = inp.parentNode.querySelector('.inv-invcost-hint');
     var skip = action === 'skip';
     inp.disabled = skip;
     if (skip) {
         if (hint) hint.textContent = 'No entra a stock';
-        return;
+        return 0;
     }
     var pidSel = tr.querySelector('select[name$="[matched_product_id]"]');
     var sameProduct = !!(pidSel && pidSel.value && String(pidSel.value) === String(tr.dataset.pid || ''));
@@ -3303,7 +3631,7 @@ function refreshInvoiceInvCostHint(tr, qty, lineBase, action, taxPct, vatInCost,
 
     var manual = invoiceParseMoneyVal(inp.value);
     var effective = manual > 0.009 ? manual : autoCost;
-    if (!hint) return;
+    if (!hint) return effective;
     var th = (window.poCurrency && window.poCurrency.thousands) || '.';
     var shortMoney = function(v) {
         return String(Math.round(v)).replace(/\B(?=(\d{3})+(?!\d))/g, th);
@@ -3316,6 +3644,58 @@ function refreshInvoiceInvCostHint(tr, qty, lineBase, action, taxPct, vatInCost,
         hint.textContent = manual > 0.009 ? 'Manual' : 'Auto (factura' + (vatInCost ? ')' : ' + IVA)');
         hint.title = '';
     }
+    return effective;
+}
+
+/** Alerta costo inventario vs P. venta: rojo si costo ≥ venta; ámbar si margen < poMarginWarnPct. No bloquea confirmar. */
+function refreshInvoiceMarginHint(tr, effectiveCost, action) {
+    var hint = tr ? tr.querySelector('.inv-margin-hint') : null;
+    if (!hint) return null;
+    if (action === 'skip') {
+        hint.textContent = '';
+        hint.style.color = '';
+        hint.style.fontWeight = '';
+        hint.title = '';
+        return null;
+    }
+    var saleEl = tr.querySelector('input[name$="[sale_price]"]');
+    var sale = saleEl ? invoiceParseMoneyVal(saleEl.value) : 0;
+    var cost = parseFloat(effectiveCost) || 0;
+    if (!(cost > 0.009)) {
+        hint.textContent = '';
+        hint.style.color = '';
+        hint.style.fontWeight = '';
+        hint.title = '';
+        return null;
+    }
+    if (!(sale > 0.009)) {
+        hint.textContent = 'Sin P. venta';
+        hint.style.color = 'var(--color-text-secondary)';
+        hint.style.fontWeight = '';
+        hint.title = 'Indique P. venta o empareje un producto del catálogo.';
+        return null;
+    }
+    if (cost >= sale - 0.009) {
+        hint.textContent = 'Costo ≥ P. venta';
+        hint.style.color = 'var(--dmc-DC2626, #DC2626)';
+        hint.style.fontWeight = '600';
+        hint.title = 'El costo de inventario es igual o mayor al precio de venta (sin utilidad).';
+        return 'loss';
+    }
+    var margin = ((sale - cost) / cost) * 100;
+    var warnPct = parseFloat(window.poMarginWarnPct) || 10;
+    if (margin < warnPct) {
+        hint.textContent = 'Margen ' + margin.toFixed(1) + '% (< ' + warnPct + '%)';
+        hint.style.color = 'var(--dmc-B45309, #B45309)';
+        hint.style.fontWeight = '600';
+        hint.title = 'Utilidad sobre costo por debajo del ' + warnPct + '%. Puede confirmar igual.';
+        return 'low';
+    }
+    hint.textContent = 'Margen ' + margin.toFixed(1) + '%';
+    hint.style.color = 'var(--dmc-047857, #047857)';
+    hint.style.fontWeight = '500';
+    hint.title = '';
+    return 'ok';
 }
 
 function refreshInvoiceRowVisual(tr, qty, cost, line, action) {
@@ -3368,6 +3748,9 @@ function recalcInvoiceReviewTotals() {
     var productDiscTotal = 0;
     var bonifCount = 0;
     var sinMonto = 0;
+    var marginLoss = 0;
+    var marginLow = 0;
+    var marginOk = 0;
     rows.forEach(function(tr) {
         if (tr.dataset.metaRow === '1') return;
         var qtyEl = tr.querySelector('input[name$="[quantity]"]');
@@ -3380,15 +3763,21 @@ function recalcInvoiceReviewTotals() {
         var qty = invoiceParseIntQty(qtyEl.value);
         var cost = invoiceParseMoneyVal(costEl.value);
         var tax = customVat ? 0 : (taxEl ? invoiceParseQty(taxEl.value) : 0);
-        var disc = discEl ? Math.max(0, Math.min(100, Math.round(invoiceParseQty(discEl.value)))) : 0;
+        var disc = discEl ? Math.max(0, Math.min(100, Math.round(invoiceParseQty(discEl.value) * 100) / 100)) : 0;
         var action = actionEl ? actionEl.value : 'add_stock';
         var lineGross = qty * cost;
         var lineDiscAmt = lineGross * (disc / 100);
         var base = lineGross - lineDiscAmt;
-        var line = (vatInCost || customVat) ? base : (base * (1 + tax / 100));
+        // Total de línea = neto (sin IVA). El IVA se suma al Sub total en el pie → Valor neto.
+        // F. Electrónica: el costo ya trae IVA; la línea es ese bruto.
+        var line = base;
         totalTd.textContent = poMoney(line);
         refreshInvoiceRowVisual(tr, qty, cost, line, action);
-        refreshInvoiceInvCostHint(tr, qty, base, action, tax, vatInCost, customVat);
+        var effInvCost = refreshInvoiceInvCostHint(tr, qty, base, action, tax, vatInCost, customVat);
+        var mLevel = refreshInvoiceMarginHint(tr, effInvCost, action);
+        if (mLevel === 'loss') marginLoss++;
+        else if (mLevel === 'low') marginLow++;
+        else if (mLevel === 'ok') marginOk++;
         if (action === 'skip') {
             // Omitir en línea solo-OC: pendiente, fuera de la factura. En línea de factura: suma, sin stock.
             if (tr.dataset.fromOc === '1') return;
@@ -3455,6 +3844,26 @@ function recalcInvoiceReviewTotals() {
             bits.push('<span style="color:var(--dmc-B45309, #B45309);font-weight:600;">Dcto. en líneas: -' + poMoney(productDiscTotal) + '</span>');
         }
         liveNotes.innerHTML = bits.length ? bits.join(' · ') : '<span style="color:var(--color-text-secondary);">Cambios aplicados al instante</span>';
+    }
+
+    var marginSummary = body.querySelector('#invMarginSummary');
+    if (marginSummary) {
+        var warnPct = parseFloat(window.poMarginWarnPct) || 10;
+        var parts = [];
+        if (marginLoss > 0) {
+            parts.push('<span style="color:var(--dmc-DC2626, #DC2626);font-weight:700;">' + marginLoss + ' con costo ≥ P. venta</span>');
+        }
+        if (marginLow > 0) {
+            parts.push('<span style="color:var(--dmc-B45309, #B45309);font-weight:700;">' + marginLow + ' con margen &lt; ' + warnPct + '%</span>');
+        }
+        if (parts.length) {
+            marginSummary.innerHTML = 'Costo inventario vs P. venta: ' + parts.join(' · ') +
+                ' <span style="color:var(--color-text-secondary);font-weight:400;">(aviso; puede confirmar igual)</span>';
+        } else if (marginOk > 0) {
+            marginSummary.innerHTML = '<span style="color:var(--dmc-047857, #047857);">Márgenes costo vs P. venta en rango (≥ ' + warnPct + '%)</span>';
+        } else {
+            marginSummary.innerHTML = '<span style="color:var(--color-text-secondary);">Empareje productos o indique P. venta para revisar margen sobre costo</span>';
+        }
     }
 }
 
@@ -3672,7 +4081,10 @@ function upsertPoProduct(p) {
     var found = false;
     for (var i = 0; i < window.poProducts.length; i++) {
         if (String(window.poProducts[i].id) === String(p.id)) {
-            window.poProducts[i] = Object.assign({}, window.poProducts[i], p);
+            window.poProducts[i] = Object.assign({}, window.poProducts[i], {
+                sale_price: p.sale_price != null ? parseFloat(p.sale_price) || 0 : window.poProducts[i].sale_price,
+                purchase_price: p.purchase_price != null ? parseFloat(p.purchase_price) || 0 : window.poProducts[i].purchase_price
+            }, p);
             found = true;
             break;
         }
@@ -3684,12 +4096,15 @@ function upsertPoProduct(p) {
             barcode: p.barcode || '',
             name: p.name || '',
             purchase_price: parseFloat(p.purchase_price) || 0,
+            sale_price: parseFloat(p.sale_price) || 0,
             tax_rate: parseFloat(p.tax_rate) || 0
         });
         window.poProducts.sort(function(a, b) {
             return String(a.name || '').localeCompare(String(b.name || ''), 'es', { sensitivity: 'base' });
         });
     }
+    window._poProductOptionsBase = null;
+    window._invPickerIdx = null;
 }
 
 function openQuickProductModal() {
@@ -3784,15 +4199,14 @@ function poRemember(v) {
         try { localStorage.setItem(window.poWarehouseKey, v); } catch (e) {}
     }
 }
-/** Prioridad: guardada en borrador → última usada → fecha factura → hoy */
+/** Prioridad: guardada en borrador → última usada → fecha factura → hoy. Nunca antes que la factura. */
 function poDefaultWarehouseDate(imp) {
-    var fromImp = poIsoDate(imp && imp.warehouse_date);
-    if (fromImp) return fromImp;
-    var remembered = poRememberedDate();
-    if (remembered) return remembered;
     var fromInv = poIsoDate(imp && imp.invoice_date);
-    if (fromInv) return fromInv;
-    return poToday();
+    var fromImp = poIsoDate(imp && imp.warehouse_date);
+    var remembered = poRememberedDate();
+    var candidate = fromImp || remembered || fromInv || poToday();
+    if (fromInv && candidate < fromInv) candidate = fromInv;
+    return candidate;
 }
 
 function productOptionsHtml(selected) {
@@ -3804,7 +4218,7 @@ function productOptionsHtml(selected) {
         var p = poFindProductById(sel);
         if (p) {
             var label = (p.code ? p.code + ' — ' : '') + p.name + (p.barcode ? ' · EAN ' + p.barcode : '');
-            h += '<option value="' + p.id + '" data-cost="' + p.purchase_price + '" data-code="' + esc(p.code || '') + '" data-barcode="' + esc(p.barcode || '') + '" selected>' +
+            h += '<option value="' + p.id + '" data-cost="' + p.purchase_price + '" data-sale="' + (p.sale_price || 0) + '" data-code="' + esc(p.code || '') + '" data-barcode="' + esc(p.barcode || '') + '" selected>' +
                 esc(label) + '</option>';
         } else {
             h += '<option value="' + esc(sel) + '" selected>#' + esc(sel) + '</option>';
@@ -3829,7 +4243,7 @@ function poFullProductOptionsHtml(selected) {
         var base = '<option value="">Seleccionar producto</option>';
         (window.poProducts || []).forEach(function(p) {
             var label = (p.code ? p.code + ' — ' : '') + p.name + (p.barcode ? ' · EAN ' + p.barcode : '');
-            base += '<option value="' + p.id + '" data-cost="' + p.purchase_price + '" data-code="' + esc(p.code || '') + '" data-barcode="' + esc(p.barcode || '') + '">' +
+            base += '<option value="' + p.id + '" data-cost="' + p.purchase_price + '" data-sale="' + (p.sale_price || 0) + '" data-code="' + esc(p.code || '') + '" data-barcode="' + esc(p.barcode || '') + '">' +
                 esc(label) + '</option>';
         });
         window._poProductOptionsBase = base;
@@ -3948,6 +4362,7 @@ function invPickerChoose(select, product) {
             opt.value = val;
             opt.textContent = invPickerLabel(product);
             opt.setAttribute('data-cost', product.purchase_price);
+            opt.setAttribute('data-sale', product.sale_price || 0);
             opt.setAttribute('data-code', product.code || '');
             opt.setAttribute('data-barcode', product.barcode || '');
             select.appendChild(opt);
@@ -3960,10 +4375,26 @@ function invPickerChoose(select, product) {
         tr.dataset.curCost = product ? (parseFloat(product.purchase_price) || 0) : 0;
         var act = tr.querySelector('select[name$="[row_action]"]');
         if (act && product && act.value === 'create_product') act.value = 'add_stock';
+        applyCatalogSaleToInvoiceRow(tr, product);
     }
     select.dispatchEvent(new Event('input', { bubbles: true }));
     select.dispatchEvent(new Event('change', { bubbles: true }));
     invPickerClose();
+}
+
+/** Al emparejar producto: poner P. venta del catálogo en la línea. */
+function applyCatalogSaleToInvoiceRow(tr, product) {
+    if (!tr) return;
+    var saleEl = tr.querySelector('input[name$="[sale_price]"]');
+    if (!saleEl) return;
+    var sale = product ? (parseFloat(product.sale_price) || 0) : 0;
+    if (sale > 0.009) {
+        saleEl.value = window.SeriMoney ? SeriMoney.format(sale) : String(sale);
+        saleEl.dataset.fromCatalog = '1';
+    } else {
+        saleEl.value = '';
+        saleEl.dataset.fromCatalog = '0';
+    }
 }
 
 function invPickerOpen(select) {
@@ -4966,20 +5397,23 @@ function viewPurchase(id) {
             }
             h += '<div><strong>Fecha OC:</strong> ' + esc((o.order_date || '').substr(0,10)) + '</div>';
             h += '<div><strong>Fecha de factura:</strong> ' + esc((o.invoice_date || '—').toString().substr(0,10)) + '</div>';
-            h += '<div><strong>Vencimiento de pago:</strong> ' + esc((o.due_date || '—').toString().substr(0,10)) + '</div>';
+            h += '<div><strong>Vence pago (CxP):</strong> ' + esc((o.due_date || '—').toString().substr(0,10)) + '</div>';
+            h += '<div><strong>Vence en factura:</strong> ' + esc((o.invoice_due_date || '—').toString().substr(0,10)) + '</div>';
             h += '<div><strong>Recepción de bodega:</strong> ' + esc((o.warehouse_date || '—').toString().substr(0,10)) + '</div>';
-            h += '<div><strong>Subtotal:</strong> ' + poMoney(o.subtotal) + '</div>';
-            h += '<div><strong>IVA:</strong> ' + poMoney(o.tax) + '</div>';
             var comAmt = parseFloat(o.commercial_discount_amount || 0) || 0;
             var comPct = parseFloat(o.commercial_discount_pct || 0) || 0;
             if (comAmt <= 0.009 && comPct > 0.009) {
                 comAmt = Math.round((parseFloat(o.subtotal || 0) || 0) * comPct) / 100;
             }
+            var subAfter = Math.max(0, (parseFloat(o.subtotal || 0) || 0) - comAmt);
+            h += '<div><strong>Total bruto:</strong> ' + poMoney(o.subtotal) + '</div>';
             if (comAmt > 0.009) {
                 h += '<div><strong>Desc. comercial:</strong> −' + poMoney(comAmt)
-                    + (comPct > 0.009 ? ' <small>(' + Math.round(comPct) + '%)</small>' : '') + '</div>';
+                    + (comPct > 0.009 ? ' <small>(' + (Math.round(comPct * 100) / 100) + '%)</small>' : '') + '</div>';
             }
-            h += '<div><strong>Total:</strong> ' + poMoney(o.total) + '</div>';
+            h += '<div><strong>Sub total:</strong> ' + poMoney(subAfter) + '</div>';
+            h += '<div><strong>IVA:</strong> ' + poMoney(o.tax) + '</div>';
+            h += '<div><strong>Valor neto:</strong> ' + poMoney(o.total) + '</div>';
             h += '<div><strong>Notas crédito:</strong> ' + poMoney(o.credit_total) + '</div>';
             h += '<div><strong>Neto:</strong> ' + poMoney(Math.max(0, parseFloat(o.total || 0) - parseFloat(o.credit_total || 0))) + '</div>';
             h += '<div><strong>Asiento:</strong> ' + esc(o.accounting_entry_number || (o.accounting_entry_id ? ('#'+o.accounting_entry_id) : 'pendiente')) + '</div>';

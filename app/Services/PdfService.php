@@ -1795,6 +1795,15 @@ class PdfService
                 <td style="text-align:right;">' . number_format($pct, 1, ',', '.') . '%</td>
             </tr>';
         }
+        $cashOther = $summary['cash_other_payable'] ?? ['amount' => 0, 'count' => 0];
+        if ((float)($cashOther['amount'] ?? 0) > 0.009) {
+            $rows .= '<tr style="color:#DC2626;">
+                <td>Efectivo fuera de caja (pagos factura)</td>
+                <td style="text-align:center;">' . (int)($cashOther['count'] ?? 0) . '</td>
+                <td style="text-align:right;">' . $fmt($cashOther['amount']) . '</td>
+                <td style="text-align:right;">—</td>
+            </tr>';
+        }
         if ($rows === '') {
             $rows = '<tr><td colspan="4" style="text-align:center;color:#666;padding:16px;">Sin ventas en el periodo</td></tr>';
         }
@@ -2367,6 +2376,33 @@ class PdfService
                 . '</td><td class="num">' . (int)$pm['count'] . '</td><td class="num">' . $fmt($pm['total'] ?? 0) . '</td></tr>';
         }
 
+        $liq = $data['purchasesLiquidity'] ?? [];
+        $drawerOriginRows = '';
+        foreach (($liq['drawer_expense_origins'] ?? []) as $origin) {
+            $drawerOriginRows .= '<tr><td>' . htmlspecialchars((string)(($origin['code'] ?? '') . ' · ' . ($origin['label'] ?? $origin['source'] ?? '')))
+                . '</td><td class="num">' . (int)($origin['entries'] ?? 0)
+                . '</td><td class="num">' . $fmt($origin['net'] ?? 0) . '</td></tr>';
+        }
+        if ($drawerOriginRows === '') {
+            $drawerOriginRows = '<tr><td colspan="3" style="text-align:center;color:#666;">Sin movimientos en 519595 / 539595</td></tr>';
+        }
+        $liquidityHtml = '
+            <table class="grid" cellpadding="6" cellspacing="0">
+                <tr><td>Efectivo fuera de caja (CxP · otro fondo)</td><td class="num"><strong>' . $fmt($liq['cash_other_amount'] ?? 0) . '</strong></td></tr>
+                <tr><td>Pagos fuera de caja (cantidad)</td><td class="num">' . (int)($liq['cash_other_count'] ?? 0) . '</td></tr>
+                <tr><td>CxP saldo abierto</td><td class="num">' . $fmt($liq['payable_total'] ?? 0) . '</td></tr>
+                <tr><td>CxP vencido</td><td class="num">' . $fmt($liq['payable_overdue'] ?? 0) . ' (' . (int)($liq['payable_overdue_count'] ?? 0) . ' fact.)</td></tr>
+                <tr><td>Ventas cobradas / por cobrar</td><td class="num">' . $fmt($liq['sales_collected'] ?? 0) . ' / ' . $fmt($liq['sales_pending'] ?? 0) . '</td></tr>
+                <tr><td>Ventas pago parcial</td><td class="num">' . (int)($liq['sales_partial_count'] ?? 0) . '</td></tr>
+                <tr><td>Desc. comercial compras</td><td class="num">' . $fmt($liq['purchase_commercial_disc'] ?? 0) . '</td></tr>
+                <tr><td>Desc. en pagos CxP</td><td class="num">' . $fmt($liq['cxp_payment_disc'] ?? 0) . '</td></tr>
+                <tr class="total"><td>Gastos cajón 519595/539595</td><td class="num"><strong>' . $fmt($liq['drawer_expense_total'] ?? 0) . '</strong></td></tr>
+            </table>
+            <table class="data" cellpadding="5" cellspacing="0" style="margin-top:8px;">
+                <tr class="head"><th>Origen gasto cajón</th><th>Asientos</th><th>Neto</th></tr>
+                ' . $drawerOriginRows . '
+            </table>';
+
         $extraFull = '';
         if (!empty($data['reportsFull'])) {
             if ($catRows !== '') {
@@ -2382,6 +2418,7 @@ class PdfService
                     </table>');
             }
         }
+        $extraFull .= $section('Compras, CxP y liquidez', $liquidityHtml);
 
         $body = '
             <style>

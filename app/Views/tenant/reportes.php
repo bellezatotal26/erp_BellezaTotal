@@ -45,6 +45,14 @@ $channelLabels = \SoftNova\Core\product_channels();
 $receivablesAging = $receivablesAging ?? ['total'=>0,'d0'=>0,'d30'=>0,'d60'=>0,'d90'=>0,'cnt'=>0];
 $topDebtors = $topDebtors ?? [];
 $cashSummary = $cashSummary ?? ['income'=>0,'expense'=>0,'net'=>0,'opening'=>0,'expected'=>0,'session'=>null];
+$purchasesLiquidity = $purchasesLiquidity ?? [
+    'cash_other_amount' => 0.0, 'cash_other_count' => 0,
+    'payable_total' => 0.0, 'payable_count' => 0, 'payable_overdue' => 0.0, 'payable_overdue_count' => 0,
+    'sales_collected' => 0.0, 'sales_pending' => 0.0, 'sales_partial_count' => 0,
+    'purchase_commercial_disc' => 0.0, 'cxp_payment_disc' => 0.0,
+    'drawer_expense_total' => 0.0, 'drawer_expense_origins' => [],
+];
+$salesSummaryRpt = $salesSummary ?? ['discount' => 0.0, 'cash_other_payable' => ['amount' => 0.0, 'count' => 0]];
 
 if (!function_exists('fmtR')) {
     function fmtR(float $a, array $c): string {
@@ -439,6 +447,78 @@ if (!function_exists('rptChartTypeSelect')) {
                     </tbody>
                 </table></div>
             <?php endif; ?>
+        </div>
+    </div>
+</div>
+
+<div class="reports-section-title">Compras, CxP y liquidez</div>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px;margin-bottom:22px;">
+    <div class="card neumorphic" style="border-left:4px solid #DC2626;">
+        <div class="card-header"><h3>Efectivo fuera de caja</h3></div>
+        <div class="card-body">
+            <div style="text-align:center;margin-bottom:10px;">
+                <div style="font-size:24px;font-weight:700;color:var(--dmc-DC2626, #DC2626);"><?php echo fmtR((float)$purchasesLiquidity['cash_other_amount'], $currency); ?></div>
+                <small style="color:var(--color-text-secondary);"><?php echo (int)$purchasesLiquidity['cash_other_count']; ?> pago(s) CxP · origen «otro fondo»</small>
+            </div>
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0;">
+                Abonos a proveedores en efectivo que <strong>no salieron del cajón</strong>. No es medio de cobro de ventas.
+            </p>
+            <a href="<?php echo $viewInstance->route('app/compras'); ?>?tab=facturas" style="font-size:12px;">Ver cuentas por pagar →</a>
+        </div>
+    </div>
+
+    <div class="card neumorphic">
+        <div class="card-header"><h3>Cuentas por pagar</h3></div>
+        <div class="card-body">
+            <div class="rpt-row"><span>Saldo abierto</span><strong style="color:<?php echo (float)$purchasesLiquidity['payable_total'] > 0.009 ? '#DC2626' : '#10B981'; ?>;"><?php echo fmtR((float)$purchasesLiquidity['payable_total'], $currency); ?></strong></div>
+            <div class="rpt-row muted"><span>Facturas abiertas</span><span><?php echo (int)$purchasesLiquidity['payable_count']; ?></span></div>
+            <div class="rpt-row"><span>Vencido</span><strong style="color:#DC2626;"><?php echo fmtR((float)$purchasesLiquidity['payable_overdue'], $currency); ?></strong></div>
+            <div class="rpt-row muted"><span>Facturas vencidas</span><span><?php echo (int)$purchasesLiquidity['payable_overdue_count']; ?></span></div>
+            <div class="rpt-row rpt-row-sep"><span>Desc. comercial (periodo)</span><strong><?php echo fmtR((float)$purchasesLiquidity['purchase_commercial_disc'], $currency); ?></strong></div>
+            <div class="rpt-row"><span>Desc. en pagos CxP</span><strong><?php echo fmtR((float)$purchasesLiquidity['cxp_payment_disc'], $currency); ?></strong></div>
+        </div>
+    </div>
+
+    <div class="card neumorphic">
+        <div class="card-header"><h3>Cobros de ventas</h3></div>
+        <div class="card-body">
+            <div class="rpt-row"><span>Cobrado en periodo</span><strong style="color:#10B981;"><?php echo fmtR((float)$purchasesLiquidity['sales_collected'], $currency); ?></strong></div>
+            <div class="rpt-row"><span>Por cobrar (crédito)</span><strong style="color:#F59E0B;"><?php echo fmtR((float)$purchasesLiquidity['sales_pending'], $currency); ?></strong></div>
+            <div class="rpt-row muted"><span>Ventas pago parcial</span><span><?php echo (int)$purchasesLiquidity['sales_partial_count']; ?></span></div>
+            <div class="rpt-row rpt-row-sep"><span>Descuentos en ventas</span><strong><?php echo fmtR((float)($salesSummaryRpt['discount'] ?? 0), $currency); ?></strong></div>
+            <?php if (!empty($paymentMethods)): ?>
+                <div style="margin-top:10px;border-top:1px dashed var(--color-border);padding-top:8px;">
+                    <?php foreach (array_slice($paymentMethods, 0, 5) as $pm): ?>
+                        <div class="rpt-row muted">
+                            <span><?php echo htmlspecialchars($pm['label'] ?? $pm['payment_method'] ?? ''); ?></span>
+                            <span><?php echo fmtR((float)($pm['total'] ?? 0), $currency); ?></span>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <div class="card neumorphic">
+        <div class="card-header"><h3>Gastos desde cajón (519595 / 539595)</h3></div>
+        <div class="card-body">
+            <div style="text-align:center;margin-bottom:10px;">
+                <div style="font-size:22px;font-weight:700;"><?php echo fmtR((float)$purchasesLiquidity['drawer_expense_total'], $currency); ?></div>
+                <small style="color:var(--color-text-secondary);">Neto contable del periodo</small>
+            </div>
+            <?php if (empty($purchasesLiquidity['drawer_expense_origins'])): ?>
+                <p class="rpt-empty" style="margin:0;">Sin movimientos en cuentas de cajón</p>
+            <?php else: ?>
+                <?php foreach ($purchasesLiquidity['drawer_expense_origins'] as $origin): ?>
+                    <div class="rpt-row muted">
+                        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:62%;" title="<?php echo htmlspecialchars(($origin['code'] ?? '') . ' · ' . ($origin['label'] ?? '')); ?>">
+                            <?php echo htmlspecialchars(($origin['code'] ?? '') . ' · ' . ($origin['label'] ?? $origin['source'] ?? '')); ?>
+                        </span>
+                        <span><?php echo fmtR((float)($origin['net'] ?? 0), $currency); ?></span>
+                    </div>
+                <?php endforeach; ?>
+            <?php endif; ?>
+            <a href="<?php echo $viewInstance->route('app/contabilidad'); ?>" style="font-size:12px;">Abrir contabilidad →</a>
         </div>
     </div>
 </div>

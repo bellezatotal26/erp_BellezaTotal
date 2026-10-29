@@ -255,6 +255,42 @@ foreach ($accounts as $account) {
     <?php endif; ?>
 
     <?php $reconciliation = $reconciliation ?? []; ?>
+    <?php
+    $entryIntegrity = $entryIntegrity ?? ['ok' => true, 'unbalanced' => [], 'bad_lines' => 0];
+    if (empty($entryIntegrity['ok'])):
+        $unb = $entryIntegrity['unbalanced'] ?? [];
+        $badLn = (int)($entryIntegrity['bad_lines'] ?? 0);
+    ?>
+        <div class="card neumorphic" style="margin-bottom:18px;border:1px solid rgba(220,38,38,.35);">
+            <div class="card-header"><h3 style="margin:0;color:var(--dmc-DC2626,#DC2626);">Integridad del libro</h3></div>
+            <div class="card-body" style="font-size:13px;">
+                <?php if ($unb): ?>
+                    <p style="margin:0 0 8px;font-weight:600;"><?php echo count($unb); ?> comprobante(s) con Debe ≠ Haber</p>
+                    <ul style="margin:0 0 10px;padding-left:18px;">
+                        <?php foreach (array_slice($unb, 0, 8) as $u): ?>
+                            <li>
+                                <?php echo htmlspecialchars((string)($u['entry_number'] ?? '')); ?>
+                                · <?php echo htmlspecialchars((string)($u['entry_date'] ?? '')); ?>
+                                · diff <?php echo acctFmt((float)($u['diff'] ?? 0), $currency); ?>
+                            </li>
+                        <?php endforeach; ?>
+                    </ul>
+                <?php endif; ?>
+                <?php if ($badLn > 0): ?>
+                    <p style="margin:0;color:var(--dmc-B45309,#B45309);"><?php echo $badLn; ?> línea(s) con débito y crédito a la vez, o ambas en cero.</p>
+                <?php endif; ?>
+            </div>
+        </div>
+    <?php endif; ?>
+
+    <?php if (empty($reconciliation)): ?>
+        <p style="margin:0 0 14px;font-size:12px;color:var(--color-text-secondary);">
+            <a href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=dashboard&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>&diagnostics=1">
+                Ver conciliación operativa vs contable
+            </a>
+            (consulta pesada; se carga aparte para no bloquear el dashboard)
+        </p>
+    <?php endif; ?>
     <?php if (!empty($reconciliation)): ?>
         <div class="card neumorphic" style="margin-bottom:18px;">
             <div class="card-header"><h3>Conciliación operativa vs contable</h3></div>
@@ -759,15 +795,15 @@ foreach ($accounts as $account) {
     };
     ?>
     <div class="trial-switch">
-        <a class="btn btn-sm btn-secondary" href="<?php echo $trialBase; ?>?tab=trial&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">Balance operativo</a>
-        <a class="btn btn-sm btn-primary" href="<?php echo $trialBase; ?>?tab=trial&view=accounts&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">Balance de comprobación (cuentas)</a>
+        <a class="btn btn-sm btn-secondary" href="<?php echo $trialBase; ?>?tab=trial&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">Balance operativo (gerencial)</a>
+        <a class="btn btn-sm btn-primary" href="<?php echo $trialBase; ?>?tab=trial&view=accounts&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">Balance de comprobación (libro)</a>
     </div>
     <div class="card neumorphic">
         <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
             <div>
-                <h3 style="margin:0;">Balance de comprobación</h3>
+                <h3 style="margin:0;">Balance de comprobación (libro mayor)</h3>
                 <div style="font-size:12px;color:var(--color-text-secondary);margin-top:4px;">
-                    <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateFrom) ?: time())); ?> → <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateTo) ?: time())); ?>
+                    Fuente: asientos contables. <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateFrom) ?: time())); ?> → <?php echo htmlspecialchars(date('d/m/Y', strtotime($dateTo) ?: time())); ?>
                     · <?php echo (int)($trTot['accounts'] ?? 0); ?> cuenta(s).
                     Saldo inicial = acumulado antes de «Desde»; saldo final = acumulado a «Hasta».
                 </div>
@@ -836,8 +872,16 @@ foreach ($accounts as $account) {
 
 <?php elseif ($tab === 'trial'): ?>
     <div class="trial-switch">
-        <a class="btn btn-sm btn-primary" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=trial&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>&year=<?php echo (int)$balanceYear; ?>">Balance operativo</a>
-        <a class="btn btn-sm btn-secondary" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=trial&view=accounts&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">Balance de comprobación (cuentas)</a>
+        <a class="btn btn-sm btn-primary" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=trial&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>&year=<?php echo (int)$balanceYear; ?>">Balance operativo (gerencial)</a>
+        <a class="btn btn-sm btn-secondary" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=trial&view=accounts&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">Balance de comprobación (libro)</a>
+    </div>
+    <div class="card neumorphic" style="margin-bottom:14px;">
+        <div class="card-body" style="font-size:13px;color:var(--color-text-secondary);padding:12px 16px;">
+            <strong style="color:var(--color-text);">Vista gerencial:</strong> suma documentos operativos (ventas, compras, gastos).
+            No es el libro mayor. Para cifras oficiales use
+            <a href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=trial&view=accounts&from=<?php echo urlencode($dateFrom); ?>&to=<?php echo urlencode($dateTo); ?>">Balance de comprobación (cuentas)</a>
+            o Estados financieros.
+        </div>
     </div>
     <?php
     $mb = $monthlyBalance;
@@ -1255,7 +1299,48 @@ foreach ($accounts as $account) {
             <?php foreach (($statements['revenue'] ?? []) as $row): ?><div class="accounting-statement-row"><span><?php echo htmlspecialchars($row['code'] . ' ' . $row['name']); ?></span><strong><?php echo acctFmt((float)$row['display_balance'], $currency); ?></strong></div><?php endforeach; ?>
             <div class="accounting-statement-total"><span>Total ingresos</span><strong><?php echo acctFmt((float)($statements['totals']['revenue'] ?? 0), $currency); ?></strong></div>
             <h4 style="margin-top:18px;">Gastos y costos</h4>
-            <?php foreach (($statements['expenses'] ?? []) as $row): ?><div class="accounting-statement-row"><span><?php echo htmlspecialchars($row['code'] . ' ' . $row['name']); ?></span><strong><?php echo acctFmt((float)$row['display_balance'], $currency); ?></strong></div><?php endforeach; ?>
+            <?php foreach (($statements['expenses'] ?? []) as $row): ?>
+                <?php
+                $expCode = (string)($row['code'] ?? '');
+                $expOrigins = $row['origins'] ?? [];
+                $ledgerHref = $viewInstance->route('app/contabilidad')
+                    . '?tab=ledger&account_id=' . (int)($row['id'] ?? 0)
+                    . '&from=' . urlencode($dateFrom) . '&to=' . urlencode($dateTo);
+                ?>
+                <div class="accounting-statement-row">
+                    <span>
+                        <?php echo htmlspecialchars($expCode . ' ' . ($row['name'] ?? '')); ?>
+                        <?php if ($expOrigins && (int)($row['id'] ?? 0) > 0): ?>
+                            <a href="<?php echo htmlspecialchars($ledgerHref); ?>" style="font-size:11px;margin-left:6px;font-weight:500;">ver mayor</a>
+                        <?php endif; ?>
+                    </span>
+                    <strong><?php echo acctFmt((float)$row['display_balance'], $currency); ?></strong>
+                </div>
+                <?php if (!empty($expOrigins)): ?>
+                    <div class="accounting-expense-origins" style="margin:2px 0 10px 12px;padding:8px 10px;border-left:3px solid rgba(148,163,184,.55);background:rgba(148,163,184,.08);border-radius:0 8px 8px 0;font-size:12px;">
+                        <div style="font-weight:600;margin-bottom:6px;color:var(--color-text-secondary);">Desglose por origen</div>
+                        <?php foreach ($expOrigins as $ori): ?>
+                            <div class="accounting-statement-row" style="font-size:12px;padding:3px 0;">
+                                <span>
+                                    <?php echo htmlspecialchars((string)($ori['label'] ?? '')); ?>
+                                    <small style="color:var(--color-text-secondary);">
+                                        (<?php echo (int)($ori['entries'] ?? 0); ?> comprobante<?php echo (int)($ori['entries'] ?? 0) === 1 ? '' : 's'; ?>)
+                                    </small>
+                                </span>
+                                <strong><?php echo acctFmt((float)($ori['amount'] ?? 0), $currency); ?></strong>
+                            </div>
+                            <?php foreach (($ori['categories'] ?? []) as $cat): ?>
+                                <div class="accounting-statement-row" style="font-size:11px;padding:2px 0 2px 14px;color:var(--color-text-secondary);">
+                                    <span>· <?php echo htmlspecialchars((string)($cat['label'] ?? '')); ?>
+                                        <small>(<?php echo (int)($cat['entries'] ?? 0); ?>)</small>
+                                    </span>
+                                    <span><?php echo acctFmt((float)($cat['amount'] ?? 0), $currency); ?></span>
+                                </div>
+                            <?php endforeach; ?>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endif; ?>
+            <?php endforeach; ?>
             <div class="accounting-statement-total"><span>Total gastos</span><strong><?php echo acctFmt((float)($statements['totals']['expenses'] ?? 0), $currency); ?></strong></div>
             <div class="accounting-statement-total" style="margin-top:18px;color:<?php echo ($statements['profit'] ?? 0) >= 0 ? '#10B981' : '#DC2626'; ?>;"><span>Resultado del periodo</span><strong><?php echo acctFmt((float)($statements['profit'] ?? 0), $currency); ?></strong></div>
         </div></div>
@@ -1671,17 +1756,47 @@ foreach ($accounts as $account) {
 
 <?php elseif ($tab === 'periods'): ?>
     <div class="card neumorphic"><div class="card-header"><h3>Cierre de periodos</h3></div><div class="card-body">
+        <?php
+        $pSync = (int)($pendingSync ?? 0);
+        $pQueue = (int)($pendingQueue ?? 0);
+        if ($pSync > 0 || $pQueue > 0):
+        ?>
+            <div style="margin-bottom:14px;padding:10px 12px;border-radius:8px;background:rgba(245,158,11,.12);font-size:13px;">
+                <strong>Antes de cerrar:</strong>
+                <?php if ($pSync > 0): ?>
+                    <?php echo $pSync; ?> operación(es) sin comprobante
+                <?php endif; ?>
+                <?php if ($pQueue > 0): ?>
+                    <?php echo $pSync > 0 ? ' · ' : ''; ?><?php echo $pQueue; ?> en cola de reintento
+                <?php endif; ?>
+                . Use «Sincronizar» en el tablero; el cierre se rechaza si quedan pendientes.
+            </div>
+        <?php endif; ?>
         <?php if ($canEdit): ?>
-            <form method="POST" action="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=period" data-ajax="true" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-bottom:18px;">
+            <form method="POST" action="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=period" data-ajax="true" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-bottom:18px;"
+                  onsubmit="var st=this.status.value; if(st==='closed'){ return confirm('¿Cerrar el periodo? Quedará bloqueado: no se podrán contabilizar documentos de ese mes (ni re-fechar a otro). Debe sincronizar pendientes antes.'); } return confirm('¿Reabrir el periodo? Quedará registro en notas/usuario de cierre.');">
                 <?php echo \SoftNova\Core\csrf_field(); ?>
                 <div class="form-group" style="margin:0;"><label>Año</label><input class="form-control" type="number" name="year" min="2000" max="2100" value="<?php echo date('Y'); ?>" required></div>
                 <div class="form-group" style="margin:0;"><label>Mes</label><select class="form-control" name="month"><?php for ($m=1;$m<=12;$m++): ?><option value="<?php echo $m; ?>" <?php echo $m === (int)date('n') ? 'selected' : ''; ?>><?php echo $m; ?></option><?php endfor; ?></select></div>
                 <div class="form-group" style="margin:0;"><label>Estado</label><select class="form-control" name="status"><option value="closed">Cerrar</option><option value="open">Reabrir</option></select></div>
-                <div class="form-group" style="margin:0;min-width:220px;"><label>Notas</label><input class="form-control" name="notes"></div>
+                <div class="form-group" style="margin:0;min-width:220px;"><label>Notas</label><input class="form-control" name="notes" placeholder="Motivo de cierre o reapertura"></div>
                 <button class="btn btn-primary" type="submit">Actualizar periodo</button>
             </form>
             <p style="font-size:13px;color:var(--color-text-secondary);margin:0 0 14px;">
-                Cerrar un periodo <strong>bloquea nuevos asientos</strong> en ese mes. No genera asiento de cierre a utilidad del ejercicio (Fase 1).
+                Cerrar un periodo <strong>bloquea todos los asientos</strong> de ese mes (automáticos y manuales). No se re-fechan a otro mes.
+                La reapertura queda auditada (usuario + fecha + notas).
+            </p>
+            <form method="POST" action="<?php echo $viewInstance->route('app/contabilidad'); ?>?action=close-year" data-ajax="true"
+                  style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-bottom:18px;padding-top:12px;border-top:1px solid var(--color-border,#e5e7eb);"
+                  onsubmit="return confirm('¿Generar el asiento de cierre de resultado del año? Traspasará ingresos y gastos a Utilidad del ejercicio (360505). El 31/12 debe estar en periodo abierto. Es idempotente por año.');">
+                <?php echo \SoftNova\Core\csrf_field(); ?>
+                <div class="form-group" style="margin:0;"><label>Cierre anual</label><input class="form-control" type="number" name="year" min="2000" max="2100" value="<?php echo (int)date('Y') - 1; ?>" required></div>
+                <div class="form-group" style="margin:0;min-width:220px;"><label>Notas</label><input class="form-control" name="notes" placeholder="Opcional"></div>
+                <button class="btn btn-secondary" type="submit">Cerrar resultado del año</button>
+            </form>
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 14px;">
+                El cierre anual crea un comprobante al 31/12 que deja en cero las cuentas de ingreso/gasto del año contra 360505.
+                Si ya existe para ese año, no se duplica.
             </p>
         <?php endif; ?>
         <div class="table-container"><table><thead><tr><th>Periodo</th><th>Estado</th><th>Cerrado por</th><th>Fecha</th><th>Notas</th></tr></thead><tbody>

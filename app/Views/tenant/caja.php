@@ -639,19 +639,28 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
         <?php else: ?>
             <div class="table-container"><table>
                 <thead><tr>
-                    <th>Factura</th><th>Cliente</th><th>Usuario</th><th>Fecha</th><th>Total</th><th>Pagado</th><th>Pago</th><th>NC</th><th>Estado</th><th>Acciones</th>
+                    <th>Factura</th><th>Cliente</th><th>Usuario</th><th>Fecha</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Pago</th><th>NC</th><th>Estado</th><th>Acciones</th>
                 </tr></thead>
                 <tbody>
                 <?php foreach ($todaySales as $sale): ?>
                     <?php
                     $cajaNcTot = round((float)($sale['credit_note_total'] ?? 0), 2);
                     $cajaSaleTot = round((float)($sale['total'] ?? 0), 2);
+                    $cajaPaidAmt = round((float)($sale['paid_amount'] ?? 0), 2);
+                    $cajaBalance = max(0.0, round($cajaSaleTot - $cajaNcTot - $cajaPaidAmt, 2));
                     $cajaNcFull = $cajaNcTot > 0.009 && $cajaNcTot >= ($cajaSaleTot - 0.02);
                     $cajaNcTip = trim((string)($sale['credit_note_numbers'] ?? ''));
                     if ($cajaNcTip === '' && $cajaNcTot > 0.009) {
                         $cajaNcTip = 'Nota(s) de crédito';
                     }
                     $cajaSaleObs = \SoftNova\Services\SalesDocumentService::displayNotes((string)($sale['notes'] ?? ''));
+                    $cajaCanAbonar = ($sale['status'] ?? '') !== 'cancelled' && $cajaBalance > 0.009;
+                    $cajaPayStatus = (string)($sale['payment_status'] ?? '');
+                    if ($cajaCanAbonar && $cajaPayStatus === 'paid') {
+                        $cajaPayStatus = $cajaPaidAmt > 0.009 ? 'partial' : 'pending';
+                    } elseif (!$cajaCanAbonar && ($sale['status'] ?? '') !== 'cancelled' && $cajaBalance <= 0.009) {
+                        $cajaPayStatus = 'paid';
+                    }
                     ?>
                     <tr<?php echo $cajaNcFull ? ' style="opacity:0.85;"' : ''; ?>>
                         <td>
@@ -676,7 +685,10 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                                 <div style="font-size:11px;color:var(--color-text-secondary);">Neto <?php echo fmt(max(0, $cajaSaleTot - $cajaNcTot), $currency); ?></div>
                             <?php endif; ?>
                         </td>
-                        <td><?php echo ($sale['payment_status'] ?? '') === 'paid' ? fmt($cajaSaleTot, $currency) : fmt((float)($sale['paid_amount'] ?? 0), $currency); ?></td>
+                        <td><?php echo ($cajaPayStatus === 'paid' && $cajaBalance <= 0.009) ? fmt(max(0, $cajaSaleTot - $cajaNcTot), $currency) : fmt($cajaPaidAmt, $currency); ?></td>
+                        <td style="font-weight:600;color:<?php echo $cajaBalance > 0.009 ? 'var(--dmc-B45309, #B45309)' : 'var(--dmc-059669, #059669)'; ?>;">
+                            <?php echo fmt($cajaBalance, $currency); ?>
+                        </td>
                         <td>
                             <span class="badge <?php
                                 $pm = (string)($sale['payment_method'] ?? '');
@@ -702,9 +714,9 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                                 <span class="badge badge-danger">Cancelado</span>
                             <?php elseif ($cajaNcFull): ?>
                                 <span class="badge badge-warning">Devuelta</span>
-                            <?php elseif (($sale['payment_status'] ?? '') === 'paid'): ?>
+                            <?php elseif ($cajaPayStatus === 'paid'): ?>
                                 <span class="badge badge-success">Pagado</span>
-                            <?php elseif (($sale['payment_status'] ?? '') === 'partial'): ?>
+                            <?php elseif ($cajaPayStatus === 'partial'): ?>
                                 <span class="badge badge-warning">Parcial</span>
                             <?php else: ?>
                                 <span class="badge badge-info">Pendiente</span>
@@ -721,8 +733,12 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
                                     Pago
                                 </button>
                             <?php endif; ?>
-                            <?php if (in_array($sale['payment_status'] ?? '', ['pending', 'partial'], true) && ($sale['status'] ?? '') !== 'cancelled'): ?>
-                                <button type="button" onclick="openPaymentModal(<?php echo (int)$sale['id']; ?>,<?php echo (float)$sale['total']; ?>,<?php echo (float)($sale['paid_amount'] ?? 0); ?>,<?php echo (float)($sale['credit_note_total'] ?? 0); ?>)" class="btn btn-sm btn-success" title="Registrar abono"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></button>
+                            <?php if ($cajaCanAbonar): ?>
+                                <button type="button"
+                                    onclick="openPaymentModal(<?php echo (int)$sale['id']; ?>,<?php echo (float)$cajaSaleTot; ?>,<?php echo (float)$cajaPaidAmt; ?>,<?php echo (float)$cajaNcTot; ?>)"
+                                    class="btn btn-sm btn-success" title="Registrar abono · pendiente <?php echo htmlspecialchars(fmt($cajaBalance, $currency)); ?>">
+                                    Abonar
+                                </button>
                             <?php endif; ?>
                             <?php if ($canDeleteSale && ($sale['status'] ?? '') !== 'cancelled'): ?>
                                 <button type="button" class="btn btn-sm btn-danger" title="Eliminar venta"

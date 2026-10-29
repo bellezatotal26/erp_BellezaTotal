@@ -443,6 +443,8 @@ class TenantComprasController extends TenantController
                     'invoice_number' => (string)$this->request->post('invoice_number', ''),
                     'invoice_date' => (string)$this->request->post('invoice_date', ''),
                     'due_date' => (string)$this->request->post('due_date', ''),
+                    'invoice_due_date' => (string)$this->request->post('invoice_due_date', ''),
+                    'payment_term_days' => $this->request->post('payment_term_days', ''),
                     'warehouse_date' => (string)$this->request->post('warehouse_date', ''),
                     'payment_mode' => (string)$this->request->post('payment_mode', 'payable'),
                     'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
@@ -937,12 +939,14 @@ class TenantComprasController extends TenantController
                 'invoice_number' => (string)$this->request->post('invoice_number', ''),
                 'invoice_date' => (string)$this->request->post('invoice_date', ''),
                 'due_date' => (string)$this->request->post('due_date', ''),
+                'invoice_due_date' => (string)$this->request->post('invoice_due_date', ''),
                 'warehouse_date' => (string)$this->request->post('warehouse_date', ''),
                 'payment_mode' => (string)$this->request->post('payment_mode', 'payable'),
                 'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
                 'commercial_discount_pct' => $this->request->post('commercial_discount_pct', ''),
                 'commercial_discount_amount' => $this->request->post('commercial_discount_amount', ''),
                 'linked_order_id' => (int)$this->request->post('linked_order_id', 0) ?: null,
+                'apply_product_vat' => $this->request->post('apply_product_vat', null),
                 'tax_override_amount' => $this->request->post('tax_override_amount', null),
                 'review_notes' => (string)$this->request->post('review_notes', ''),
             ]);
@@ -1026,12 +1030,14 @@ class TenantComprasController extends TenantController
                 'invoice_number' => (string)$this->request->post('invoice_number', ''),
                 'invoice_date' => (string)$this->request->post('invoice_date', ''),
                 'due_date' => (string)$this->request->post('due_date', ''),
+                'invoice_due_date' => (string)$this->request->post('invoice_due_date', ''),
                 'warehouse_date' => (string)$this->request->post('warehouse_date', ''),
                 'payment_mode' => (string)$this->request->post('payment_mode', 'payable'),
                 'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
                 'commercial_discount_pct' => $this->request->post('commercial_discount_pct', ''),
                 'commercial_discount_amount' => $this->request->post('commercial_discount_amount', ''),
                 'linked_order_id' => (int)$this->request->post('linked_order_id', 0) ?: null,
+                'apply_product_vat' => $this->request->post('apply_product_vat', null),
                 'tax_override_amount' => $this->request->post('tax_override_amount', null),
                 'review_notes' => (string)$this->request->post('review_notes', ''),
             ]);
@@ -1495,8 +1501,10 @@ class TenantComprasController extends TenantController
         $rows[] = $sumRow('Proveedor', (string)($import['supplier_name'] ?? ''));
         $rows[] = $sumRow('Fecha', (string)($import['invoice_date'] ?? ''));
         $rows[] = $sumRow('Origen', strtoupper((string)($import['source'] ?? '')));
+        // Suma líneas = neto (sin IVA). Total bruto = mercancía antes de desc. comercial.
+        // Sub total → + IVA = Valor neto (el IVA se suma al subtotal, no al total de línea).
         $rows[] = $sumRow('Suma líneas', $money($linesSum));
-        $rows[] = $sumRow('Total bruto', $money((float)$disc['gross']));
+        $rows[] = $sumRow('Total bruto', $money($subtotal));
         $rows[] = $sumRow('Desc. comercial', $money(-1 * $commercialAmt));
         $rows[] = $sumRow('Sub total', $money($subAfterDisc));
         $rows[] = $sumRow('IVA', $money($taxTotal));
@@ -2385,9 +2393,28 @@ class TenantComprasController extends TenantController
                     'Para pagar en efectivo desde el cajón debe haber una caja abierta. Abra la caja o elija otra forma de pago.'
                 );
             }
+            $invoiceDateRecv = trim((string)$this->request->post('invoice_date', ''));
+            $warehouseDateRecv = trim((string)$this->request->post('warehouse_date', date('Y-m-d')));
+            if ($invoiceDateRecv !== '' && $warehouseDateRecv !== ''
+                && preg_match('/^\d{4}-\d{2}-\d{2}/', $invoiceDateRecv)
+                && preg_match('/^\d{4}-\d{2}-\d{2}/', $warehouseDateRecv)
+                && substr($warehouseDateRecv, 0, 10) < substr($invoiceDateRecv, 0, 10)
+            ) {
+                throw new \RuntimeException(
+                    'La recepción de bodega no puede ser anterior a la fecha de factura.'
+                );
+            }
+            $invoiceDueRecv = trim((string)$this->request->post('invoice_due_date', ''));
+            $cxpDueRecv = trim((string)$this->request->post('due_date', ''));
+            $termDaysRecv = trim((string)$this->request->post('payment_term_days', ''));
+            // Sin días de plazo → CxP = vence en factura.
+            if ($termDaysRecv === '' && $invoiceDueRecv !== '' && $cxpDueRecv === '') {
+                $cxpDueRecv = $invoiceDueRecv;
+            }
             $this->purchasing->applyInvoiceMeta($orderId, [
-                'due_date' => trim((string)$this->request->post('due_date', '')),
-                'invoice_date' => trim((string)$this->request->post('invoice_date', '')),
+                'due_date' => $cxpDueRecv,
+                'invoice_due_date' => $invoiceDueRecv,
+                'invoice_date' => $invoiceDateRecv,
                 'invoice_number' => trim((string)$this->request->post('invoice_number', '')),
                 'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
                 'commercial_discount_pct' => $this->request->post('commercial_discount_pct', ''),
@@ -2395,7 +2422,7 @@ class TenantComprasController extends TenantController
             ]);
             $recv = $this->doReceive(
                 $orderId,
-                (string)$this->request->post('warehouse_date', date('Y-m-d')),
+                $warehouseDateRecv !== '' ? $warehouseDateRecv : date('Y-m-d'),
                 trim((string)$this->request->post('invoice_number', '')),
                 (string)$this->request->post('payment_mode', 'payable'),
                 trim((string)$this->request->post('notes', ''))

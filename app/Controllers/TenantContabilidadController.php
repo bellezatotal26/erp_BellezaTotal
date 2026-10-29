@@ -29,7 +29,7 @@ class TenantContabilidadController extends TenantController
                 'save-account' => '/app/contabilidad?tab=accounts',
                 'save-commission-rates', 'save-commission-config', 'save-user-commission', 'settle-commissions',
                 'recalc-commissions' => '/app/contabilidad?tab=commissions',
-                'period' => '/app/contabilidad?tab=periods',
+                'period', 'close-year' => '/app/contabilidad?tab=periods',
                 'manual-entry', 'void-entry' => '/app/contabilidad?tab=entries',
                 default => '/app/contabilidad',
             };
@@ -54,6 +54,7 @@ class TenantContabilidadController extends TenantController
                 'settle-commissions' => $this->settleCommissions(),
                 'recalc-commissions' => $this->recalcCommissions(),
                 'period' => $this->updatePeriod(),
+                'close-year' => $this->closeFiscalYear(),
                 'sync' => $this->syncOperations(),
                 'save-integration' => $this->saveIntegration(),
                 'set-active-provider' => $this->setActiveProvider(),
@@ -154,18 +155,33 @@ class TenantContabilidadController extends TenantController
             }
         }
         $trace = ['rows' => [], 'total' => 0];
-        if (in_array($tab, ['dashboard', 'trace'], true)) {
-            $stock = new \SoftNova\Services\StockService($this->db);
-            $trace = $stock->listMovements(['from' => $from, 'to' => $to], 25, 0);
+        // Dashboard: no cargar kardex (caro). Solo en tab trace.
+        if ($tab === 'trace') {
+            try {
+                $stock = new \SoftNova\Services\StockService($this->db);
+                $trace = $stock->listMovements(['from' => $from, 'to' => $to], 25, 0);
+            } catch (\Throwable $e) {
+                $trace = ['rows' => [], 'total' => 0];
+            }
         }
 
-        $accounts = $this->accounting->accounts();
         $needsStatements = in_array($tab, ['dashboard', 'statements'], true);
-        $needsRecon = $tab === 'dashboard';
-        $needsAccountAudit = in_array($tab, ['dashboard', 'accounts'], true);
+        // Conciliación operativa es cara (inventario valorizado + CxP correlacionada):
+        // solo con ?diagnostics=1 para no tumbar el dashboard por timeout.
+        $needsRecon = $tab === 'dashboard' && (string)$this->request->get('diagnostics', '') === '1';
+        $needsAccountAudit = $tab === 'accounts';
         $needsEntries = in_array($tab, ['dashboard', 'entries'], true);
         $needsLedgerDetail = $tab === 'ledger' && $accountId > 0;
-        $needsPeriods = in_array($tab, ['dashboard', 'periods'], true);
+        $needsPeriods = $tab === 'periods';
+        $needsAccountsList = in_array($tab, ['accounts', 'ledger', 'entries', 'statements'], true);
+        $accounts = [];
+        if ($needsAccountsList) {
+            try {
+                $accounts = $this->accounting->accounts();
+            } catch (\Throwable $e) {
+                error_log('Contabilidad accounts: ' . $e->getMessage());
+            }
+        }
 
         $trialAccountType = trim((string)$this->request->get('account_type', ''));
         $trialQ = trim((string)$this->request->get('q', ''));
@@ -179,64 +195,94 @@ class TenantContabilidadController extends TenantController
             $balanceYear = (int)substr($from, 0, 4);
         }
         $trialView = (string)$this->request->get('view', '') === 'accounts' ? 'accounts' : 'operational';
-        $monthlyBalance = $tab === 'trial' && $trialView === 'operational'
-            ? $this->accounting->monthlyOperationalBalance($balanceYear)
-            : [
-                'year' => $balanceYear,
-                'months' => [],
-                'totals' => [],
-                'chart' => [],
-            ];
+        $monthlyBalance = [
+            'year' => $balanceYear,
+            'months' => [],
+            'totals' => [],
+            'chart' => [],
+        ];
+        if ($tab === 'trial' && $trialView === 'operational') {
+            try {
+                $monthlyBalance = $this->accounting->monthlyOperationalBalance($balanceYear);
+            } catch (\Throwable $e) {
+                error_log('Contabilidad monthlyBalance: ' . $e->getMessage());
+            }
+        }
         $accountsTrial = $tab === 'trial' && $trialView === 'accounts';
-        $trialReport = ($needsStatements || $accountsTrial)
-            ? $this->accounting->trialBalance($from, $to, $accountsTrial ? [
-                'account_type' => $trialAccountType,
-                'q' => $trialQ,
-                'include_zero' => $trialIncludeZero,
-            ] : [
-                'account_type' => '',
-                'q' => '',
-                'include_zero' => false,
-            ])
-            : [
-                'rows' => [],
-                'totals' => [
-                    'opening_debit' => 0, 'opening_credit' => 0,
-                    'debit' => 0, 'credit' => 0,
-                    'closing_debit' => 0, 'closing_credit' => 0,
-                    'accounts' => 0,
-                ],
-                'balanced' => ['opening' => true, 'period' => true, 'closing' => true],
-                'from' => $from,
-                'to' => $to,
-            ];
+        $emptyTrial = [
+            'rows' => [],
+            'totals' => [
+                'opening_debit' => 0, 'opening_credit' => 0,
+                'debit' => 0, 'credit' => 0,
+                'closing_debit' => 0, 'closing_credit' => 0,
+                'accounts' => 0,
+            ],
+            'balanced' => ['opening' => true, 'period' => true, 'closing' => true],
+            'from' => $from,
+            'to' => $to,
+        ];
+        $trialReport = $emptyTrial;
+        if ($needsStatements || $accountsTrial) {
+            try {
+                $trialReport = $this->accounting->trialBalance($from, $to, $accountsTrial ? [
+                    'account_type' => $trialAccountType,
+                    'q' => $trialQ,
+                    'include_zero' => $trialIncludeZero,
+                ] : [
+                    'account_type' => '',
+                    'q' => '',
+                    'include_zero' => false,
+                ]);
+            } catch (\Throwable $e) {
+                error_log('Contabilidad trialBalance: ' . $e->getMessage());
+                $trialReport = $emptyTrial;
+            }
+        }
         $trialBalance = $trialReport['rows'];
-        $statements = $needsStatements ? $this->accounting->financialStatements($from, $to) : [
+        $statements = [
             'assets' => [], 'liabilities' => [], 'equity' => [],
             'revenue' => [], 'expenses' => [],
             'totals' => ['assets' => 0, 'liabilities' => 0, 'equity' => 0, 'revenue' => 0, 'expenses' => 0],
             'profit' => 0,
         ];
+        if ($needsStatements) {
+            try {
+                // Reutiliza filas del trialBalance (antes se calculaba 2 veces → timeout).
+                $statements = $this->accounting->financialStatements($from, $to, $trialBalance);
+            } catch (\Throwable $e) {
+                error_log('Contabilidad financialStatements: ' . $e->getMessage());
+            }
+        }
         $ledgerQ = trim((string)$this->request->get('lq', ''));
-        $generalLedger = $tab === 'ledger' && !$needsLedgerDetail
-            ? $this->accounting->generalLedger($from, $to, [
-                'account_type' => $trialAccountType,
-                'q' => $trialQ,
-                'include_zero' => $trialIncludeZero,
-                'mode' => $ledgerMode,
-            ])
-            : [
-                'rows' => [],
-                'totals' => [],
-                'balanced' => ['opening' => true, 'period' => true, 'closing' => true],
-                'from' => $from,
-                'to' => $to,
-                'mode' => $ledgerMode,
-                'mode_label' => '',
-            ];
-        $ledgerReport = $needsLedgerDetail
-            ? $this->accounting->ledger($accountId, $from, $to, $ledgerQ)
-            : ['opening_balance' => 0.0, 'rows' => []];
+        $generalLedger = [
+            'rows' => [],
+            'totals' => [],
+            'balanced' => ['opening' => true, 'period' => true, 'closing' => true],
+            'from' => $from,
+            'to' => $to,
+            'mode' => $ledgerMode,
+            'mode_label' => '',
+        ];
+        if ($tab === 'ledger' && !$needsLedgerDetail) {
+            try {
+                $generalLedger = $this->accounting->generalLedger($from, $to, [
+                    'account_type' => $trialAccountType,
+                    'q' => $trialQ,
+                    'include_zero' => $trialIncludeZero,
+                    'mode' => $ledgerMode,
+                ]);
+            } catch (\Throwable $e) {
+                error_log('Contabilidad generalLedger: ' . $e->getMessage());
+            }
+        }
+        $ledgerReport = ['opening_balance' => 0.0, 'rows' => []];
+        if ($needsLedgerDetail) {
+            try {
+                $ledgerReport = $this->accounting->ledger($accountId, $from, $to, $ledgerQ);
+            } catch (\Throwable $e) {
+                error_log('Contabilidad ledger: ' . $e->getMessage());
+            }
+        }
         $ledger = $ledgerReport['rows'] ?? [];
         $ledgerOpening = (float)($ledgerReport['opening_balance'] ?? 0);
         $withholdings = null;
@@ -263,13 +309,48 @@ class TenantContabilidadController extends TenantController
                 ];
             }
         }
-        $accountAudit = $needsAccountAudit ? $this->accounting->auditCriticalAccounts() : [];
-        $reconciliation = $needsRecon ? $this->accounting->subledgerReconciliation() : [];
-        $pendingQueue = $needsRecon ? $this->accounting->pendingQueueCount() : 0;
-        // pendingSync = operaciones sin asiento (sin incluir cola, para no doble-contar en UI).
-        $pendingSync = $needsRecon
-            ? max(0, $this->accounting->pendingSyncCount() - $pendingQueue)
-            : 0;
+        $accountAudit = [];
+        if ($needsAccountAudit) {
+            try {
+                $accountAudit = $this->accounting->auditCriticalAccounts();
+            } catch (\Throwable $e) {
+                error_log('Contabilidad auditCriticalAccounts: ' . $e->getMessage());
+            }
+        }
+        $reconciliation = [];
+        $entryIntegrity = ['ok' => true, 'unbalanced' => [], 'bad_lines' => 0];
+        if ($needsRecon) {
+            try {
+                $reconciliation = $this->accounting->subledgerReconciliation();
+            } catch (\Throwable $e) {
+                error_log('Contabilidad reconciliation: ' . $e->getMessage());
+            }
+        }
+        // Integridad ligera en dashboard (sin ?diagnostics): solo asientos desbalanceados recientes.
+        if ($tab === 'dashboard') {
+            try {
+                $entryIntegrity = $this->accounting->auditEntryIntegrity($needsRecon ? 20 : 8);
+            } catch (\Throwable $e) {
+                error_log('Contabilidad integrity: ' . $e->getMessage());
+            }
+        }
+        $needsPendingCounts = $tab === 'dashboard' || $needsPeriods;
+        $pendingQueue = 0;
+        $pendingSync = 0;
+        if ($needsPendingCounts) {
+            try {
+                $pendingQueue = $this->accounting->pendingQueueCount();
+            } catch (\Throwable $e) {
+                $pendingQueue = 0;
+            }
+            try {
+                // Dashboard/periodos: conteo rápido (sin scrapear stock/OC/caja históricos).
+                $pendingSync = max(0, $this->accounting->pendingSyncCount(true) - $pendingQueue);
+            } catch (\Throwable $e) {
+                error_log('Contabilidad pendingSync: ' . $e->getMessage());
+                $pendingSync = 0;
+            }
+        }
 
         $commissionCfg = [];
         $commissionList = ['rows' => [], 'pending' => 0, 'paid' => 0, 'cancelled' => 0];
@@ -310,7 +391,18 @@ class TenantContabilidadController extends TenantController
             'dateFrom' => $from,
             'dateTo' => $to,
             'accounts' => $accounts,
-            'entries' => $needsEntries ? $this->accounting->entries($from, $to) : [],
+            'entries' => $needsEntries
+                ? (function () use ($from, $to, $tab) {
+                    try {
+                        // Dashboard solo necesita pocos; el tab diario usa el límite normal.
+                        $limit = $tab === 'dashboard' ? 12 : 200;
+                        return $this->accounting->entries($from, $to, $limit);
+                    } catch (\Throwable $e) {
+                        error_log('Contabilidad entries: ' . $e->getMessage());
+                        return [];
+                    }
+                })()
+                : [],
             'trialBalance' => $trialBalance,
             'trialReport' => $trialReport,
             'monthlyBalance' => $monthlyBalance,
@@ -329,9 +421,18 @@ class TenantContabilidadController extends TenantController
             'withholdings' => $withholdings,
             'salesBook' => $salesBook,
             'selectedAccountId' => $accountId,
-            'periods' => $needsPeriods ? $this->accounting->periods() : [],
-            'integrationStatuses' => $integrations->statuses(),
-            'activeProvider' => $integrations->settings()->getActiveProvider(),
+            'periods' => (function () use ($needsPeriods) {
+                if (!$needsPeriods) {
+                    return [];
+                }
+                try {
+                    return $this->accounting->periods();
+                } catch (\Throwable $e) {
+                    return [];
+                }
+            })(),
+            'integrationStatuses' => $tab === 'integrations' ? $integrations->statuses() : [],
+            'activeProvider' => $tab === 'integrations' ? $integrations->settings()->getActiveProvider() : null,
             'purchaseSummary' => $purchaseSummary,
             'expenseByType' => $expenseByType,
             'traceMovements' => $trace['rows'],
@@ -341,6 +442,7 @@ class TenantContabilidadController extends TenantController
             'invoiceTraceDir' => $invoiceTraceDir,
             'accountAudit' => $accountAudit,
             'reconciliation' => $reconciliation,
+            'entryIntegrity' => $entryIntegrity,
             'pendingSync' => $pendingSync,
             'pendingQueue' => $pendingQueue,
             'commissionCfg' => $commissionCfg,
@@ -671,6 +773,7 @@ class TenantContabilidadController extends TenantController
     {
         TenantMiddleware::authorize('contabilidad', 'edit');
         try {
+            // Cierre: conteo completo (no quick) para no cerrar con pendientes ocultos.
             $this->accounting->closePeriod(
                 (int)$this->request->post('year'),
                 (int)$this->request->post('month'),
@@ -678,6 +781,23 @@ class TenantContabilidadController extends TenantController
                 trim((string)$this->request->post('notes', '')) ?: null
             );
             $this->respond(true, 'Periodo contable actualizado', '/app/contabilidad?tab=periods');
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/contabilidad?tab=periods');
+        }
+    }
+
+    private function closeFiscalYear(): void
+    {
+        TenantMiddleware::authorize('contabilidad', 'edit');
+        try {
+            $year = (int)$this->request->post('year', date('Y'));
+            $notes = trim((string)$this->request->post('notes', '')) ?: null;
+            $entryId = $this->accounting->closeFiscalYear($year, $notes);
+            $this->respond(
+                true,
+                'Cierre de resultado ' . $year . ' registrado (comprobante #' . $entryId . ')',
+                '/app/contabilidad?tab=periods&entry_id=' . $entryId
+            );
         } catch (\Throwable $e) {
             $this->respond(false, $e->getMessage(), '/app/contabilidad?tab=periods');
         }

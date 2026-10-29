@@ -157,6 +157,10 @@ $sumPresetUrl = static function (string $from, string $to) use ($ventasBase, $su
 $sumMethods = $salesSummary['by_method'] ?? [];
 $sumPending = (float)($salesSummary['pending'] ?? 0);
 $sumTotal = (float)($salesSummary['total'] ?? 0);
+$sumCashOther = $salesSummary['cash_other_payable'] ?? ['amount' => 0.0, 'count' => 0];
+$sumCashOtherAmt = (float)($sumCashOther['amount'] ?? 0);
+$sumCashOtherCnt = (int)($sumCashOther['count'] ?? 0);
+$sumHasBody = $sumTotal > 0.009 || $sumCashOtherAmt > 0.009;
 $sumExportQs = http_build_query(['sum_from' => $salesSummary['from'], 'sum_to' => $salesSummary['to']]);
 $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6', '#6366F1', '#EF4444'];
 ?>
@@ -175,21 +179,25 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
                     <span style="width:<?php echo round(($sumPending / $sumTotal) * 100, 2); ?>%;background:#F59E0B;opacity:.55;" title="Por cobrar"></span>
                 <?php endif; ?>
             </span>
-            <span class="sales-pay-summary__hint"><?php echo count($sumMethods); ?> medio(s)</span>
+            <span class="sales-pay-summary__hint"><?php echo count($sumMethods); ?> medio(s)<?php
+                echo $sumCashOtherAmt > 0.009 ? ' · CxP fuera de caja' : '';
+            ?></span>
+        <?php elseif ($sumCashOtherAmt > 0.009): ?>
+            <span class="sales-pay-summary__hint">Sin ventas · hay pagos CxP fuera de caja</span>
         <?php else: ?>
             <span class="sales-pay-summary__hint">Sin ventas en el periodo</span>
         <?php endif; ?>
-        <?php if ($canExportSale && $sumTotal > 0.009): ?>
+        <?php if ($canExportSale && $sumHasBody): ?>
             <span class="sales-pay-summary__actions" onclick="event.stopPropagation();">
                 <a class="btn btn-secondary btn-sm" data-export-download href="<?php echo $ventasBase; ?>?action=summary_csv&amp;<?php echo htmlspecialchars($sumExportQs); ?>" title="Descargar resumen en CSV">CSV</a>
                 <a class="btn btn-secondary btn-sm" data-export-download href="<?php echo $ventasBase; ?>?action=summary_pdf&amp;<?php echo htmlspecialchars($sumExportQs); ?>" title="Descargar resumen en PDF">PDF</a>
             </span>
         <?php endif; ?>
     </summary>
-    <?php if ($sumTotal > 0.009): ?>
     <div class="sales-pay-summary__body">
+        <div class="sales-pay-summary__methods">
         <?php foreach ($sumMethods as $i => $pm):
-            $pct = round(((float)$pm['amount'] / $sumTotal) * 100, 1);
+            $pct = $sumTotal > 0.009 ? round(((float)$pm['amount'] / $sumTotal) * 100, 1) : 0;
             $color = $sumPalette[$i % count($sumPalette)]; ?>
             <div class="sales-pay-chip" style="border-left-color:<?php echo $color; ?>;">
                 <div class="sales-pay-chip__label"><?php echo htmlspecialchars($pm['label']); ?></div>
@@ -207,8 +215,28 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
                 <div class="sales-pay-chip__track"><span style="width:<?php echo $pct; ?>%;background:#F59E0B;"></span></div>
             </div>
         <?php endif; ?>
+        <?php if ($sumTotal <= 0.009 && $sumPending <= 0.009): ?>
+            <div class="sales-pay-chip sales-pay-chip--empty">
+                <div class="sales-pay-chip__label">Medios de cobro</div>
+                <div class="sales-pay-chip__amount" style="font-size:13px;font-weight:600;">Sin ventas en el periodo</div>
+                <div class="sales-pay-chip__meta">Los chips de la izquierda solo reflejan cobros de ventas</div>
+            </div>
+        <?php endif; ?>
+        </div>
+        <aside class="sales-pay-summary__aside" aria-label="Pagos CxP fuera de caja">
+            <div class="sales-pay-chip sales-pay-chip--cash-other" title="Abonos a proveedores en efectivo que no salieron del cajón (origen «otro fondo» al pagar la factura). No forma parte de los medios de cobro de ventas.">
+                <div class="sales-pay-chip__eyebrow">CxP · no es medio de venta</div>
+                <div class="sales-pay-chip__label">Efectivo fuera de caja</div>
+                <div class="sales-pay-chip__amount"><?php echo fmtV($sumCashOtherAmt, $currency); ?></div>
+                <div class="sales-pay-chip__meta"><?php
+                    echo $sumCashOtherCnt > 0
+                        ? ($sumCashOtherCnt . ' pago(s) de factura · otro fondo')
+                        : 'Sin pagos CxP fuera de caja en el periodo';
+                ?></div>
+                <div class="sales-pay-chip__track"><span style="width:<?php echo $sumCashOtherAmt > 0.009 ? '100' : '0'; ?>%;background:#DC2626;"></span></div>
+            </div>
+        </aside>
     </div>
-    <?php endif; ?>
 </details>
 <?php endif; ?>
 <style>
@@ -229,12 +257,22 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
 .sales-pay-summary__hint { font-size: 12px; color: var(--color-text-secondary); }
 .sales-pay-summary__actions { margin-left: auto; display: inline-flex; gap: 6px; }
 .sales-pay-summary__body {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px;
+    display: flex; flex-wrap: nowrap; align-items: stretch; gap: 16px;
     padding: 12px 16px 14px; border-top: 1px dashed var(--color-border);
+}
+.sales-pay-summary__methods {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px;
+    flex: 1 1 auto; min-width: 0;
+}
+.sales-pay-summary__aside {
+    flex: 0 0 240px; max-width: 260px; margin-left: auto;
+    display: flex; align-items: stretch;
+    padding-left: 16px;
+    border-left: 1px dashed var(--color-border);
 }
 .sales-pay-chip {
     padding: 10px 12px; border: 1px solid var(--color-border); border-left: 4px solid #10B981;
-    border-radius: 8px;
+    border-radius: 8px; width: 100%; box-sizing: border-box;
 }
 .sales-pay-chip__label { font-size: 12px; color: var(--color-text-secondary); }
 .sales-pay-chip__amount { font-size: 16px; font-weight: 700; margin: 2px 0; }
@@ -244,6 +282,27 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
 .sales-pay-chip--pending { border-left-color: #F59E0B; background: rgba(245, 158, 11, 0.06); }
 .sales-pay-chip--pending .sales-pay-chip__label,
 .sales-pay-chip--pending .sales-pay-chip__amount { color: var(--dmc-B45309, #B45309); }
+.sales-pay-chip--empty { border-left-color: #94A3B8; background: rgba(148, 163, 184, 0.08); }
+.sales-pay-chip--cash-other {
+    border-left-color: #DC2626; background: rgba(220, 38, 38, 0.06);
+    border-style: dashed; height: 100%;
+}
+.sales-pay-chip--cash-other .sales-pay-chip__eyebrow {
+    font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+    color: var(--dmc-DC2626, #DC2626); margin-bottom: 2px; opacity: .85;
+}
+.sales-pay-chip--cash-other .sales-pay-chip__label,
+.sales-pay-chip--cash-other .sales-pay-chip__amount { color: var(--dmc-DC2626, #DC2626); }
+@media (max-width: 900px) {
+    .sales-pay-summary__body { flex-wrap: wrap; }
+    .sales-pay-summary__aside {
+        flex: 1 1 100%; max-width: none; margin-left: 0;
+        padding-left: 0; padding-top: 10px; border-left: none;
+        border-top: 1px dashed var(--color-border);
+        justify-content: flex-end;
+    }
+    .sales-pay-chip--cash-other { max-width: 320px; }
+}
 </style>
 <script>
 (function () {
@@ -396,6 +455,7 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
                     <th><?php $viewInstance->partial('sortable_th', ['label'=>'Fecha','column'=>'date','filters'=>$filters,'baseUrl'=>$ventasBase]); ?></th>
                     <th><?php $viewInstance->partial('sortable_th', ['label'=>'Total','column'=>'total','filters'=>$filters,'baseUrl'=>$ventasBase]); ?></th>
                     <th><?php $viewInstance->partial('sortable_th', ['label'=>'Pagado','column'=>'paid','filters'=>$filters,'baseUrl'=>$ventasBase]); ?></th>
+                    <th>Saldo</th>
                     <th><?php $viewInstance->partial('sortable_th', ['label'=>'Pago','column'=>'method','filters'=>$filters,'baseUrl'=>$ventasBase]); ?></th>
                     <th>NC</th>
                     <th><?php $viewInstance->partial('sortable_th', ['label'=>'Estado','column'=>'status','filters'=>$filters,'baseUrl'=>$ventasBase]); ?></th>
@@ -406,12 +466,17 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
                     <?php
                     $ncTot = round((float)($sale['credit_note_total'] ?? 0), 2);
                     $saleTot = round((float)($sale['total'] ?? 0), 2);
+                    $paidAmt = round((float)($sale['paid_amount'] ?? 0), 2);
+                    $balanceDue = isset($sale['balance_due'])
+                        ? round((float)$sale['balance_due'], 2)
+                        : max(0.0, round($saleTot - $ncTot - $paidAmt, 2));
                     $ncFull = $ncTot > 0.009 && $ncTot >= ($saleTot - 0.02);
                     $ncTip = trim((string)($sale['credit_note_numbers'] ?? ''));
                     if ($ncTip === '' && $ncTot > 0.009) {
                         $ncTip = 'Nota(s) de crédito';
                     }
                     $saleObs = \SoftNova\Services\SalesDocumentService::displayNotes((string)($sale['notes'] ?? ''));
+                    $canAbonar = ($sale['status'] ?? '') !== 'cancelled' && $balanceDue > 0.009;
                     ?>
                     <tr<?php echo $ncFull ? ' style="opacity:0.85;"' : ''; ?>>
                         <td>
@@ -435,7 +500,10 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
                                 <div style="font-size:11px;color:var(--color-text-secondary);">Neto <?php echo fmtV(max(0, $saleTot - $ncTot), $currency); ?></div>
                             <?php endif; ?>
                         </td>
-                        <td><?php echo $sale['payment_status'] === 'paid' ? fmtV($saleTot, $currency) : fmtV($sale['paid_amount'] ?? 0, $currency); ?></td>
+                        <td><?php echo $sale['payment_status'] === 'paid' && $balanceDue <= 0.009 ? fmtV($saleTot - $ncTot, $currency) : fmtV($paidAmt, $currency); ?></td>
+                        <td style="font-weight:600;color:<?php echo $balanceDue > 0.009 ? 'var(--dmc-B45309, #B45309)' : 'var(--dmc-059669, #059669)'; ?>;">
+                            <?php echo fmtV($balanceDue, $currency); ?>
+                        </td>
                         <td>
                             <span class="badge <?php echo $sale['payment_method'] === 'cash' ? 'badge-success' : (in_array($sale['payment_method'], ['mixed','card','dataphone','payment_link','transfer','debit_card','credit_card','nequi'], true) ? 'badge-info' : 'badge-warning'); ?>">
                                 <?php echo htmlspecialchars(\SoftNova\Services\PaymentMethodCatalog::label((string)$sale['payment_method'])); ?>
@@ -478,8 +546,12 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
                                 <button type="button" class="btn btn-sm btn-warning" title="Nota de crédito / devolución"
                                     onclick="openSaleCreditNoteModal(<?php echo (int)$sale['id']; ?>)">NC</button>
                             <?php endif; ?>
-                            <?php if (in_array($sale['payment_status'], ['pending', 'partial'])): ?>
-                                <button onclick="openPaymentModal(<?php echo (int)$sale['id']; ?>,<?php echo (float)$sale['total']; ?>,<?php echo (float)($sale['paid_amount'] ?? 0); ?>,<?php echo (float)($sale['credit_note_total'] ?? 0); ?>)" class="btn btn-sm btn-success" title="Registrar abono"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg></button>
+                            <?php if ($canAbonar): ?>
+                                <button type="button"
+                                    onclick="openPaymentModal(<?php echo (int)$sale['id']; ?>,<?php echo (float)$saleTot; ?>,<?php echo (float)$paidAmt; ?>,<?php echo (float)$ncTot; ?>)"
+                                    class="btn btn-sm btn-success" title="Registrar abono · pendiente <?php echo htmlspecialchars(fmtV($balanceDue, $currency)); ?>">
+                                    Abonar
+                                </button>
                             <?php endif; ?>
                             <?php if ($canDeleteSale && $sale['status'] !== 'cancelled'): ?>
                                 <button type="button" class="btn btn-sm btn-danger" title="Eliminar venta"

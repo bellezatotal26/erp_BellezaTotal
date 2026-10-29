@@ -79,6 +79,7 @@ function openInventarioModal() {
         var el = document.getElementById(id);
         if (el) el.value = '';
     });
+    resetProductNotesUi(false);
     setProdUnit('UND');
     document.getElementById('prodType').value = 'product';
     document.getElementById('prodCat').value = '';
@@ -194,13 +195,112 @@ function editProduct(id) {
     var descEl = document.getElementById('prodDesc');
     if (descEl) descEl.value = d.desc || '';
     var notesEl = document.getElementById('prodNotes');
-    if (notesEl) notesEl.value = d.notes || '';
+    if (notesEl) notesEl.value = '';
     var sup = document.getElementById('prodSupplier');
     if (sup) sup.value = d.supplierId || '';
     var sku = document.getElementById('prodSupplierSku');
     if (sku) sku.value = d.supplierSku || '';
     onTypeChange();
+    resetProductNotesUi(true);
+    loadProductNotesHistory(id);
     document.getElementById('productModal').style.display = 'flex';
+}
+
+function resetProductNotesUi(editing) {
+    var section = document.getElementById('prodNotesSection');
+    var wrap = document.getElementById('prodNotesHistoryWrap');
+    var label = document.getElementById('prodNotesLabel');
+    var hint = document.getElementById('prodNotesHint');
+    var modalBox = document.getElementById('productModalContent');
+    var countEl = document.getElementById('prodNotesHistoryCount');
+    var list = document.getElementById('prodNotesHistory');
+    if (section) {
+        section.style.gridTemplateColumns = editing ? '1fr 1fr' : '1fr';
+    }
+    if (wrap) wrap.style.display = editing ? '' : 'none';
+    if (modalBox) modalBox.style.maxWidth = editing ? '820px' : '600px';
+    if (label) {
+        label.innerHTML = editing
+            ? 'Nueva nota interna <span class="field-tip" data-tip="Se agrega al historial con su usuario y fecha al guardar. Deje vacío para no agregar nota.">?</span>'
+            : 'Notas internas <span class="field-tip" data-tip="Al crear o editar, cada texto se agrega al histórico con fecha y usuario. No sobrescribe notas anteriores.">?</span>';
+    }
+    if (hint) {
+        hint.textContent = editing
+            ? 'Al guardar se agrega al histórico (no modifica notas anteriores).'
+            : 'Quedará como nota inicial del producto.';
+    }
+    if (countEl) countEl.textContent = '';
+    if (list) list.innerHTML = '<p style="margin:0;color:var(--color-text-secondary);">Cargando…</p>';
+    if (!editing && list) {
+        list.innerHTML = '<p style="margin:0;color:var(--color-text-secondary);">Sin notas aún</p>';
+    }
+}
+
+function formatProductNoteWhen(iso) {
+    var s = String(iso || '');
+    if (!s) return '—';
+    var d = new Date(s.replace(' ', 'T'));
+    if (isNaN(d.getTime())) return s.substr(0, 16);
+    var pad = function(n) { return n < 10 ? '0' + n : String(n); };
+    return pad(d.getDate()) + '/' + pad(d.getMonth() + 1) + '/' + d.getFullYear()
+        + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function renderProductNotesHistory(notes) {
+    var list = document.getElementById('prodNotesHistory');
+    var countEl = document.getElementById('prodNotesHistoryCount');
+    if (!list) return;
+    notes = Array.isArray(notes) ? notes : [];
+    if (countEl) countEl.textContent = notes.length ? (notes.length + ' nota(s)') : '';
+    if (!notes.length) {
+        list.innerHTML = '<p style="margin:0;color:var(--color-text-secondary);">Sin notas aún. Escriba una a la izquierda y guarde.</p>';
+        return;
+    }
+    var h = '';
+    notes.forEach(function(n) {
+        var who = n.user_name ? esc(n.user_name) : 'Sistema / legado';
+        h += '<div style="padding:8px 0;border-bottom:1px solid var(--color-border);">'
+            + '<div style="font-size:11px;color:var(--color-text-secondary);margin-bottom:3px;">'
+            + '<strong>' + esc(formatProductNoteWhen(n.created_at)) + '</strong> · ' + who
+            + '</div>'
+            + '<div style="white-space:pre-wrap;line-height:1.35;">' + esc(n.note || '') + '</div>'
+            + '</div>';
+    });
+    list.innerHTML = h;
+}
+
+function loadProductNotesHistory(productId) {
+    var url = (window.invRouteProductNotes || (window.invRouteBase + '?action=product_notes'))
+        + '&id=' + encodeURIComponent(productId);
+    fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' }, credentials: 'same-origin' })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            renderProductNotesHistory((d && d.notes) || []);
+        })
+        .catch(function() {
+            renderProductNotesHistory([]);
+        });
+}
+
+function productNotesHistoryHtml(notes) {
+    notes = Array.isArray(notes) ? notes : [];
+    if (!notes.length) {
+        return '<p style="margin:0 0 12px;padding:8px 10px;background:var(--bg-input);border-radius:8px;font-size:13px;color:var(--color-text-secondary);"><strong>Notas internas:</strong> sin historial</p>';
+    }
+    var h = '<div style="margin:0 0 12px;padding:10px 12px;background:var(--bg-input);border-radius:8px;">'
+        + '<strong style="font-size:13px;">Notas internas (' + notes.length + ')</strong>'
+        + '<div style="max-height:220px;overflow:auto;margin-top:8px;">';
+    notes.forEach(function(n) {
+        var who = n.user_name ? esc(n.user_name) : 'Sistema / legado';
+        h += '<div style="padding:8px 0;border-bottom:1px solid var(--color-border);font-size:13px;">'
+            + '<div style="font-size:11px;color:var(--color-text-secondary);margin-bottom:3px;">'
+            + '<strong>' + esc(formatProductNoteWhen(n.created_at)) + '</strong> · ' + who
+            + '</div>'
+            + '<div style="white-space:pre-wrap;line-height:1.35;">' + esc(n.note || '') + '</div>'
+            + '</div>';
+    });
+    h += '</div></div>';
+    return h;
 }
 
 /** Reserva el siguiente EAN de la secuencia (Configuración → Preferencias). */
@@ -531,9 +631,7 @@ function viewDetail(id) {
             h += productCostHistoryHtml(d.cost_history, moneyVal);
         }
         h += '<p style="margin:0 0 12px;padding:8px 10px;background:var(--bg-input);border-radius:8px;font-size:13px;white-space:pre-wrap;"><strong>Descripción:</strong> ' + esc(p.description || '—') + '</p>';
-        if (p.notes) {
-            h += '<p style="margin:0 0 12px;padding:8px 10px;background:var(--bg-input);border-radius:8px;font-size:13px;"><strong>Notas:</strong> ' + esc(p.notes) + '</p>';
-        }
+        h += productNotesHistoryHtml(d.notes_history && d.notes_history.length ? d.notes_history : (p.notes ? [{ note: p.notes, created_at: '', user_name: null }] : []));
         var debts = d.stock_debts || [];
         if (debts.length) {
             h += '<h4>Deuda de stock (vendido sin inventario)</h4><ul style="margin:0 0 12px;padding-left:18px;">';

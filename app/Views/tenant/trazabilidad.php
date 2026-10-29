@@ -98,16 +98,18 @@ $typeLabels = ['in' => 'Entrada', 'out' => 'Salida', 'adjustment' => 'Ajuste'];
             <button class="btn btn-primary" type="submit">Filtrar</button>
             <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/inventario'); ?>?action=traceability#movimientos-stock">Limpiar</a>
             <?php
-            $tracePdfQ = http_build_query(array_filter([
-                'action' => 'traceability_pdf',
+            $traceFilterQ = array_filter([
                 'q' => $filters['q'] ?? null,
                 'type' => $filters['type'] ?? null,
                 'reference_type' => $filters['reference_type'] ?? null,
                 'from' => $filters['from'] ?? null,
                 'to' => $filters['to'] ?? null,
                 'product_id' => $filters['product_id'] ?? null,
-            ], static fn($v) => $v !== null && $v !== ''));
+            ], static fn($v) => $v !== null && $v !== '');
+            $tracePdfQ = http_build_query(array_merge(['action' => 'traceability_pdf'], $traceFilterQ));
+            $traceXlsQ = http_build_query(array_merge(['action' => 'traceability_export'], $traceFilterQ));
             ?>
+            <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/inventario') . '?' . $traceXlsQ; ?>" title="Exportar movimientos del filtro actual a Excel">Exportar Excel</a>
             <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/inventario') . '?' . $tracePdfQ; ?>" target="_blank" title="Descargar PDF detallado">Reporte PDF</a>
             <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/inventario'); ?>">Volver a inventario</a>
             <a class="btn btn-secondary" href="<?php echo $viewInstance->route('app/compras'); ?>">Compras</a>

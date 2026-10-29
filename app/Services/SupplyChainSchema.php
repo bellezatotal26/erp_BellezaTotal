@@ -369,6 +369,9 @@ class SupplyChainSchema
 
             // Fecha real de ingreso a bodega (puede diferir de la fecha de factura)
             ['purchase_invoice_imports', 'warehouse_date', 'DATE NULL AFTER due_date'],
+            // Vencimiento impreso en factura (referencia). due_date = operativo (recepción + plazo).
+            ['purchase_invoice_imports', 'invoice_due_date', 'DATE NULL AFTER due_date'],
+            ['purchase_orders', 'invoice_due_date', 'DATE NULL AFTER due_date'],
 
             // Tipo de documento proveedor: electrónica / normal / remisión (define IVA de líneas e inventario)
             ['purchase_invoice_imports', 'document_kind', "VARCHAR(20) NULL AFTER payment_mode"],

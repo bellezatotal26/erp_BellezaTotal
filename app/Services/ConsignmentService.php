@@ -991,6 +991,9 @@ class ConsignmentService
         }
         $paymentMethod = PaymentMethodCatalog::normalize($paymentMethod) ?: 'cash';
 
+        // DDL contable antes de la TX (MySQL hace COMMIT implícito en CREATE/ALTER).
+        AccountingService::warm($this->db);
+
         $ownTx = !$this->db->inTransaction();
         if ($ownTx) {
             $this->db->beginTransaction();

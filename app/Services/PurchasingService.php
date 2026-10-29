@@ -100,6 +100,10 @@ class PurchasingService
             if (!isset($cols['due_date'])) {
                 $alters[] = 'ADD COLUMN due_date DATE NULL AFTER expected_date';
             }
+            // Fecha impresa en la factura (referencia). El semáforo CxP usa due_date (operativo).
+            if (!isset($cols['invoice_due_date'])) {
+                $alters[] = 'ADD COLUMN invoice_due_date DATE NULL AFTER due_date';
+            }
             if (!isset($cols['invoice_date'])) {
                 $alters[] = 'ADD COLUMN invoice_date DATE NULL AFTER invoice_number';
             }
@@ -180,7 +184,8 @@ class PurchasingService
         $commercialPct = max(0, min(100, (float)(int)round($commercialPct)));
         $commercialAmountInput = max(0, round($commercialAmountInput, 2));
 
-        // Desc. comercial sobre el subtotal (antes de IVA): Total bruto − dcto. líneas − comercial = Sub total → + IVA = Neto.
+        // Desc. comercial sobre el subtotal (antes de IVA).
+        // Orden: Total bruto − dcto. comercial = Sub total → + IVA = Valor neto.
         // Si hay monto en $, prevalece; el % guardado queda en 0 para no recalcular mal después.
         $amountWins = $commercialAmountInput > 0.009;
         $commercialAmt = $amountWins
@@ -189,6 +194,7 @@ class PurchasingService
         $storeCommercialPct = $amountWins ? 0.0 : $commercialPct;
 
         $netSubtotal = max(0, round($subtotal - $commercialAmt, 2));
+        // IVA se suma al Sub total (no al total de línea ni a un bruto que ya lo incluya).
         $afterCommercial = round($netSubtotal + $tax, 2);
         $earlyAmt = round($afterCommercial * ($earlyPct / 100), 2);
         $total = max(0, round($afterCommercial - $earlyAmt, 2));
@@ -1107,7 +1113,7 @@ class PurchasingService
      * (vencimiento, fecha factura, descuento pronto pago).
      *
      * @param array{
-     *   due_date?:?string,invoice_date?:?string,invoice_number?:?string,
+     *   due_date?:?string,invoice_due_date?:?string,invoice_date?:?string,invoice_number?:?string,
      *   early_payment_discount_pct?:float|string|null,
      *   commercial_discount_pct?:float|string|null,
      *   commercial_discount_amount?:float|string|null
@@ -1126,6 +1132,9 @@ class PurchasingService
         $dueDate = array_key_exists('due_date', $meta)
             ? $this->validExpiry($meta['due_date'] ?? null)
             : ($order['due_date'] ?? null);
+        $invoiceDueDate = array_key_exists('invoice_due_date', $meta)
+            ? $this->validExpiry($meta['invoice_due_date'] ?? null)
+            : ($order['invoice_due_date'] ?? null);
         $invoiceDate = array_key_exists('invoice_date', $meta)
             ? $this->validExpiry($meta['invoice_date'] ?? null)
             : ($order['invoice_date'] ?? null);
@@ -1171,6 +1180,7 @@ class PurchasingService
             $this->query(
                 "UPDATE purchase_orders SET
                     due_date = ?,
+                    invoice_due_date = ?,
                     invoice_date = ?,
                     invoice_number = COALESCE(?, invoice_number),
                     early_payment_discount_pct = ?,
@@ -1180,24 +1190,60 @@ class PurchasingService
                     total = ?
                  WHERE id = ?",
                 [
-                    $dueDate, $invoiceDate, $invoiceNumber,
+                    $dueDate, $invoiceDueDate, $invoiceDate, $invoiceNumber,
                     $earlyPct, $disc['early_amount'],
                     $disc['commercial_pct'], $disc['commercial_amount'],
                     $disc['total'], $orderId,
                 ]
             );
         } catch (\Throwable $e) {
+            // Fallback: installs sin invoice_due_date / columnas comerciales.
+            try {
+                $this->query(
+                    "UPDATE purchase_orders SET
+                        due_date = ?,
+                        invoice_date = ?,
+                        invoice_number = COALESCE(?, invoice_number),
+                        early_payment_discount_pct = ?,
+                        early_payment_discount_amount = ?,
+                        commercial_discount_pct = ?,
+                        commercial_discount_amount = ?,
+                        total = ?
+                     WHERE id = ?",
+                    [
+                        $dueDate, $invoiceDate, $invoiceNumber,
+                        $earlyPct, $disc['early_amount'],
+                        $disc['commercial_pct'], $disc['commercial_amount'],
+                        $disc['total'], $orderId,
+                    ]
+                );
+            } catch (\Throwable $e2) {
+                $this->query(
+                    "UPDATE purchase_orders SET
+                        due_date = ?,
+                        invoice_date = ?,
+                        invoice_number = COALESCE(?, invoice_number),
+                        early_payment_discount_pct = ?,
+                        early_payment_discount_amount = ?,
+                        total = ?
+                     WHERE id = ?",
+                    [$dueDate, $invoiceDate, $invoiceNumber, $earlyPct, $disc['early_amount'], $disc['total'], $orderId]
+                );
+            }
+        }
+    }
+
+    /** Guarda solo la fecha de vencimiento impresa en factura (no toca el semáforo CxP). */
+    public function setInvoiceDueDate(int $orderId, ?string $invoiceDueDate): void
+    {
+        $date = $this->validExpiry($invoiceDueDate);
+        try {
             $this->query(
-                "UPDATE purchase_orders SET
-                    due_date = ?,
-                    invoice_date = ?,
-                    invoice_number = COALESCE(?, invoice_number),
-                    early_payment_discount_pct = ?,
-                    early_payment_discount_amount = ?,
-                    total = ?
-                 WHERE id = ?",
-                [$dueDate, $invoiceDate, $invoiceNumber, $earlyPct, $disc['early_amount'], $disc['total'], $orderId]
+                "UPDATE purchase_orders SET invoice_due_date = ? WHERE id = ?",
+                [$date, $orderId]
             );
+        } catch (\Throwable $e) {
+            // Columna aún no migrada: no bloquear recepción/confirmación.
         }
     }
 
@@ -3467,8 +3513,8 @@ class PurchasingService
         }
         try {
             return $this->query(
-                "SELECT po.id, po.order_number, po.invoice_number, po.order_date, po.due_date,
-                        po.total, po.supplier_invoice_value, po.payment_status, s.name supplier_name, po.supplier_id,
+                "SELECT po.id, po.order_number, po.invoice_number, po.order_date, po.due_date, po.invoice_due_date,
+                        po.warehouse_date, po.total, po.supplier_invoice_value, po.payment_status, s.name supplier_name, po.supplier_id,
                         COALESCE((
                             SELECT SUM(sp.amount) FROM supplier_payments sp
                             WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
@@ -3501,7 +3547,45 @@ class PurchasingService
                  LIMIT {$limit}"
             )->fetchAll();
         } catch (\Throwable $e) {
-            return [];
+            // Fallback si invoice_due_date aún no existe en la BD.
+            try {
+                return $this->query(
+                    "SELECT po.id, po.order_number, po.invoice_number, po.order_date, po.due_date,
+                            po.total, po.supplier_invoice_value, po.payment_status, s.name supplier_name, po.supplier_id,
+                            COALESCE((
+                                SELECT SUM(sp.amount) FROM supplier_payments sp
+                                WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                            ), 0) paid_amount,
+                            COALESCE((
+                                SELECT SUM(sp.discount_amount) FROM supplier_payments sp
+                                WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                            ), 0) discount_amount,
+                            COALESCE((
+                                SELECT SUM(cn.total) FROM purchase_credit_notes cn
+                                WHERE cn.purchase_order_id = po.id AND cn.status = 'posted'
+                            ), 0) credit_amount,
+                            DATEDIFF(CURDATE(), po.due_date) days_overdue
+                     FROM purchase_orders po
+                     LEFT JOIN suppliers s ON s.id = po.supplier_id
+                     WHERE po.status = 'received'
+                       AND COALESCE(po.payment_mode, 'payable') = 'payable'
+                       AND COALESCE(NULLIF(po.supplier_invoice_value, 0), po.total) - COALESCE((
+                            SELECT SUM(sp.amount) FROM supplier_payments sp
+                            WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                       ), 0) - COALESCE((
+                            SELECT SUM(sp.discount_amount) FROM supplier_payments sp
+                            WHERE sp.purchase_order_id = po.id AND sp.status = 'applied'
+                       ), 0) - COALESCE((
+                            SELECT SUM(cn.total) FROM purchase_credit_notes cn
+                            WHERE cn.purchase_order_id = po.id AND cn.status = 'posted'
+                       ), 0) > 0.009
+                       {$dueSql}
+                     ORDER BY po.due_date IS NULL, po.due_date, po.id
+                     LIMIT {$limit}"
+                )->fetchAll();
+            } catch (\Throwable $e2) {
+                return [];
+            }
         }
     }
 

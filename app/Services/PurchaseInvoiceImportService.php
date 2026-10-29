@@ -413,9 +413,33 @@ class PurchaseInvoiceImportService
     ): int {
         $invoiceNumber = trim((string)($meta['invoice_number'] ?? '')) ?: trim((string)($header['invoice_number'] ?? ''));
         $invoiceDate = $this->normalizeDate($meta['invoice_date'] ?? null) ?? $this->normalizeDate($header['invoice_date'] ?? null);
-        $dueDate = $this->normalizeDate($meta['due_date'] ?? null) ?? $this->normalizeDate($header['due_date'] ?? null);
+        // Vence en factura = fecha impresa (OCR/header o formulario). Históricamente venía en due_date.
+        $printedDue = $this->normalizeDate($meta['invoice_due_date'] ?? null)
+            ?? $this->normalizeDate($header['invoice_due_date'] ?? null)
+            ?? $this->normalizeDate($header['due_date'] ?? null);
+        $formCxpDue = $this->normalizeDate($meta['due_date'] ?? null);
+        if ($printedDue === null && $formCxpDue !== null) {
+            // Solo llegó un vencimiento → es el impreso (legado / OCR vía form).
+            $printedDue = $formCxpDue;
+        }
+        $invoiceDueDate = $printedDue;
         // Recepción a bodega: lo que el usuario indicó al cargar; si no, hoy (no la fecha de factura).
         $warehouseDate = $this->normalizeDate($meta['warehouse_date'] ?? null) ?? date('Y-m-d');
+        if ($warehouseDate && $invoiceDate && $warehouseDate < $invoiceDate) {
+            $warehouseDate = $invoiceDate;
+        }
+        // Vence pago (CxP): bodega + días de plazo; si no hay plazo → igual a vence en factura.
+        $daysRaw = $meta['payment_term_days'] ?? null;
+        $hasDays = $daysRaw !== null && $daysRaw !== '';
+        if ($hasDays && $warehouseDate) {
+            $dueDate = $this->addDaysToDate($warehouseDate, max(0, (int)$daysRaw));
+            // Si el form ya calculó CxP, preferir ese valor (misma regla, evita desfase TZ).
+            if ($formCxpDue !== null) {
+                $dueDate = $formCxpDue;
+            }
+        } else {
+            $dueDate = $invoiceDueDate;
+        }
         $paymentMode = in_array($meta['payment_mode'] ?? '', ['payable', 'cash', 'transfer', 'card'], true)
             ? (string)$meta['payment_mode']
             : 'payable';
@@ -519,6 +543,16 @@ class PurchaseInvoiceImportService
                 );
             } catch (\Throwable $e) {
                 // Columna aún no migrada: ensureSchema la crea en el siguiente request.
+            }
+        }
+        if ($invoiceDueDate !== null) {
+            try {
+                $this->query(
+                    "UPDATE purchase_invoice_imports SET invoice_due_date = ? WHERE id = ?",
+                    [$invoiceDueDate, $importId]
+                );
+            } catch (\Throwable $e) {
+                // Columna aún no migrada.
             }
         }
 
@@ -635,9 +669,9 @@ class PurchaseInvoiceImportService
             $item['unit_cost'] = $cost;
             $item['tax_rate'] = $tax;
             if ($qty > 0 && $cost >= 0) {
-                $item['line_total'] = $embedVat
-                    ? round($qty * $cost * (1 - $disc / 100), 2)
-                    : round($qty * $cost * (1 - $disc / 100) * (1 + $tax / 100), 2);
+                // Total de línea siempre neto (o bruto si F. Electrónica ya embebió IVA en el costo).
+                // El IVA % de F. Normal vive en tax_rate y se suma al subtotal en refreshTotals / pie.
+                $item['line_total'] = round($qty * $cost * (1 - $disc / 100), 2);
             }
             $out[] = $item;
         }
@@ -748,11 +782,8 @@ class PurchaseInvoiceImportService
                     [$cost, $newTax, $lineTotal, (int)$row['id'], $importId]
                 );
             } else {
-                if ($embedVat) {
-                    $lineTotal = round($qty * $cost * (1 - $dst / 100), 2);
-                } else {
-                    $lineTotal = round($qty * $cost * (1 - $dst / 100) * (1 + $newTax / 100), 2);
-                }
+                // Neto (F. Normal) o bruto ya con IVA en costo (F. Electrónica sin re-embeber).
+                $lineTotal = round($qty * $cost * (1 - $dst / 100), 2);
                 $this->query(
                     "UPDATE purchase_invoice_import_items SET tax_rate = ?, line_total = ? WHERE id = ? AND import_id = ?",
                     [$newTax, $lineTotal, (int)$row['id'], $importId]
@@ -775,8 +806,9 @@ class PurchaseInvoiceImportService
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
 
-        $vatInCost = self::documentEmbedsVatInCost($documentKind);
         $lineNo = 0;
+        /** @var array<int,float> cache sale_price del catálogo por product_id */
+        $catalogSaleCache = [];
         foreach ($items as $item) {
             $descripcion = trim((string)($item['description'] ?? ''));
             $item = $this->normalizeInvoiceLineAmounts($item);
@@ -798,10 +830,30 @@ class PurchaseInvoiceImportService
             $costo = round((float)($item['unit_cost'] ?? 0), 2);
             $descuento = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))));
             $impuesto = round(max(0, (float)($item['tax_rate'] ?? 0)), 2);
-            // F. Electrónica: costo ya trae IVA; no volver a multiplicar.
-            $totalLinea = $vatInCost
-                ? round($cantidad * $costo * (1 - $descuento / 100), 2)
-                : round($cantidad * $costo * (1 - $descuento / 100) * (1 + $impuesto / 100), 2);
+            // Total de línea neto. F. Electrónica: el IVA ya va en unit_cost.
+            // F. Normal: IVA en tax_rate → se suma al subtotal (no al total de línea).
+            $totalLinea = round($cantidad * $costo * (1 - $descuento / 100), 2);
+
+            // P. venta: el del archivo manda; si viene vacío y hay match, el del catálogo.
+            $salePrice = isset($item['sale_price']) && (float)$item['sale_price'] > 0
+                ? round((float)$item['sale_price'], 2)
+                : null;
+            if ($salePrice === null && $autoMatch && !empty($match['product_id'])) {
+                $pid = (int)$match['product_id'];
+                if (!array_key_exists($pid, $catalogSaleCache)) {
+                    try {
+                        $catalogSaleCache[$pid] = (float)$this->query(
+                            "SELECT COALESCE(sale_price, 0) FROM products WHERE id = ? LIMIT 1",
+                            [$pid]
+                        )->fetchColumn();
+                    } catch (\Throwable $e) {
+                        $catalogSaleCache[$pid] = 0.0;
+                    }
+                }
+                if ($catalogSaleCache[$pid] > 0.009) {
+                    $salePrice = round($catalogSaleCache[$pid], 2);
+                }
+            }
 
             $stmt->execute([
                 $importId,
@@ -820,7 +872,7 @@ class PurchaseInvoiceImportService
                 $autoMatch ? 'add_stock' : 'create_product',
                 substr(trim((string)($item['lot_code'] ?? '')), 0, 60) ?: null,
                 $this->normalizeDate($item['expiry_date'] ?? null),
-                isset($item['sale_price']) && (float)$item['sale_price'] > 0 ? round((float)$item['sale_price'], 2) : null,
+                $salePrice,
                 $autoMatch ? (int)($match['confidence'] ?? 0) : 0,
             ]);
 
@@ -2363,6 +2415,9 @@ class PurchaseInvoiceImportService
             return null;
         }
 
+        // Borradores previos al split de fechas: due_date traía el vencimiento impreso.
+        $this->healLegacyImportDueDates($import);
+
         $items = $this->query(
             "SELECT it.*, p.name matched_product_name, p.code matched_product_code,
                     p.stock matched_stock, p.sale_price matched_sale_price, p.track_lots matched_track_lots,
@@ -2373,6 +2428,19 @@ class PurchaseInvoiceImportService
              ORDER BY it.line_no ASC, it.id ASC",
             [$importId]
         )->fetchAll();
+
+        // Borradores viejos sin P. venta: exponer el del catálogo para la plantilla de revisión.
+        foreach ($items as &$it) {
+            $ownSale = round((float)($it['sale_price'] ?? 0), 2);
+            $catSale = round((float)($it['matched_sale_price'] ?? 0), 2);
+            if ($ownSale <= 0.009 && $catSale > 0.009) {
+                $it['sale_price'] = $catSale;
+                $it['sale_price_from_catalog'] = 1;
+            } else {
+                $it['sale_price_from_catalog'] = 0;
+            }
+        }
+        unset($it);
 
         return ['import' => $import, 'items' => $items];
     }
@@ -2455,9 +2523,8 @@ class PurchaseInvoiceImportService
                 $accion = 'create_product';
             }
 
-            $lineTotal = $vatInCost
-                ? round($cantidad * $costo * (1 - $descuento / 100), 2)
-                : round($cantidad * $costo * (1 - $descuento / 100) * (1 + $impuesto / 100), 2);
+            // Neto: el IVA % no se embebe en line_total (se suma al subtotal al refrescar totales).
+            $lineTotal = round($cantidad * $costo * (1 - $descuento / 100), 2);
 
             $stmt->execute([
                 substr(trim((string)($row['description'] ?? '')), 0, 255),
@@ -2608,9 +2675,7 @@ class PurchaseInvoiceImportService
                     : ($cost > 0 ? $cost : (float)$existing['unit_cost']);
                 $useTax = (float)$existing['tax_rate'];
                 $dst = (float)$existing['discount_pct'];
-                $lineTotal = $vatInCost
-                    ? round($newQty * $useCost * (1 - $dst / 100), 2)
-                    : round($newQty * $useCost * (1 - $dst / 100) * (1 + $useTax / 100), 2);
+                $lineTotal = round($newQty * $useCost * (1 - $dst / 100), 2);
                 $this->query(
                     "UPDATE purchase_invoice_import_items
                      SET quantity = ?, unit_cost = ?, line_total = ?
@@ -2626,9 +2691,7 @@ class PurchaseInvoiceImportService
             }
         }
 
-        $lineTotal = $vatInCost
-            ? round($qty * $cost, 2)
-            : round($qty * $cost * (1 + $tax / 100), 2);
+        $lineTotal = round($qty * $cost, 2);
         $sale = $salePrice !== null && $salePrice > 0
             ? round($salePrice, 2)
             : (isset($product['sale_price']) && (float)$product['sale_price'] > 0
@@ -2923,9 +2986,7 @@ class PurchaseInvoiceImportService
                     $newCost = round($newCost * (1 + $useTax / 100), 2);
                 }
                 $dst = (float)($ex['discount_pct'] ?? 0);
-                $lineTotal = $vatInCost
-                    ? round($newQty * $newCost * (1 - $dst / 100), 2)
-                    : round($newQty * $newCost * (1 - $dst / 100) * (1 + $useTax / 100), 2);
+                $lineTotal = round($newQty * $newCost * (1 - $dst / 100), 2);
                 $this->query(
                     "UPDATE purchase_invoice_import_items
                      SET quantity = ?, unit_cost = ?, tax_rate = ?, line_total = ?
@@ -2964,9 +3025,7 @@ class PurchaseInvoiceImportService
                     $ocCost = round($ocCost * (1 + $ocTax / 100), 2);
                 }
             }
-            $lineTotal = $vatInCost
-                ? round($qty * $ocCost, 2)
-                : round($qty * $ocCost * (1 + $ocTax / 100), 2);
+            $lineTotal = round($qty * $ocCost, 2);
             $sale = isset($product['sale_price']) && (float)$product['sale_price'] > 0
                 ? round((float)$product['sale_price'], 2)
                 : null;
@@ -3292,6 +3351,17 @@ class PurchaseInvoiceImportService
                     $headerParams[8],
                 ]
             );
+        }
+
+        if (array_key_exists('invoice_due_date', $meta)) {
+            try {
+                $this->query(
+                    "UPDATE purchase_invoice_imports SET invoice_due_date = ? WHERE id = ? AND status = 'pending'",
+                    [$this->normalizeDate($meta['invoice_due_date'] ?? null), $importId]
+                );
+            } catch (\Throwable $e) {
+                // Columna aún no migrada.
+            }
         }
 
         // IVA personalizado (F. Normal): monto exacto de la factura → 240802 al confirmar.
@@ -3694,11 +3764,26 @@ class PurchaseInvoiceImportService
         }
 
         $purchasing = new PurchasingService($this->db);
-        $fechaFactura = (string)($import['invoice_date'] ?? date('Y-m-d'));
+        $fechaFactura = $this->normalizeDate((string)($import['invoice_date'] ?? '')) ?? date('Y-m-d');
         // Prioridad: lo enviado al confirmar → lo guardado en el borrador → fecha de factura.
         $fechaBodega = $this->normalizeDate($warehouseDate)
             ?? $this->normalizeDate($import['warehouse_date'] ?? null)
             ?? $fechaFactura;
+        if ($fechaBodega < $fechaFactura) {
+            throw new \RuntimeException(
+                'La recepción de bodega (' . $fechaBodega . ') no puede ser anterior a la fecha de factura (' . $fechaFactura . ').'
+            );
+        }
+        // Vence en factura / CxP: si falta el impreso y solo hay due_date legado, ya se sanó en get().
+        $invoiceDue = $this->normalizeDate($import['invoice_due_date'] ?? null);
+        $cxpDue = $this->normalizeDate($import['due_date'] ?? null);
+        if ($invoiceDue === null && $cxpDue !== null) {
+            $invoiceDue = $cxpDue;
+            $import['invoice_due_date'] = $invoiceDue;
+        }
+        if ($cxpDue === null && $invoiceDue !== null) {
+            $import['due_date'] = $invoiceDue;
+        }
 
         $linkedOrderId = !empty($import['linked_order_id']) ? (int)$import['linked_order_id'] : 0;
         $keepOpen = $linkedOrderId > 0 && $ocDisposition === 'keep_open';
@@ -3770,6 +3855,7 @@ class PurchaseInvoiceImportService
                      WHERE id = ?",
                     [$importId, $sourceLabel, $orderId]
                 );
+                $purchasing->setInvoiceDueDate($orderId, $import['invoice_due_date'] ?? null);
                 $sourceRemain = $purchasing->deductOpenOrderQuantities(
                     $linkedOrderId,
                     array_values(array_filter($lineas, static fn($ln) => empty($ln['no_stock']))),
@@ -3779,6 +3865,7 @@ class PurchaseInvoiceImportService
                 $purchasing->replaceOrderItems($linkedOrderId, $lineas);
                 $purchasing->applyInvoiceMeta($linkedOrderId, [
                     'due_date' => $import['due_date'] ?? null,
+                    'invoice_due_date' => $import['invoice_due_date'] ?? null,
                     'invoice_date' => $fechaFactura,
                     'invoice_number' => $import['invoice_number'] ?? null,
                     'early_payment_discount_pct' => $import['early_payment_discount_pct'] ?? 0,
@@ -3817,6 +3904,7 @@ class PurchaseInvoiceImportService
                 "UPDATE purchase_orders SET origin = 'invoice_import', invoice_import_id = ? WHERE id = ?",
                 [$importId, $orderId]
             );
+            $purchasing->setInvoiceDueDate($orderId, $import['invoice_due_date'] ?? null);
         }
 
         // Vincular import → OC ANTES de receiveOrder: si falla después, releaseImportClaim
@@ -3981,7 +4069,8 @@ class PurchaseInvoiceImportService
         $base = round($cantidadFloat * max(0.0, (float)($item['unit_cost'] ?? 0)) * (1 - $descuento / 100), 2);
         $lineTotal = (float)($item['line_total'] ?? 0);
         if ($base <= 0.009 && $lineTotal > 0) {
-            $base = $taxRate > 0.009 ? round($lineTotal / (1 + $taxRate / 100), 2) : round($lineTotal, 2);
+            // line_total del borrador es neto (F. Normal) o bruto con IVA en costo (F. Electrónica).
+            $base = round($lineTotal, 2);
         }
         if ($base <= 0.009) {
             return null;
@@ -5227,6 +5316,7 @@ class PurchaseInvoiceImportService
             return;
         }
 
+        // F. Normal: line_total es neto; total provisional = subtotal + IVA (luego desc. comercial).
         $this->query(
             "UPDATE purchase_invoice_imports i
              SET i.subtotal = COALESCE((
@@ -5239,11 +5329,18 @@ class PurchaseInvoiceImportService
                     FROM purchase_invoice_import_items it
                     WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
                  ), 0),
-                 i.total = COALESCE((
-                    SELECT SUM(it.line_total)
-                    FROM purchase_invoice_import_items it
-                    WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
-                 ), 0)
+                 i.total = ROUND(
+                    COALESCE((
+                        SELECT SUM(ROUND(it.quantity * it.unit_cost * (1 - it.discount_pct / 100), 2))
+                        FROM purchase_invoice_import_items it
+                        WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
+                     ), 0)
+                    + COALESCE((
+                        SELECT SUM(ROUND(it.quantity * it.unit_cost * (1 - it.discount_pct / 100) * (it.tax_rate / 100), 2))
+                        FROM purchase_invoice_import_items it
+                        WHERE it.import_id = i.id AND NOT (it.row_action = 'skip' AND COALESCE(it.match_type, '') = 'purchase_order')
+                     ), 0)
+                 , 2)
              WHERE i.id = ?",
             [$importId]
         );
@@ -5393,6 +5490,79 @@ class PurchaseInvoiceImportService
             }
         }
         return mb_convert_encoding($texto, 'UTF-8', 'UTF-8');
+    }
+
+    /**
+     * Restaura «Vence en factura» en borradores donde el impreso quedó solo en due_date (CxP).
+     * También evita recepción de bodega anterior a la fecha de factura.
+     *
+     * @param array<string,mixed> $import
+     */
+    private function healLegacyImportDueDates(array &$import): void
+    {
+        if (($import['status'] ?? '') !== 'pending') {
+            return;
+        }
+
+        $id = (int)($import['id'] ?? 0);
+        if ($id <= 0) {
+            return;
+        }
+
+        $invoiceDue = $this->normalizeDate(isset($import['invoice_due_date']) ? (string)$import['invoice_due_date'] : null);
+        $cxpDue = $this->normalizeDate(isset($import['due_date']) ? (string)$import['due_date'] : null);
+        $invoiceDate = $this->normalizeDate(isset($import['invoice_date']) ? (string)$import['invoice_date'] : null);
+        $warehouse = $this->normalizeDate(isset($import['warehouse_date']) ? (string)$import['warehouse_date'] : null);
+
+        $sets = [];
+        $params = [];
+
+        if ($invoiceDue === null && $cxpDue !== null) {
+            $invoiceDue = $cxpDue;
+            $import['invoice_due_date'] = $invoiceDue;
+            $sets[] = 'invoice_due_date = ?';
+            $params[] = $invoiceDue;
+        }
+
+        // Sin plazo persistido: CxP operativo = vence en factura.
+        if ($invoiceDue !== null && $cxpDue === null) {
+            $cxpDue = $invoiceDue;
+            $import['due_date'] = $cxpDue;
+            $sets[] = 'due_date = ?';
+            $params[] = $cxpDue;
+        }
+
+        if ($warehouse !== null && $invoiceDate !== null && $warehouse < $invoiceDate) {
+            $warehouse = $invoiceDate;
+            $import['warehouse_date'] = $warehouse;
+            $sets[] = 'warehouse_date = ?';
+            $params[] = $warehouse;
+        }
+
+        if ($sets === []) {
+            return;
+        }
+
+        $params[] = $id;
+        try {
+            $this->query(
+                'UPDATE purchase_invoice_imports SET ' . implode(', ', $sets)
+                . " WHERE id = ? AND status = 'pending'",
+                $params
+            );
+        } catch (\Throwable $e) {
+            // Columnas aún no migradas en installs antiguos.
+        }
+    }
+
+    private function addDaysToDate(string $ymd, int $days): string
+    {
+        $dt = \DateTimeImmutable::createFromFormat('!Y-m-d', $ymd);
+        if (!$dt) {
+            return $ymd;
+        }
+        $suffix = ($days >= 0 ? '+' : '') . $days . ' days';
+        return $dt->modify($suffix)->format('Y-m-d');
     }
 
     private function normalizeDate(?string $date): ?string
