@@ -196,11 +196,11 @@ class CashClosingReportBuilder
             . 'background:#16A34A;font-size:12px;font-weight:700;">' . number_format($margin, 2, ',', '.') . '%</span>';
 
         $html = $kpi(
-            'FACTURADO + BASE',
+            'CAJA INICIAL + FACTURADO',
             htmlspecialchars($fmt($ventasConBase)),
             '#2563EB',
-            '<span style="font-weight:500;font-size:11px;opacity:0.9;"> — ventas del día + apertura ('
-            . $salesCount . ' facturada' . ($salesCount === 1 ? '' : 's') . ')</span>'
+            '<span style="font-weight:500;font-size:11px;opacity:0.9;"> — apertura del cajón + ventas ('
+            . $salesCount . ' facturada' . ($salesCount === 1 ? '' : 's') . '; no es un medio de pago)</span>'
         );
         if ($showCostProfit) {
             $html .= $kpi('COSTO MERCANCÍA', htmlspecialchars($fmt($cost)), '#DC2626');
@@ -259,8 +259,15 @@ class CashClosingReportBuilder
         }
 
         $cashCnt = (int)(($totals['payment_breakdown']['cash']['count'] ?? 0));
+        $collectionsOnly = (int)($totals['collections_only_count'] ?? 0);
+        $cashLabel = $collectionsOnly > 0
+            ? 'Efectivo cobrado <span style="color:#64748B;font-size:10px;">(ventas + abonos)</span>'
+            : 'Efectivo cobrado';
+        if ($cashCnt > 0) {
+            $cashLabel .= ' <span style="color:#64748B;font-size:10px;">(' . $cashCnt . ')</span>';
+        }
         $add(
-            'Ventas efectivo' . ($cashCnt > 0 ? ' <span style="color:#64748B;font-size:10px;">(' . $cashCnt . ')</span>' : ''),
+            $cashLabel,
             '+',
             htmlspecialchars($fmt($cashSales)),
             '#ECFDF5',
@@ -498,6 +505,99 @@ class CashClosingReportBuilder
     }
 
     /**
+     * Adjunta filas de sale_payments a cada venta (para desglose de pago mixto).
+     *
+     * @param list<array<string,mixed>> $sales
+     * @return list<array<string,mixed>>
+     */
+    public static function attachSalePayments(\PDO $db, array $sales): array
+    {
+        $ids = [];
+        foreach ($sales as $s) {
+            $id = (int)($s['id'] ?? 0);
+            if ($id > 0) {
+                $ids[$id] = true;
+            }
+        }
+        if ($ids === []) {
+            return $sales;
+        }
+        $idList = array_keys($ids);
+        $ph = implode(',', array_fill(0, count($idList), '?'));
+        $bySale = [];
+        try {
+            $st = $db->prepare(
+                "SELECT sale_id, amount, payment_method, notes
+                 FROM sale_payments
+                 WHERE sale_id IN ($ph)
+                 ORDER BY id ASC"
+            );
+            $st->execute($idList);
+            foreach ($st->fetchAll(\PDO::FETCH_ASSOC) ?: [] as $row) {
+                $sid = (int)($row['sale_id'] ?? 0);
+                if ($sid <= 0) {
+                    continue;
+                }
+                $bySale[$sid][] = [
+                    'amount' => round((float)($row['amount'] ?? 0), 2),
+                    'payment_method' => (string)($row['payment_method'] ?? 'cash'),
+                    'notes' => (string)($row['notes'] ?? ''),
+                ];
+            }
+        } catch (\Throwable $e) {
+            return $sales;
+        }
+
+        foreach ($sales as &$s) {
+            $sid = (int)($s['id'] ?? 0);
+            $s['payments'] = $bySale[$sid] ?? [];
+        }
+        unset($s);
+
+        return $sales;
+    }
+
+    /**
+     * Texto compacto del desglose: «Efectivo $ 5.000,00 + Nequi $ 4.000,00».
+     *
+     * @param list<array<string,mixed>> $payments
+     * @param callable(float):string|null $fmt
+     */
+    public static function formatPaymentPartsLabel(array $payments, ?callable $fmt = null, ?\PDO $db = null): string
+    {
+        $parts = [];
+        foreach ($payments as $p) {
+            $amt = round((float)($p['amount'] ?? 0), 2);
+            if ($amt < 0.009) {
+                continue;
+            }
+            $label = PaymentMethodCatalog::label((string)($p['payment_method'] ?? 'cash'), $db);
+            $parts[] = $fmt !== null
+                ? ($label . ' ' . $fmt($amt))
+                : ($label . ' ' . number_format($amt, 2, ',', '.'));
+        }
+        return implode(' + ', $parts);
+    }
+
+    /**
+     * ¿La venta debe mostrarse como pago mixto desglosado?
+     *
+     * @param array<string,mixed> $sale
+     */
+    public static function saleHasMixedBreakdown(array $sale): bool
+    {
+        $pm = strtolower(trim((string)($sale['payment_method'] ?? '')));
+        $payments = $sale['payments'] ?? [];
+        if (!is_array($payments)) {
+            return false;
+        }
+        if ($pm === 'mixed') {
+            return count($payments) >= 1;
+        }
+        return count($payments) > 1;
+    }
+
+    /**
      * Medio anterior de cambios registrados antes de guardar "from" en auditoría:
      * solo se puede deducir por el efectivo que entró o salió del cajón.
      */
@@ -530,13 +630,32 @@ class CashClosingReportBuilder
      */
     public static function buildUnifiedActivityHtml(array $sales, array $movements, callable $fmt): string
     {
-        $saleLinked = ['sale', 'sale_cancel', 'sale_payment', 'sale_payment_adjust'];
+        // Ingreso tipado 'sale'/'sale_cancel'/'sale_payment_adjust' ya se refleja
+        // en la fila de venta (mismo operador). Los abonos (sale_payment) SIEMPRE
+        // se listan: pueden ser de otro usuario (caja única) y no son "la venta".
+        // Si el cobro en caja de una venta fue de distinto usuario al vendedor,
+        // también se lista para no perder a Administrador / cajero.
+        $saleLinkedAlways = ['sale', 'sale_cancel', 'sale_payment_adjust'];
+        $saleUserById = [];
+        $saleCreditById = [];
+        foreach ($sales as $sale) {
+            $sid = (int)($sale['id'] ?? 0);
+            if ($sid <= 0) {
+                continue;
+            }
+            $saleUserById[$sid] = trim((string)($sale['user_name'] ?? ''));
+            $pm0 = strtolower(trim((string)($sale['payment_method'] ?? '')));
+            $st0 = strtolower(trim((string)($sale['payment_status'] ?? '')));
+            $saleCreditById[$sid] = ($pm0 === 'credit') || in_array($st0, ['pending', 'partial'], true);
+        }
         $rows = [];
         $discountCount = 0;
         $discountSum = 0.0;
         $changeCount = 0;
         $ncCount = 0;
         $ncSum = 0.0;
+        $abonoCount = 0;
+        $abonoSum = 0.0;
         $noteStyle = 'display:block;margin-top:2px;font-size:10px;';
 
         foreach ($sales as $sale) {
@@ -553,7 +672,7 @@ class CashClosingReportBuilder
                 $discountSum += $disc;
                 $sub = round((float)($sale['subtotal'] ?? 0), 2);
                 $pct = $sub > 0.009 ? ' (' . number_format($disc / $sub * 100, 1, ',', '.') . '%)' : '';
-                $notes .= '<span style="' . $noteStyle . 'color:#B45309;">Descuento aplicado: −'
+                $notes .= '<span style="' . $noteStyle . 'color:#B45309;">Descuento aplicado: -'
                     . htmlspecialchars($fmt($disc)) . $pct
                     . ($sub > 0.009 ? ' · subtotal ' . htmlspecialchars($fmt($sub)) : '')
                     . '</span>';
@@ -612,9 +731,39 @@ class CashClosingReportBuilder
                 $flags[] = 'Cambio pago';
                 $bg = $bg === '' ? '#EFF6FF' : $bg;
             }
+            $pm = strtolower(trim((string)($sale['payment_method'] ?? '')));
+            $payStatus = strtolower(trim((string)($sale['payment_status'] ?? '')));
+            // Crédito / CxC: facturado del día, sin cobro (no es ingreso de caja).
+            $isCreditSale = ($pm === 'credit') || in_array($payStatus, ['pending', 'partial'], true);
+            $isMixedSale = !$isCreditSale && self::saleHasMixedBreakdown($sale);
+            $mixedParts = $isMixedSale
+                ? self::formatPaymentPartsLabel(
+                    is_array($sale['payments'] ?? null) ? $sale['payments'] : [],
+                    $fmt
+                )
+                : '';
+            if ($isCreditSale) {
+                $flags[] = 'Crédito';
+                $bg = $bg === '' ? '#F8FAFC' : $bg;
+            } elseif ($isMixedSale) {
+                $flags[] = 'Mixto';
+                $bg = $bg === '' ? '#EEF2FF' : $bg;
+                if ($mixedParts !== '') {
+                    $notes .= '<span style="' . $noteStyle . 'color:#3730A3;">Desglose mixto: '
+                        . htmlspecialchars($mixedParts) . '</span>';
+                }
+            }
             $flags = array_values(array_unique($flags));
 
             $saleUser = trim((string)($sale['user_name'] ?? ''));
+            $medioLabel = 'Efectivo';
+            if ($isCreditSale) {
+                $medioLabel = 'Crédito';
+            } elseif ($isMixedSale && $mixedParts !== '') {
+                $medioLabel = 'Mixto: ' . $mixedParts;
+            } else {
+                $medioLabel = PaymentMethodCatalog::label((string)($sale['payment_method'] ?? 'cash'));
+            }
             $rows[] = [
                 'ts' => (string)($sale['sale_date'] ?? ''),
                 'sort' => strtotime((string)($sale['sale_date'] ?? 'now')) ?: 0,
@@ -628,36 +777,99 @@ class CashClosingReportBuilder
                 ),
                 'notes_html' => $notes,
                 'bg' => $bg,
-                'medio' => PaymentMethodCatalog::label((string)($sale['payment_method'] ?? 'cash')),
+                'medio' => $medioLabel,
                 'amount' => (float)($sale['total'] ?? 0),
-                'sign' => '+',
-                'color' => '#059669',
+                // Crédito: facturado (informativo), no cobro que entra a caja.
+                'sign' => $isCreditSale ? '' : '+',
+                'color' => $isCreditSale ? '#64748B' : '#059669',
             ];
         }
 
         foreach ($movements as $mov) {
             $rt = (string)($mov['reference_type'] ?? '');
-            if (in_array($rt, $saleLinked, true)) {
-                continue; // ya aparece como venta
-            }
+            $movUser = trim((string)($mov['user_name'] ?? ''));
             $isIncome = (($mov['type'] ?? '') === 'income');
             $isNc = $rt === 'sale_credit_note';
+            $isAbono = $rt === 'sale_payment';
+            $isCashSaleLink = in_array($rt, $saleLinkedAlways, true);
+
+            if ($isCashSaleLink) {
+                // reference_id = sale_id en sale / sale_cancel / sale_payment_adjust
+                $linkedSaleId = (int)($mov['reference_id'] ?? 0);
+                if ($linkedSaleId > 0 && isset($saleUserById[$linkedSaleId])) {
+                    $saleIsCredit = !empty($saleCreditById[$linkedSaleId]);
+                    // Venta a crédito: la fila «Venta» no es cobro → siempre mostrar el movimiento.
+                    if (!$saleIsCredit) {
+                        $saleUser = (string)$saleUserById[$linkedSaleId];
+                        $sameOperator = $movUser === '' || $saleUser === ''
+                            || strcasecmp($movUser, $saleUser) === 0;
+                        // Contado mismo operador: la venta ya atribuye el cobro.
+                        if ($sameOperator) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Abono real en cajón (cash_movements.sale_payment): siempre listar.
+            // Documental no-efectivo: omitir solo si la venta de CONTADO del día
+            // ya está listada (evitar duplicar «Pago · Transferencia»).
+            if ($isAbono) {
+                $isRealCashMov = empty($mov['_meta_only']) && (int)($mov['id'] ?? 0) > 0;
+                if (!$isRealCashMov) {
+                    $linkedSaleId = (int)($mov['linked_sale_id'] ?? 0);
+                    if ($linkedSaleId > 0 && isset($saleUserById[$linkedSaleId]) && empty($saleCreditById[$linkedSaleId])) {
+                        continue;
+                    }
+                }
+            }
+
             $detalle = trim((string)($mov['origin_label'] ?? ''));
             if ($detalle === '') {
                 $detalle = trim((string)($mov['description'] ?? ''));
             }
-            if (!empty($mov['user_name'])) {
-                $detalle = trim($detalle . ' · ' . $mov['user_name']);
+            if ($movUser !== '') {
+                $detalle = trim($detalle . ' · ' . $movUser);
             }
+            $amount = (float)($mov['amount'] ?? 0);
+            if ($isAbono && $isIncome) {
+                $abonoCount++;
+                $abonoSum += $amount;
+            }
+
+            $tipo = 'Ingreso';
+            $flags = [];
+            $bg = '';
+            $medio = 'Caja';
+            if ($isNc) {
+                $tipo = 'NC venta';
+                $flags = ['NC'];
+                $bg = '#FFF7ED';
+            } elseif ($isAbono) {
+                $tipo = 'Abono';
+                $flags = ['Abono crédito'];
+                $bg = '#ECFDF5';
+                $abonoMethod = trim((string)($mov['payment_method'] ?? ''));
+                $medio = $abonoMethod !== ''
+                    ? PaymentMethodCatalog::label($abonoMethod)
+                    : 'Caja';
+            } elseif ($isCashSaleLink && $isIncome) {
+                $tipo = 'Cobro caja';
+                $flags = ['Caja'];
+                $bg = '#F0FDF4';
+            } elseif (!$isIncome) {
+                $tipo = 'Egreso';
+            }
+
             $rows[] = [
                 'ts' => (string)($mov['created_at'] ?? ''),
                 'sort' => strtotime((string)($mov['created_at'] ?? 'now')) ?: 0,
-                'tipo' => $isNc ? 'NC venta' : ($isIncome ? 'Ingreso' : 'Egreso'),
-                'flags' => $isNc ? ['NC'] : [],
+                'tipo' => $tipo,
+                'flags' => $flags,
                 'detalle' => $detalle,
-                'bg' => $isNc ? '#FFF7ED' : '',
-                'medio' => $isIncome ? 'Caja' : 'Caja',
-                'amount' => (float)($mov['amount'] ?? 0),
+                'bg' => $bg,
+                'medio' => $medio,
+                'amount' => $amount,
                 'sign' => $isIncome ? '+' : '−',
                 'color' => $isNc ? '#C2410C' : ($isIncome ? '#059669' : '#DC2626'),
             ];
@@ -676,10 +888,23 @@ class CashClosingReportBuilder
             foreach (($r['flags'] ?? []) as $flag) {
                 $isDisc = $flag === 'Desc.';
                 $isNcFlag = $flag === 'NC' || $flag === 'Devuelta';
+                $isAbonoFlag = $flag === 'Abono crédito';
+                $isCreditFlag = $flag === 'Crédito';
+                $isMixedFlag = $flag === 'Mixto';
+                $badgeStyle = 'background:#DBEAFE;color:#1E40AF;';
+                if ($isDisc) {
+                    $badgeStyle = 'background:#FEF3C7;color:#92400E;';
+                } elseif ($isNcFlag) {
+                    $badgeStyle = 'background:#FFEDD5;color:#9A3412;';
+                } elseif ($isAbonoFlag) {
+                    $badgeStyle = 'background:#D1FAE5;color:#047857;';
+                } elseif ($isCreditFlag) {
+                    $badgeStyle = 'background:#E2E8F0;color:#475569;';
+                } elseif ($isMixedFlag) {
+                    $badgeStyle = 'background:#E0E7FF;color:#3730A3;';
+                }
                 $tipo .= '<br><span style="display:inline-block;margin-top:2px;padding:1px 4px;border-radius:3px;font-size:9px;font-weight:700;'
-                    . ($isDisc
-                        ? 'background:#FEF3C7;color:#92400E;'
-                        : ($isNcFlag ? 'background:#FFEDD5;color:#9A3412;' : 'background:#DBEAFE;color:#1E40AF;')) . '">'
+                    . $badgeStyle . '">'
                     . htmlspecialchars($flag) . '</span>';
             }
             $body .= '<tr' . (!empty($r['bg']) ? ' style="background:' . $r['bg'] . ';"' : '') . '>'
@@ -694,7 +919,7 @@ class CashClosingReportBuilder
         }
 
         $summary = '';
-        if ($discountCount > 0 || $changeCount > 0 || $ncCount > 0) {
+        if ($discountCount > 0 || $changeCount > 0 || $ncCount > 0 || $abonoCount > 0) {
             $parts = [];
             if ($discountCount > 0) {
                 $parts[] = '<span style="color:#92400E;"><strong>' . $discountCount . '</strong> venta'
@@ -707,6 +932,11 @@ class CashClosingReportBuilder
             if ($ncCount > 0) {
                 $parts[] = '<span style="color:#9A3412;"><strong>' . $ncCount . '</strong> venta'
                     . ($ncCount === 1 ? '' : 's') . ' con NC / devolución (' . htmlspecialchars($fmt($ncSum)) . ')</span>';
+            }
+            if ($abonoCount > 0) {
+                $parts[] = '<span style="color:#047857;"><strong>' . $abonoCount . '</strong> abono'
+                    . ($abonoCount === 1 ? '' : 's') . ' a crédito (no son ventas del día · '
+                    . htmlspecialchars($fmt($abonoSum)) . ')</span>';
             }
             $summary = '<p style="margin:0 0 6px;font-size:11px;">' . implode(' &nbsp;·&nbsp; ', $parts) . '</p>';
         }

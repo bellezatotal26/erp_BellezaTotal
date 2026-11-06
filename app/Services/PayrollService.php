@@ -1006,6 +1006,27 @@ class PayrollService
         if (!$employees) {
             throw new \RuntimeException('No hay empleados activos para liquidar');
         }
+        // Filtrar por empleados elegidos en el modal (si vienen IDs válidos).
+        $pickedIds = [];
+        if (!empty($options['employee_ids']) && is_array($options['employee_ids'])) {
+            foreach ($options['employee_ids'] as $rawId) {
+                $id = (int)$rawId;
+                if ($id > 0) {
+                    $pickedIds[$id] = true;
+                }
+            }
+        }
+        if ($pickedIds) {
+            $employees = array_values(array_filter(
+                $employees,
+                static fn (array $emp): bool => isset($pickedIds[(int)($emp['id'] ?? 0)])
+            ));
+            if (!$employees) {
+                throw new \RuntimeException('Seleccione al menos un empleado activo para liquidar');
+            }
+        } else {
+            throw new \RuntimeException('Seleccione al menos un empleado para liquidar');
+        }
         $preRno = !empty($options['schedule_rno']);
         $preOt = !empty($options['schedule_ot']);
         if ($preRno || $preOt) {
@@ -1273,6 +1294,29 @@ class PayrollService
             throw $e;
         }
         return $updated;
+    }
+
+    public function countSchedules(): int
+    {
+        try {
+            return (int)$this->query('SELECT COUNT(*) FROM payroll_schedules')->fetchColumn();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /** Neto de la nómina del mes (prioriza pagada → contabilizada → borrador). */
+    public function monthNetPayroll(int $year, int $month): float
+    {
+        $row = $this->query(
+            "SELECT net_total, status FROM payroll_runs
+             WHERE period_year = ? AND period_month = ?
+               AND status IN ('paid','posted','draft')
+             ORDER BY FIELD(status,'paid','posted','draft'), id DESC
+             LIMIT 1",
+            [$year, $month]
+        )->fetch();
+        return $row ? (float)$row['net_total'] : 0.0;
     }
 
     public function countEmployees(string $status = 'active'): int

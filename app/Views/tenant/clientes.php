@@ -178,11 +178,39 @@ function viewDetail(id) {
             <div><strong>Teléfono:</strong> ${esc(c.phone||'-')}</div>
             <div><strong>Dirección:</strong> ${esc(c.address||'-')}</div>
         </div>`;
-        html += '<h4 style="margin-bottom:10px;">📋 Historial de Compras ('+p.length+')</h4>';
+        html += '<h4 style="margin-bottom:10px;">Historial de Compras ('+p.length+')</h4>';
         if(p.length===0) html += '<p style="color:var(--color-text-secondary);text-align:center;">Sin compras registradas</p>';
         else {
-            html += '<div class="table-container"><table><thead><tr><th>Factura</th><th>Fecha</th><th>Total</th><th>Método</th><th>Vendedor</th></tr></thead><tbody>';
-            p.forEach(s=>{html+=`<tr><td>${esc(s.invoice_number)}</td><td>${s.sale_date?.substr(0,16)}</td><td>$${parseFloat(s.total).toFixed(0)}</td><td>${esc(s.payment_method)}</td><td>${esc(s.user_name||'-')}</td></tr>`});
+            var money = function(n){
+                return '$ '+Number(n||0).toLocaleString('es-CO',{minimumFractionDigits:2,maximumFractionDigits:2});
+            };
+            html += '<div class="table-container"><table><thead><tr>'
+                + '<th>Factura</th><th>Fecha</th><th>Total</th><th>Pagado</th><th>Saldo</th><th>Pago</th><th>Estado</th><th>Vendedor</th>'
+                + '</tr></thead><tbody>';
+            p.forEach(s=>{
+                var fecha = String(s.sale_date || s.created_at || '').replace('T',' ').substr(0,16);
+                var st = String(s.status || 'completed');
+                var pay = String(s.payment_status || '');
+                var balance = Number(s.balance_due != null ? s.balance_due : 0);
+                var paid = Number(s.paid_amount != null ? s.paid_amount : 0);
+                var stLabel = st === 'pending' ? 'Pendiente' : (st === 'completed' ? 'Completada' : st);
+                if (pay === 'partial' || (balance > 0.009 && paid > 0.009)) stLabel = 'Parcial';
+                else if (pay === 'pending' || (balance > 0.009 && st === 'pending')) stLabel = 'Pendiente';
+                else if (pay === 'paid' || balance <= 0.009) stLabel = 'Pagada';
+                var saldoHtml = balance > 0.009
+                    ? '<strong style="color:var(--dmc-B45309,#B45309);">'+money(balance)+'</strong>'
+                    : money(0);
+                html += '<tr>'
+                    + '<td><strong>'+esc(s.invoice_number||'')+'</strong></td>'
+                    + '<td style="white-space:nowrap;">'+esc(fecha)+'</td>'
+                    + '<td>'+money(s.total)+'</td>'
+                    + '<td>'+money(paid)+'</td>'
+                    + '<td>'+saldoHtml+'</td>'
+                    + '<td>'+esc(s.payment_method||'-')+'</td>'
+                    + '<td>'+esc(stLabel)+'</td>'
+                    + '<td>'+esc(s.user_name||'-')+'</td>'
+                    + '</tr>';
+            });
             html+='</tbody></table></div>';
         }
         document.getElementById('detailContent').innerHTML = html;

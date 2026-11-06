@@ -123,7 +123,7 @@ $canCompras = !$isPosRole && \SoftNova\Core\TenantMiddleware::canAccess('compras
 if (!$isPosRole) {
     $pageTopStatsHtml = '
 <div class="page-top-stat" title="Fondo con el que se abrió el cajón (no es venta)"><h4>Base cajón</h4><div class="stat-value">' . htmlspecialchars(fmt((float)$openSession['opening_amount'], $currency)) . '</div></div>
-<div class="page-top-stat" title="Cobros en efectivo de ventas del día (sin la base)"><h4>Efectivo ventas</h4><div class="stat-value page-top-stat--in" id="cajaStatCashSales">+' . htmlspecialchars(fmt((float)($totals['cash_sales'] ?? 0), $currency)) . '</div></div>
+<div class="page-top-stat" title="Efectivo cobrado en la sesión: ventas del día + abonos a crédito (sin la base). Los abonos no suman al facturado."><h4>Efectivo cobrado</h4><div class="stat-value page-top-stat--in" id="cajaStatCashSales">+' . htmlspecialchars(fmt((float)($totals['cash_sales'] ?? 0), $currency)) . '</div></div>
 <div class="page-top-stat" title="Cobros en Nequi, transferencia, tarjetas y otros (no efectivo)"><h4>Otros medios</h4><div class="stat-value page-top-stat--in" id="cajaStatOtherIncomes">+' . htmlspecialchars(fmt((float)($totals['other_incomes'] ?? 0), $currency)) . '</div></div>
 <div class="page-top-stat"><h4>Egresos</h4><div class="stat-value page-top-stat--out" id="cajaStatExpenses">-' . htmlspecialchars(fmt((float)$totals['expenses'], $currency)) . '</div></div>
 <div class="page-top-stat" title="Base + efectivo del día − egresos (lo que debe haber en el cajón)"><h4>En cajón</h4><div class="stat-value ' . ((($totals['expected_cash'] ?? $totals['balance'] ?? 0) >= 0) ? 'page-top-stat--in' : 'page-top-stat--out') . '" id="cajaStatBalance">' . htmlspecialchars(fmt((float)($totals['expected_cash'] ?? $totals['balance'] ?? 0), $currency)) . '</div></div>';
@@ -764,34 +764,39 @@ $canCreateCustomer = \SoftNova\Core\TenantMiddleware::canDo('create', 'clientes'
 <?php
 $payBreakDashboard = $totals['payment_breakdown'] ?? [];
 $payBreakTotalSum = 0.0;
-foreach ($payBreakDashboard as $pbRow) {
+foreach ($payBreakDashboard as $codeDash => $pbRow) {
+    if ((string)$codeDash === 'credit' || !empty($pbRow['informational'])) {
+        continue;
+    }
     $payBreakTotalSum += (float)($pbRow['total'] ?? 0);
 }
 ?>
 <?php if (!empty($payBreakDashboard)): ?>
 <div class="card neumorphic" style="margin-bottom:20px;padding:14px 16px;">
     <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
-        <h3 style="margin:0;font-size:15px;color:var(--color-accent-text, var(--color-primary));">Totales cobrados por medio de pago</h3>
+        <h3 style="margin:0;font-size:15px;color:var(--color-accent-text, var(--color-primary));">Medios de pago y crédito</h3>
         <span style="font-size:12px;color:var(--color-text-secondary);">
-            Suma de cobros de la sesión · Total <?php echo fmt($payBreakTotalSum, $currency); ?>
+            Cobrado (sin crédito) · <?php echo fmt($payBreakTotalSum, $currency); ?>
         </span>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;">
         <?php foreach ($payBreakDashboard as $code => $pb): ?>
             <?php
             $isCash = ($code === 'cash');
-            $cardBg = $isCash ? 'rgba(16,185,129,.08)' : 'var(--bg-body,#f8f8f8)';
-            $cardBorder = $isCash ? '#10B981' : 'var(--color-border)';
+            $isCredit = ((string)$code === 'credit' || !empty($pb['informational']));
+            $cardBg = $isCash ? 'rgba(16,185,129,.08)' : ($isCredit ? 'rgba(100,116,139,.1)' : 'var(--bg-body,#f8f8f8)');
+            $cardBorder = $isCash ? '#10B981' : ($isCredit ? '#94A3B8' : 'var(--color-border)');
             ?>
             <div style="background:<?php echo $cardBg; ?>;border:1px solid <?php echo $cardBorder; ?>;border-radius:8px;padding:10px 12px;">
                 <div style="font-size:12px;color:var(--color-text-secondary);margin-bottom:4px;">
                     <?php echo htmlspecialchars((string)($pb['label'] ?? $code)); ?>
                 </div>
-                <div style="font-size:18px;font-weight:700;line-height:1.2;">
+                <div style="font-size:18px;font-weight:700;line-height:1.2;<?php echo $isCredit ? 'color:#64748B;' : ''; ?>">
                     <?php echo fmt((float)($pb['total'] ?? 0), $currency); ?>
                 </div>
                 <div style="font-size:11px;color:var(--color-text-secondary);margin-top:4px;">
-                    <?php echo (int)($pb['count'] ?? 0); ?> cobro(s)
+                    <?php echo (int)($pb['count'] ?? 0); ?>
+                    <?php echo $isCredit ? ' venta(s) · no entra a caja' : ' cobro(s)'; ?>
                 </div>
             </div>
         <?php endforeach; ?>
@@ -799,7 +804,7 @@ foreach ($payBreakDashboard as $pbRow) {
     <?php if (isset($totals['expected_cash'])): ?>
     <p style="margin:12px 0 0;font-size:12px;color:var(--color-text-secondary);">
         En cajón = base <?php echo fmt((float)$openSession['opening_amount'], $currency); ?>
-        + efectivo ventas <?php echo fmt((float)($totals['cash_sales'] ?? 0), $currency); ?>
+        + efectivo cobrado <?php echo fmt((float)($totals['cash_sales'] ?? 0), $currency); ?>
         <?php if ((float)($totals['other_cash_incomes'] ?? 0) > 0.009): ?>
         + otros ingresos <?php echo fmt((float)$totals['other_cash_incomes'], $currency); ?>
         <?php endif; ?>
@@ -1042,29 +1047,46 @@ window.CajaLiveSyncConfig = <?php echo json_encode([
                             $payBreakSum += (float)($pbTmp['total'] ?? 0);
                         }
                         if (!empty($payBreak)):
+                            $payBreakCollectedSum = 0.0;
+                            foreach ($payBreak as $codeTmp => $pbTmp) {
+                                if ((string)$codeTmp === 'credit' || !empty($pbTmp['informational'])) {
+                                    continue;
+                                }
+                                $payBreakCollectedSum += (float)($pbTmp['total'] ?? 0);
+                            }
                         ?>
-                            <div style="font-weight:700;margin-bottom:8px;font-size:14px;">Totales cobrados por medio de pago</div>
+                            <div style="font-weight:700;margin-bottom:8px;font-size:14px;">Medios de pago y crédito</div>
                             <p style="margin:0 0 10px;font-size:12px;color:var(--color-text-secondary);">
-                                Aquí ve cuánto entró en cada medio (efectivo, Nequi, Daviplata, tarjeta, etc.).
+                                Cobros reales (efectivo, Nequi, transferencia…) y ventas a crédito del día (informativo, no entran al cajón).
                             </p>
                             <?php foreach ($payBreak as $code => $pb): ?>
-                                <?php $isCashMethod = ($code === 'cash'); ?>
-                                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;padding:8px 10px;border-radius:6px;background:<?php echo $isCashMethod ? 'rgba(16,185,129,.1)' : 'var(--bg-body,#f5f5f5)'; ?>;">
+                                <?php
+                                $isCashMethod = ($code === 'cash');
+                                $isCreditMethod = ((string)$code === 'credit' || !empty($pb['informational']));
+                                $bg = $isCashMethod
+                                    ? 'rgba(16,185,129,.1)'
+                                    : ($isCreditMethod ? 'rgba(100,116,139,.12)' : 'var(--bg-body,#f5f5f5)');
+                                ?>
+                                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;padding:8px 10px;border-radius:6px;background:<?php echo $bg; ?>;">
                                     <span>
                                         <strong><?php echo htmlspecialchars((string)($pb['label'] ?? '')); ?></strong>
-                                        <span style="color:var(--color-text-secondary);font-size:11px;"> · <?php echo (int)($pb['count'] ?? 0); ?> cobro(s)</span>
+                                        <span style="color:var(--color-text-secondary);font-size:11px;">
+                                            · <?php echo (int)($pb['count'] ?? 0); ?>
+                                            <?php echo $isCreditMethod ? ' venta(s)' : ' cobro(s)'; ?>
+                                            <?php if ($isCreditMethod): ?> · no entra a caja<?php endif; ?>
+                                        </span>
                                     </span>
-                                    <strong style="font-size:15px;<?php echo $isCashMethod ? 'color:var(--dmc-059669, #059669);' : ''; ?>">
+                                    <strong style="font-size:15px;<?php echo $isCashMethod ? 'color:var(--dmc-059669, #059669);' : ($isCreditMethod ? 'color:#64748B;' : ''); ?>">
                                         <?php echo fmt((float)($pb['total'] ?? 0), $currency); ?>
                                     </strong>
                                 </div>
                             <?php endforeach; ?>
                             <div style="display:flex;justify-content:space-between;border-top:1px dashed var(--color-border);padding-top:8px;margin-top:4px;font-size:12px;">
-                                <span>Suma de todos los medios</span>
-                                <strong><?php echo fmt($payBreakSum, $currency); ?></strong>
+                                <span>Suma cobrada (sin crédito)</span>
+                                <strong><?php echo fmt($payBreakCollectedSum, $currency); ?></strong>
                             </div>
                         <?php else: ?>
-                            <div style="color:var(--color-text-secondary);">Sin cobros por medio de pago en esta sesión.</div>
+                            <div style="color:var(--color-text-secondary);">Sin cobros ni ventas a crédito en esta sesión.</div>
                         <?php endif; ?>
                     </div>
                     <div style="display:flex;justify-content:space-between;border-top:1px solid var(--color-border);padding-top:8px;margin-top:4px;">
@@ -1851,7 +1873,7 @@ $cajaBase = $viewInstance->route('app/caja');
         <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 12px;line-height:1.45;">
             <strong>Contado cajón</strong> = solo efectivo físico (base + ventas en efectivo − egresos).
             <strong>Ventas del día</strong> = todos los medios (transferencia, Nequi, tarjetas, efectivo…).
-            Use <strong>Detalle</strong> para ver el desglose completo antes del PDF.
+            Use <strong>Detalle</strong> para ver el desglose completo antes del PDF o Excel.
         </p>
         <div class="table-container"><table>
             <thead>
@@ -1920,6 +1942,7 @@ $cajaBase = $viewInstance->route('app/caja');
                     <td style="white-space:nowrap;">
                         <button type="button" class="btn btn-sm btn-primary" onclick="cajaShowClosingDetail(<?php echo (int)$h['id']; ?>)" title="Ver detalle del cierre">Detalle</button>
                         <a href="<?php echo $cajaBase; ?>?action=pdf&id=<?php echo (int)$h['id']; ?>" class="btn btn-sm btn-info" target="_blank" rel="noopener" title="Descargar PDF">PDF</a>
+                        <a href="<?php echo $cajaBase; ?>?action=excel&id=<?php echo (int)$h['id']; ?>" class="btn btn-sm btn-success" title="Descargar Excel detallado">Excel</a>
                         <button type="button" class="btn btn-sm btn-secondary" onclick="cajaShareWhatsapp(<?php echo (int)$h['id']; ?>)" title="Enviar por WhatsApp">WhatsApp</button>
                         <button type="button" class="btn btn-sm btn-secondary" onclick="cajaShareEmail(<?php echo (int)$h['id']; ?>)" title="Enviar por correo">Correo</button>
                     </td>
@@ -1942,6 +1965,7 @@ $cajaBase = $viewInstance->route('app/caja');
         <div class="modal-footer" style="flex-wrap:wrap;gap:8px;">
             <button type="button" class="btn btn-secondary" onclick="document.getElementById('cajaClosingDetailModal').style.display='none'">Cerrar</button>
             <a href="#" class="btn btn-info" id="cajaClosingDetailPdf" target="_blank" rel="noopener">PDF</a>
+            <a href="#" class="btn btn-success" id="cajaClosingDetailExcel">Excel</a>
             <button type="button" class="btn btn-secondary" id="cajaClosingDetailWa">WhatsApp</button>
             <button type="button" class="btn btn-secondary" id="cajaClosingDetailMail">Correo</button>
         </div>
@@ -2057,11 +2081,13 @@ $cajaBase = $viewInstance->route('app/caja');
         var body = document.getElementById('cajaClosingDetailBody');
         var title = document.getElementById('cajaClosingDetailTitle');
         var pdf = document.getElementById('cajaClosingDetailPdf');
+        var excel = document.getElementById('cajaClosingDetailExcel');
         var wa = document.getElementById('cajaClosingDetailWa');
         var mail = document.getElementById('cajaClosingDetailMail');
         if (title) title.textContent = 'Detalle de cierre #' + sessionId;
         if (body) body.innerHTML = '<p style="color:var(--color-text-secondary);">Cargando…</p>';
         if (pdf) pdf.href = window.cajaBase + '?action=pdf&id=' + encodeURIComponent(sessionId);
+        if (excel) excel.href = window.cajaBase + '?action=excel&id=' + encodeURIComponent(sessionId);
         if (wa) wa.onclick = function() { cajaShareWhatsapp(sessionId); };
         if (mail) mail.onclick = function() { cajaShareEmail(sessionId); };
         if (modal) modal.style.display = 'flex';
@@ -2109,7 +2135,7 @@ $cajaBase = $viewInstance->route('app/caja');
                 if (p.is_cash) return;
                 accountHtml += row(cajaEsc(p.label) + ' (' + (p.count || 0) + ')', 'i', cajaEsc(p.total_fmt));
             });
-            accountHtml += row('Ventas efectivo', '+', cajaEsc(dr.cash_sales_fmt), 'rgba(16,185,129,.12)', 'color:var(--dmc-059669, #059669);');
+            accountHtml += row('Efectivo cobrado (ventas + abonos)', '+', cajaEsc(dr.cash_sales_fmt), 'rgba(16,185,129,.12)', 'color:var(--dmc-059669, #059669);');
             if ((sa.discount || 0) > 0.009) {
                 accountHtml += row('Descuentos', 'i', cajaEsc(sa.discount_fmt), '', 'color:var(--dmc-B45309, #B45309);');
             }
@@ -2187,12 +2213,25 @@ $cajaBase = $viewInstance->route('app/caja');
             var userHtml = '';
             if (byUser.length) {
                 userHtml = '<div style="border:1px solid var(--color-border,#e5e7eb);border-radius:8px;overflow:hidden;margin-bottom:14px;">'
-                    + '<div style="padding:8px 10px;background:var(--bg-body,#f8fafc);font-weight:700;font-size:13px;">Por usuario (caja única)</div>';
+                    + '<div style="padding:8px 10px;background:var(--bg-body,#f8fafc);font-weight:700;font-size:13px;">Por usuario (caja única)</div>'
+                    + '<div style="padding:6px 10px;font-size:11px;color:var(--color-text-secondary);border-bottom:1px solid var(--color-border,#e5e7eb);">'
+                    + 'Cajón = efectivo. Abonos por transferencia u otros medios se muestran aparte (no suman al cajón).</div>';
                 byUser.forEach(function(u) {
+                    var abonosN = Number(u.abonos_count || 0);
+                    var abonosLine = '';
+                    if (abonosN > 0) {
+                        abonosLine = '<div style="font-size:11px;color:var(--dmc-047857,#047857);margin-top:2px;">Abonos crédito: '
+                            + abonosN + ' · ' + cajaEsc(u.abonos_total_fmt || '—');
+                        if (Number(u.abonos_other || 0) > 0.009) {
+                            abonosLine += ' <span style="opacity:.85;">(otros medios ' + cajaEsc(u.abonos_other_fmt || '') + ')</span>';
+                        }
+                        abonosLine += '</div>';
+                    }
                     userHtml += '<div style="display:flex;justify-content:space-between;gap:8px;padding:7px 10px;border-bottom:1px solid var(--color-border,#e5e7eb);font-size:12px;">'
-                        + '<span><strong>' + cajaEsc(u.user_name) + '</strong> · ' + (u.count || 0) + ' mov.</span>'
+                        + '<span><strong>' + cajaEsc(u.user_name) + '</strong> · ' + (u.count || 0) + ' mov. cajón'
+                        + abonosLine + '</span>'
                         + '<span style="text-align:right;">+ ' + cajaEsc(u.incomes_fmt) + ' · − ' + cajaEsc(u.expenses_fmt)
-                        + '<br><strong>Neto ' + cajaEsc(u.net_fmt) + '</strong></span></div>';
+                        + '<br><strong>Neto cajón ' + cajaEsc(u.net_fmt) + '</strong></span></div>';
                 });
                 userHtml += '</div>';
             }
@@ -2203,12 +2242,19 @@ $cajaBase = $viewInstance->route('app/caja');
                     + '<div style="max-height:320px;overflow:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;">'
                     + '<thead><tr><th style="text-align:left;padding:6px 8px;">Hora</th><th style="text-align:left;padding:6px 8px;">Usuario</th><th style="text-align:left;padding:6px 8px;">Tipo</th><th style="text-align:left;padding:6px 8px;">Descripción</th><th style="text-align:right;padding:6px 8px;">Monto</th></tr></thead><tbody>';
                 movs.forEach(function(m) {
-                    movHtml += '<tr style="border-top:1px solid var(--color-border,#e5e7eb);">'
+                    var isCreditSale = !!m.is_credit_sale;
+                    var isMixedSale = !!m.is_mixed_sale;
+                    var rowBg = isCreditSale
+                        ? 'background:rgba(100,116,139,.08);'
+                        : (isMixedSale ? 'background:rgba(99,102,241,.08);' : '');
+                    movHtml += '<tr style="border-top:1px solid var(--color-border,#e5e7eb);' + rowBg + '">'
                         + '<td style="padding:5px 8px;">' + cajaEsc(m.time) + '</td>'
                         + '<td style="padding:5px 8px;"><strong>' + cajaEsc(m.user_name) + '</strong></td>'
                         + '<td style="padding:5px 8px;">' + cajaEsc(m.type_label) + '</td>'
                         + '<td style="padding:5px 8px;">' + cajaEsc(m.description) + '</td>'
-                        + '<td style="padding:5px 8px;text-align:right;"><strong>' + cajaEsc(m.amount_fmt) + '</strong></td></tr>';
+                        + '<td style="padding:5px 8px;text-align:right;"><strong>'
+                        + cajaEsc(m.amount_fmt)
+                        + '</strong></td></tr>';
                 });
                 movHtml += '</tbody></table></div></div>';
             }
@@ -2225,8 +2271,8 @@ $cajaBase = $viewInstance->route('app/caja');
                 body.innerHTML = '<p style="margin:0 0 12px;font-size:13px;color:var(--color-text-secondary);">'
                     + 'Abierta por ' + cajaEsc(d.user_name) + ' · ' + cajaEsc(d.opening_date) + ' → ' + cajaEsc(d.closing_date) + '</p>'
                     + closingObsHtml
-                    + kpi('FACTURADO + BASE', cajaEsc(sa.ventas_totales_con_base_fmt || sa.total_fmt), '#2563EB',
-                        ' <span style="font-weight:500;font-size:11px;opacity:.9;">ventas del día + apertura</span>')
+                    + kpi('CAJA INICIAL + FACTURADO', cajaEsc(sa.ventas_totales_con_base_fmt || sa.total_fmt), '#2563EB',
+                        ' <span style="font-weight:500;font-size:11px;opacity:.9;">apertura del cajón + ventas (no es medio de pago)</span>')
                     + marginToggle
                     + marginBlock
                     + '<p style="margin:4px 0 12px;font-size:12px;color:var(--color-text-secondary);line-height:1.4;">'
@@ -2471,6 +2517,7 @@ $cajaBasePos = $viewInstance->route('app/caja');
             '<div class="modal-body"><p style="margin-top:0;">Enviar reporte de cierre:</p>' +
             '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
             '<a class="btn btn-info" target="_blank" rel="noopener" href="' + window.cajaBase + '?action=pdf&id=' + encodeURIComponent(shareId) + '">PDF</a>' +
+            '<a class="btn btn-success" href="' + window.cajaBase + '?action=excel&id=' + encodeURIComponent(shareId) + '">Excel</a>' +
             '<button type="button" class="btn btn-secondary" id="cajaPosShareWa">WhatsApp</button>' +
             '<button type="button" class="btn btn-secondary" id="cajaPosShareMail">Correo</button>' +
             '</div></div>' +

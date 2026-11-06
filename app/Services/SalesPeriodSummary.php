@@ -59,6 +59,10 @@ final class SalesPeriodSummary
         $methods = [];
         $add = static function (string $method, float $amount, int $count) use (&$methods): void {
             $m = PaymentMethodCatalog::normalize($method !== '' ? $method : 'cash');
+            // «mixed» no es un medio cobrado: el desglose real va en sale_payments.
+            if ($m === 'mixed' || abs($amount) < 0.005) {
+                return;
+            }
             if (!isset($methods[$m])) {
                 $methods[$m] = ['amount' => 0.0, 'count' => 0];
             }
@@ -67,18 +71,57 @@ final class SalesPeriodSummary
         };
 
         try {
+            // Cobros reales por medio. Tope por venta = total facturado (evita inflar
+            // efectivo con billete recibido / filas de pago descuadradas).
+            // No incluye base de cajón (opening_amount): eso solo vive en cash_sessions.
             $st = $db->prepare(
-                "SELECT sp.payment_method m, COUNT(DISTINCT sp.sale_id) c, COALESCE(SUM(sp.amount), 0) a
+                "SELECT sp.sale_id, sp.payment_method m, sp.amount a, s.total sale_total
                  FROM sale_payments sp
                  INNER JOIN sales s ON s.id = sp.sale_id
                  WHERE {$active}
-                 GROUP BY sp.payment_method"
+                 ORDER BY sp.sale_id, sp.id"
             );
             $st->execute($range);
+            $bySale = [];
             foreach ($st->fetchAll(\PDO::FETCH_ASSOC) ?: [] as $r) {
-                $add((string)$r['m'], (float)$r['a'], (int)$r['c']);
+                $sid = (int)($r['sale_id'] ?? 0);
+                if ($sid <= 0) {
+                    continue;
+                }
+                if (!isset($bySale[$sid])) {
+                    $bySale[$sid] = [
+                        'cap' => max(0.0, round((float)($r['sale_total'] ?? 0), 2)),
+                        'used' => 0.0,
+                        'parts' => [],
+                    ];
+                }
+                $method = (string)($r['m'] ?? 'cash');
+                $amt = round((float)($r['a'] ?? 0), 2);
+                if ($amt <= 0.009) {
+                    continue;
+                }
+                $remain = round($bySale[$sid]['cap'] - $bySale[$sid]['used'], 2);
+                if ($remain <= 0.009) {
+                    continue;
+                }
+                $take = min($amt, $remain);
+                $bySale[$sid]['used'] = round($bySale[$sid]['used'] + $take, 2);
+                if (!isset($bySale[$sid]['parts'][$method])) {
+                    $bySale[$sid]['parts'][$method] = ['amount' => 0.0, 'count' => 0];
+                }
+                $bySale[$sid]['parts'][$method]['amount'] = round(
+                    $bySale[$sid]['parts'][$method]['amount'] + $take,
+                    2
+                );
+                $bySale[$sid]['parts'][$method]['count']++;
+            }
+            foreach ($bySale as $saleBag) {
+                foreach ($saleBag['parts'] as $method => $part) {
+                    $add((string)$method, (float)$part['amount'], 1);
+                }
             }
 
+            // Ventas pagadas sin filas de pago (instalaciones viejas): un solo medio en cabecera.
             $st = $db->prepare(
                 "SELECT s.payment_method m, COUNT(*) c, COALESCE(SUM(s.total), 0) a
                  FROM sales s
@@ -94,9 +137,13 @@ final class SalesPeriodSummary
         } catch (\Throwable $e) {
             $methods = [];
             try {
+                // Fallback: solo cobrado (paid/partial), nunca créditos abiertos como efectivo.
                 $st = $db->prepare(
                     "SELECT s.payment_method m, COUNT(*) c, COALESCE(SUM(s.total), 0) a
-                     FROM sales s WHERE {$active} GROUP BY s.payment_method"
+                     FROM sales s
+                     WHERE {$active}
+                       AND s.payment_status IN ('paid', 'partial')
+                     GROUP BY s.payment_method"
                 );
                 $st->execute($range);
                 foreach ($st->fetchAll(\PDO::FETCH_ASSOC) ?: [] as $r) {

@@ -11,6 +11,12 @@ class ProductSupplierService
 {
     private \PDO $db;
 
+    /** @var list<array{id:int,name:string,norm:string}>|null */
+    private ?array $productNameIndex = null;
+
+    /** @var array<int, list<array{id:int,name:string,norm:string}>> */
+    private array $supplierNameIndex = [];
+
     public function __construct(\PDO $db)
     {
         $this->db = $db;
@@ -177,7 +183,8 @@ class ProductSupplierService
 
     /**
      * Busca el producto que corresponde a una línea de factura del proveedor.
-     * Prioridad: EAN/barcode → SKU proveedor → código interno → nombre exacto.
+     * Prioridad: EAN/barcode → SKU proveedor → código interno → nombre exacto
+     * (case-insensitive / normalizado) → nombre similar / alias del proveedor.
      *
      * @return array{product_id:int,match_type:string,confidence:int}|null
      */
@@ -226,16 +233,251 @@ class ProductSupplierService
         }
 
         if ($description !== '') {
-            $row = $this->query(
-                "SELECT id FROM products WHERE name = ? AND status = 'active' LIMIT 1",
-                [$description]
-            )->fetch();
-            if ($row) {
-                return ['product_id' => (int)$row['id'], 'match_type' => 'name', 'confidence' => 80];
+            $byName = $this->matchByProductName($supplierId, $description);
+            if ($byName !== null) {
+                return $byName;
             }
         }
 
         return null;
+    }
+
+    /**
+     * Empareja por nombre de inventario o alias del proveedor (exacto → normalizado → similar).
+     *
+     * @return array{product_id:int,match_type:string,confidence:int}|null
+     */
+    private function matchByProductName(?int $supplierId, string $description): ?array
+    {
+        $description = trim($description);
+        if ($description === '') {
+            return null;
+        }
+        $needle = $this->normalizeProductName($description);
+        if ($needle === '' || mb_strlen($needle) < 3) {
+            return null;
+        }
+
+        // Exacto (mayúsculas/minúsculas e espacios extremos).
+        $row = $this->query(
+            "SELECT id FROM products
+             WHERE status = 'active' AND LOWER(TRIM(name)) = LOWER(?)
+             LIMIT 1",
+            [$description]
+        )->fetch();
+        if ($row) {
+            return ['product_id' => (int)$row['id'], 'match_type' => 'name', 'confidence' => 92];
+        }
+
+        // Alias guardado en vínculo proveedor (mismo texto de factura que ya se usó).
+        if ($supplierId && $supplierId > 0) {
+            $row = $this->query(
+                "SELECT ps.product_id
+                 FROM product_suppliers ps
+                 INNER JOIN products p ON p.id = ps.product_id
+                 WHERE ps.supplier_id = ?
+                   AND ps.status = 'active'
+                   AND p.status = 'active'
+                   AND LOWER(TRIM(COALESCE(ps.supplier_product_name, ''))) = LOWER(?)
+                 LIMIT 1",
+                [$supplierId, $description]
+            )->fetch();
+            if ($row) {
+                return ['product_id' => (int)$row['product_id'], 'match_type' => 'name', 'confidence' => 90];
+            }
+        }
+
+        $bestId = 0;
+        $bestScore = 0.0;
+        $bestType = 'name_similar';
+
+        $candidates = $this->productNameIndex();
+        if ($supplierId && $supplierId > 0) {
+            $candidates = array_merge($candidates, $this->supplierProductNameIndex($supplierId));
+        }
+
+        foreach ($candidates as $cand) {
+            $hay = (string)($cand['norm'] ?? '');
+            if ($hay === '') {
+                continue;
+            }
+            if ($hay === $needle) {
+                return [
+                    'product_id' => (int)$cand['id'],
+                    'match_type' => 'name',
+                    'confidence' => 90,
+                ];
+            }
+
+            $score = $this->nameSimilarityScore($needle, $hay);
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $bestId = (int)$cand['id'];
+                $bestType = 'name_similar';
+            }
+        }
+
+        // Umbral alto: auto-emparejar en la revisión (confidence >= 80 en el import).
+        if ($bestId > 0 && $bestScore >= 88.0) {
+            return [
+                'product_id' => $bestId,
+                'match_type' => $bestType,
+                'confidence' => (int)min(89, max(80, round($bestScore))),
+            ];
+        }
+        // Similar razonable: sugerir con confianza media-alta (aún auto-selecciona).
+        if ($bestId > 0 && $bestScore >= 80.0) {
+            return [
+                'product_id' => $bestId,
+                'match_type' => 'name_similar',
+                'confidence' => (int)min(84, max(80, round($bestScore))),
+            ];
+        }
+
+        return null;
+    }
+
+    /**
+     * @return list<array{id:int,name:string,norm:string}>
+     */
+    private function productNameIndex(): array
+    {
+        if ($this->productNameIndex !== null) {
+            return $this->productNameIndex;
+        }
+        $this->productNameIndex = [];
+        try {
+            $rows = $this->query(
+                "SELECT id, name FROM products
+                 WHERE status = 'active' AND TRIM(COALESCE(name, '')) <> ''
+                 ORDER BY id DESC
+                 LIMIT 8000"
+            )->fetchAll() ?: [];
+        } catch (\Throwable $e) {
+            return $this->productNameIndex;
+        }
+        foreach ($rows as $r) {
+            $name = trim((string)($r['name'] ?? ''));
+            if ($name === '') {
+                continue;
+            }
+            $this->productNameIndex[] = [
+                'id' => (int)$r['id'],
+                'name' => $name,
+                'norm' => $this->normalizeProductName($name),
+            ];
+        }
+        return $this->productNameIndex;
+    }
+
+    /**
+     * @return list<array{id:int,name:string,norm:string}>
+     */
+    private function supplierProductNameIndex(int $supplierId): array
+    {
+        if (isset($this->supplierNameIndex[$supplierId])) {
+            return $this->supplierNameIndex[$supplierId];
+        }
+        $out = [];
+        try {
+            $rows = $this->query(
+                "SELECT ps.product_id AS id, ps.supplier_product_name AS name
+                 FROM product_suppliers ps
+                 INNER JOIN products p ON p.id = ps.product_id
+                 WHERE ps.supplier_id = ?
+                   AND ps.status = 'active'
+                   AND p.status = 'active'
+                   AND TRIM(COALESCE(ps.supplier_product_name, '')) <> ''
+                 LIMIT 4000",
+                [$supplierId]
+            )->fetchAll() ?: [];
+        } catch (\Throwable $e) {
+            $this->supplierNameIndex[$supplierId] = [];
+            return [];
+        }
+        foreach ($rows as $r) {
+            $name = trim((string)($r['name'] ?? ''));
+            if ($name === '') {
+                continue;
+            }
+            $out[] = [
+                'id' => (int)$r['id'],
+                'name' => $name,
+                'norm' => $this->normalizeProductName($name),
+            ];
+        }
+        $this->supplierNameIndex[$supplierId] = $out;
+        return $out;
+    }
+
+    /** Normaliza para comparar: minúsculas, sin tildes, sin puntuación sobrante. */
+    private function normalizeProductName(string $value): string
+    {
+        $value = trim(mb_strtolower($value, 'UTF-8'));
+        if ($value === '') {
+            return '';
+        }
+        if (class_exists(\Transliterator::class)) {
+            $tr = \Transliterator::create('Any-Latin; Latin-ASCII; Lower()');
+            if ($tr) {
+                $converted = $tr->transliterate($value);
+                if (is_string($converted) && $converted !== '') {
+                    $value = $converted;
+                }
+            }
+        } elseif (function_exists('iconv')) {
+            $converted = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value);
+            if (is_string($converted) && $converted !== '') {
+                $value = mb_strtolower($converted, 'UTF-8');
+            }
+        }
+        $value = preg_replace('/[^a-z0-9]+/u', ' ', $value) ?? $value;
+        $value = preg_replace('/\s+/u', ' ', $value) ?? $value;
+        return trim($value);
+    }
+
+    /** Puntaje 0–100: similar_text + bonus si uno contiene al otro con longitudes cercanas. */
+    private function nameSimilarityScore(string $a, string $b): float
+    {
+        if ($a === '' || $b === '') {
+            return 0.0;
+        }
+        if ($a === $b) {
+            return 100.0;
+        }
+        $pct = 0.0;
+        similar_text($a, $b, $pct);
+        $score = (float)$pct;
+
+        $lenA = mb_strlen($a);
+        $lenB = mb_strlen($b);
+        $minLen = min($lenA, $lenB);
+        $maxLen = max($lenA, $lenB);
+        if ($minLen >= 4 && $maxLen > 0) {
+            $ratio = $minLen / $maxLen;
+            if (str_contains($a, $b) || str_contains($b, $a)) {
+                // Contención con longitudes parecidas → muy probable el mismo producto.
+                $score = max($score, 72.0 + (28.0 * $ratio));
+            }
+            // Tokens en común (palabras ≥ 3 chars).
+            $tokA = array_values(array_filter(explode(' ', $a), static fn($t) => mb_strlen($t) >= 3));
+            $tokB = array_values(array_filter(explode(' ', $b), static fn($t) => mb_strlen($t) >= 3));
+            if ($tokA !== [] && $tokB !== []) {
+                $setB = array_fill_keys($tokB, true);
+                $hit = 0;
+                foreach ($tokA as $t) {
+                    if (isset($setB[$t])) {
+                        $hit++;
+                    }
+                }
+                $tokenScore = 100.0 * $hit / max(count($tokA), count($tokB));
+                if ($hit >= 2 || ($hit === 1 && count($tokA) === 1)) {
+                    $score = max($score, $tokenScore * 0.92);
+                }
+            }
+        }
+
+        return round(min(100.0, $score), 2);
     }
 
     private function normalizeBarcode(string $value): string

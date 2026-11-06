@@ -436,6 +436,43 @@ class TenantComprasController extends TenantController
             return;
         }
 
+        // IA + PDF pueden superar el timeout por defecto del hosting.
+        if (\function_exists('set_time_limit')) {
+            @set_time_limit(180);
+        }
+        @ini_set('max_execution_time', '180');
+        if (\function_exists('ini_set')) {
+            @ini_set('memory_limit', '256M');
+        }
+
+        // Si PHP muere por memoria/tiempo, el hosting devuelve HTML 500 y el front solo ve "HTTP 500".
+        $wantsJson = $this->request->isAjax() || $this->wantsJson();
+        if ($wantsJson) {
+            register_shutdown_function(static function (): void {
+                $err = error_get_last();
+                if ($err === null) {
+                    return;
+                }
+                $fatal = [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR];
+                if (!in_array((int)$err['type'], $fatal, true)) {
+                    return;
+                }
+                if (headers_sent()) {
+                    return;
+                }
+                $raw = (string)($err['message'] ?? '');
+                $msg = 'El servidor cortó la lectura de la factura (memoria o tiempo). Use foto JPG/PNG o CSV/Excel.';
+                if (stripos($raw, 'memory') !== false || stripos($raw, 'Allowed memory') !== false) {
+                    $msg = 'Memoria insuficiente al leer la factura. Use foto JPG/PNG o CSV/Excel.';
+                } elseif (stripos($raw, 'Maximum execution') !== false || stripos($raw, 'timed out') !== false) {
+                    $msg = 'Tiempo agotado con la IA. Pruebe foto JPG/PNG o un PDF más liviano.';
+                }
+                http_response_code(200);
+                header('Content-Type: application/json; charset=utf-8');
+                echo json_encode(['success' => false, 'message' => $msg], JSON_UNESCAPED_UNICODE);
+            });
+        }
+
         try {
             $resultado = $this->invoiceImports()->ingest(
                 [
@@ -461,7 +498,13 @@ class TenantComprasController extends TenantController
                 (string)$this->request->post('pasted_text', '')
             );
         } catch (\Throwable $e) {
-            $this->respond(false, $this->clientErrorMessage($e, 'No se pudo completar la operación'), '/app/compras');
+            error_log('invoice_import: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+            $mensaje = $this->invoiceImportClientError($e);
+            if ($this->request->isAjax()) {
+                $this->json(['success' => false, 'message' => $mensaje]);
+                return;
+            }
+            $this->respond(false, $mensaje, '/app/compras');
             return;
         }
 
@@ -480,6 +523,10 @@ class TenantComprasController extends TenantController
         if ($resultado['notes'] !== '' && !str_contains($mensaje, $resultado['notes'])) {
             $mensaje .= ' (' . $resultado['notes'] . ')';
         }
+        // Mensaje de UI: no saturar el toast con notas largas de IA.
+        if (strlen($mensaje) > 420) {
+            $mensaje = substr($mensaje, 0, 400) . '…';
+        }
 
         if ($this->request->isAjax()) {
             $this->json([
@@ -488,12 +535,50 @@ class TenantComprasController extends TenantController
                 'import_id' => $resultado['import_id'],
                 'items_count' => $itemsCount,
                 'spreadsheet_failed' => $spreadsheetFailed,
-                'preview' => $this->invoiceImports()->get($resultado['import_id']),
+                'notes' => (string)($resultado['notes'] ?? ''),
             ]);
             return;
         }
 
         $this->respond(true, $mensaje, '/app/compras?action=facturas&import_id=' . $resultado['import_id']);
+    }
+
+    /** Error legible al leer factura (sin ocultar la causa útil detrás del fallback genérico). */
+    private function invoiceImportClientError(\Throwable $e): string
+    {
+        // RuntimeException de createImport ya trae causa corta; no taparla.
+        $raw = trim($e->getMessage());
+        if ($e instanceof \PDOException) {
+            $detail = '';
+            if (isset($e->errorInfo[2]) && is_string($e->errorInfo[2])) {
+                $detail = trim((string)$e->errorInfo[2]);
+            }
+            if ($detail === '') {
+                $detail = $raw;
+            }
+            $detail = preg_replace('/\s+/', ' ', $detail) ?? $detail;
+            if (stripos($detail, 'Incorrect string value') !== false || str_contains($detail, '1366')) {
+                return 'Error al guardar el borrador (texto con caracteres inválidos). Reintente con este update.';
+            }
+            if (stripos($detail, 'Data too long') !== false || str_contains($detail, '1406')) {
+                return 'Error al guardar el borrador (nombre de archivo o notas demasiado largos).';
+            }
+            $short = function_exists('mb_substr') ? mb_substr($detail, 0, 120) : substr($detail, 0, 120);
+            return 'Error al guardar el borrador: ' . $short;
+        }
+        // Quitar rutas/líneas que clientErrorMessage suele censurar.
+        $raw = preg_replace('/\s+in\s+\S+\s+on line\s+\d+/i', '', $raw) ?? $raw;
+        $raw = preg_replace('/(?:\/home\/|\/var\/|\\\\xampp)[^\s]*/i', '', $raw) ?? $raw;
+        $raw = trim(preg_replace('/\s+/', ' ', $raw) ?? $raw);
+        if ($raw !== '' && strlen($raw) <= 280) {
+            return $raw;
+        }
+        $safe = $this->clientErrorMessage($e, '');
+        if ($safe !== '') {
+            return $safe;
+        }
+        return 'No se pudo leer la factura. Pruebe foto JPG/PNG o CSV/Excel. '
+            . 'Si usa IA, confirme OPENROUTER_API_KEY y que el modelo tenga visión.';
     }
 
     /**
@@ -1469,19 +1554,10 @@ class TenantComprasController extends TenantController
         }
 
         $subtotal = (float)($import['subtotal'] ?? 0);
-        $taxTotal = (float)($import['tax_total'] ?? 0);
-        if (isset($import['tax_override_amount']) && $import['tax_override_amount'] !== null && $import['tax_override_amount'] !== '') {
-            $taxTotal = (float)$import['tax_override_amount'];
-        }
-        $disc = \SoftNova\Services\PurchasingService::resolvePurchaseDiscounts(
-            $subtotal,
-            $taxTotal,
-            (float)($import['early_payment_discount_pct'] ?? 0),
-            (float)($import['commercial_discount_pct'] ?? 0),
-            (float)($import['commercial_discount_amount'] ?? 0)
-        );
+        $disc = \SoftNova\Services\PurchaseInvoiceImportService::resolveImportDisplayTotals($import);
         $commercialAmt = (float)$disc['commercial_amount'];
         $subAfterDisc = max(0.0, round($subtotal - $commercialAmt, 2));
+        $taxTotal = (float)$disc['tax'];
 
         $blank = array_fill(0, 16, null);
         $sumRow = static function (string $label, mixed $value) use ($blank): array {

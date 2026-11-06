@@ -161,12 +161,13 @@ class PurchasingService
     }
 
     /**
-     * Totales de OC/factura: bruto − desc. comercial (siempre) − desc. pronto pago (si aplica %).
+     * Totales de OC/factura: Total bruto − descuentos = Sub total → IVA sobre ese Sub total → Valor neto.
      * El comercial acepta % o monto en moneda (si monto > 0, manda el monto).
      *
+     * @param bool $taxAlreadyFinal true = IVA ya es el de la factura (p.ej. personalizado); no prorratear
      * @return array{
      *   gross:float,commercial_pct:float,commercial_amount:float,
-     *   early_pct:float,early_amount:float,total:float
+     *   early_pct:float,early_amount:float,tax:float,net_subtotal:float,total:float
      * }
      */
     public static function resolvePurchaseDiscounts(
@@ -174,18 +175,17 @@ class PurchasingService
         float $tax,
         float $earlyPct = 0.0,
         float $commercialPct = 0.0,
-        float $commercialAmountInput = 0.0
+        float $commercialAmountInput = 0.0,
+        bool $taxAlreadyFinal = false
     ): array {
         $subtotal = round(max(0, $subtotal), 2);
         $tax = round(max(0, $tax), 2);
-        $gross = round($subtotal + $tax, 2);
         $earlyPct = max(0, min(100, round($earlyPct, 2)));
         // % comercial siempre entero (0–100).
         $commercialPct = max(0, min(100, (float)(int)round($commercialPct)));
         $commercialAmountInput = max(0, round($commercialAmountInput, 2));
 
-        // Desc. comercial sobre el subtotal (antes de IVA).
-        // Orden: Total bruto − dcto. comercial = Sub total → + IVA = Valor neto.
+        // Orden: Total bruto − dcto. = Sub total → IVA = Sub total × tasa → Valor neto.
         // Si hay monto en $, prevalece; el % guardado queda en 0 para no recalcular mal después.
         $amountWins = $commercialAmountInput > 0.009;
         $commercialAmt = $amountWins
@@ -194,8 +194,19 @@ class PurchasingService
         $storeCommercialPct = $amountWins ? 0.0 : $commercialPct;
 
         $netSubtotal = max(0, round($subtotal - $commercialAmt, 2));
-        // IVA se suma al Sub total (no al total de línea ni a un bruto que ya lo incluya).
-        $afterCommercial = round($netSubtotal + $tax, 2);
+        // IVA sobre el Sub total (después de descuentos), no sobre el Total bruto.
+        // Con tasas mixtas se prorratea el IVA de líneas; con IVA personalizado no se toca.
+        if ($taxAlreadyFinal) {
+            $taxOnSubtotal = $tax;
+        } elseif ($subtotal > 0.009 && $commercialAmt > 0.009) {
+            $taxOnSubtotal = round($tax * ($netSubtotal / $subtotal), 2);
+        } elseif ($subtotal <= 0.009) {
+            $taxOnSubtotal = 0.0;
+        } else {
+            $taxOnSubtotal = $tax;
+        }
+        $gross = round($subtotal + $tax, 2);
+        $afterCommercial = round($netSubtotal + $taxOnSubtotal, 2);
         $earlyAmt = round($afterCommercial * ($earlyPct / 100), 2);
         $total = max(0, round($afterCommercial - $earlyAmt, 2));
 
@@ -205,6 +216,8 @@ class PurchasingService
             'commercial_amount' => $commercialAmt,
             'early_pct' => $earlyPct,
             'early_amount' => $earlyAmt,
+            'tax' => $taxOnSubtotal,
+            'net_subtotal' => $netSubtotal,
             'total' => $total,
         ];
     }
@@ -226,7 +239,8 @@ class PurchasingService
         ?string $invoiceNumber = null,
         bool $autoApplyAllyDiscount = true,
         float $commercialDiscountPct = 0.0,
-        float $commercialDiscountAmount = 0.0
+        float $commercialDiscountAmount = 0.0,
+        bool $taxAlreadyFinal = false
     ): int {
         if (!in_array($status, ['draft', 'ordered'], true)) {
             $status = 'ordered';
@@ -310,12 +324,15 @@ class PurchasingService
             $tax,
             $earlyPaymentDiscountPct,
             $commercialDiscountPct,
-            $commercialDiscountAmount
+            $commercialDiscountAmount,
+            $taxAlreadyFinal
         );
         $discountAmt = $disc['early_amount'];
         $commercialAmt = $disc['commercial_amount'];
         $commercialDiscountPct = $disc['commercial_pct'];
         $total = $disc['total'];
+        // Cabecera: IVA ya sobre Sub total (después de desc. comercial) para CxP / asiento 240802.
+        $tax = (float)$disc['tax'];
 
         $orderNumber = $this->nextOrderNumber($orderDate);
         try {
@@ -783,7 +800,7 @@ class PurchasingService
      *
      * @param list<array{product_id?:int,product_name?:string,quantity:int,unit_cost:float,tax_rate?:float,lot_code?:?string,expiry_date?:?string}> $items
      */
-    public function replaceOrderItems(int $orderId, array $items): void
+    public function replaceOrderItems(int $orderId, array $items, bool $taxAlreadyFinal = false): void
     {
         $order = $this->getOrder($orderId);
         if (!$order) {
@@ -856,11 +873,13 @@ class PurchasingService
             $tax,
             $earlyPct,
             $commercialPct,
-            $commercialPct > 0.009 ? 0.0 : $commercialAmtIn
+            $commercialPct > 0.009 ? 0.0 : $commercialAmtIn,
+            $taxAlreadyFinal
         );
         $discountAmt = $disc['early_amount'];
         $commercialAmt = $disc['commercial_amount'];
         $total = $disc['total'];
+        $tax = (float)$disc['tax'];
 
         $this->query("DELETE FROM purchase_order_items WHERE purchase_order_id = ?", [$orderId]);
         $this->insertOrderItemRows($orderId, $normalized);
@@ -1119,7 +1138,7 @@ class PurchasingService
      *   commercial_discount_amount?:float|string|null
      * } $meta
      */
-    public function applyInvoiceMeta(int $orderId, array $meta): void
+    public function applyInvoiceMeta(int $orderId, array $meta, bool $taxAlreadyFinal = false): void
     {
         $order = $this->getOrder($orderId);
         if (!$order) {
@@ -1167,13 +1186,21 @@ class PurchasingService
         }
 
         $subtotal = (float)($order['subtotal'] ?? 0);
-        $tax = (float)($order['tax'] ?? 0);
+        // IVA de líneas (base antes de desc. comercial). No usar order.tax: puede ya estar prorrateado.
+        $taxFromLines = round((float)$this->query(
+            "SELECT COALESCE(SUM(tax_amount), 0) FROM purchase_order_items WHERE purchase_order_id = ?",
+            [$orderId]
+        )->fetchColumn(), 2);
+        if ($taxFromLines <= 0.009) {
+            $taxFromLines = (float)($order['tax'] ?? 0);
+        }
         $disc = self::resolvePurchaseDiscounts(
             $subtotal,
-            $tax,
+            $taxFromLines,
             $earlyPct,
             $commercialPct,
-            $commercialAmtIn
+            $commercialAmtIn,
+            $taxAlreadyFinal
         );
 
         try {
@@ -1187,13 +1214,14 @@ class PurchasingService
                     early_payment_discount_amount = ?,
                     commercial_discount_pct = ?,
                     commercial_discount_amount = ?,
+                    tax = ?,
                     total = ?
                  WHERE id = ?",
                 [
                     $dueDate, $invoiceDueDate, $invoiceDate, $invoiceNumber,
                     $earlyPct, $disc['early_amount'],
                     $disc['commercial_pct'], $disc['commercial_amount'],
-                    $disc['total'], $orderId,
+                    $disc['tax'], $disc['total'], $orderId,
                 ]
             );
         } catch (\Throwable $e) {
@@ -1208,13 +1236,14 @@ class PurchasingService
                         early_payment_discount_amount = ?,
                         commercial_discount_pct = ?,
                         commercial_discount_amount = ?,
+                        tax = ?,
                         total = ?
                      WHERE id = ?",
                     [
                         $dueDate, $invoiceDate, $invoiceNumber,
                         $earlyPct, $disc['early_amount'],
                         $disc['commercial_pct'], $disc['commercial_amount'],
-                        $disc['total'], $orderId,
+                        $disc['tax'], $disc['total'], $orderId,
                     ]
                 );
             } catch (\Throwable $e2) {
@@ -1225,9 +1254,14 @@ class PurchasingService
                         invoice_number = COALESCE(?, invoice_number),
                         early_payment_discount_pct = ?,
                         early_payment_discount_amount = ?,
+                        tax = ?,
                         total = ?
                      WHERE id = ?",
-                    [$dueDate, $invoiceDate, $invoiceNumber, $earlyPct, $disc['early_amount'], $disc['total'], $orderId]
+                    [
+                        $dueDate, $invoiceDate, $invoiceNumber,
+                        $earlyPct, $disc['early_amount'],
+                        $disc['tax'], $disc['total'], $orderId,
+                    ]
                 );
             }
         }
@@ -1613,6 +1647,7 @@ class PurchasingService
                     $commercialPct,
                     $commercialPct > 0.009 ? 0.0 : $commercialAmtIn
                 );
+                $taxHeader = (float)$disc['tax'];
                 try {
                     $this->query(
                         "UPDATE purchase_orders SET subtotal = ?, tax = ?, total = ?,
@@ -1623,7 +1658,7 @@ class PurchasingService
                          WHERE id = ?",
                         [
                             round($subtotal, 2),
-                            round($tax, 2),
+                            round($taxHeader, 2),
                             $disc['total'],
                             $disc['early_amount'],
                             $disc['commercial_amount'],
@@ -1640,7 +1675,7 @@ class PurchasingService
                          WHERE id = ?",
                         [
                             round($subtotal, 2),
-                            round($tax, 2),
+                            round($taxHeader, 2),
                             $disc['total'],
                             $disc['early_amount'],
                             $note !== '' ? $note : 'Recepción parcial aplicada',
@@ -2871,6 +2906,7 @@ class PurchasingService
             $commercialAmtIn
         );
         $total = $disc['total'];
+        $tax = (float)$disc['tax'];
         $discountAmt = round($disc['commercial_amount'] + $disc['early_amount'], 2);
         if ($discountAmt > 0.009) {
             $reason = trim($reason);

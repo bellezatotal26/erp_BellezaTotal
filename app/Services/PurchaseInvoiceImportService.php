@@ -221,97 +221,100 @@ class PurchaseInvoiceImportService
         $aiService = null;
         $useAi = !empty($meta['use_ai']);
 
-        // Órdenes/facturas con "ID: … / EAN: …" (ej. Recamier): parseo estructurado antes que IA genérica.
-        if (empty($items) && $rawText !== '' && !$isImageFile && !$pdfLooksScanned
-            && preg_match('/\bEAN\s*:/i', $rawText)) {
-            $items = $this->parseIdEanInvoiceText($rawText);
-            if ($items !== []) {
-                $source = 'text';
-                $notas[] = count($items) . ' línea(s) con ID/EAN detectados';
+        // Toda la lectura IA/patrones va aislada: un fallo de memoria/timeout no tumba el borrador.
+        try {
+            // Órdenes/facturas con "ID: … / EAN: …" (ej. Recamier): parseo estructurado antes que IA genérica.
+            if (empty($items) && $rawText !== '' && !$isImageFile && !$pdfLooksScanned
+                && preg_match('/\bEAN\s*:/i', $rawText)) {
+                $items = $this->parseIdEanInvoiceText($rawText);
+                if ($items !== []) {
+                    $source = 'text';
+                    $notas[] = count($items) . ' línea(s) con ID/EAN detectados';
+                }
             }
-        }
 
-        // Texto + IA (PDF con capa de texto, TXT pegado, etc.)
-        if (empty($items) && $rawText !== '' && $useAi && !$pdfLooksScanned && !$isImageFile) {
-            $aiService = new AiService($this->db);
-            $ai = $aiService->extractInvoiceData($rawText);
-            if ($ai !== null && !empty($ai['items'])) {
-                $header = $ai;
-                $items = $this->normalizeAiItems($ai['items']);
-                $source = 'ai';
-                $notas[] = count($items) . ' línea(s) interpretadas por IA (texto)';
-            } else {
-                $notas[] = 'La IA no devolvió líneas utilizables del texto; se usó el análisis por patrones';
+            // Texto + IA (PDF con capa de texto, TXT pegado, etc.)
+            if (empty($items) && $rawText !== '' && $useAi && !$pdfLooksScanned && !$isImageFile) {
+                $aiService = new AiService($this->db);
+                $ai = $aiService->extractInvoiceData($rawText);
+                if ($ai !== null && !empty($ai['items'])) {
+                    $header = $ai;
+                    $items = $this->normalizeAiItems($ai['items']);
+                    $source = 'ai';
+                    $notas[] = count($items) . ' línea(s) interpretadas por IA (texto)';
+                } else {
+                    $err = $aiService->getLastError();
+                    $notas[] = $err !== ''
+                        ? ('IA texto: ' . $err)
+                        : 'La IA no devolvió líneas utilizables del texto; se usó el análisis por patrones';
+                }
             }
-        }
 
-        // PDF solo imagen / foto / híbrido (dirección OK, tabla ilegible): visión
-        if (empty($items) && $stored && ($isImageFile || $pdfLooksScanned || $pdfWeakProducts)) {
-            if ($useAi) {
-                $aiService = $aiService ?? new AiService($this->db);
-                if ($aiService->isConfigured()) {
-                    $images = $this->collectInvoiceImages($stored['path'], $ext);
-                    if ($images !== []) {
-                        $ai = $aiService->extractInvoiceFromImages($images);
-                        if ($ai !== null && !empty($ai['items'])) {
-                            $header = $ai;
-                            $items = $this->normalizeAiItems($ai['items']);
+            // PDF solo imagen / foto / híbrido (dirección OK, tabla ilegible): visión
+            if (empty($items) && $stored && ($isImageFile || $pdfLooksScanned || $pdfWeakProducts)) {
+                if ($useAi) {
+                    $aiService = $aiService ?? new AiService($this->db);
+                    if ($aiService->isConfigured()) {
+                        $vision = $this->tryAiVisionOnStoredFile($aiService, $stored, $ext, $pdfLooksScanned, $pdfWeakProducts);
+                        if ($vision['items'] !== []) {
+                            $header = $vision['header'];
+                            $items = $vision['items'];
                             $source = 'ai';
-                            $motivo = $pdfLooksScanned
-                                ? ' (PDF escaneado)'
-                                : ($pdfWeakProducts ? ' (PDF con poco texto de productos)' : '');
-                            $notas[] = count($items) . ' línea(s) leídas por IA desde imagen' . $motivo;
-                        } else {
-                            $notas[] = 'La IA con visión no pudo leer productos en la imagen. Pegue el texto o use CSV';
+                        }
+                        if ($vision['note'] !== '') {
+                            $notas[] = $vision['note'];
                         }
                     } else {
-                        $notas[] = 'PDF/imagen sin contenido visual extraíble. Pruebe exportar a CSV o pegar el texto';
+                        $notas[] = 'PDF/imagen requiere IA (OPENROUTER_API_KEY) para leer escaneos';
                     }
                 } else {
-                    $notas[] = 'PDF/imagen requiere IA (OPENROUTER_API_KEY) para leer escaneos';
-                }
-            } else {
-                $notas[] = $pdfWeakProducts
-                    ? 'El PDF tiene texto de cabecera pero no productos legibles. Active «Interpretar con IA» o use CSV/Excel.'
-                    : 'Este archivo parece solo imagen (sin texto). Active «Interpretar con IA» o pegue el texto / use CSV';
-            }
-        }
-
-        if (empty($items) && $rawText !== '' && !$isImageFile) {
-            if ($pdfLooksScanned) {
-                // Ya se intentó visión arriba; no forzar patrones sobre basura.
-            } else {
-                if (preg_match('/\bEAN\s*:/i', $rawText)) {
-                    $items = $this->parseIdEanInvoiceText($rawText);
-                }
-                if ($items === []) {
-                    $items = $this->parseText($rawText);
-                }
-                if ($items) {
-                    $withEan = count(array_filter($items, static fn($i) => trim((string)($i['barcode'] ?? '')) !== ''));
-                    $notas[] = count($items) . ' línea(s) detectadas por patrones'
-                        . ($withEan > 0 ? " ({$withEan} con EAN)" : '');
-                } elseif ($ext === 'pdf') {
-                    $notas[] = 'No se detectaron líneas de producto legibles en el PDF; active IA o use CSV/XML DIAN';
+                    $notas[] = $pdfWeakProducts
+                        ? 'El PDF tiene texto de cabecera pero no productos legibles. Active «Interpretar con IA» o use CSV/Excel.'
+                        : 'Este archivo parece solo imagen (sin texto). Active «Interpretar con IA» o pegue el texto / use CSV';
                 }
             }
-        }
 
-        // PDF con texto "usable" que falló en patrones/IA texto: último intento con visión.
-        if (empty($items) && $ext === 'pdf' && $stored && !$pdfLooksScanned && !$pdfWeakProducts && $useAi) {
-            $aiService = $aiService ?? new AiService($this->db);
-            if ($aiService->isConfigured()) {
-                $images = $this->collectInvoiceImages($stored['path'], $ext);
-                if ($images !== []) {
-                    $ai = $aiService->extractInvoiceFromImages($images);
-                    if ($ai !== null && !empty($ai['items'])) {
-                        $header = $ai;
-                        $items = $this->normalizeAiItems($ai['items']);
-                        $source = 'ai';
-                        $notas[] = count($items) . ' línea(s) leídas por IA (visión tras fallar texto)';
+            if (empty($items) && $rawText !== '' && !$isImageFile) {
+                if ($pdfLooksScanned) {
+                    // Ya se intentó visión arriba; no forzar patrones sobre basura.
+                } else {
+                    if (preg_match('/\bEAN\s*:/i', $rawText)) {
+                        $items = $this->parseIdEanInvoiceText($rawText);
+                    }
+                    if ($items === []) {
+                        $items = $this->parseText($rawText);
+                    }
+                    if ($items) {
+                        $withEan = count(array_filter($items, static fn($i) => trim((string)($i['barcode'] ?? '')) !== ''));
+                        $notas[] = count($items) . ' línea(s) detectadas por patrones'
+                            . ($withEan > 0 ? " ({$withEan} con EAN)" : '');
+                    } elseif ($ext === 'pdf') {
+                        $notas[] = 'No se detectaron líneas de producto legibles en el PDF; active IA o use CSV/XML DIAN';
                     }
                 }
             }
+
+            // PDF con texto "usable" que falló en patrones/IA texto: último intento con visión / PDF crudo.
+            if (empty($items) && $ext === 'pdf' && $stored && !$pdfLooksScanned && !$pdfWeakProducts && $useAi) {
+                $aiService = $aiService ?? new AiService($this->db);
+                if ($aiService->isConfigured()) {
+                    $vision = $this->tryAiVisionOnStoredFile($aiService, $stored, $ext, false, false);
+                    if ($vision['items'] !== []) {
+                        $header = $vision['header'];
+                        $items = $vision['items'];
+                        $source = 'ai';
+                        $notas[] = count($items) . ' línea(s) leídas por IA (visión tras fallar texto)';
+                    } elseif ($vision['note'] !== '') {
+                        $notas[] = $vision['note'];
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            error_log('invoice ingest AI/parse: ' . $e->getMessage());
+            $hint = trim($e->getMessage());
+            $hint = preg_replace('/\s+in\s+\S+\s+on line\s+\d+/i', '', $hint) ?? $hint;
+            $notas[] = 'Lectura IA/patrones interrumpida: ' . substr($hint !== '' ? $hint : 'error interno', 0, 180)
+                . '. Puede agregar productos a mano en la revisión.';
         }
 
         // Enriquecer ID/EAN si quedaron dentro de la descripción.
@@ -465,17 +468,23 @@ class PurchaseInvoiceImportService
             $taxOverride = round(max(0, (float)$meta['tax_override_amount']), 2);
         }
 
+        // UTF-8 seguro: substr() cortaba notas de IA a mitad de carácter → MySQL 1366 → “Error al guardar el borrador”.
+        $parseNotes = $this->safeDbVarchar(implode('. ', $notas), 240);
+        $originalName = $this->safeDbVarchar((string)($stored['original'] ?? ''), 180);
+        $fileMime = $this->safeDbVarchar((string)($stored['mime'] ?? ''), 120);
+        $filePath = $this->safeDbVarchar((string)($stored['path'] ?? ''), 255);
+
         $paramsBase = [
             !empty($meta['supplier_id']) ? (int)$meta['supplier_id'] : null,
-            $invoiceNumber !== '' ? substr($invoiceNumber, 0, 80) : null,
+            $invoiceNumber !== '' ? $this->safeDbVarchar($invoiceNumber, 80) : null,
             $invoiceDate,
             $dueDate,
             $source,
-            $stored['path'] ?? null,
-            $stored['mime'] ?? null,
-            $stored['original'] ?? null,
-            $rawText !== '' ? mb_substr($rawText, 0, 60000) : null,
-            substr(implode('. ', $notas), 0, 255) ?: null,
+            $filePath !== '' ? $filePath : null,
+            $fileMime !== '' ? $fileMime : null,
+            $originalName !== '' ? $originalName : null,
+            $rawText !== '' ? $this->safeMbSubstr($rawText, 0, 50000) : null,
+            $parseNotes !== '' ? $parseNotes : null,
             $paymentMode,
             $documentKind !== '' ? $documentKind : null,
             $applyVat,
@@ -518,19 +527,28 @@ class PurchaseInvoiceImportService
                 );
             } catch (\Throwable $e2) {
                 // Installs viejos sin columna warehouse_date / comerciales.
-                $this->query(
-                    "INSERT INTO purchase_invoice_imports
-                        (supplier_id, invoice_number, invoice_date, due_date, source, file_path, file_mime,
-                         original_name, raw_text, parse_notes, payment_mode, document_kind, apply_product_vat,
-                         early_payment_discount_pct, created_by)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        $paramsBase[0], $paramsBase[1], $paramsBase[2], $paramsBase[3],
-                        $paramsBase[4], $paramsBase[5], $paramsBase[6], $paramsBase[7], $paramsBase[8],
-                        $paramsBase[9], $paramsBase[10], $paramsBase[11], $paramsBase[12], $paramsBase[14],
-                        $paramsBase[17],
-                    ]
-                );
+                try {
+                    $this->query(
+                        "INSERT INTO purchase_invoice_imports
+                            (supplier_id, invoice_number, invoice_date, due_date, source, file_path, file_mime,
+                             original_name, raw_text, parse_notes, payment_mode, document_kind, apply_product_vat,
+                             early_payment_discount_pct, created_by)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            $paramsBase[0], $paramsBase[1], $paramsBase[2], $paramsBase[3],
+                            $paramsBase[4], $paramsBase[5], $paramsBase[6], $paramsBase[7], $paramsBase[8],
+                            $paramsBase[9], $paramsBase[10], $paramsBase[11], $paramsBase[12], $paramsBase[14],
+                            $paramsBase[17],
+                        ]
+                    );
+                } catch (\Throwable $e3) {
+                    error_log('createImport PDO: ' . $e3->getMessage());
+                    throw new \RuntimeException(
+                        'No se pudo guardar el borrador: ' . $this->shortDbError($e3),
+                        0,
+                        $e3
+                    );
+                }
             }
         }
 
@@ -660,7 +678,7 @@ class PurchaseInvoiceImportService
             $tax = $this->resolveLineTaxRateForDocument($kind, $applyProductVat, $current);
             $qty = round((float)($item['quantity'] ?? 0), 3);
             $cost = round((float)($item['unit_cost'] ?? 0), 2);
-            $disc = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))));
+            $disc = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))), 2);
 
             // F. Electrónica: sumar IVA al costo salvo que el Excel ya lo traiga incluido.
             if ($embedVat && $tax > 0.009 && $cost > 0 && !$vatAlreadyIncluded) {
@@ -825,10 +843,10 @@ class PurchaseInvoiceImportService
                 $barcode = $this->normalizeBarcodeValue($sku);
             }
             $match = $this->links->matchInvoiceLine($supplierId, $sku, $descripcion, $barcode);
-            // Auto-relacionar solo con identificadores fuertes (EAN / SKU / código / nombre exacto).
+            // Auto-relacionar: EAN / SKU / código / nombre exacto o muy similar (≥ 80 %).
             $autoMatch = $match && (int)($match['confidence'] ?? 0) >= 80;
             $costo = round((float)($item['unit_cost'] ?? 0), 2);
-            $descuento = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))));
+            $descuento = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))), 2);
             $impuesto = round(max(0, (float)($item['tax_rate'] ?? 0)), 2);
             // Total de línea neto. F. Electrónica: el IVA ya va en unit_cost.
             // F. Normal: IVA en tax_rate → se suma al subtotal (no al total de línea).
@@ -962,7 +980,74 @@ class PurchaseInvoiceImportService
     }
 
     /**
-     * Imágenes para IA con visión: archivo imagen directo, o JPEG embebidos en PDF escaneado.
+     * Visión IA sobre archivo guardado: imágenes rasterizadas, o PDF crudo a Gemini.
+     *
+     * @param array{path:string,mime:string,original:string,extension:string} $stored
+     * @return array{header:array<string,mixed>,items:list<array<string,mixed>>,note:string}
+     */
+    private function tryAiVisionOnStoredFile(
+        AiService $aiService,
+        array $stored,
+        string $ext,
+        bool $pdfLooksScanned,
+        bool $pdfWeakProducts
+    ): array {
+        $empty = ['header' => [], 'items' => [], 'note' => ''];
+        $images = $this->collectInvoiceImages($stored['path'], $ext);
+        if ($images !== []) {
+            $ai = $aiService->extractInvoiceFromImages($images);
+            if ($ai !== null && !empty($ai['items'])) {
+                $motivo = $pdfLooksScanned
+                    ? ' (PDF escaneado)'
+                    : ($pdfWeakProducts ? ' (PDF con poco texto de productos)' : '');
+                return [
+                    'header' => $ai,
+                    'items' => $this->normalizeAiItems($ai['items']),
+                    'note' => count($ai['items']) . ' línea(s) leídas por IA desde imagen' . $motivo,
+                ];
+            }
+        }
+
+        // Sin páginas rasterizables (falta Imagick/GS o PDF vectorial): enviar PDF a OpenRouter.
+        if ($ext === 'pdf') {
+            $absolute = dirname(__DIR__, 2) . '/public/' . $stored['path'];
+            if (is_readable($absolute)) {
+                try {
+                    $bin = (string)file_get_contents($absolute);
+                    $ai = $aiService->extractInvoiceFromPdf($bin, (string)($stored['original'] ?? 'factura.pdf'));
+                    if ($ai !== null && !empty($ai['items'])) {
+                        return [
+                            'header' => $ai,
+                            'items' => $this->normalizeAiItems($ai['items']),
+                            'note' => count($ai['items']) . ' línea(s) leídas por IA desde el PDF',
+                        ];
+                    }
+                } catch (\Throwable $e) {
+                    error_log('extractInvoiceFromPdf: ' . $e->getMessage());
+                    $empty['note'] = 'IA PDF falló: ' . substr(trim($e->getMessage()), 0, 160)
+                        . '. Pruebe foto JPG/PNG o CSV.';
+                    return $empty;
+                }
+            }
+        }
+
+        $err = $aiService->getLastError();
+        if ($images === [] && $ext === 'pdf') {
+            $empty['note'] = ($err !== '' ? ($err . '. ') : '')
+                . 'No se pudieron rasterizar páginas del PDF (Imagick/Ghostscript). '
+                . 'Se intentó enviar el PDF a la IA'
+                . ($err !== '' ? '' : ' sin éxito')
+                . '. Pruebe foto JPG/PNG de la factura o CSV/Excel.';
+            return $empty;
+        }
+        $empty['note'] = $err !== ''
+            ? $err
+            : 'La IA con visión no pudo leer productos. Pegue el texto o use CSV/Excel.';
+        return $empty;
+    }
+
+    /**
+     * Imágenes para IA con visión: archivo imagen directo, o páginas PDF (Imagick / Ghostscript / JPEG embebido).
      *
      * @return list<array{mime:string,data:string}>
      */
@@ -990,6 +1075,10 @@ class PurchaseInvoiceImportService
             $fromImagick = $this->pdfPagesToImagesImagick($absolute);
             if ($fromImagick !== []) {
                 return $fromImagick;
+            }
+            $fromGs = $this->pdfPagesToImagesGhostscript($absolute);
+            if ($fromGs !== []) {
+                return $fromGs;
             }
             return $this->extractEmbeddedJpegFromPdf($absolute);
         }
@@ -1023,6 +1112,118 @@ class PurchaseInvoiceImportService
             error_log('Imagick PDF factura: ' . $e->getMessage());
             return [];
         }
+    }
+
+    /**
+     * Rasteriza PDF con Ghostscript si está instalado en el servidor (alternativa a Imagick).
+     *
+     * @return list<array{mime:string,data:string}>
+     */
+    private function pdfPagesToImagesGhostscript(string $absolute): array
+    {
+        // Hostings compartidos suelen tener exec() en disable_functions.
+        if (!\function_exists('exec')) {
+            return [];
+        }
+        $gs = $this->findGhostscriptBinary();
+        if ($gs === null) {
+            return [];
+        }
+        $tmpDir = sys_get_temp_dir() . '/seri_pdf_' . bin2hex(random_bytes(4));
+        if (!@mkdir($tmpDir, 0700, true) && !is_dir($tmpDir)) {
+            return [];
+        }
+        $pattern = $tmpDir . DIRECTORY_SEPARATOR . 'page-%d.jpg';
+        $cmd = \escapeshellarg($gs)
+            . ' -dSAFER -dBATCH -dNOPAUSE -dQUIET'
+            . ' -sDEVICE=jpeg -dJPEGQ=85 -r150'
+            . ' -dFirstPage=1 -dLastPage=3'
+            . ' -sOutputFile=' . \escapeshellarg($pattern)
+            . ' ' . \escapeshellarg($absolute)
+            . ' 2>&1';
+        $out = [];
+        try {
+            $output = [];
+            $code = 1;
+            \exec($cmd, $output, $code);
+            if ($code === 0) {
+                for ($i = 1; $i <= 3; $i++) {
+                    $file = $tmpDir . DIRECTORY_SEPARATOR . 'page-' . $i . '.jpg';
+                    if (!is_readable($file)) {
+                        continue;
+                    }
+                    $blob = (string)file_get_contents($file);
+                    if ($blob !== '' && strlen($blob) > 2000) {
+                        $out[] = ['mime' => 'image/jpeg', 'data' => $blob];
+                    }
+                }
+            } else {
+                error_log('Ghostscript PDF factura exit=' . $code . ' ' . implode(' ', array_slice($output, 0, 3)));
+            }
+        } catch (\Throwable $e) {
+            error_log('Ghostscript PDF factura: ' . $e->getMessage());
+        } finally {
+            foreach (glob($tmpDir . DIRECTORY_SEPARATOR . '*') ?: [] as $f) {
+                @unlink($f);
+            }
+            @rmdir($tmpDir);
+        }
+        return $out;
+    }
+
+    private function findGhostscriptBinary(): ?string
+    {
+        static $cached = false;
+        static $path = null;
+        if ($cached) {
+            return $path;
+        }
+        $cached = true;
+        if (!\function_exists('exec')) {
+            return null;
+        }
+        $candidates = [
+            'gs',
+            'gswin64c',
+            'gswin32c',
+            '/usr/bin/gs',
+            '/usr/local/bin/gs',
+            'C:\\Program Files\\gs\\gs10.03.1\\bin\\gswin64c.exe',
+            'C:\\Program Files\\gs\\gs10.02.1\\bin\\gswin64c.exe',
+        ];
+        $env = getenv('GHOSTSCRIPT_PATH') ?: getenv('GS_PATH');
+        if (is_string($env) && $env !== '') {
+            array_unshift($candidates, $env);
+        }
+        foreach ($candidates as $bin) {
+            if ($bin !== '' && (is_executable($bin) || $this->commandExists($bin))) {
+                $path = $bin;
+                return $path;
+            }
+        }
+        return null;
+    }
+
+    private function commandExists(string $bin): bool
+    {
+        if (str_contains($bin, '/') || str_contains($bin, '\\')) {
+            return is_file($bin);
+        }
+        if (!\function_exists('exec')) {
+            return false;
+        }
+        $isWin = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
+        $cmd = $isWin
+            ? ('where ' . \escapeshellarg($bin) . ' 2>NUL')
+            : ('command -v ' . \escapeshellarg($bin) . ' 2>/dev/null');
+        $out = [];
+        $code = 1;
+        try {
+            \exec($cmd, $out, $code);
+        } catch (\Throwable $e) {
+            return false;
+        }
+        return $code === 0 && !empty($out[0]);
     }
 
     /**
@@ -2011,6 +2212,8 @@ class PurchaseInvoiceImportService
         $fila['quantity'] = $qty;
         $fila['unit_cost'] = $cost;
         $fila['line_total'] = $total;
+        $fila['discount_pct'] = round($disc, 2);
+        $fila['tax_rate'] = round($tax, 2);
         return $fila;
     }
 
@@ -2445,6 +2648,40 @@ class PurchaseInvoiceImportService
         return ['import' => $import, 'items' => $items];
     }
 
+    /**
+     * Totales a pagar/mostrar de un borrador (lista, modal, Excel).
+     * Con IVA personalizado (apply_product_vat=2 / tax_override_amount) el IVA no se re-prorratea.
+     *
+     * @param array<string,mixed> $import
+     * @return array{
+     *   gross:float,commercial_pct:float,commercial_amount:float,early_pct:float,early_amount:float,
+     *   tax:float,net_subtotal:float,total:float
+     * }
+     */
+    public static function resolveImportDisplayTotals(array $import): array
+    {
+        $subtotal = (float)($import['subtotal'] ?? 0);
+        $taxTotal = (float)($import['tax_total'] ?? 0);
+        $applyMode = self::parseApplyProductVat($import['apply_product_vat'] ?? 0);
+        $taxFinal = $applyMode === 2;
+        if (array_key_exists('tax_override_amount', $import)
+            && $import['tax_override_amount'] !== null
+            && $import['tax_override_amount'] !== ''
+        ) {
+            $taxTotal = (float)$import['tax_override_amount'];
+            $taxFinal = true;
+        }
+
+        return PurchasingService::resolvePurchaseDiscounts(
+            $subtotal,
+            $taxTotal,
+            (float)($import['early_payment_discount_pct'] ?? 0),
+            (float)($import['commercial_discount_pct'] ?? 0),
+            (float)($import['commercial_discount_amount'] ?? 0),
+            $taxFinal
+        );
+    }
+
     /** @return list<array<string,mixed>> */
     public function pendingImports(int $limit = 50): array
     {
@@ -2458,17 +2695,14 @@ class PurchaseInvoiceImportService
              LIMIT " . max(1, min(200, $limit))
         )->fetchAll();
 
-        // Total de listado = neto a pagar (bruto − desc. comercial − pronto pago), no el bruto.
+        // Misma lógica que el modal de revisión (IVA personalizado sin re-prorratear).
         foreach ($rows as &$row) {
-            $disc = PurchasingService::resolvePurchaseDiscounts(
-                (float)($row['subtotal'] ?? 0),
-                (float)($row['tax_total'] ?? 0),
-                (float)($row['early_payment_discount_pct'] ?? 0),
-                (float)($row['commercial_discount_pct'] ?? 0),
-                (float)($row['commercial_discount_amount'] ?? 0)
-            );
+            $disc = self::resolveImportDisplayTotals($row);
             $row['total'] = $disc['total'];
             $row['gross_total'] = $disc['gross'];
+            $row['display_tax'] = $disc['tax'];
+            $row['display_net_subtotal'] = $disc['net_subtotal'];
+            $row['display_commercial_amount'] = $disc['commercial_amount'];
         }
         unset($row);
 
@@ -2514,7 +2748,7 @@ class PurchaseInvoiceImportService
             $cantidad = round(max(0, (float)($row['quantity'] ?? 0)), 3);
             $costo = round(max(0, (float)($row['unit_cost'] ?? 0)), 2);
             $impuesto = round(max(0, min(100, (float)($row['tax_rate'] ?? 0))), 2);
-            $descuento = round(max(0, min(100, (float)($row['discount_pct'] ?? 0))));
+            $descuento = round(max(0, min(100, (float)($row['discount_pct'] ?? 0))), 2);
             $productoId = !empty($row['matched_product_id']) ? (int)$row['matched_product_id'] : null;
             $accion = in_array($row['row_action'] ?? '', ['add_stock', 'create_product', 'skip'], true)
                 ? (string)$row['row_action']
@@ -2526,12 +2760,15 @@ class PurchaseInvoiceImportService
             // Neto: el IVA % no se embebe en line_total (se suma al subtotal al refrescar totales).
             $lineTotal = round($cantidad * $costo * (1 - $descuento / 100), 2);
 
+            // String con 2 decimales: evita que PDO/MySQL truncen 14.30 → 14 en columnas INT residuales.
+            $descuentoSql = number_format($descuento, 2, '.', '');
+
             $stmt->execute([
                 substr(trim((string)($row['description'] ?? '')), 0, 255),
                 $cantidad,
                 $costo,
                 $impuesto,
-                $descuento,
+                $descuentoSql,
                 $lineTotal,
                 $productoId,
                 $accion,
@@ -3679,7 +3916,7 @@ class PurchaseInvoiceImportService
             }
 
             // El descuento de línea se traslada al costo: la OC no maneja descuento por ítem.
-            $descuento = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))));
+            $descuento = round(max(0, min(100, (float)($item['discount_pct'] ?? 0))), 2);
             $costo = round((float)$item['unit_cost'] * (1 - $descuento / 100), 2);
             if ($costo <= 0 && (float)($item['line_total'] ?? 0) > 0) {
                 $costo = round((float)$item['line_total'] / $cantidad, 2);
@@ -3845,7 +4082,8 @@ class PurchaseInvoiceImportService
                     $import['invoice_number'] ?? null,
                     false,
                     (float)($import['commercial_discount_pct'] ?? 0),
-                    (float)($import['commercial_discount_amount'] ?? 0)
+                    (float)($import['commercial_discount_amount'] ?? 0),
+                    $isCustomVat
                 );
                 $this->query(
                     "UPDATE purchase_orders SET origin = 'invoice_import', invoice_import_id = ?,
@@ -3862,7 +4100,7 @@ class PurchaseInvoiceImportService
                     'Recepción parcial por factura importada #' . $importId
                 );
             } else {
-                $purchasing->replaceOrderItems($linkedOrderId, $lineas);
+                $purchasing->replaceOrderItems($linkedOrderId, $lineas, $isCustomVat);
                 $purchasing->applyInvoiceMeta($linkedOrderId, [
                     'due_date' => $import['due_date'] ?? null,
                     'invoice_due_date' => $import['invoice_due_date'] ?? null,
@@ -3871,7 +4109,7 @@ class PurchaseInvoiceImportService
                     'early_payment_discount_pct' => $import['early_payment_discount_pct'] ?? 0,
                     'commercial_discount_pct' => $import['commercial_discount_pct'] ?? 0,
                     'commercial_discount_amount' => $import['commercial_discount_amount'] ?? 0,
-                ]);
+                ], $isCustomVat);
                 $this->query(
                     "UPDATE purchase_orders SET origin = COALESCE(NULLIF(origin,''), 'invoice_import'),
                         invoice_import_id = ?, notes = CONCAT(COALESCE(notes,''),
@@ -3897,7 +4135,8 @@ class PurchaseInvoiceImportService
                 $import['invoice_number'] ?? null,
                 false, // no forzar descuento aliado sobre el total de factura
                 (float)($import['commercial_discount_pct'] ?? 0),
-                (float)($import['commercial_discount_amount'] ?? 0)
+                (float)($import['commercial_discount_amount'] ?? 0),
+                $isCustomVat
             );
 
             $this->query(
@@ -5355,27 +5594,35 @@ class PurchaseInvoiceImportService
     {
         try {
             $row = $this->query(
-                "SELECT subtotal, tax_total,
+                "SELECT subtotal, tax_total, tax_override_amount,
                         COALESCE(early_payment_discount_pct, 0) AS early_payment_discount_pct,
                         COALESCE(commercial_discount_pct, 0) AS commercial_discount_pct,
-                        COALESCE(commercial_discount_amount, 0) AS commercial_discount_amount
+                        COALESCE(commercial_discount_amount, 0) AS commercial_discount_amount,
+                        COALESCE(apply_product_vat, 0) AS apply_product_vat
                  FROM purchase_invoice_imports WHERE id = ? LIMIT 1",
                 [$importId]
             )->fetch();
         } catch (\Throwable $e) {
-            return;
+            // Instalaciones sin tax_override_amount: misma lógica con columnas base.
+            try {
+                $row = $this->query(
+                    "SELECT subtotal, tax_total,
+                            COALESCE(early_payment_discount_pct, 0) AS early_payment_discount_pct,
+                            COALESCE(commercial_discount_pct, 0) AS commercial_discount_pct,
+                            COALESCE(commercial_discount_amount, 0) AS commercial_discount_amount,
+                            COALESCE(apply_product_vat, 0) AS apply_product_vat
+                     FROM purchase_invoice_imports WHERE id = ? LIMIT 1",
+                    [$importId]
+                )->fetch();
+            } catch (\Throwable $e2) {
+                return;
+            }
         }
         if (!$row) {
             return;
         }
 
-        $disc = PurchasingService::resolvePurchaseDiscounts(
-            (float)$row['subtotal'],
-            (float)$row['tax_total'],
-            (float)$row['early_payment_discount_pct'],
-            (float)$row['commercial_discount_pct'],
-            (float)$row['commercial_discount_amount']
-        );
+        $disc = self::resolveImportDisplayTotals($row);
 
         $this->query(
             "UPDATE purchase_invoice_imports SET total = ? WHERE id = ?",
@@ -5411,6 +5658,49 @@ class PurchaseInvoiceImportService
             return '';
         }
         return (string)($campos[$mapa[$clave]] ?? '');
+    }
+
+    private function safeMbSubstr(string $text, int $start, int $length): string
+    {
+        if (\function_exists('mb_substr')) {
+            return (string)mb_substr($text, $start, $length);
+        }
+        return substr($text, $start, $length);
+    }
+
+    /** Recorte UTF-8 limpio para columnas VARCHAR (evita MySQL 1366 por byte a medias). */
+    private function safeDbVarchar(string $text, int $maxChars): string
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return '';
+        }
+        if (\function_exists('mb_check_encoding') && !mb_check_encoding($text, 'UTF-8')) {
+            $converted = @mb_convert_encoding($text, 'UTF-8', 'UTF-8, ISO-8859-1, Windows-1252');
+            $text = is_string($converted) && $converted !== '' ? $converted : $text;
+        }
+        // Quitar NUL y controles que rompen inserts.
+        $text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $text) ?? $text;
+        return $this->safeMbSubstr($text, 0, max(1, $maxChars));
+    }
+
+    private function shortDbError(\Throwable $e): string
+    {
+        $msg = trim($e->getMessage());
+        if ($e instanceof \PDOException && isset($e->errorInfo[2]) && is_string($e->errorInfo[2])) {
+            $msg = trim((string)$e->errorInfo[2]);
+        }
+        $msg = preg_replace('/\s+/', ' ', $msg) ?? $msg;
+        if (stripos($msg, 'Incorrect string value') !== false || str_contains($msg, '1366')) {
+            return 'caracteres no válidos en notas/nombre de archivo';
+        }
+        if (stripos($msg, 'Data too long') !== false || str_contains($msg, '1406')) {
+            return 'un campo era demasiado largo';
+        }
+        if (stripos($msg, 'Unknown column') !== false) {
+            return 'falta una columna en la BD (migración pendiente)';
+        }
+        return $this->safeMbSubstr($msg, 0, 140);
     }
 
     /**

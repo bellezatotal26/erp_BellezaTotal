@@ -199,10 +199,19 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
         <?php foreach ($sumMethods as $i => $pm):
             $pct = $sumTotal > 0.009 ? round(((float)$pm['amount'] / $sumTotal) * 100, 1) : 0;
             $color = $sumPalette[$i % count($sumPalette)]; ?>
-            <div class="sales-pay-chip" style="border-left-color:<?php echo $color; ?>;">
+            <div class="sales-pay-chip" style="border-left-color:<?php echo $color; ?>;"<?php
+                echo (($pm['method'] ?? '') === 'cash')
+                    ? ' title="Solo cobros de ventas en efectivo. No incluye la base/apertura del cajón."'
+                    : '';
+            ?>>
                 <div class="sales-pay-chip__label"><?php echo htmlspecialchars($pm['label']); ?></div>
                 <div class="sales-pay-chip__amount"><?php echo fmtV((float)$pm['amount'], $currency); ?></div>
-                <div class="sales-pay-chip__meta"><?php echo (int)$pm['count']; ?> venta(s) · <?php echo str_replace('.', ',', (string)$pct); ?>%</div>
+                <div class="sales-pay-chip__meta"><?php
+                    echo (int)$pm['count'] . ' venta(s) · ' . str_replace('.', ',', (string)$pct) . '%';
+                    if (($pm['method'] ?? '') === 'cash') {
+                        echo ' · sin base cajón';
+                    }
+                ?></div>
                 <div class="sales-pay-chip__track"><span style="width:<?php echo $pct; ?>%;background:<?php echo $color; ?>;"></span></div>
             </div>
         <?php endforeach; ?>
@@ -678,15 +687,15 @@ $sumPalette = ['#10B981', '#3B82F6', '#8B5CF6', '#F59E0B', '#EC4899', '#14B8A6',
                 </div>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;">
-                <div class="form-group">
-                    <label>Método de Pago <span class="field-tip" data-tip="Medio con el que se recibe el dinero (efectivo, tarjeta, transferencia u otro).">?</span></label>
+                <div class="form-group" id="paymentMethodGroup">
+                    <label>Método de Pago <span class="field-tip" data-tip="Medio con el que se recibe el dinero ahora. En crédito sin abono no aplica: el medio se registra al abonar.">?</span></label>
                     <select name="payment_method" class="form-control" data-custom-other="payment_method">
                         <?php echo $paymentMethodOptionsHtml; ?>
                     </select>
                 </div>
                 <div class="form-group" id="initialPaymentGroup" style="display:none;">
-                    <label>Abono Inicial <span class="field-tip" data-tip="Monto que el cliente paga hoy. El resto queda como cuenta por cobrar.">?</span></label>
-                    <input type="text" name="initial_payment" class="form-control money-input" data-money="1" inputmode="decimal" placeholder="0">
+                    <label>Abono Inicial <span class="field-tip" data-tip="Monto que el cliente paga hoy. Si es 0, la venta queda a crédito sin medio de pago hasta el primer abono.">?</span></label>
+                    <input type="text" name="initial_payment" class="form-control money-input" data-money="1" inputmode="decimal" placeholder="0" oninput="typeof syncCreditPaymentMethodVisibility==='function'&&syncCreditPaymentMethodVisibility()">
                 </div>
             </div>
             <div class="modal-footer">

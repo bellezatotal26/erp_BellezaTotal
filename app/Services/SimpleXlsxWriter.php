@@ -7,6 +7,7 @@ namespace SoftNova\Services;
 /**
  * Escritura mínima de .xlsx (Office Open XML) sin dependencias externas.
  * Soporta texto, número, cantidad, porcentaje y moneda (formato de celda Excel).
+ * Una hoja (download/build) o varias (downloadSheets/buildSheets).
  */
 final class SimpleXlsxWriter
 {
@@ -17,6 +18,19 @@ final class SimpleXlsxWriter
      */
     public static function download(string $filename, array $headers, array $rows, array $columnTypes = []): void
     {
+        self::downloadSheets($filename, [[
+            'name' => 'Datos',
+            'headers' => $headers,
+            'rows' => $rows,
+            'columnTypes' => $columnTypes,
+        ]]);
+    }
+
+    /**
+     * @param list<array{name?:string,headers:list<string>,rows?:list<list<mixed>>,columnTypes?:array<int,string>}> $sheets
+     */
+    public static function downloadSheets(string $filename, array $sheets): void
+    {
         if (!class_exists(\ZipArchive::class)) {
             throw new \RuntimeException('El servidor no tiene ext-zip para generar Excel (.xlsx)');
         }
@@ -26,7 +40,7 @@ final class SimpleXlsxWriter
             $filename .= '.xlsx';
         }
 
-        $binary = self::build($headers, $rows, $columnTypes);
+        $binary = self::buildSheets($sheets);
 
         header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
         header('Content-Disposition: attachment; filename="' . $filename . '"');
@@ -44,11 +58,39 @@ final class SimpleXlsxWriter
      */
     public static function build(array $headers, array $rows = [], array $columnTypes = []): string
     {
+        return self::buildSheets([[
+            'name' => 'Datos',
+            'headers' => $headers,
+            'rows' => $rows,
+            'columnTypes' => $columnTypes,
+        ]]);
+    }
+
+    /**
+     * @param list<array{name?:string,headers:list<string>,rows?:list<list<mixed>>,columnTypes?:array<int,string>}> $sheets
+     */
+    public static function buildSheets(array $sheets): string
+    {
         if (!class_exists(\ZipArchive::class)) {
             throw new \RuntimeException('El servidor no tiene ext-zip para generar Excel (.xlsx)');
         }
+        if ($sheets === []) {
+            throw new \InvalidArgumentException('Excel sin hojas');
+        }
 
-        $sheetXml = self::sheetXml($headers, $rows, $columnTypes);
+        $normalized = [];
+        $usedNames = [];
+        foreach ($sheets as $i => $sheet) {
+            $name = self::sanitizeSheetName((string)($sheet['name'] ?? ('Hoja' . ($i + 1))), $usedNames);
+            $usedNames[mb_strtolower($name)] = true;
+            $normalized[] = [
+                'name' => $name,
+                'headers' => array_values($sheet['headers'] ?? []),
+                'rows' => array_values($sheet['rows'] ?? []),
+                'columnTypes' => $sheet['columnTypes'] ?? [],
+            ];
+        }
+
         $tmp = tempnam(sys_get_temp_dir(), 'xlsx');
         if ($tmp === false) {
             throw new \RuntimeException('No se pudo crear archivo temporal para Excel');
@@ -61,18 +103,46 @@ final class SimpleXlsxWriter
             throw new \RuntimeException('No se pudo crear el archivo Excel');
         }
 
-        $zip->addFromString('[Content_Types].xml', self::contentTypesXml());
+        $zip->addFromString('[Content_Types].xml', self::contentTypesXml(count($normalized)));
         $zip->addFromString('_rels/.rels', self::rootRelsXml());
-        $zip->addFromString('xl/workbook.xml', self::workbookXml());
-        $zip->addFromString('xl/_rels/workbook.xml.rels', self::workbookRelsXml());
+        $zip->addFromString('xl/workbook.xml', self::workbookXml($normalized));
+        $zip->addFromString('xl/_rels/workbook.xml.rels', self::workbookRelsXml(count($normalized)));
         $zip->addFromString('xl/styles.xml', self::stylesXml());
-        $zip->addFromString('xl/worksheets/sheet1.xml', $sheetXml);
+        foreach ($normalized as $i => $sheet) {
+            $n = $i + 1;
+            $zip->addFromString(
+                'xl/worksheets/sheet' . $n . '.xml',
+                self::sheetXml($sheet['headers'], $sheet['rows'], $sheet['columnTypes'])
+            );
+        }
         $zip->close();
 
         $binary = (string)file_get_contents($zipPath);
         @unlink($zipPath);
 
         return $binary;
+    }
+
+    /**
+     * @param array<string,bool> $usedLower
+     */
+    private static function sanitizeSheetName(string $name, array $usedLower): string
+    {
+        $name = trim(preg_replace('/[\\\\\/\?\*\[\]\:]/u', ' ', $name) ?? '');
+        if ($name === '') {
+            $name = 'Hoja';
+        }
+        if (mb_strlen($name) > 31) {
+            $name = mb_substr($name, 0, 31);
+        }
+        $base = $name;
+        $n = 2;
+        while (isset($usedLower[mb_strtolower($name)])) {
+            $suffix = ' (' . $n . ')';
+            $name = mb_substr($base, 0, max(1, 31 - mb_strlen($suffix))) . $suffix;
+            $n++;
+        }
+        return $name;
     }
 
     /**
@@ -87,29 +157,34 @@ final class SimpleXlsxWriter
             $colCount = max($colCount, count($row));
         }
 
+        $freeze = $headers !== [];
         $xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             . '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
-            . ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            . '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
-            . '<cols>';
+            . ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
+        if ($freeze) {
+            $xml .= '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>';
+        }
+        $xml .= '<cols>';
         for ($c = 0; $c < $colCount; $c++) {
             $width = match ($columnTypes[$c] ?? '') {
                 'currency' => 14,
                 'percent', 'qty', 'number' => 11,
-                default => ($c === 3 || $c === 4) ? 28 : 14,
+                default => ($c === 3 || $c === 4) ? 28 : 16,
             };
             $xml .= '<col min="' . ($c + 1) . '" max="' . ($c + 1) . '" width="' . $width . '" customWidth="1"/>';
         }
         $xml .= '</cols><sheetData>';
 
-        // Encabezado
-        $xml .= '<row r="1">';
-        foreach ($headers as $c => $label) {
-            $xml .= self::cellXml(self::colLetter((int)$c) . '1', (string)$label, 'text', true);
+        $r = 1;
+        if ($headers !== []) {
+            $xml .= '<row r="1">';
+            foreach ($headers as $c => $label) {
+                $xml .= self::cellXml(self::colLetter((int)$c) . '1', (string)$label, 'text', true);
+            }
+            $xml .= '</row>';
+            $r = 2;
         }
-        $xml .= '</row>';
 
-        $r = 2;
         foreach ($rows as $row) {
             $xml .= '<row r="' . $r . '">';
             for ($c = 0; $c < $colCount; $c++) {
@@ -184,16 +259,19 @@ final class SimpleXlsxWriter
         return htmlspecialchars($value, ENT_XML1 | ENT_QUOTES, 'UTF-8');
     }
 
-    private static function contentTypesXml(): string
+    private static function contentTypesXml(int $sheetCount): string
     {
-        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        $xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             . '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
             . '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
             . '<Default Extension="xml" ContentType="application/xml"/>'
             . '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-            . '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-            . '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
-            . '</Types>';
+            . '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>';
+        for ($i = 1; $i <= $sheetCount; $i++) {
+            $xml .= '<Override PartName="/xl/worksheets/sheet' . $i . '.xml"'
+                . ' ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
+        }
+        return $xml . '</Types>';
     }
 
     private static function rootRelsXml(): string
@@ -204,22 +282,35 @@ final class SimpleXlsxWriter
             . '</Relationships>';
     }
 
-    private static function workbookXml(): string
+    /**
+     * @param list<array{name:string}> $sheets
+     */
+    private static function workbookXml(array $sheets): string
     {
-        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        $xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             . '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
             . ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            . '<sheets><sheet name="Factura" sheetId="1" r:id="rId1"/></sheets>'
-            . '</workbook>';
+            . '<sheets>';
+        foreach ($sheets as $i => $sheet) {
+            $n = $i + 1;
+            $xml .= '<sheet name="' . self::xml($sheet['name']) . '" sheetId="' . $n . '" r:id="rId' . $n . '"/>';
+        }
+        return $xml . '</sheets></workbook>';
     }
 
-    private static function workbookRelsXml(): string
+    private static function workbookRelsXml(int $sheetCount): string
     {
-        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            . '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            . '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-            . '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
-            . '</Relationships>';
+        $xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            . '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
+        for ($i = 1; $i <= $sheetCount; $i++) {
+            $xml .= '<Relationship Id="rId' . $i . '"'
+                . ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"'
+                . ' Target="worksheets/sheet' . $i . '.xml"/>';
+        }
+        $xml .= '<Relationship Id="rId' . ($sheetCount + 1) . '"'
+            . ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"'
+            . ' Target="styles.xml"/>';
+        return $xml . '</Relationships>';
     }
 
     private static function stylesXml(): string
@@ -243,12 +334,12 @@ final class SimpleXlsxWriter
             . '<borders count="1"><border/></borders>'
             . '<cellStyleXfs count="1"><xf/></cellStyleXfs>'
             . '<cellXfs count="6">'
-            . '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' // 0 general
-            . '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>' // 1 header
-            . '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>' // 2 currency
-            . '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>' // 3 percent-like
-            . '<xf numFmtId="166" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>' // 4 qty
-            . '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>' // 5 number
+            . '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+            . '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+            . '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+            . '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+            . '<xf numFmtId="166" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+            . '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
             . '</cellXfs>'
             . '</styleSheet>';
     }

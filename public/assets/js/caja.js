@@ -1308,14 +1308,43 @@
         if (elDeliverySplit) elDeliverySplit.style.display = 'none';
     }
 
+    function syncPosCreditPaymentMethod() {
+        var credit = elPayType && elPayType.value === 'credit';
+        var initial = 0;
+        if (elInitialPay) {
+            initial = (typeof parseMoneyInput === 'function')
+                ? (parseMoneyInput(elInitialPay.value) || 0)
+                : (parseFloat(String(elInitialPay.value || '0').replace(/[^\d.,-]/g, '').replace(',', '.')) || 0);
+        }
+        var needMethod = !credit || initial > 0.009;
+        var singleWrap = document.getElementById('posSinglePayWrap');
+        var mixedToggle = document.querySelector('label[for="posMixedPay"]');
+        var mixedWrap = document.getElementById('posMixedPayWrap');
+        if (singleWrap) singleWrap.style.display = needMethod ? '' : 'none';
+        if (mixedToggle) mixedToggle.style.display = needMethod ? '' : 'none';
+        if (!needMethod && mixedWrap) {
+            mixedWrap.style.display = 'none';
+            if (elMixedPay) elMixedPay.checked = false;
+        }
+        var methodLabel = singleWrap ? singleWrap.querySelector('label') : null;
+        if (methodLabel) {
+            if (!methodLabel.getAttribute('data-label-base')) {
+                methodLabel.setAttribute('data-label-base', methodLabel.textContent || 'Método de pago');
+            }
+            methodLabel.textContent = (credit && needMethod) ? 'Método del abono' : methodLabel.getAttribute('data-label-base');
+        }
+    }
+
     function togglePosCredit() {
         var credit = elPayType && elPayType.value === 'credit';
         if (elTermsGroup) elTermsGroup.style.display = credit ? '' : 'none';
         if (elInitialGroup) elInitialGroup.style.display = credit ? '' : 'none';
+        syncPosCreditPaymentMethod();
         renderCart();
     }
     if (elPayType) elPayType.addEventListener('change', togglePosCredit);
     if (elPayTerms) elPayTerms.addEventListener('change', function () { renderCart(); });
+    if (elInitialPay) elInitialPay.addEventListener('input', syncPosCreditPaymentMethod);
     togglePosCredit();
     var elWholesale = document.getElementById('posWholesaleMode');
     if (elWholesale) {

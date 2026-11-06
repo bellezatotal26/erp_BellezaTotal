@@ -90,57 +90,59 @@ class TenantNominaController extends TenantController
 
         $empFilters = $this->employeeFilters();
         $runFilters = $this->runFilters();
+        $employees = [];
+        $activeEmployees = [];
+        $runs = [];
         $runYears = [];
+        $params = [];
+        $schedules = [];
+        $scheduleCount = 0;
+        $q = $empFilters['q'];
+        $status = $empFilters['status'];
+        $activeCount = 0;
+        $monthPayroll = 0.0;
+
         try {
-            $q = $empFilters['q'];
-            $status = $empFilters['status'];
-            $employees = $tab === 'schedules'
-                ? $this->payroll->employees('active')
-                : ($tab === 'employees'
-                    ? $this->payroll->employees($status, $q, $empFilters['schedule'])
-                    : $this->payroll->employees());
-            $recentRuns = $this->payroll->runs(36);
-            $runs = ($runFilters['year'] > 0 || $runFilters['status'] !== '')
-                ? $this->payroll->runs(120, $runFilters['year'], $runFilters['status'])
-                : $recentRuns;
-            $runYears = $this->payroll->runYears();
+            // Datos livianos del encabezado (todas las pestañas).
             $params = $this->payroll->params();
-            $schedules = $this->payroll->schedules();
             $activeCount = $this->payroll->countEmployees('active');
-            $monthPayroll = 0.0;
-            $y = (int)date('Y');
-            $m = (int)date('n');
-            foreach ($recentRuns as $run) {
-                if ((int)$run['period_year'] === $y && (int)$run['period_month'] === $m
-                    && in_array(($run['status'] ?? ''), ['paid', 'posted', 'draft'], true)
-                ) {
-                    if (($run['status'] ?? '') === 'paid' || $monthPayroll <= 0) {
-                        $monthPayroll = (float)$run['net_total'];
-                    }
-                    if (($run['status'] ?? '') === 'paid') {
-                        break;
-                    }
-                }
+            $scheduleCount = $this->payroll->countSchedules();
+            $monthPayroll = $this->payroll->monthNetPayroll((int)date('Y'), (int)date('n'));
+
+            // Carga bajo demanda: evita schedules/empleados/runs pesados fuera de su pestaña.
+            if ($tab === 'employees') {
+                $employees = $this->payroll->employees($status, $q, $empFilters['schedule']);
+                $schedules = $this->payroll->schedules();
+                $scheduleCount = count($schedules);
+            } elseif ($tab === 'schedules') {
+                $employees = $this->payroll->employees('active');
+                $activeEmployees = $employees;
+                $schedules = $this->payroll->schedules();
+                $scheduleCount = count($schedules);
+            } elseif ($tab === 'runs') {
+                $activeEmployees = $this->payroll->employees('active');
+                $schedules = $this->payroll->schedules(); // flags RNO/HE del modal
+                $scheduleCount = count($schedules);
+                $runYears = $this->payroll->runYears();
+                $runs = ($runFilters['year'] > 0 || $runFilters['status'] !== '')
+                    ? $this->payroll->runs(120, $runFilters['year'], $runFilters['status'])
+                    : $this->payroll->runs(36);
+            } elseif ($tab === 'params') {
+                $employees = $this->payroll->employees('active'); // comisiones fijas
             }
         } catch (\Throwable $e) {
             error_log('Nomina index: ' . $e->getMessage());
             $_SESSION['error'] = 'No se pudo cargar nómina: ' . $e->getMessage();
-            $employees = [];
-            $runs = [];
-            $params = [];
-            $schedules = [];
-            $q = '';
-            $status = '';
-            $activeCount = 0;
-            $monthPayroll = 0.0;
         }
 
         $this->view('tenant.nomina', $this->tenantViewData([
             'tab' => $tab,
             'employees' => $employees,
+            'activeEmployees' => $activeEmployees,
             'runs' => $runs,
             'params' => $params,
             'schedules' => $schedules,
+            'scheduleCount' => $scheduleCount,
             'q' => $q,
             'statusFilter' => $status,
             'scheduleFilter' => $empFilters['schedule'],
@@ -372,6 +374,20 @@ class TenantNominaController extends TenantController
                     }
                 }
             }
+            $rawEmpIds = $this->request->post('employee_ids', []);
+            $employeeIds = [];
+            if (is_array($rawEmpIds)) {
+                foreach ($rawEmpIds as $rawId) {
+                    $id = (int)$rawId;
+                    if ($id > 0) {
+                        $employeeIds[] = $id;
+                    }
+                }
+            }
+            $employeeIds = array_values(array_unique($employeeIds));
+            if (!$employeeIds) {
+                throw new \RuntimeException('Seleccione al menos un empleado para liquidar');
+            }
             $runId = $this->payroll->createRun(
                 $year,
                 $month,
@@ -388,6 +404,7 @@ class TenantNominaController extends TenantController
                     'schedule_rno' => $this->request->post('schedule_rno') === '1',
                     'schedule_ot' => $this->request->post('schedule_ot') === '1',
                     'incapacity' => $incapacity,
+                    'employee_ids' => $employeeIds,
                 ]
             );
             $this->respond(true, 'Liquidación creada', '/app/nomina?tab=runs&action=run_detail&id=' . $runId);
@@ -484,7 +501,19 @@ class TenantNominaController extends TenantController
                 'payroll_run',
                 $id
             );
-            $this->respond(true, $msg, '/app/nomina?tab=runs&action=run_detail&id=' . $id);
+            \SoftNova\Services\TenantNotifyService::push(
+                $this->db,
+                'payroll_paid:' . $id . ':' . time(),
+                'Nómina contabilizada y pagada',
+                $msg,
+                '/app/nomina?tab=runs&action=run_detail&id=' . $id,
+                true,
+                'payroll',
+                'Nómina'
+            );
+            $this->respond(true, $msg, '/app/nomina?tab=runs&action=run_detail&id=' . $id, [
+                'sticky_alert' => true,
+            ]);
         } catch (\Throwable $e) {
             $this->respond(false, $e->getMessage(), '/app/nomina?tab=runs');
         }
@@ -667,18 +696,35 @@ class TenantNominaController extends TenantController
             [$id]
         )->fetch() ?: null;
 
+        $activeEmployees = [];
+        try {
+            $activeEmployees = $this->payroll->employees('active');
+        } catch (\Throwable $e) {
+            $activeEmployees = [];
+        }
+
+        $schedules = [];
+        try {
+            $schedules = $this->payroll->schedules();
+        } catch (\Throwable $e) {
+            $schedules = [];
+        }
+
         $this->view('tenant.nomina', $this->tenantViewData([
             'tab' => 'run_detail',
             'employees' => [],
+            'activeEmployees' => $activeEmployees,
             'runs' => [],
             'params' => $this->payroll->params(),
+            'schedules' => $schedules,
+            'scheduleCount' => count($schedules),
             'detail' => $detail,
             'accountingEntry' => $accountingEntry,
             'paymentEntry' => $paymentEntry,
             'q' => '',
             'statusFilter' => '',
-            'activeCount' => 0,
-            'monthPayroll' => 0,
+            'activeCount' => count($activeEmployees),
+            'monthPayroll' => $this->payroll->monthNetPayroll((int)date('Y'), (int)date('n')),
         ]));
     }
 

@@ -720,6 +720,8 @@ body.dark-mode .sidebar-toggle {
 .notif-type-sale { background: #0D7C4A; }
 .notif-type-inventory { background: #D97706; }
 .notif-type-news { background: #7C3AED; }
+.notif-type-payroll { background: #0D7C4A; }
+.notif-type-system { background: #475569; }
 
 .notification-item-content {
     display: flex;
@@ -2708,10 +2710,15 @@ body.dark-mode .card-rose .card-icon { background: linear-gradient(135deg, #8813
     position: fixed;
     top: 20px;
     right: 20px;
-    z-index: 9999;
+    /* Por encima de modales de factura (11000) y proveedor rápido (12000) */
+    z-index: 14000;
     display: flex;
     flex-direction: column;
     gap: 10px;
+    pointer-events: none;
+}
+.toast-container .toast {
+    pointer-events: auto;
 }
 
 .toast {
@@ -2727,6 +2734,38 @@ body.dark-mode .card-rose .card-icon { background: linear-gradient(135deg, #8813
     display: flex;
     align-items: center;
     gap: 10px;
+}
+
+.toast .toast-msg {
+    flex: 1 1 auto;
+    min-width: 0;
+    line-height: 1.35;
+}
+
+.toast-close {
+    flex: 0 0 auto;
+    margin: -4px -6px -4px 4px;
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.toast-close:hover {
+    background: rgba(255, 255, 255, 0.3);
+}
+
+.toast.toast-sticky {
+    animation: toastIn 0.3s ease;
+    max-width: min(520px, calc(100vw - 40px));
 }
 
 .toast-success { background: linear-gradient(135deg, #059669, #10b981); }
@@ -3138,8 +3177,17 @@ body.dark-mode .feature-locked-overlay {
     animation: toastPop 0.35s ease, toastOut 0.3s ease 4.5s forwards;
 }
 
+.toast.toast-sticky {
+    animation: toastPop 0.35s ease;
+}
+
 .toast-success.toast-bounce {
     animation: toastPop 0.35s ease, successPulse 0.6s ease 0.2s, toastOut 0.3s ease 4.5s forwards;
+}
+
+.toast-success.toast-sticky.toast-bounce,
+.toast.toast-sticky.toast-bounce {
+    animation: toastPop 0.35s ease, successPulse 0.6s ease 0.2s;
 }
 
 @keyframes successPulse {
@@ -3455,6 +3503,15 @@ a.stat-card-link:hover {
     overscroll-behavior: contain;
     z-index: 11000;
 }
+#invoiceUploadModal .inv-upload-busy {
+    flex: 1 1 100%;
+    max-width: 100%;
+    white-space: normal;
+    word-break: break-word;
+    line-height: 1.35;
+    margin: 6px 0 0;
+    font-size: 13px;
+}
 #invoiceReviewModal .invoice-review-shell,
 .invoice-review-shell {
     width: 100%;
@@ -3504,9 +3561,13 @@ a.stat-card-link:hover {
 }
 #invoiceReviewModal .invoice-review-table {
     width: 100%;
+    min-width: 1240px;
     /* separate: sticky thead fiable en Chrome/Edge */
     border-collapse: separate;
     border-spacing: 0;
+}
+#invoiceReviewModal .invoice-review-table.invoice-review-table--resizable {
+    table-layout: fixed;
 }
 #invoiceReviewModal .invoice-review-table thead th,
 #invoiceReviewModal table.invoice-review-table > thead > tr > th {
@@ -3521,8 +3582,77 @@ a.stat-card-link:hover {
     font-size: 13px !important;
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.18);
     border-bottom: 1px solid rgba(255, 255, 255, 0.2) !important;
+    border-right: 2px solid #000000 !important;
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding-right: 10px !important;
+}
+#invoiceReviewModal .invoice-review-table thead th:last-child {
+    border-right: 2px solid #000000 !important;
+}
+#invoiceReviewModal .invoice-review-table thead th .inv-col-resizer {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 2px;
+    height: 100%;
+    cursor: col-resize;
+    user-select: none;
+    z-index: 7;
+    background: #000000;
+    opacity: 1;
+}
+/* Hit area más amplia; el borde visible sigue en 2px */
+#invoiceReviewModal .invoice-review-table thead th .inv-col-resizer::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: -5px;
+    width: 12px;
+}
+#invoiceReviewModal .invoice-review-table thead th .inv-col-resizer:hover,
+body.inv-col-resizing #invoiceReviewModal .invoice-review-table thead th .inv-col-resizer {
+    background: #000000;
+    width: 2px;
+}
+body.inv-col-resizing {
+    cursor: col-resize !important;
+    user-select: none !important;
+}
+body.inv-col-resizing * {
+    cursor: col-resize !important;
+}
+/* Al redimensionar: el contenido nunca se sale ni se monta en la columna vecina */
+#invoiceReviewModal .invoice-review-table.invoice-review-table--resizable td {
+    overflow: hidden;
+    vertical-align: top;
+    max-width: 0; /* fuerza que table-layout:fixed respete el ancho de <col> */
+}
+#invoiceReviewModal .invoice-review-table.invoice-review-table--resizable td > * {
+    max-width: 100%;
+    box-sizing: border-box;
+}
+#invoiceReviewModal .invoice-review-table.invoice-review-table--resizable .form-control,
+#invoiceReviewModal .invoice-review-table.invoice-review-table--resizable input,
+#invoiceReviewModal .invoice-review-table.invoice-review-table--resizable select,
+#invoiceReviewModal .invoice-review-table.invoice-review-table--resizable .btn {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+}
+#invoiceReviewModal .invoice-review-table.invoice-review-table--resizable td > div {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+#invoiceReviewModal .invoice-review-table.invoice-review-table--resizable .inv-invcost-hint,
+#invoiceReviewModal .invoice-review-table.invoice-review-table--resizable .inv-margin-hint {
+    max-width: 100% !important;
 }
 @media (max-width: 900px) {
     #invoiceReviewModal .invoice-review-shell,
@@ -3674,8 +3804,35 @@ a.stat-card-link:hover {
 #invoiceReviewModal .invoice-review-table select.form-control { padding-right: 22px; }
 #invoiceReviewModal .invoice-review-table select[name$="[row_action]"] { width: 128px; }
 #invoiceReviewModal .invoice-review-table input[name$="[description]"] { width: 190px; }
-#invoiceReviewModal .invoice-review-table input[name$="[supplier_sku]"],
-#invoiceReviewModal .invoice-review-table input[name$="[barcode]"] { width: 130px !important; }
+#invoiceReviewModal .invoice-review-table td.inv-stack {
+    vertical-align: top;
+    min-width: 110px;
+}
+#invoiceReviewModal .invoice-review-table .inv-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    max-width: 100%;
+}
+#invoiceReviewModal .invoice-review-table .inv-stack .form-control,
+#invoiceReviewModal .invoice-review-table .inv-stack input {
+    width: 100% !important;
+    min-width: 0 !important;
+}
+#invoiceReviewModal .invoice-review-table .inv-sku-ean input.inv-sku,
+#invoiceReviewModal .invoice-review-table .inv-sku-ean input.inv-ean {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px;
+}
+#invoiceReviewModal .invoice-review-table .inv-lot-vence input.inv-lot {
+    font-size: 12px;
+}
+#invoiceReviewModal .invoice-review-table .inv-lot-vence input.inv-vence {
+    font-size: 12px;
+    padding-left: 4px;
+    padding-right: 2px;
+}
 #invoiceReviewModal .invoice-review-table select[name$="[matched_product_id]"] { width: 210px; }
 #invoiceReviewModal .invoice-review-table input[name$="[quantity]"] { width: 64px; }
 #invoiceReviewModal .invoice-review-table input[name$="[unit_cost]"],
@@ -3686,11 +3843,39 @@ a.stat-card-link:hover {
 #invoiceReviewModal .invoice-review-table input[name$="[inventory_cost]"]:disabled { opacity: .45; }
 #invoiceReviewModal .invoice-review-table .inv-invcost-hint { max-width: 140px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #invoiceReviewModal .invoice-review-table input[name$="[tax_rate]"] { width: 60px; }
-#invoiceReviewModal .invoice-review-table input[name$="[discount_pct]"] { width: 56px; }
-#invoiceReviewModal .invoice-review-table input[name$="[lot_code]"] { width: 84px; }
-#invoiceReviewModal .invoice-review-table input[name$="[expiry_date]"] { width: 132px; }
+#invoiceReviewModal .invoice-review-table input[name$="[discount_pct]"] { width: 72px; }
 #invoiceReviewModal .invoice-review-table td > div { font-size: 10.5px !important; line-height: 1.25; margin-top: 2px; }
 #invoiceReviewModal .invoice-review-table td .btn-sm { padding: 3px 8px !important; font-size: 11px !important; }
+#invoiceReviewModal .invoice-review-table .inv-del-btn {
+    width: 28px !important;
+    min-width: 28px !important;
+    max-width: 28px !important;
+    height: 28px;
+    padding: 0 !important;
+    margin: 0;
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    color: #dc2626;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    border-radius: 4px;
+}
+#invoiceReviewModal .invoice-review-table .inv-del-btn:hover {
+    color: #b91c1c;
+    background: rgba(220, 38, 38, 0.08) !important;
+}
+#invoiceReviewModal .invoice-review-table .inv-del-btn:focus-visible {
+    outline: 2px solid #dc2626;
+    outline-offset: 1px;
+}
+#invoiceReviewModal .invoice-review-table .inv-del-btn svg {
+    display: block;
+    flex-shrink: 0;
+}
 
 /* Pantallas bajas: mantiene pantalla completa; compacta cabecera/pie */
 @media (max-height: 800px) {

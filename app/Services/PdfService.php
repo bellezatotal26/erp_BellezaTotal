@@ -1256,11 +1256,22 @@ class PdfService
             $paymentBreakdown[$methodCode]['total'] += $saleTotal;
             $paymentBreakdown[$methodCode]['count']++;
 
+            $salePayLabel = PaymentMethodCatalog::label((string)($sale['payment_method'] ?? 'cash'));
+            if (CashClosingReportBuilder::saleHasMixedBreakdown($sale)) {
+                $mixedParts = CashClosingReportBuilder::formatPaymentPartsLabel(
+                    is_array($sale['payments'] ?? null) ? $sale['payments'] : [],
+                    $fmt
+                );
+                if ($mixedParts !== '') {
+                    $salePayLabel = 'Mixto: ' . $mixedParts;
+                }
+            }
+
             $salesHtml .= '<tr>
                 <td>' . date('H:i', strtotime($sale['sale_date'] ?? 'now')) . '</td>
                 <td>' . htmlspecialchars((string)($sale['invoice_number'] ?? ('#' . ($sale['id'] ?? '')))) . '</td>
                 <td>' . htmlspecialchars((string)($sale['customer_name'] ?? 'Publico general')) . '</td>
-                <td>' . htmlspecialchars(PaymentMethodCatalog::label((string)($sale['payment_method'] ?? 'cash'))) . '</td>
+                <td>' . htmlspecialchars($salePayLabel) . '</td>
                 <td style="text-align:right;">' . $fmt($saleTotal) . '</td>
             </tr>';
         }
@@ -1361,6 +1372,8 @@ class PdfService
             $showCostProfit
         );
         $activityHtml = CashClosingReportBuilder::buildUnifiedActivityHtml($sales, $movements, $fmt);
+        $byUserHtml = $this->cashClosingByUserHtml($movements, $fmt);
+        $creditAbonosHtml = $this->cashClosingCreditAbonosHtml($movements, $fmt);
 
         $html = $this->wrapHtml('CIERRE DE CAJA - REPORTE DEL DIA', $companyName, '
             <div style="margin-bottom:14px;">
@@ -1372,7 +1385,8 @@ class PdfService
                             <strong>Cierre:</strong> ' . date('d/m/Y H:i', strtotime($session['closing_date'] ?? 'now')) . '
                         </td>
                         <td width="45%" style="text-align:right;">
-                            <strong>Usuario:</strong> ' . htmlspecialchars($session['user_name'] ?? 'N/A') . '
+                            <strong>Quién abrió:</strong> ' . htmlspecialchars($session['user_name'] ?? 'N/A') . '<br>
+                            <span style="font-size:10px;color:#64748B;">Caja única: pueden operar varios usuarios</span>
                         </td>
                     </tr>
                 </table>
@@ -1380,11 +1394,15 @@ class PdfService
 
             ' . $summaryHtml . '
 
+            ' . $byUserHtml . '
+
+            ' . $creditAbonosHtml . '
+
             <h3 style="margin:18px 0 8px;font-size:13px;background:#F1F5F9;border:1px solid #CBD5E1;padding:8px 10px;">
                 Movimientos de caja + Ventas
             </h3>
             <p style="margin:0 0 8px;font-size:10px;color:#64748B;">
-                Una sola lista del día: cada venta aparece una vez; los egresos/ingresos manuales del cajón se suman sin duplicar cobros de venta.
+                Ventas del día + movimientos de cajón. Los abonos a crédito también aparecen abajo (y en el bloque informativo de arriba).
             </p>
             ' . $activityHtml . '
 
@@ -1392,6 +1410,180 @@ class PdfService
         ');
 
         return $this->generate($html);
+    }
+
+    /**
+     * Bloque informativo: abonos a crédito del día (efectivo y otros medios).
+     * No alteran el arqueo; documentan cobros de facturas ya vendidas.
+     *
+     * @param list<array<string,mixed>> $movements
+     */
+    private function cashClosingCreditAbonosHtml(array $movements, callable $fmt): string
+    {
+        $rows = [];
+        $totalCash = 0.0;
+        $totalOther = 0.0;
+        foreach ($movements as $mov) {
+            if ((string)($mov['reference_type'] ?? '') !== 'sale_payment') {
+                continue;
+            }
+            if ((string)($mov['type'] ?? '') !== 'income') {
+                continue;
+            }
+            $amt = round((float)($mov['amount'] ?? 0), 2);
+            if ($amt < 0.009) {
+                continue;
+            }
+            $method = (string)($mov['payment_method'] ?? '');
+            $isMeta = !empty($mov['_meta_only']) || (int)($mov['id'] ?? 0) <= 0;
+            $isCash = !$isMeta && ($method === '' || PaymentMethodCatalog::affectsCash($method));
+            if ($isCash) {
+                $totalCash = round($totalCash + $amt, 2);
+                $methodLabel = $method !== '' ? PaymentMethodCatalog::label($method) : 'Efectivo';
+            } else {
+                $totalOther = round($totalOther + $amt, 2);
+                $methodLabel = $method !== '' ? PaymentMethodCatalog::label($method) : 'Otro medio';
+            }
+            $hora = !empty($mov['created_at']) ? date('H:i', strtotime((string)$mov['created_at']) ?: time()) : '—';
+            $detalle = trim((string)($mov['origin_label'] ?? $mov['description'] ?? 'Abono'));
+            $user = trim((string)($mov['user_name'] ?? ''));
+            if ($user !== '') {
+                $detalle .= ' · ' . $user;
+            }
+            $rows[] = '<tr>
+                <td style="padding:5px 8px;border-bottom:1px solid #E2E8F0;font-size:11px;">' . htmlspecialchars($hora) . '</td>
+                <td style="padding:5px 8px;border-bottom:1px solid #E2E8F0;font-size:11px;">' . htmlspecialchars($detalle) . '</td>
+                <td style="padding:5px 8px;border-bottom:1px solid #E2E8F0;font-size:11px;">' . htmlspecialchars($methodLabel) . '</td>
+                <td style="padding:5px 8px;border-bottom:1px solid #E2E8F0;text-align:right;font-size:11px;color:#059669;">+'
+                . htmlspecialchars($fmt($amt)) . '</td>
+            </tr>';
+        }
+
+        if ($rows === []) {
+            return '';
+        }
+
+        $tot = round($totalCash + $totalOther, 2);
+        return '
+            <h3 style="margin:18px 0 8px;font-size:13px;background:#ECFDF5;border:1px solid #A7F3D0;padding:8px 10px;">
+                Abonos a crédito del día (informativo)
+            </h3>
+            <p style="margin:0 0 8px;font-size:10px;color:#64748B;">
+                Cobros de facturas ya vendidas. El efectivo sí entra al cajón; transferencia/Nequi/etc. no mueven el cajón pero sí se reportan aquí.
+                Total ' . htmlspecialchars($fmt($tot))
+                . ' · efectivo ' . htmlspecialchars($fmt($totalCash))
+                . ' · otros medios ' . htmlspecialchars($fmt($totalOther)) . '.
+            </p>
+            <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #E2E8F0;margin-bottom:8px;">
+                <tr style="background:#F0FDF4;">
+                    <th style="text-align:left;padding:6px 8px;font-size:11px;">Hora</th>
+                    <th style="text-align:left;padding:6px 8px;font-size:11px;">Detalle</th>
+                    <th style="text-align:left;padding:6px 8px;font-size:11px;">Medio</th>
+                    <th style="text-align:right;padding:6px 8px;font-size:11px;">Monto</th>
+                </tr>
+                ' . implode('', $rows) . '
+            </table>';
+    }
+
+    /**
+     * Resumen por usuario (caja única compartida), igual que el modal de detalle.
+     *
+     * @param list<array<string,mixed>> $movements
+     */
+    private function cashClosingByUserHtml(array $movements, callable $fmt): string
+    {
+        $byUser = [];
+        foreach ($movements as $mov) {
+            $uName = trim((string)($mov['user_name'] ?? 'Sin usuario'));
+            if ($uName === '') {
+                $uName = 'Sin usuario';
+            }
+            $isIn = (string)($mov['type'] ?? '') === 'income';
+            $amt = round((float)($mov['amount'] ?? 0), 2);
+            $isMeta = !empty($mov['_meta_only']) || (int)($mov['id'] ?? 0) <= 0;
+            $isAbono = (string)($mov['reference_type'] ?? '') === 'sale_payment';
+            $method = (string)($mov['payment_method'] ?? '');
+
+            if (!isset($byUser[$uName])) {
+                $byUser[$uName] = [
+                    'user_name' => $uName,
+                    'incomes' => 0.0,
+                    'expenses' => 0.0,
+                    'count' => 0,
+                    'abonos_count' => 0,
+                    'abonos_total' => 0.0,
+                    'abonos_other' => 0.0,
+                ];
+            }
+
+            if ($isAbono && $isIn) {
+                $byUser[$uName]['abonos_count']++;
+                $byUser[$uName]['abonos_total'] = round($byUser[$uName]['abonos_total'] + $amt, 2);
+                if ($isMeta || ($method !== '' && !PaymentMethodCatalog::affectsCash($method))) {
+                    $byUser[$uName]['abonos_other'] = round($byUser[$uName]['abonos_other'] + $amt, 2);
+                }
+            }
+
+            if ($isMeta) {
+                continue;
+            }
+            $byUser[$uName][$isIn ? 'incomes' : 'expenses'] = round(
+                $byUser[$uName][$isIn ? 'incomes' : 'expenses'] + $amt,
+                2
+            );
+            $byUser[$uName]['count']++;
+        }
+
+        $byUser = array_filter(
+            $byUser,
+            static fn($bu) => (int)$bu['count'] > 0 || (int)$bu['abonos_count'] > 0
+        );
+        if ($byUser === []) {
+            return '';
+        }
+
+        uasort($byUser, static function ($a, $b) {
+            $netA = (float)$a['incomes'] - (float)$a['expenses'];
+            $netB = (float)$b['incomes'] - (float)$b['expenses'];
+            return $netB <=> $netA;
+        });
+
+        $rows = '';
+        foreach ($byUser as $bu) {
+            $net = round((float)$bu['incomes'] - (float)$bu['expenses'], 2);
+            $abonosLine = '';
+            if ((int)$bu['abonos_count'] > 0) {
+                $abonosLine = '<br><span style="color:#047857;font-size:10px;">Abonos crédito: '
+                    . (int)$bu['abonos_count'] . ' · ' . htmlspecialchars($fmt($bu['abonos_total']));
+                if ((float)$bu['abonos_other'] > 0.009) {
+                    $abonosLine .= ' (otros medios ' . htmlspecialchars($fmt($bu['abonos_other'])) . ')';
+                }
+                $abonosLine .= '</span>';
+            }
+            $rows .= '<tr>
+                <td style="padding:6px 8px;border-bottom:1px solid #E2E8F0;">
+                    <strong>' . htmlspecialchars((string)$bu['user_name']) . '</strong>
+                    <span style="color:#64748B;font-size:10px;"> · ' . (int)$bu['count'] . ' mov. cajón</span>
+                    ' . $abonosLine . '
+                </td>
+                <td style="padding:6px 8px;border-bottom:1px solid #E2E8F0;text-align:right;font-size:11px;">
+                    <span style="color:#059669;">+' . htmlspecialchars($fmt($bu['incomes'])) . '</span>
+                    · <span style="color:#DC2626;">−' . htmlspecialchars($fmt($bu['expenses'])) . '</span><br>
+                    <strong>Neto cajón ' . htmlspecialchars($fmt($net)) . '</strong>
+                </td>
+            </tr>';
+        }
+
+        return '
+            <h3 style="margin:18px 0 8px;font-size:13px;background:#EEF2FF;border:1px solid #C7D2FE;padding:8px 10px;">
+                Por usuario (caja única)
+            </h3>
+            <p style="margin:0 0 8px;font-size:10px;color:#64748B;">
+                Cajón = solo efectivo. Los abonos por transferencia/Nequi se listan aparte (no entran al cajón).
+            </p>
+            <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #E2E8F0;font-size:11px;margin-bottom:8px;">
+                ' . $rows . '
+            </table>';
     }
 
     /**

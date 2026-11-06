@@ -101,12 +101,35 @@ function updateShareWhatsappLink() {
 }
 
 function toggleCredit() {
-    var s = document.getElementById('paymentType').value === 'credit';
-    document.getElementById('initialPaymentGroup').style.display = s ? 'block' : 'none';
+    var typeEl = document.getElementById('paymentType');
+    var s = typeEl && typeEl.value === 'credit';
+    var initGroup = document.getElementById('initialPaymentGroup');
+    if (initGroup) initGroup.style.display = s ? 'block' : 'none';
     var terms = document.getElementById('paymentTerms');
     if (terms && s && terms.value === 'cash') {
         terms.value = 'net_30';
         onPaymentTermsChange();
+    }
+    syncCreditPaymentMethodVisibility();
+}
+
+/** Crédito sin abono inicial: no pedir medio (aún no se sabe cómo pagará). */
+function syncCreditPaymentMethodVisibility() {
+    var typeEl = document.getElementById('paymentType');
+    var isCredit = typeEl && typeEl.value === 'credit';
+    var methodGroup = document.getElementById('paymentMethodGroup');
+    var mixedWrap = document.getElementById('paymentMixedGroup') || document.querySelector('[data-credit-hide-method]');
+    var initInput = document.querySelector('#initialPaymentGroup input[name="initial_payment"], #initialPaymentGroup input');
+    var initial = 0;
+    if (initInput && window.parseMoney) {
+        initial = parseMoney(initInput.value) || 0;
+    } else if (initInput) {
+        initial = parseFloat(String(initInput.value || '0').replace(/[^\d.,-]/g, '').replace(',', '.')) || 0;
+    }
+    var needMethod = !isCredit || initial > 0.009;
+    if (methodGroup) methodGroup.style.display = needMethod ? '' : 'none';
+    if (mixedWrap && mixedWrap !== methodGroup) {
+        mixedWrap.style.display = needMethod ? '' : 'none';
     }
 }
 

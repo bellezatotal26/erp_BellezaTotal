@@ -1749,9 +1749,9 @@ function openPurchaseLimitModal() {
                         <input type="checkbox" name="use_ai" id="invoiceUseAi" value="1" style="width:auto;margin-top:3px;"
                                <?php echo $aiInvoiceReady ? 'checked' : 'disabled'; ?>>
                         <span>
-                            Interpretar con IA <span class="field-tip" data-tip="Usa IA para leer fotos o PDF escaneados. Si el PDF ya tiene texto, también mejora el armado de líneas. Requiere OPENROUTER_API_KEY." tabindex="0">?</span>
+                            Interpretar con IA <span class="field-tip" data-tip="Usa OpenRouter para leer fotos y PDF (texto o escaneado). Si el servidor no puede convertir el PDF a imagen, se envía el PDF completo al modelo. Requiere OPENROUTER_API_KEY." tabindex="0">?</span>
                             <small style="display:block;color:var(--color-text-secondary);font-weight:400;">
-                                Necesario para PDF escaneados o fotos. Si el PDF ya trae texto, también mejora la lectura.
+                                Necesario para PDF escaneados o fotos. Si falla, revise el mensaje del borrador (créditos ≠ modelo con visión) o suba JPG/PNG / CSV.
                             </small>
                             <?php if (!$aiInvoiceReady): ?>
                                 <small style="display:block;color:var(--dmc-B45309, #B45309);">Configure OPENROUTER_API_KEY para habilitarlo.</small>
@@ -2315,6 +2315,56 @@ function closeInvoiceUpload() {
     document.getElementById('invoiceUploadModal').style.display = 'none';
     poSyncInvoiceModalScrollLock();
 }
+/** Normaliza Dcto % a notación con punto antes de enviar (14,30 → 14.30). */
+function normalizeInvoiceDiscInputs(form) {
+    if (!form) return;
+    form.querySelectorAll('input[name$="[discount_pct]"], input[name="commercial_discount_pct"], input[name="early_payment_discount_pct"]').forEach(function(el) {
+        var n = Math.max(0, Math.min(100, Math.round(invoiceParseQty(el.value) * 100) / 100));
+        el.value = (Math.abs(n - Math.round(n)) < 0.0005) ? String(Math.round(n)) : n.toFixed(2);
+    });
+}
+
+function setInvoiceLiveSaveStatus(state, detail) {
+    var liveNotes = document.querySelector('#invoiceReviewBody #invLiveStatusNotes');
+    if (!liveNotes) return;
+    if (state === 'saving') {
+        liveNotes.innerHTML = '<span style="color:var(--color-text-secondary);">Guardando cambios…</span>';
+        return;
+    }
+    if (state === 'error') {
+        liveNotes.innerHTML = '<span style="color:var(--dmc-DC2626, #DC2626);font-weight:600;">' +
+            esc(detail || 'No se pudo guardar el borrador') + '</span>';
+        return;
+    }
+    if (state === 'saved') {
+        liveNotes.innerHTML = '<span style="color:var(--dmc-047857, #047857);font-weight:600;">Guardado</span>' +
+            '<span style="color:var(--color-text-secondary);"> · ' + esc(detail || 'Dcto % y demás campos persistidos') + '</span>';
+        return;
+    }
+}
+
+function scheduleInvoiceReviewAutosave() {
+    if (window._irAutosaveTimer) clearTimeout(window._irAutosaveTimer);
+    window._irAutosaveTimer = setTimeout(function() {
+        if (window._irAutosaveBusy) {
+            scheduleInvoiceReviewAutosave();
+            return;
+        }
+        window._irAutosaveBusy = true;
+        setInvoiceLiveSaveStatus('saving');
+        persistInvoiceReviewDraft()
+        .then(function(d) {
+            if (d) setInvoiceLiveSaveStatus('saved', 'listo');
+        })
+        .catch(function(err) {
+            setInvoiceLiveSaveStatus('error', err && err.message ? err.message : 'Error al guardar');
+        })
+        .finally(function() {
+            window._irAutosaveBusy = false;
+        });
+    }, 650);
+}
+
 function persistInvoiceReviewDraft() {
     return new Promise(function(resolve, reject) {
         var form = document.getElementById('invoiceReviewForm');
@@ -2324,6 +2374,7 @@ function persistInvoiceReviewDraft() {
             resolve(null);
             return;
         }
+        normalizeInvoiceDiscInputs(form);
         if (window.SeriMoney && typeof SeriMoney.normalizeForm === 'function') {
             SeriMoney.normalizeForm(form);
         }
@@ -2342,6 +2393,12 @@ function persistInvoiceReviewDraft() {
             }
             if (Array.isArray(d.items)) {
                 window._invoiceReviewItems = d.items;
+                // Reaplicar Dcto % desde BD por si el servidor normalizó el valor.
+                d.items.forEach(function(it) {
+                    if (!it || !it.id) return;
+                    var el = form.querySelector('input[name="items[' + it.id + '][discount_pct]"]');
+                    if (el) el.value = formatInvoiceDiscPct(it.discount_pct);
+                });
             }
             resolve(d);
         })
@@ -2492,24 +2549,118 @@ function validateInvoiceUploadMeta() {
         if (t.name === 'apply_product_vat') syncInvoiceCustomVatUi();
     });
     form.addEventListener('submit', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
         if (!validateInvoiceUploadMeta()) {
-            e.preventDefault();
-            e.stopPropagation();
             return;
         }
-        var footer = form.querySelector('.invoice-shell-footer');
-        if (footer && !footer.querySelector('.inv-upload-busy')) {
-            var busy = document.createElement('div');
-            busy.className = 'inv-upload-busy';
-            busy.style.cssText = 'flex:1 1 100%;font-size:13px;color:var(--color-text-secondary);margin:4px 0 0;';
-            busy.textContent = 'Leyendo factura… esto puede tardar si usa IA o PDF. No cierre la ventana.';
-            footer.appendChild(busy);
+        var hid = document.getElementById('invoiceSupplierId');
+        if (!hid || !hid.value) {
+            if (typeof showAlert === 'function') {
+                showAlert('Seleccione un proveedor de la lista (o cree uno con + Nuevo)', 'warning');
+            }
+            return;
         }
-        form.querySelectorAll('button').forEach(function(b) { b.disabled = true; });
-        var submitBtn = form.querySelector('button[type="submit"]');
-        if (submitBtn) submitBtn.textContent = 'Leyendo…';
+        submitInvoiceUploadAjax(form);
     });
 })();
+
+/** Lectura de factura por AJAX (timeout largo para IA/PDF) + abrir revisión. */
+function submitInvoiceUploadAjax(form) {
+    if (!form || form.dataset.submitting === '1') return;
+    form.dataset.submitting = '1';
+
+    var footer = form.querySelector('.invoice-shell-footer');
+    var busy = footer ? footer.querySelector('.inv-upload-busy') : null;
+    if (footer && !busy) {
+        busy = document.createElement('div');
+        busy.className = 'inv-upload-busy';
+        busy.style.cssText = 'flex:1 1 100%;font-size:13px;color:var(--color-text-secondary);margin:4px 0 0;';
+        footer.appendChild(busy);
+    }
+    if (busy) {
+        busy.style.color = 'var(--color-text-secondary)';
+        busy.style.fontWeight = '500';
+        busy.textContent = 'Leyendo factura… con IA puede tardar 1–2 min. No cierre la ventana.';
+    }
+
+    var buttons = form.querySelectorAll('button');
+    buttons.forEach(function(b) { b.disabled = true; });
+    var submitBtn = form.querySelector('button[type="submit"]');
+    var prevLabel = submitBtn ? submitBtn.textContent : '';
+    if (submitBtn) submitBtn.textContent = 'Leyendo…';
+
+    if (window.SeriCsrf && typeof SeriCsrf.ensureOnForm === 'function') {
+        SeriCsrf.ensureOnForm(form);
+    }
+    var csrfNow = (window.SeriCsrf && SeriCsrf.get) ? SeriCsrf.get() : '';
+    var fd = new FormData(form);
+    var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function() { try { ctrl.abort(); } catch (e) {} }, 180000) : null;
+
+    fetch(form.action, {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        signal: ctrl ? ctrl.signal : undefined,
+        headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json',
+            'X-CSRF-TOKEN': csrfNow || ''
+        }
+    })
+    .then(function(r) {
+        return r.text().then(function(text) {
+            var data = null;
+            try { data = JSON.parse(text); } catch (e) { data = null; }
+            if (!r.ok) {
+                var msg = (data && data.message) ? data.message : ('Error del servidor (HTTP ' + r.status + ')');
+                if (!data && text) {
+                    var plain = String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180);
+                    if (plain) {
+                        msg += ' — ' + plain;
+                    } else if (r.status === 500 || r.status === 502 || r.status === 504) {
+                        msg += '. Suele ser timeout/memoria del hosting con PDF+IA; pruebe foto JPG/PNG o CSV.';
+                    }
+                }
+                throw new Error(msg);
+            }
+            if (!data) {
+                throw new Error('El servidor no devolvió JSON. Si usa IA, puede ser timeout del hosting; pruebe foto JPG o CSV.');
+            }
+            return data;
+        });
+    })
+    .then(function(d) {
+        if (!d.success) {
+            throw new Error(d.message || 'No se pudo leer la factura');
+        }
+        if (typeof closeInvoiceUpload === 'function') closeInvoiceUpload();
+        if (typeof showAlert === 'function') {
+            showAlert(d.message || 'Factura leída', d.items_count > 0 ? 'success' : 'warning');
+        }
+        if (d.import_id) {
+            openInvoiceReview(d.import_id);
+        }
+    })
+    .catch(function(err) {
+        var msg = (err && err.name === 'AbortError')
+            ? 'Tiempo agotado al leer la factura (IA/PDF). Pruebe foto JPG/PNG o CSV/Excel.'
+            : ((err && err.message) ? err.message : 'Error de conexión');
+        if (typeof showAlert === 'function') showAlert(msg, 'error');
+        if (busy) {
+            busy.style.color = '#b45309';
+            busy.style.fontWeight = '600';
+            busy.textContent = msg;
+        }
+    })
+    .finally(function() {
+        if (timer) clearTimeout(timer);
+        form.dataset.submitting = '0';
+        buttons.forEach(function(b) { b.disabled = false; });
+        if (submitBtn) submitBtn.textContent = prevLabel || 'Leer factura';
+    });
+}
 
 /** Crea un borrador de factura vacío (sin PDF/foto) y abre la revisión para agregar productos a mano. */
 function startManualInvoiceDraft() {
@@ -2919,25 +3070,27 @@ function renderInvoiceReview(imp, items) {
          '<th style="' + thStyle + '">#</th>' +
          '<th style="' + thStyle + '">Acción</th>' +
          '<th style="' + thStyle + '">Descripción</th>' +
-         '<th style="' + thStyle + '">SKU / ID</th>' +
-         '<th style="' + thStyle + '">EAN</th>' +
+         '<th style="' + thStyle + '" title="SKU / ID arriba · EAN abajo">SKU / EAN</th>' +
          '<th style="' + thStyle + '">Producto en catálogo</th>' +
          '<th style="' + thStyle + '">Cant.</th>' +
          '<th style="' + thStyle + '" title="Valor unitario de la factura del proveedor: define subtotal, IVA, total, CxP y asiento contable">Costo factura</th>' +
          '<th style="' + thStyle + '">IVA %</th>' +
          '<th style="' + thStyle + '">Dcto %</th>' +
-         '<th style="' + thStyle + '">Lote</th>' +
-         '<th style="' + thStyle + '">Vence</th>' +
+         '<th style="' + thStyle + '" title="Lote arriba · Vencimiento abajo">Lote / Vence</th>' +
          '<th style="' + thStyle + '" title="Precio de costo con el que queda el producto en inventario (y valor de la entrada en kardex). Vacío = automático: costo factura con descuento, + IVA en F. Normal">Costo inventario</th>' +
          '<th style="' + thStyle + '" title="Precio de venta del catálogo (se autocompleta al emparejar). Se compara con el costo para alertar margen bajo o pérdida.">P. venta</th>' +
          '<th style="' + thStyle + '">Total</th>' +
          '<th style="' + thStyle + '"></th>' +
          '</tr></thead><tbody>';
 
-    var matchLabels = { ean: 'EAN', supplier_sku: 'SKU proveedor', code: 'Código', name: 'Nombre', manual: 'Manual', purchase_order: 'OC' };
+    var matchLabels = {
+        ean: 'EAN', supplier_sku: 'SKU proveedor', code: 'Código',
+        name: 'Nombre exacto', name_similar: 'Nombre similar',
+        manual: 'Manual', purchase_order: 'OC'
+    };
     var vatInCost = docKind === 'electronic';
 
-    h += '<tr data-meta-row="1"><td colspan="17" style="padding:8px 10px;background:rgba(148,163,184,.08);border-bottom:1px solid var(--color-border,#e5e7eb);">' +
+    h += '<tr data-meta-row="1"><td colspan="15" style="padding:8px 10px;background:rgba(148,163,184,.08);border-bottom:1px solid var(--color-border,#e5e7eb);">' +
          '<div id="invMarginSummary" style="font-size:13px;color:var(--color-text-secondary);">Revisando márgenes costo vs P. venta…</div>' +
          '</td></tr>';
 
@@ -2982,12 +3135,14 @@ function renderInvoiceReview(imp, items) {
         h += '<td><input type="text" name="' + base + '[description]" class="form-control" style="min-width:190px;" value="' + esc(it.description || '') + '">' +
              (isBonus ? '<div class="inv-bonus-hint" style="font-size:11px;color:var(--dmc-1D4ED8, #1D4ED8);font-weight:600;">Bonificación: factura $0 · inventario conserva costo</div>' : '') +
              '</td>';
-        h += '<td><input type="text" name="' + base + '[supplier_sku]" class="form-control" style="width:160px;min-width:160px;font-family:ui-monospace,Consolas,monospace;font-size:12px;" value="' + esc(it.supplier_sku || '') + '" placeholder="SKU / ID" title="SKU / ID proveedor"></td>';
-        h += '<td><input type="text" name="' + base + '[barcode]" class="form-control" style="width:180px;min-width:180px;font-family:ui-monospace,Consolas,monospace;font-size:12px;" value="' + esc(it.barcode || '') + '" placeholder="EAN" title="Código de barras / EAN"></td>';
+        h += '<td class="inv-stack inv-sku-ean">' +
+             '<input type="text" name="' + base + '[supplier_sku]" class="form-control inv-sku" value="' + esc(it.supplier_sku || '') + '" placeholder="SKU / ID" title="SKU / ID proveedor">' +
+             '<input type="text" name="' + base + '[barcode]" class="form-control inv-ean" value="' + esc(it.barcode || '') + '" placeholder="EAN" title="Código de barras / EAN">' +
+             '</td>';
         h += '<td><select name="' + base + '[matched_product_id]" class="form-control" style="min-width:210px;">' + productOptionsHtml(it.matched_product_id || '') + '</select>' +
              (it.match_type && it.match_type !== 'none'
                 ? '<div style="font-size:11px;color:var(--color-text-secondary);">Coincidencia: ' + esc(matchLabels[it.match_type] || it.match_type) + ' (' + (parseInt(it.confidence,10) || 0) + '%)</div>'
-                : '<div style="font-size:11px;color:var(--color-text-secondary);">Sin EAN coincidente: elija producto o cree uno nuevo</div>') +
+                : '<div style="font-size:11px;color:var(--color-text-secondary);">Sin coincidencia (EAN / SKU / nombre): elija producto o cree uno nuevo</div>') +
              '</td>';
         h += '<td><input type="number" step="1" min="0" inputmode="numeric" name="' + base + '[quantity]" class="form-control inv-qty" style="min-width:80px;" value="' + qty + '"' + (bad ? ' required' : '') + ' title="Cantidad en enteros"></td>';
         h += '<td><input type="text" inputmode="decimal" name="' + base + '[unit_cost]" class="form-control money-input inv-cost" data-money="1" style="min-width:95px;" value="' + (window.SeriMoney ? SeriMoney.format(cost) : cost) + '"' +
@@ -3002,9 +3157,11 @@ function renderInvoiceReview(imp, items) {
         } else {
             h += '<td><input type="number" step="0.01" min="0" name="' + base + '[tax_rate]" class="form-control" style="min-width:70px;" value="' + lineTax + '" title="IVA del producto (editable)"></td>';
         }
-        h += '<td><input type="number" step="0.01" min="0" max="100" inputmode="decimal" name="' + base + '[discount_pct]" class="form-control inv-disc" style="min-width:70px;" value="' + Math.max(0, Math.min(100, Math.round((parseFloat(String(it.discount_pct || 0).toString().replace(',', '.')) || 0) * 100) / 100)) + '" title="Descuento en % (hasta 2 decimales)"></td>';
-        h += '<td><input type="text" maxlength="60" name="' + base + '[lot_code]" class="form-control" style="min-width:90px;" value="' + esc(it.lot_code || '') + '"></td>';
-        h += '<td><input type="date" name="' + base + '[expiry_date]" class="form-control" style="min-width:130px;" value="' + (it.expiry_date || '') + '"></td>';
+        h += '<td><input type="text" inputmode="decimal" name="' + base + '[discount_pct]" class="form-control inv-disc" style="min-width:78px;" value="' + formatInvoiceDiscPct(it.discount_pct) + '" title="Descuento en % con decimales (ej. 14,30)" autocomplete="off"></td>';
+        h += '<td class="inv-stack inv-lot-vence">' +
+             '<input type="text" maxlength="60" name="' + base + '[lot_code]" class="form-control inv-lot" value="' + esc(it.lot_code || '') + '" placeholder="Lote" title="Lote">' +
+             '<input type="date" name="' + base + '[expiry_date]" class="form-control inv-vence" value="' + (it.expiry_date || '') + '" title="Fecha de vencimiento">' +
+             '</td>';
         var invCost = parseFloat(it.inventory_cost) || 0;
         h += '<td><input type="text" inputmode="decimal" name="' + base + '[inventory_cost]" class="form-control money-input inv-inv-cost" data-money="1" style="min-width:95px;" value="' +
              (invCost > 0 ? (window.SeriMoney ? SeriMoney.format(invCost) : invCost) : '') + '"' +
@@ -3021,9 +3178,12 @@ function renderInvoiceReview(imp, items) {
              '<div class="inv-margin-hint" style="font-size:11px;margin-top:2px;line-height:1.3;"></div></td>';
         h += '<td class="inv-line-total" style="white-space:nowrap;">' + poMoney(total) + '</td>';
         h += '<td style="white-space:nowrap;text-align:center;">' +
-             '<button type="button" class="btn btn-sm btn-danger" style="padding:4px 10px;font-size:12px;" ' +
+             '<button type="button" class="inv-del-btn" ' +
              'onclick="removeInvoiceReviewLine(' + parseInt(it.id, 10) + ')" ' +
-             'title="Eliminar esta línea del borrador">Eliminar</button></td>';
+             'title="Eliminar esta línea del borrador" aria-label="Eliminar línea">' +
+             '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">' +
+             '<path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>' +
+             '</svg></button></td>';
         h += '</tr>';
     });
 
@@ -3053,6 +3213,7 @@ function renderInvoiceReview(imp, items) {
     invPickerClose();
     bindInvoiceProductPicker();
     bindInvoiceLineTotals();
+    enableInvoiceReviewColResize();
     recalcInvoiceReviewTotals();
     if (window.SeriMoney && typeof SeriMoney.enhanceAll === 'function') {
         SeriMoney.enhanceAll(document.getElementById('invoiceReviewBody') || document);
@@ -3488,6 +3649,15 @@ function invoiceParseQty(raw) {
     return isNaN(n) ? 0 : n;
 }
 
+/** Dcto % de línea: hasta 2 decimales (14,30), nunca entero forzado. */
+function formatInvoiceDiscPct(raw) {
+    var n = Math.max(0, Math.min(100, Math.round(invoiceParseQty(raw) * 100) / 100));
+    var s = (Math.abs(n - Math.round(n)) < 0.0005)
+        ? String(Math.round(n))
+        : n.toFixed(2);
+    return s.replace('.', ',');
+}
+
 /** Cantidades de factura/inventario: siempre enteros. */
 function invoiceParseIntQty(raw) {
     return Math.max(0, Math.round(invoiceParseQty(raw)));
@@ -3498,6 +3668,103 @@ function invoiceParseMoneyVal(raw) {
         return SeriMoney.parse(raw);
     }
     return invoiceParseQty(raw);
+}
+
+/** Persistencia de anchos de columnas (revisión de factura). */
+var INV_REVIEW_COL_WIDTHS_KEY = 'seri_inv_review_col_widths_v3';
+
+function loadInvoiceReviewColWidths(expectedCount) {
+    try {
+        var raw = localStorage.getItem(INV_REVIEW_COL_WIDTHS_KEY);
+        if (!raw) return null;
+        var arr = JSON.parse(raw);
+        if (!Array.isArray(arr) || arr.length !== expectedCount) return null;
+        return arr.map(function(w) {
+            var n = parseInt(w, 10);
+            return isNaN(n) ? 0 : Math.max(56, n);
+        });
+    } catch (e) {
+        return null;
+    }
+}
+
+function saveInvoiceReviewColWidths(cols) {
+    try {
+        var arr = cols.map(function(col) {
+            return parseInt(col.dataset.width || col.style.width, 10) || 56;
+        });
+        localStorage.setItem(INV_REVIEW_COL_WIDTHS_KEY, JSON.stringify(arr));
+    } catch (e) { /* ignore quota / private mode */ }
+}
+
+/** Arrastre en el borde derecho (negro) del encabezado para redimensionar columnas. */
+function enableInvoiceReviewColResize() {
+    var table = document.querySelector('#invoiceReviewBody .invoice-review-table');
+    if (!table) return;
+    table.classList.add('invoice-review-table--resizable');
+    var ths = Array.prototype.slice.call(table.querySelectorAll('thead th'));
+    if (!ths.length) return;
+
+    var saved = loadInvoiceReviewColWidths(ths.length);
+
+    // <colgroup> fija el ancho real de cada columna (evita que inputs anchos se monten).
+    var colgroup = table.querySelector('colgroup.inv-colgroup');
+    if (!colgroup) {
+        colgroup = document.createElement('colgroup');
+        colgroup.className = 'inv-colgroup';
+        ths.forEach(function(th, i) {
+            var col = document.createElement('col');
+            var w = (saved && saved[i]) ? saved[i] : Math.max(56, th.offsetWidth || 80);
+            col.style.width = w + 'px';
+            col.dataset.width = String(w);
+            th.style.width = w + 'px';
+            colgroup.appendChild(col);
+        });
+        table.insertBefore(colgroup, table.firstChild);
+    }
+    var cols = Array.prototype.slice.call(colgroup.querySelectorAll('col'));
+
+    function syncTableMinWidth() {
+        var sum = 0;
+        cols.forEach(function(col) {
+            sum += parseInt(col.dataset.width || col.style.width, 10) || 56;
+        });
+        table.style.minWidth = sum + 'px';
+        table.style.width = sum + 'px';
+    }
+    syncTableMinWidth();
+
+    ths.forEach(function(th, idx) {
+        if (th.querySelector('.inv-col-resizer')) return;
+        var grip = document.createElement('span');
+        grip.className = 'inv-col-resizer';
+        grip.title = 'Arrastre el borde negro para redimensionar (se guarda automáticamente)';
+        th.appendChild(grip);
+        grip.addEventListener('mousedown', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            var col = cols[idx];
+            if (!col) return;
+            var startX = e.pageX;
+            var startW = parseInt(col.dataset.width || col.style.width, 10) || th.offsetWidth || 80;
+            function onMove(ev) {
+                var w = Math.max(56, startW + (ev.pageX - startX));
+                col.style.width = w + 'px';
+                col.dataset.width = String(w);
+                th.style.width = w + 'px';
+                syncTableMinWidth();
+            }
+            function onUp() {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+                document.body.classList.remove('inv-col-resizing');
+                saveInvoiceReviewColWidths(cols);
+            }
+            document.body.classList.add('inv-col-resizing');
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        });
+    });
 }
 
 function bindInvoiceLineTotals() {
@@ -3530,6 +3797,9 @@ function bindInvoiceLineTotals() {
             t.dataset.fromCatalog = '0';
         }
         scheduleRecalc();
+        if (/\[discount_pct\]$/.test(t.name) || /commercial_discount/.test(t.name)) {
+            scheduleInvoiceReviewAutosave();
+        }
     });
     body.addEventListener('change', function(e) {
         var t = e.target;
@@ -3537,9 +3807,8 @@ function bindInvoiceLineTotals() {
         if (/\[quantity\]$/.test(t.name)) {
             t.value = String(invoiceParseIntQty(t.value));
         }
-        if (/\[discount_pct\]$/.test(t.name)) {
-            var dPct = Math.max(0, Math.min(100, Math.round(invoiceParseQty(t.value) * 100) / 100));
-            t.value = String(dPct);
+        if (/\[discount_pct\]$/.test(t.name) || t.name === 'commercial_discount_pct' || t.name === 'early_payment_discount_pct') {
+            t.value = formatInvoiceDiscPct(t.value);
         }
         if (/\[matched_product_id\]$/.test(t.name)) {
             var trMatch = t.closest('tr');
@@ -3568,12 +3837,20 @@ function bindInvoiceLineTotals() {
             return;
         }
         scheduleRecalc();
+        scheduleInvoiceReviewAutosave();
     });
     body.addEventListener('blur', function(e) {
         var t = e.target;
         if (!t || !t.name) return;
+        if (/\[discount_pct\]$/.test(t.name) || t.name === 'commercial_discount_pct' || t.name === 'early_payment_discount_pct') {
+            t.value = formatInvoiceDiscPct(t.value);
+            scheduleRecalc();
+            scheduleInvoiceReviewAutosave();
+            return;
+        }
         if (/\[(unit_cost|inventory_cost|sale_price)\]$/.test(t.name) || t.classList.contains('money-input')) {
             scheduleRecalc();
+            scheduleInvoiceReviewAutosave();
         }
     }, true);
 }
@@ -3811,10 +4088,16 @@ function recalcInvoiceReviewTotals() {
     var comAmtEl = form ? form.querySelector('input[name="commercial_discount_amount"]') : null;
     var comPct = comPctEl ? Math.max(0, Math.min(100, Math.round(invoiceParseQty(comPctEl.value)))) : 0;
     var comAmtIn = comAmtEl ? Math.max(0, invoiceParseMoneyVal(comAmtEl.value)) : 0;
-    // Orden: Total bruto → dcto. líneas → dcto. comercial → Sub total → IVA → Valor neto.
+    // Orden: Total bruto → dcto. → Sub total → IVA (sobre Sub total) → Valor neto.
     var totalBruto = subtotal + productDiscTotal;
     var commercialAmt = comAmtIn > 0.009 ? Math.min(comAmtIn, subtotal) : (subtotal * comPct / 100);
     var subAfterDisc = Math.max(0, subtotal - commercialAmt);
+    // IVA personalizado = monto exacto de la factura. IVA % = prorrateo sobre Sub total (no sobre bruto).
+    if (!customVat && subtotal > 0.009 && commercialAmt > 0.009) {
+        taxTotal = taxTotal * (subAfterDisc / subtotal);
+    } else if (!customVat && subtotal <= 0.009) {
+        taxTotal = 0;
+    }
     var payable = Math.max(0, subAfterDisc + taxTotal);
 
     var foot = body.querySelector('.inv-review-foot');
@@ -5402,18 +5685,25 @@ function viewPurchase(id) {
             h += '<div><strong>Recepción de bodega:</strong> ' + esc((o.warehouse_date || '—').toString().substr(0,10)) + '</div>';
             var comAmt = parseFloat(o.commercial_discount_amount || 0) || 0;
             var comPct = parseFloat(o.commercial_discount_pct || 0) || 0;
+            var bruto = parseFloat(o.subtotal || 0) || 0;
             if (comAmt <= 0.009 && comPct > 0.009) {
-                comAmt = Math.round((parseFloat(o.subtotal || 0) || 0) * comPct) / 100;
+                comAmt = Math.round(bruto * comPct) / 100;
             }
-            var subAfter = Math.max(0, (parseFloat(o.subtotal || 0) || 0) - comAmt);
-            h += '<div><strong>Total bruto:</strong> ' + poMoney(o.subtotal) + '</div>';
+            var subAfter = Math.max(0, bruto - comAmt);
+            // o.tax en OC nuevas ya viene sobre Sub total; si fuera legacy (sobre bruto), prorratear.
+            var ivaShow = parseFloat(o.tax || 0) || 0;
+            var neto = parseFloat(o.total || 0) || 0;
+            if (comAmt > 0.009 && bruto > 0.009 && Math.abs((subAfter + ivaShow) - neto) > 1) {
+                ivaShow = ivaShow * (subAfter / bruto);
+            }
+            h += '<div><strong>Total bruto:</strong> ' + poMoney(bruto) + '</div>';
             if (comAmt > 0.009) {
                 h += '<div><strong>Desc. comercial:</strong> −' + poMoney(comAmt)
                     + (comPct > 0.009 ? ' <small>(' + (Math.round(comPct * 100) / 100) + '%)</small>' : '') + '</div>';
             }
             h += '<div><strong>Sub total:</strong> ' + poMoney(subAfter) + '</div>';
-            h += '<div><strong>IVA:</strong> ' + poMoney(o.tax) + '</div>';
-            h += '<div><strong>Valor neto:</strong> ' + poMoney(o.total) + '</div>';
+            h += '<div><strong>IVA:</strong> ' + poMoney(ivaShow) + '</div>';
+            h += '<div><strong>Valor neto:</strong> ' + poMoney(neto) + '</div>';
             h += '<div><strong>Notas crédito:</strong> ' + poMoney(o.credit_total) + '</div>';
             h += '<div><strong>Neto:</strong> ' + poMoney(Math.max(0, parseFloat(o.total || 0) - parseFloat(o.credit_total || 0))) + '</div>';
             h += '<div><strong>Asiento:</strong> ' + esc(o.accounting_entry_number || (o.accounting_entry_id ? ('#'+o.accounting_entry_id) : 'pendiente')) + '</div>';

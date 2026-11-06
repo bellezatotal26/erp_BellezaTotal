@@ -11,6 +11,7 @@ $filters = $filters ?? ['q' => '', 'type' => '', 'status' => 'pending', 'reason'
 $filterOptions = $filterOptions ?? ['reasons' => [], 'people' => []];
 $loanSummary = $loanSummary ?? ['out_count' => 0, 'out_units' => 0, 'in_count' => 0, 'in_units' => 0, 'aged_count' => 0];
 $stockAlert = $stockAlert ?? ['count' => 0, 'debts' => [], 'summary_lines' => [], 'negative_count' => 0];
+$negativeStockProducts = $negativeStockProducts ?? [];
 $products = $products ?? [];
 $canCreate = $canCreate ?? false;
 $canEdit = $canEdit ?? false;
@@ -293,6 +294,63 @@ foreach ($loanSections as $section):
     </div>
 </div>
 <?php endforeach; ?>
+
+<div class="card neumorphic" id="prestamos-stock-negativo" style="margin-bottom:18px;">
+    <div class="card-header">
+        <h3>Productos en stock negativo
+            <span style="font-weight:400;font-size:13px;color:var(--color-text-secondary);">
+                (<?php echo count($negativeStockProducts); ?>)
+            </span>
+        </h3>
+    </div>
+    <div class="card-body">
+        <p style="margin:0 0 12px;font-size:13px;color:var(--color-text-secondary);">
+            Inventario por debajo de cero (ventas, préstamos u ajustes). Revisa compras o devoluciones para equilibrar.
+        </p>
+        <?php if (empty($negativeStockProducts)): ?>
+            <p style="text-align:center;color:var(--color-text-secondary);padding:24px;margin:0;">
+                No hay productos con stock negativo.
+            </p>
+        <?php else: ?>
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Producto</th>
+                        <th>SKU / Código</th>
+                        <th>EAN</th>
+                        <th style="text-align:right;">Stock actual</th>
+                        <th>Propiedad</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($negativeStockProducts as $np):
+                    $own = (string)($np['ownership'] ?? 'owned');
+                    $ownLabel = $own === 'borrowed' ? 'Prestado (nos prestaron)' : ($own === 'consignment' ? 'Consignación' : 'Propio');
+                ?>
+                    <tr>
+                        <td><strong><?php echo htmlspecialchars((string)($np['name'] ?? '')); ?></strong></td>
+                        <td><?php echo htmlspecialchars((string)($np['code'] ?? '') !== '' ? (string)$np['code'] : '—'); ?></td>
+                        <td style="font-size:13px;"><?php echo htmlspecialchars((string)($np['barcode'] ?? '') !== '' ? (string)$np['barcode'] : '—'); ?></td>
+                        <td style="text-align:right;font-weight:700;color:var(--dmc-DC2626, #DC2626);">
+                            <?php echo (int)($np['stock'] ?? 0); ?>
+                        </td>
+                        <td style="font-size:13px;"><?php echo htmlspecialchars($ownLabel); ?></td>
+                        <td class="table-actions" style="white-space:nowrap;">
+                            <a class="btn btn-sm btn-secondary"
+                               href="<?php echo htmlspecialchars($viewInstance->route('app/inventario') . '?q=' . rawurlencode((string)($np['code'] ?? $np['name'] ?? '')), ENT_QUOTES); ?>">
+                                Ver en inventario
+                            </a>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php endif; ?>
+    </div>
+</div>
 <?php else: ?>
 <div class="card neumorphic" id="prestamos-trazabilidad" style="margin-bottom:18px;">
     <div class="card-header">

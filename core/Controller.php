@@ -145,7 +145,8 @@ abstract class Controller
         if (preg_match('/SQLSTATE|Unknown column|Table [\'"`].*[\'"`]| synta|\/home\/|\\\\xampp|on line \d|Stack trace|PDOException/i', $msg)) {
             return $fallback;
         }
-        if (mb_strlen($msg) > 240) {
+        $len = \function_exists('mb_strlen') ? mb_strlen($msg) : strlen($msg);
+        if ($len > 240) {
             return $fallback;
         }
 

@@ -4,9 +4,11 @@ $title = 'Nómina - ' . ($tenantName ?? 'Sistema');
 $pageTitle = 'Nómina';
 $tab = $tab ?? 'employees';
 $employees = $employees ?? [];
+$activeEmployees = $activeEmployees ?? [];
 $runs = $runs ?? [];
 $params = $params ?? [];
 $schedules = $schedules ?? [];
+$scheduleCount = isset($scheduleCount) ? (int)$scheduleCount : count($schedules);
 $detail = $detail ?? null;
 $q = $q ?? '';
 $statusFilter = $statusFilter ?? '';
@@ -120,6 +122,14 @@ $hasOvertimeSchedules = (bool)array_filter($schedules, static fn ($s) => (float)
 .nm-modal-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
 .nm-modal-grid .full{grid-column:1/-1}
 .nm-check{display:flex;align-items:center;gap:8px;font-size:13px}
+.nm-emp-pick{border:1px solid var(--color-border);border-radius:10px;overflow:hidden;background:var(--color-secondary,#f8fafc)}
+.nm-emp-pick__bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;border-bottom:1px solid var(--color-border);background:var(--color-white)}
+.nm-emp-pick__bar .form-control{flex:1 1 160px;min-width:140px}
+.nm-emp-pick__list{max-height:180px;overflow:auto;padding:6px 8px;display:flex;flex-direction:column;gap:2px}
+.nm-emp-pick__row{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;font-size:13px;cursor:pointer}
+.nm-emp-pick__row:hover{background:rgba(13,124,74,.08)}
+.nm-emp-pick__row .meta{margin-left:auto;font-size:11px;color:var(--color-text-secondary);white-space:nowrap}
+.nm-emp-pick__empty{padding:12px;font-size:13px;color:var(--color-text-secondary);text-align:center}
 .nm-void-form{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0}
 .nm-void-form .form-control{width:auto;min-width:150px;max-width:260px}
 </style>
@@ -128,15 +138,15 @@ $hasOvertimeSchedules = (bool)array_filter($schedules, static fn ($s) => (float)
     <div class="stat-card neumorphic"><h4>Empleados activos</h4><div class="stat-value"><?php echo (int)$activeCount; ?></div></div>
     <div class="stat-card neumorphic"><h4>Nómina neta del mes</h4><div class="stat-value" style="color:var(--color-accent-text, var(--color-primary));"><?php echo fmtN((float)$monthPayroll, $currency); ?></div></div>
     <div class="stat-card neumorphic"><h4>SMMLV configurado</h4><div class="stat-value" style="font-size:18px;"><?php echo fmtN((float)($params['smmlv'] ?? 0), $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Horarios</h4><div class="stat-value" style="font-size:18px;"><?php echo count($schedules); ?></div></div>
+    <div class="stat-card neumorphic"><h4>Horarios</h4><div class="stat-value" style="font-size:18px;"><?php echo (int)$scheduleCount; ?></div></div>
 </div>
 
 <nav class="nm-tabs">
-    <a class="<?php echo $tab === 'employees' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=employees">Empleados</a>
-    <a class="<?php echo $tab === 'schedules' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=schedules">Horarios <span class="nm-count"><?php echo count($schedules); ?></span></a>
-    <a class="<?php echo in_array($tab, ['runs', 'run_detail'], true) ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=runs">Liquidaciones</a>
-    <a class="<?php echo $tab === 'payments' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=payments">Pagos de nómina</a>
-    <a class="<?php echo $tab === 'params' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=params">Parámetros</a>
+    <a class="<?php echo $tab === 'employees' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=employees" title="Alta y edición de empleados, salarios y horarios">Empleados</a>
+    <a class="<?php echo $tab === 'schedules' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=schedules" title="Turnos semanales y asignación a empleados">Horarios <span class="nm-count"><?php echo (int)$scheduleCount; ?></span></a>
+    <a class="<?php echo in_array($tab, ['runs', 'run_detail'], true) ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=runs" title="Crear, revisar y contabilizar liquidaciones mensuales">Liquidaciones</a>
+    <a class="<?php echo $tab === 'payments' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=payments" title="Pagar saldos de seguridad social, parafiscales y prestaciones">Pagos de nómina</a>
+    <a class="<?php echo $tab === 'params' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=params" title="SMMLV, aportes, recargos, jornada y comisiones">Parámetros</a>
 </nav>
 
 <?php if ($tab === 'employees'): ?>
@@ -160,9 +170,9 @@ $hasOvertimeSchedules = (bool)array_filter($schedules, static fn ($s) => (float)
                 <?php endforeach; ?>
             </select>
         </div>
-        <button class="btn btn-secondary" type="submit">Filtrar</button>
+        <button class="btn btn-secondary" type="submit" title="Aplicar búsqueda y filtros de empleados">Filtrar</button>
         <?php if ($q !== '' || $statusFilter !== '' || $scheduleFilter !== null): ?>
-            <a class="btn btn-secondary" href="<?php echo $base; ?>?tab=employees">Limpiar</a>
+            <a class="btn btn-secondary" href="<?php echo $base; ?>?tab=employees" title="Quitar búsqueda y filtros">Limpiar</a>
         <?php endif; ?>
     </form>
     <?php
@@ -170,10 +180,10 @@ $hasOvertimeSchedules = (bool)array_filter($schedules, static fn ($s) => (float)
     $empExportQs = $empExportQs !== '' ? '&' . $empExportQs : '';
     ?>
     <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <a class="btn btn-secondary" data-export-download href="<?php echo $base; ?>?action=export_employees&amp;format=csv<?php echo htmlspecialchars($empExportQs); ?>" title="Descargar CSV con los filtros aplicados">CSV</a>
-        <a class="btn btn-secondary" data-export-download href="<?php echo $base; ?>?action=export_employees&amp;format=pdf<?php echo htmlspecialchars($empExportQs); ?>" title="Descargar PDF con los filtros aplicados">PDF</a>
+        <a class="btn btn-secondary" data-export-download href="<?php echo $base; ?>?action=export_employees&amp;format=csv<?php echo htmlspecialchars($empExportQs); ?>" title="Exportar listado de empleados a CSV (respeta filtros)">CSV</a>
+        <a class="btn btn-secondary" data-export-download href="<?php echo $base; ?>?action=export_employees&amp;format=pdf<?php echo htmlspecialchars($empExportQs); ?>" title="Exportar listado de empleados a PDF (respeta filtros)">PDF</a>
         <?php if ($canCreate): ?>
-            <button type="button" class="btn btn-primary" onclick="openEmployeeModal()">+ Empleado</button>
+            <button type="button" class="btn btn-primary" onclick="openEmployeeModal()" title="Registrar un empleado nuevo (salario, cargo, horario, auxilio)">+ Empleado</button>
         <?php endif; ?>
     </div>
 </div>
@@ -194,7 +204,7 @@ $hasOvertimeSchedules = (bool)array_filter($schedules, static fn ($s) => (float)
                 <td><?php echo !empty($e['has_transport_aid']) ? 'Sí' : 'No'; ?></td>
                 <td><?php echo $scheduleChip($schedules[(int)($e['schedule_id'] ?? 0)] ?? null); ?></td>
                 <td><span class="badge <?php echo $e['status'] === 'active' ? 'badge-success' : 'badge-warning'; ?>"><?php echo $e['status'] === 'active' ? 'Activo' : 'Inactivo'; ?></span></td>
-                <td><?php if ($canEdit): ?><button type="button" class="btn btn-sm btn-secondary" onclick='editEmployee(<?php echo json_encode($e, JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_UNESCAPED_UNICODE); ?>)'>Editar</button><?php endif; ?></td>
+                <td><?php if ($canEdit): ?><button type="button" class="btn btn-sm btn-secondary" title="Editar datos, salario, horario y estado del empleado" onclick='editEmployee(<?php echo json_encode($e, JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_UNESCAPED_UNICODE); ?>)'>Editar</button><?php endif; ?></td>
             </tr>
         <?php endforeach; ?>
         </tbody>
@@ -208,7 +218,7 @@ $hasOvertimeSchedules = (bool)array_filter($schedules, static fn ($s) => (float)
         <p>Defina turnos semanales y aplíquelos a los empleados. Se calculan horas semanales, nocturnas (desde las <?php echo (int)($params['night_start_hour'] ?? 19); ?>:00) y dominicales.</p>
     </div>
     <?php if ($canCreate): ?>
-        <button type="button" class="btn btn-primary" onclick="openScheduleModal()">+ Nuevo horario</button>
+        <button type="button" class="btn btn-primary" onclick="openScheduleModal()" title="Crear un turno semanal (días, horas, descanso) para asignarlo a empleados">+ Nuevo horario</button>
     <?php endif; ?>
 </div>
 
@@ -248,13 +258,13 @@ $hasOvertimeSchedules = (bool)array_filter($schedules, static fn ($s) => (float)
             <?php if (!empty($s['notes'])): ?><div style="font-size:12px;color:var(--color-text-secondary);"><?php echo htmlspecialchars($s['notes']); ?></div><?php endif; ?>
             <div class="nm-actions">
                 <?php if ($canEdit): ?>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="openScheduleModal(<?php echo (int)$s['id']; ?>)">Editar</button>
+                    <button type="button" class="btn btn-sm btn-secondary" onclick="openScheduleModal(<?php echo (int)$s['id']; ?>)" title="Modificar días, horas y descanso de este horario">Editar</button>
                 <?php endif; ?>
                 <?php if ($canDelete): ?>
                     <form method="POST" action="<?php echo $base; ?>?action=delete_schedule" data-ajax="true" style="display:inline;">
                         <?php echo \SoftNova\Core\csrf_field(); ?>
                         <input type="hidden" name="id" value="<?php echo (int)$s['id']; ?>">
-                        <button type="submit" class="btn btn-sm btn-danger" onclick="return confirm('¿Eliminar el horario «<?php echo htmlspecialchars(addslashes($s['name']), ENT_QUOTES); ?>»? Los empleados asignados quedarán sin horario.')">Eliminar</button>
+                        <button type="submit" class="btn btn-sm btn-danger" title="Eliminar horario; los empleados asignados quedan sin turno" onclick="return confirm('¿Eliminar el horario «<?php echo htmlspecialchars(addslashes($s['name']), ENT_QUOTES); ?>»? Los empleados asignados quedarán sin horario.')">Eliminar</button>
                     </form>
                 <?php endif; ?>
             </div>
@@ -282,7 +292,7 @@ $hasOvertimeSchedules = (bool)array_filter($schedules, static fn ($s) => (float)
                 </div>
                 <div class="form-group"><label>Buscar</label><input class="form-control" type="search" id="assignSearch" placeholder="Nombre o cargo" autocomplete="off"></div>
                 <?php if ($canEdit): ?>
-                    <button type="submit" class="btn btn-primary" id="assignBtn" disabled>Aplicar a seleccionados (<span id="assignCount">0</span>)</button>
+                    <button type="submit" class="btn btn-primary" id="assignBtn" disabled title="Asignar el horario elegido a los empleados marcados (o quitar horario si eligió «Quitar»)">Aplicar a seleccionados (<span id="assignCount">0</span>)</button>
                 <?php endif; ?>
             </div>
             <div class="table-container"><table>
@@ -339,16 +349,16 @@ $runExportQs = $runExportQs !== '' ? '&' . $runExportQs : '';
                 <?php endforeach; ?>
             </select>
         </div>
-        <button class="btn btn-secondary" type="submit">Filtrar</button>
+        <button class="btn btn-secondary" type="submit" title="Filtrar liquidaciones por año y estado">Filtrar</button>
         <?php if ($runFiltered): ?>
-            <a class="btn btn-secondary" href="<?php echo $base; ?>?tab=runs">Limpiar</a>
+            <a class="btn btn-secondary" href="<?php echo $base; ?>?tab=runs" title="Quitar filtros de liquidaciones">Limpiar</a>
         <?php endif; ?>
     </form>
     <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <a class="btn btn-secondary" data-export-download href="<?php echo $base; ?>?action=export_runs&amp;format=csv<?php echo htmlspecialchars($runExportQs); ?>" title="Descargar CSV con los filtros aplicados (todas las columnas de totales)">CSV</a>
-        <a class="btn btn-secondary" data-export-download href="<?php echo $base; ?>?action=export_runs&amp;format=pdf<?php echo htmlspecialchars($runExportQs); ?>" title="Descargar PDF con los filtros aplicados">PDF</a>
+        <a class="btn btn-secondary" data-export-download href="<?php echo $base; ?>?action=export_runs&amp;format=csv<?php echo htmlspecialchars($runExportQs); ?>" title="Exportar liquidaciones a CSV con totales (respeta filtros)">CSV</a>
+        <a class="btn btn-secondary" data-export-download href="<?php echo $base; ?>?action=export_runs&amp;format=pdf<?php echo htmlspecialchars($runExportQs); ?>" title="Exportar liquidaciones a PDF (respeta filtros)">PDF</a>
         <?php if ($canCreate): ?>
-            <button type="button" class="btn btn-primary" onclick="document.getElementById('runModal').style.display='flex'">Nueva liquidación</button>
+            <button type="button" class="btn btn-primary" onclick="openRunModal()" title="Crear borrador de nómina: elija empleados, periodo, días y conceptos a incluir">Nueva liquidación</button>
         <?php endif; ?>
     </div>
 </div>
@@ -370,8 +380,8 @@ $runExportQs = $runExportQs !== '' ? '&' . $runExportQs : '';
                 <td><?php echo fmtN((float)$r['deductions_total'], $currency); ?></td>
                 <td><strong><?php echo fmtN((float)$r['net_total'], $currency); ?></strong></td>
                 <td><span class="badge <?php echo $stClass; ?>"><?php echo htmlspecialchars($stLabel); ?></span></td>
-                <td><a class="btn btn-sm btn-secondary" href="<?php echo $base; ?>?tab=runs&amp;action=run_detail&amp;id=<?php echo (int)$r['id']; ?>">Ver</a>
-                    <a class="btn btn-sm btn-secondary" target="_blank" href="<?php echo $base; ?>?action=pdf&amp;id=<?php echo (int)$r['id']; ?>">PDF</a></td>
+                <td><a class="btn btn-sm btn-secondary" href="<?php echo $base; ?>?tab=runs&amp;action=run_detail&amp;id=<?php echo (int)$r['id']; ?>" title="Abrir detalle: empleados, HE, incapacidades y contabilizar">Ver</a>
+                    <a class="btn btn-sm btn-secondary" target="_blank" href="<?php echo $base; ?>?action=pdf&amp;id=<?php echo (int)$r['id']; ?>" title="Descargar PDF de la liquidación completa">PDF</a></td>
             </tr>
         <?php endforeach; ?>
         </tbody>
@@ -495,7 +505,7 @@ $includes = [
 .nm-run-table td{white-space:nowrap;font-variant-numeric:tabular-nums}
 .nm-run-table thead tr.grp th{padding:6px 8px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;text-align:center;color:#fff;border-bottom:3px solid var(--g,transparent)}
 </style>
-<div style="margin-bottom:12px;"><a class="btn btn-secondary" href="<?php echo $base; ?>?tab=runs">← Volver</a></div>
+<div style="margin-bottom:12px;"><a class="btn btn-secondary" href="<?php echo $base; ?>?tab=runs" title="Volver al listado de liquidaciones">← Volver</a></div>
 <div class="card neumorphic" style="margin-bottom:16px;">
     <div class="card-body">
         <div class="nm-run-head">
@@ -518,12 +528,12 @@ $includes = [
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
                 <?php if (!empty($accountingEntry['id'])): ?>
-                    <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$accountingEntry['id']; ?>">
+                    <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$accountingEntry['id']; ?>" title="Ver asiento de causación en Contabilidad (gastos 5105xx y pasivos)">
                         Asiento <?php echo htmlspecialchars((string)($accountingEntry['entry_number'] ?? '')); ?>
                     </a>
                 <?php endif; ?>
                 <?php if (!empty($paymentEntry['id'])): ?>
-                    <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$paymentEntry['id']; ?>" title="Asiento del pago (fecha de pago)">
+                    <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$paymentEntry['id']; ?>" title="Asiento del pago del neto (fecha de pago; no descuenta cajón POS)">
                         Pago <?php echo htmlspecialchars((string)($paymentEntry['entry_number'] ?? '')); ?>
                     </a>
                 <?php endif; ?>
@@ -578,25 +588,25 @@ $includes = [
         </div>
 
         <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-            <a class="btn btn-secondary" target="_blank" href="<?php echo $base; ?>?action=pdf&amp;id=<?php echo (int)$run['id']; ?>">PDF liquidación</a>
+            <a class="btn btn-secondary" target="_blank" href="<?php echo $base; ?>?action=pdf&amp;id=<?php echo (int)$run['id']; ?>" title="Descargar PDF de la liquidación con todos los empleados y totales">PDF liquidación</a>
         <?php if (($run['status'] ?? '') === 'draft' && $canEdit): ?>
                 <form method="POST" action="<?php echo $base; ?>?action=pay_run" data-ajax="true" style="display:inline;">
                     <?php echo \SoftNova\Core\csrf_field(); ?>
                     <input type="hidden" name="id" value="<?php echo (int)$run['id']; ?>">
-                    <button class="btn btn-primary" type="submit" onclick="return confirm('¿Contabilizar nómina y marcar como pagada?\n\nSe registra el gasto por el costo total de la empresa (<?php echo htmlspecialchars(fmtN($companyCost, $currency), ENT_QUOTES); ?>) con fecha <?php echo date('d/m/Y', strtotime($accrualDate)); ?>. No descuenta el cajón de caja.')">Contabilizar y pagar</button>
+                    <button class="btn btn-primary" type="submit" title="Genera asiento contable (5105xx / pasivos), marca como pagada y registra el costo total. No mueve el cajón POS." onclick="return confirm('¿Contabilizar nómina y marcar como pagada?\n\nSe registra el gasto por el costo total de la empresa (<?php echo htmlspecialchars(fmtN($companyCost, $currency), ENT_QUOTES); ?>) con fecha <?php echo date('d/m/Y', strtotime($accrualDate)); ?>. No descuenta el cajón de caja.')">Contabilizar y pagar</button>
                 </form>
                 <form method="POST" action="<?php echo $base; ?>?action=cancel_run" data-ajax="true" style="display:inline;">
                     <?php echo \SoftNova\Core\csrf_field(); ?>
                     <input type="hidden" name="id" value="<?php echo (int)$run['id']; ?>">
-                    <button class="btn btn-danger" type="submit" onclick="return confirm('¿Cancelar liquidación?')">Cancelar</button>
+                    <button class="btn btn-danger" type="submit" title="Descarta este borrador sin generar asiento contable" onclick="return confirm('¿Cancelar esta liquidación en borrador?\n\nNo se genera asiento. Podrá crear otra para el mismo periodo.')">Cancelar borrador</button>
                 </form>
         <?php endif; ?>
         <?php if (in_array(($run['status'] ?? ''), ['paid', 'posted'], true) && $canDelete): ?>
                 <form method="POST" action="<?php echo $base; ?>?action=cancel_paid_run" data-ajax="true" class="nm-void-form">
                     <?php echo \SoftNova\Core\csrf_field(); ?>
                     <input type="hidden" name="id" value="<?php echo (int)$run['id']; ?>">
-                    <input type="text" name="reason" class="form-control" required minlength="5" maxlength="200" placeholder="Motivo de la anulación (obligatorio)">
-                    <button class="btn btn-danger" type="submit" data-confirm="¿Anular el pago de esta nómina? Se revierten sus asientos contables, se anula el gasto en Gastos y la liquidación vuelve a borrador para corregirla. Si ya registró pagos de seguridad social de este periodo, revíselos en «Pagos de nómina».">Anular pago</button>
+                    <input type="text" name="reason" class="form-control" required minlength="5" maxlength="200" placeholder="Motivo de la anulación (obligatorio)" title="Explique por qué anula el pago (mín. 5 caracteres)">
+                    <button class="btn btn-danger" type="submit" title="Revierte asientos, anula el gasto y vuelve la liquidación a borrador" data-confirm="¿Anular el pago de esta nómina? Se revierten sus asientos contables, se anula el gasto en Gastos y la liquidación vuelve a borrador para corregirla. Si ya registró pagos de seguridad social de este periodo, revíselos en «Pagos de nómina».">Anular pago</button>
                 </form>
         <?php endif; ?>
         </div>
@@ -614,7 +624,9 @@ $includes = [
                 <th></th>
             </tr>
             <tr><th>Empleado</th><th>Días</th><th>Inc.</th>
-                <th>Salario + aux. <?php echo nmTip('Salario de los días trabajados + auxilio de transporte + pago de incapacidad.'); ?></th><th>HE / rec.</th><th>Comisión</th><th>Prima</th><th>Total</th>
+                <th>Salario + aux. <?php echo nmTip('Salario de los días trabajados + auxilio de transporte + pago de incapacidad.'); ?></th>
+                <th>HE / rec. <?php echo nmTip('Valor de horas extras y recargos (HED, HEN, RNO, Dom., HEDD, HEND). Edítelos en la captura masiva debajo.'); ?></th>
+                <th>Comisión</th><th>Prima</th><th>Total</th>
                 <th>Salud</th><th>Pensión</th><th>Neto</th>
                 <th>Provisiones <?php echo nmTip('Cesantías + intereses + vacaciones de este empleado.'); ?></th><th></th></tr>
         </thead>
@@ -641,17 +653,9 @@ $includes = [
                 <td><strong style="color:var(--color-accent-text, var(--color-primary));"><?php echo fmtN((float)$it['net_pay'], $currency); ?></strong></td>
                 <td style="color:var(--color-text-secondary);"><?php echo $provAmt > 0 ? fmtN($provAmt, $currency) : '-'; ?></td>
                 <td style="white-space:nowrap;">
-                    <a class="btn btn-sm btn-secondary" target="_blank" href="<?php echo $base; ?>?action=payslip&amp;run_id=<?php echo (int)$run['id']; ?>&amp;item_id=<?php echo (int)$it['id']; ?>">PDF</a>
+                    <a class="btn btn-sm btn-secondary" target="_blank" href="<?php echo $base; ?>?action=payslip&amp;run_id=<?php echo (int)$run['id']; ?>&amp;item_id=<?php echo (int)$it['id']; ?>" title="Comprobante de pago (payslip) de este empleado">PDF</a>
                     <?php if (($run['status'] ?? '') === 'draft' && $canEdit): ?>
-                        <button type="button" class="btn btn-sm btn-secondary" onclick="editIncapacity(<?php echo (int)$it['id']; ?>,<?php echo (int)$run['id']; ?>,<?php echo (int)($it['incapacity_days'] ?? 0); ?>,'<?php echo htmlspecialchars($it['incapacity_type'] ?? 'enfermedad', ENT_QUOTES); ?>')">Inc.</button>
-                        <button type="button" class="btn btn-sm btn-secondary" onclick="editOvertime(<?php echo (int)$it['id']; ?>,<?php echo (int)$run['id']; ?>,<?php echo json_encode([
-                            'day' => (float)($it['overtime_day_hours'] ?? 0),
-                            'night' => (float)($it['overtime_night_hours'] ?? 0),
-                            'rno' => (float)($it['night_surcharge_hours'] ?? 0),
-                            'dom' => (float)($it['dominical_hours'] ?? 0),
-                            'hedd' => (float)($it['overtime_dom_day_hours'] ?? 0),
-                            'hend' => (float)($it['overtime_dom_night_hours'] ?? 0),
-                        ], JSON_HEX_APOS | JSON_HEX_QUOT); ?>)">HE</button>
+                        <button type="button" class="btn btn-sm btn-secondary" title="Registrar o ajustar días de incapacidad de este empleado" onclick="editIncapacity(<?php echo (int)$it['id']; ?>,<?php echo (int)$run['id']; ?>,<?php echo (int)($it['incapacity_days'] ?? 0); ?>,'<?php echo htmlspecialchars($it['incapacity_type'] ?? 'enfermedad', ENT_QUOTES); ?>')">Inc.</button>
                     <?php endif; ?>
                 </td>
             </tr>
@@ -670,7 +674,7 @@ $includes = [
     ];
     ?>
     <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--color-border);">
-        <h4 style="margin:0 0 8px;">Captura masiva de horas extras <?php echo nmTip('Digite las horas del periodo por empleado. Solo se recalculan las filas que cambian. Valor hora = salario ÷ ' . (float)($params['payroll_monthly_hours'] ?? 210) . ' h.'); ?></h4>
+        <h4 id="nmOtBulk" style="margin:0 0 8px;">Captura masiva de horas extras <?php echo nmTip('Digite las horas del periodo por empleado. Solo se recalculan las filas que cambian. Valor hora = salario ÷ ' . (float)($params['payroll_monthly_hours'] ?? 210) . ' h.'); ?></h4>
         <form method="POST" action="<?php echo $base; ?>?action=save_overtime_bulk" data-ajax="true">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="run_id" value="<?php echo (int)$run['id']; ?>">
@@ -699,12 +703,12 @@ $includes = [
                     </tbody>
                 </table>
             </div>
-            <button type="submit" class="btn btn-primary" style="margin-top:12px;">Recalcular horas extras</button>
+            <button type="submit" class="btn btn-primary" style="margin-top:12px;" title="Guarda HED/HEN/RNO/Dom./HEDD/HEND y recalcula valores, aportes y neto">Recalcular horas extras</button>
         </form>
     </div>
     <?php endif; ?>
     <p class="nm-footnote">
-        En borrador ajuste incapacidad y horas extras por empleado o en la tabla masiva.
+        En borrador ajuste incapacidad por empleado y las horas extras en la captura masiva.
         Cesantías y vacaciones (si se incluyen) son provisiones contables (261005 y 261015) y <strong>no aumentan el neto a pagar</strong>.
         Al pagar se genera asiento (sueldos, HE, comisiones, aportes, parafiscales y provisiones) y queda en auditoría.
         <strong>La nómina no descuenta el cajón físico de Caja/POS</strong>.
@@ -717,7 +721,26 @@ $includes = [
 $liabilities = $liabilities ?? [];
 $liabilityPayments = $liabilityPayments ?? [];
 $conceptDefs = \SoftNova\Services\PayrollService::LIABILITY_CONCEPTS;
-$kindLabels = ['pila' => 'Seguridad social y parafiscales (PILA)', 'benefits' => 'Prestaciones y salarios por pagar'];
+$kindLabels = [
+    'pila' => 'Seguridad social y parafiscales (PILA)',
+    'benefits' => 'Prestaciones y salarios por pagar',
+];
+$kindTips = [
+    'pila' => 'Pagos a EPS, fondos de pensión, ARL, caja, SENA e ICBF causados al liquidar la nómina. Aquí solo baja el pasivo; el gasto ya quedó registrado.',
+    'benefits' => 'Cesantías al fondo, intereses, vacaciones y el neto de salarios aún no desembolsado a los empleados (cuenta 250505).',
+];
+$liabTips = [
+    'health' => 'Aporte a EPS causado en la liquidación. Pague aquí cuando consignue la planilla PILA.',
+    'pension' => 'Aporte a pensión causado en la liquidación. Se paga con la planilla PILA.',
+    'arl' => 'Riesgos laborales (ARL) del empleador. Se paga con la planilla PILA.',
+    'caja' => 'Aporte a caja de compensación familiar (parafiscal).',
+    'sena' => 'Aporte al SENA (parafiscal).',
+    'icbf' => 'Aporte al ICBF (parafiscal).',
+    'cesantias' => 'Provisión de cesantías por consignar al fondo (no se paga al empleado). Cuenta 261005.',
+    'cesantias_interest' => 'Intereses sobre cesantías; normalmente se pagan al empleado en enero. Cuenta 261010.',
+    'vacation' => 'Vacaciones consolidadas pendientes de pago al empleado. Cuenta 261015.',
+    'salaries' => 'Neto a pagar a los empleados (cuenta 250505) que aún no se ha desembolsado. Si al liquidar usó «Contabilizar y pagar», el saldo queda en $0. Solo aparece valor si contabilizó sin pagar o quedó un remanente pendiente.',
+];
 $moneyPlain = static function (float $v): string {
     $v = round($v, 2);
     return abs($v - round($v)) < 0.005
@@ -744,46 +767,62 @@ foreach ($liabilities as $li) {
 <div class="nm-run-banner" style="margin:0 0 16px;">
     Aquí se registran los pagos de lo que la nómina dejó <strong>por pagar</strong>: planilla PILA (salud, pensión, ARL, caja, SENA, ICBF),
     consignación de cesantías, intereses, vacaciones pagadas y salarios pendientes.
+    <strong>Salarios por pagar (neto pendiente)</strong> es el dinero que aún se le debe a los empleados (cuenta 250505): si al liquidar usó «Contabilizar y pagar», ese saldo queda en $0.
     El pago <strong>no genera gasto</strong> (el costo ya se registró al liquidar la nómina): solo baja el pasivo contra banco o caja de nómina.
     No registre estos pagos en Gastos porque el costo quedaría duplicado.
+    Pase el cursor por <span class="nm-tip" style="cursor:default;">i</span> en cada concepto para ver el detalle.
 </div>
 <div class="nm-liab-grid">
 <?php foreach (['pila', 'benefits'] as $kindKey): ?>
     <div class="card neumorphic" style="margin:0;">
-        <div class="card-header"><h3><?php echo htmlspecialchars($kindLabels[$kindKey]); ?></h3></div>
+        <div class="card-header"><h3><?php echo htmlspecialchars($kindLabels[$kindKey]); ?><?php echo nmTip($kindTips[$kindKey]); ?></h3></div>
         <div class="card-body">
         <form method="POST" action="<?php echo $base; ?>?action=save_liability_payment" data-ajax="true" class="js-liab-form">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <input type="hidden" name="kind" value="<?php echo $kindKey; ?>">
             <div class="nm-liab-row" style="font-size:11px;text-transform:uppercase;color:var(--color-text-secondary);border-bottom-style:solid;">
-                <span>Concepto</span><span class="bal">Saldo por pagar</span><span>Valor a pagar</span>
+                <span title="Pasivo laboral causado al liquidar la nómina">Concepto</span>
+                <span class="bal" title="Saldo actual de la cuenta contable (crédito − débito). Si es $0, no hay nada pendiente.">Saldo por pagar</span>
+                <span title="Monto que va a registrar ahora. Puede ser parcial o el saldo completo.">Valor a pagar</span>
             </div>
             <?php foreach ($byKind[$kindKey] as $li):
                 $bal = (float)$li['balance'];
-                $balClass = $bal < -0.004 ? 'neg' : (abs($bal) < 0.005 ? 'zero' : ''); ?>
+                $balClass = $bal < -0.004 ? 'neg' : (abs($bal) < 0.005 ? 'zero' : '');
+                $tip = $liabTips[$li['concept']] ?? '';
+                $balTitle = $bal < -0.004
+                    ? 'Saldo a favor: se ha pagado más de lo causado'
+                    : (abs($bal) < 0.005
+                        ? 'Sin saldo pendiente en esta cuenta'
+                        : 'Pendiente de pago en cuenta ' . $li['account']);
+                ?>
                 <div class="nm-liab-row">
-                    <span><?php echo htmlspecialchars($li['label']); ?><br><span class="acc">Cuenta <?php echo htmlspecialchars($li['account']); ?></span></span>
-                    <span class="bal <?php echo $balClass; ?>" title="<?php echo $bal < -0.004 ? 'Saldo a favor: se ha pagado más de lo causado' : ''; ?>"><?php echo fmtN($bal, $currency); ?></span>
+                    <span>
+                        <?php echo htmlspecialchars($li['label']); ?><?php if ($tip !== '') { echo nmTip($tip); } ?>
+                        <br><span class="acc" title="Cuenta contable de pasivo">Cuenta <?php echo htmlspecialchars($li['account']); ?></span>
+                    </span>
+                    <span class="bal <?php echo $balClass; ?>" title="<?php echo htmlspecialchars($balTitle); ?>"><?php echo fmtN($bal, $currency); ?></span>
                     <span>
                         <?php if ($canEdit): ?>
                         <input type="text" inputmode="decimal" class="form-control money-input js-liab-amount" data-money="1"
                                name="amounts[<?php echo htmlspecialchars($li['concept']); ?>]"
-                               data-balance="<?php echo htmlspecialchars($moneyPlain(max(0, $bal))); ?>" placeholder="0">
+                               data-balance="<?php echo htmlspecialchars($moneyPlain(max(0, $bal))); ?>"
+                               placeholder="0"
+                               title="Digite el valor a pagar de <?php echo htmlspecialchars($li['label']); ?>. Use «Usar saldos» para cargar el pendiente.">
                         <?php endif; ?>
                     </span>
                 </div>
             <?php endforeach; ?>
             <?php if ($canEdit): ?>
-            <div class="nm-liab-total"><span>Total a pagar</span><span class="js-liab-total">0</span></div>
+            <div class="nm-liab-total"><span title="Suma de los valores digitados en esta tarjeta">Total a pagar</span><span class="js-liab-total">0</span></div>
             <div class="nm-liab-foot">
-                <div class="form-group" style="margin:0;"><label>Fecha de pago</label><input class="form-control" type="date" name="payment_date" value="<?php echo date('Y-m-d'); ?>" max="<?php echo date('Y-m-d'); ?>" required></div>
-                <div class="form-group" style="margin:0;"><label>Medio de pago</label><select class="form-control" name="payment_method"><?php echo \SoftNova\Core\payment_method_options('transfer'); ?></select></div>
-                <div class="form-group" style="margin:0;"><label>Referencia</label><input class="form-control" name="reference" maxlength="120" placeholder="<?php echo $kindKey === 'pila' ? 'Nº planilla PILA' : 'Fondo / soporte'; ?>"></div>
+                <div class="form-group" style="margin:0;"><label title="Fecha del desembolso o consignación">Fecha de pago <?php echo nmTip('Fecha en que sale el dinero (transferencia, consignación al fondo o efectivo de caja nómina).'); ?></label><input class="form-control" type="date" name="payment_date" value="<?php echo date('Y-m-d'); ?>" max="<?php echo date('Y-m-d'); ?>" required title="Fecha del pago"></div>
+                <div class="form-group" style="margin:0;"><label title="Cómo sale el dinero">Medio de pago <?php echo nmTip('Transferencia/medios electrónicos → banco. Efectivo → caja de nómina 110510 (no descuenta el cajón POS).'); ?></label><select class="form-control" name="payment_method" title="Medio con el que se registra el egreso"><?php echo \SoftNova\Core\payment_method_options('transfer'); ?></select></div>
+                <div class="form-group" style="margin:0;"><label title="Número de planilla, fondo o soporte">Referencia <?php echo nmTip($kindKey === 'pila' ? 'Número de planilla PILA u otro soporte del pago.' : 'Número de consignación al fondo, comprobante o soporte del pago.'); ?></label><input class="form-control" name="reference" maxlength="120" placeholder="<?php echo $kindKey === 'pila' ? 'Nº planilla PILA' : 'Fondo / soporte'; ?>" title="<?php echo $kindKey === 'pila' ? 'Nº planilla PILA u otro soporte' : 'Fondo / soporte del pago'; ?>"></div>
             </div>
-            <div class="form-group" style="margin:10px 0 0;"><label>Notas</label><input class="form-control" name="notes" maxlength="255"></div>
+            <div class="form-group" style="margin:10px 0 0;"><label title="Observación opcional del pago">Notas <?php echo nmTip('Texto libre para auditoría (quién recibió, periodo cubierto, etc.).'); ?></label><input class="form-control" name="notes" maxlength="255" title="Notas opcionales del pago"></div>
             <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;flex-wrap:wrap;">
-                <button type="button" class="btn btn-secondary js-liab-fill" title="Llena cada concepto con su saldo por pagar">Usar saldos</button>
-                <button type="submit" class="btn btn-primary" data-confirm="¿Registrar este pago? Se contabiliza contra banco (medios electrónicos) o caja de nómina 110510 (efectivo). No descuenta el cajón POS.">Registrar pago</button>
+                <button type="button" class="btn btn-secondary js-liab-fill" title="Completa cada concepto con el saldo pendiente actual (puede editar antes de guardar)">Usar saldos</button>
+                <button type="submit" class="btn btn-primary" title="Contabiliza el pago: baja el pasivo contra banco o caja nómina 110510. No genera gasto nuevo ni descuenta el cajón POS." data-confirm="¿Registrar este pago? Se contabiliza contra banco (medios electrónicos) o caja de nómina 110510 (efectivo). No descuenta el cajón POS.">Registrar pago</button>
             </div>
             <?php endif; ?>
         </form>
@@ -793,7 +832,7 @@ foreach ($liabilities as $li) {
 </div>
 
 <div class="card neumorphic">
-    <div class="card-header"><h3>Historial de pagos de nómina</h3></div>
+    <div class="card-header"><h3>Historial de pagos de nómina <?php echo nmTip('Pagos ya registrados de PILA y prestaciones. Desde aquí puede ver el asiento o anular para revertir el saldo.'); ?></h3></div>
     <div class="card-body"><div class="table-container"><table>
         <thead><tr><th>Fecha</th><th>Tipo</th><th>Conceptos</th><th>Total</th><th>Medio</th><th>Referencia</th><th>Asiento</th><th>Estado</th><?php if ($canDelete): ?><th></th><?php endif; ?></tr></thead>
         <tbody>
@@ -815,7 +854,7 @@ foreach ($liabilities as $li) {
                 <td><?php echo htmlspecialchars((string)($p['reference'] ?? '')); ?></td>
                 <td>
                     <?php if (!empty($p['entry_id'])): ?>
-                        <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$p['entry_id']; ?>"><?php echo htmlspecialchars((string)($p['entry_number'] ?? 'Ver')); ?></a>
+                        <a class="btn btn-sm btn-info" href="<?php echo $viewInstance->route('app/contabilidad'); ?>?tab=entries&amp;entry_id=<?php echo (int)$p['entry_id']; ?>" title="Ver asiento contable de este pago"><?php echo htmlspecialchars((string)($p['entry_number'] ?? 'Ver')); ?></a>
                     <?php else: ?>—<?php endif; ?>
                 </td>
                 <td>
@@ -832,7 +871,7 @@ foreach ($liabilities as $li) {
                         <?php echo \SoftNova\Core\csrf_field(); ?>
                         <input type="hidden" name="id" value="<?php echo (int)$p['id']; ?>">
                         <input type="text" name="reason" class="form-control" required minlength="5" maxlength="200" placeholder="Motivo">
-                        <button type="submit" class="btn btn-sm btn-danger" data-confirm="¿Anular este pago? Se revierte el asiento y el saldo vuelve a quedar por pagar.">Anular</button>
+                        <button type="submit" class="btn btn-sm btn-danger" title="Anular pago: revierte el asiento y restaura el saldo por pagar" data-confirm="¿Anular este pago? Se revierte el asiento y el saldo vuelve a quedar por pagar.">Anular</button>
                     </form>
                     <?php endif; ?>
                 </td>
@@ -1040,8 +1079,8 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
     <div class="nm-savebar">
         <span class="nm-note" id="paramsNote">Los cambios aplican a las liquidaciones nuevas y a los recálculos de borradores.</span>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
-            <button type="button" class="btn btn-secondary" onclick="nmSuggestParams()">Sugerir valores legales 2026 <?php echo nmTip('Rellena SMMLV, auxilio, jornada, ventana nocturna y recargos con los valores legales de 2026. No toca los % de aportes ni parafiscales. Revise y pulse Guardar.'); ?></button>
-            <button class="btn btn-primary" type="submit">Guardar parámetros</button>
+            <button type="button" class="btn btn-secondary" onclick="nmSuggestParams()" title="Rellena SMMLV, auxilio, jornada y recargos legales 2026 (no cambia % de aportes). Revise y guarde.">Sugerir valores legales 2026 <?php echo nmTip('Rellena SMMLV, auxilio, jornada, ventana nocturna y recargos con los valores legales de 2026. No toca los % de aportes ni parafiscales. Revise y pulse Guardar.'); ?></button>
+            <button class="btn btn-primary" type="submit" title="Guardar parámetros y recalcular borradores afectados (p. ej. comisiones)">Guardar parámetros</button>
         </div>
     </div>
     <?php endif; ?>
@@ -1085,7 +1124,7 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
                 <div class="form-group" style="align-self:end;"><label class="nm-check"><input type="checkbox" name="has_transport_aid" id="empTransport" value="1" checked> Auxilio de transporte <?php echo nmTip('Solo se paga si el salario es de hasta 2 SMMLV, aunque la casilla esté marcada.'); ?></label></div>
                 <div class="form-group full"><label>Notas</label><textarea class="form-control" name="notes" id="empNotes" rows="2"></textarea></div>
             </div></div>
-            <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="closeEmployeeModal()">Cancelar</button><button type="submit" class="btn btn-primary">Guardar</button></div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="closeEmployeeModal()" title="Cerrar sin guardar">Cancelar</button><button type="submit" class="btn btn-primary" title="Guardar empleado (alta o cambios)">Guardar</button></div>
         </form>
     </div>
 </div>
@@ -1103,11 +1142,11 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
                 </div>
                 <div class="nm-templates">
                     <span style="font-size:12px;color:var(--color-text-secondary);align-self:center;">Plantillas:</span>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="nmTemplate('office')">L-V 8:00-17:00 (40 h)</button>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="nmTemplate('salon')">L-S 9:00-17:00 (42 h)</button>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="nmTemplate('late')">L-S 13:00-21:00 (42 h)</button>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="nmTemplate('half')">Medio tiempo L-S 8:00-12:00</button>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="nmCopyMonday()">Copiar lunes a días marcados <?php echo nmTip('Copia entrada, salida y descanso del lunes a todos los días marcados como laborables.'); ?></button>
+                    <button type="button" class="btn btn-sm btn-secondary" onclick="nmTemplate('office')" title="Plantilla oficina: lunes a viernes 8:00–17:00 (40 h/sem)">L-V 8:00-17:00 (40 h)</button>
+                    <button type="button" class="btn btn-sm btn-secondary" onclick="nmTemplate('salon')" title="Plantilla salón: lunes a sábado 9:00–17:00 (42 h/sem)">L-S 9:00-17:00 (42 h)</button>
+                    <button type="button" class="btn btn-sm btn-secondary" onclick="nmTemplate('late')" title="Plantilla tarde/noche: lunes a sábado 13:00–21:00 (incluye horas nocturnas)">L-S 13:00-21:00 (42 h)</button>
+                    <button type="button" class="btn btn-sm btn-secondary" onclick="nmTemplate('half')" title="Medio tiempo: lunes a sábado 8:00–12:00">Medio tiempo L-S 8:00-12:00</button>
+                    <button type="button" class="btn btn-sm btn-secondary" onclick="nmCopyMonday()" title="Copia entrada, salida y descanso del lunes a los demás días laborables marcados">Copiar lunes a días marcados <?php echo nmTip('Copia entrada, salida y descanso del lunes a todos los días marcados como laborables.'); ?></button>
                 </div>
                 <div class="table-container">
                 <table class="nm-week-editor">
@@ -1135,14 +1174,14 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
                 <ul class="nm-warn" id="schWarnings" style="display:none;margin-top:10px;"></ul>
                 <div class="form-group" style="margin:12px 0 0;"><label>Notas</label><input class="form-control" name="notes" id="schNotes" maxlength="255" placeholder="Opcional"></div>
             </div>
-            <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="closeScheduleModal()">Cancelar</button><button type="submit" class="btn btn-primary">Guardar horario</button></div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="closeScheduleModal()" title="Cerrar sin guardar">Cancelar</button><button type="submit" class="btn btn-primary" title="Guardar turno semanal">Guardar horario</button></div>
         </form>
     </div>
 </div>
 
 <div id="runModal" class="modal-overlay" style="display:none;">
     <div class="modal-content neumorphic" style="max-width:560px;">
-        <div class="modal-header"><h3>Nueva liquidación</h3><button type="button" class="modal-close" onclick="document.getElementById('runModal').style.display='none'">&times;</button></div>
+        <div class="modal-header"><h3>Nueva liquidación</h3><button type="button" class="modal-close" onclick="closeRunModal()" title="Cerrar">&times;</button></div>
         <form method="POST" action="<?php echo $base; ?>?action=create_run" data-ajax="true">
             <?php echo \SoftNova\Core\csrf_field(); ?>
             <div class="modal-body"><div class="nm-modal-grid">
@@ -1151,6 +1190,37 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
                 <div class="form-group"><label>Fecha de pago</label><input class="form-control" type="date" name="pay_date" value="<?php echo date('Y-m-d'); ?>" required></div>
                 <div class="form-group"><label>Días trabajados <?php echo nmTip('Días del periodo (base 30). Las incapacidades se descuentan después en el detalle.'); ?></label><input class="form-control" type="number" min="1" max="31" name="days_worked" value="30"></div>
                 <div class="form-group full"><label>Medio de pago</label><select class="form-control" name="payment_method"><?php echo \SoftNova\Core\payment_method_options('transfer'); ?></select></div>
+                <div class="form-group full">
+                    <label>Empleados a liquidar <?php echo nmTip('Elija uno o varios empleados activos. Solo los seleccionados entrarán en esta liquidación.'); ?></label>
+                    <div class="nm-emp-pick" id="runEmpPick">
+                        <div class="nm-emp-pick__bar">
+                            <input type="search" class="form-control" id="runEmpSearch" placeholder="Buscar por nombre o cargo…" autocomplete="off">
+                            <label class="nm-check" style="margin:0;white-space:nowrap;"><input type="checkbox" id="runEmpAll" <?php echo $activeEmployees ? 'checked' : ''; ?>> Todos</label>
+                            <span class="nm-pill" id="runEmpCount" style="margin-left:auto;"><?php echo count($activeEmployees); ?> sel.</span>
+                        </div>
+                        <div class="nm-emp-pick__list" id="runEmpList">
+                            <?php if (!$activeEmployees): ?>
+                                <div class="nm-emp-pick__empty">No hay empleados activos. Créelos en la pestaña Empleados.</div>
+                            <?php else: ?>
+                                <?php foreach ($activeEmployees as $ae): ?>
+                                    <?php
+                                    $aeName = trim(($ae['first_name'] ?? '') . ' ' . ($ae['last_name'] ?? ''));
+                                    if ($aeName === '') {
+                                        $aeName = (string)($ae['name'] ?? ('Empleado #' . (int)$ae['id']));
+                                    }
+                                    $aePos = trim((string)($ae['position_title'] ?? ''));
+                                    $aeSearch = mb_strtolower($aeName . ' ' . $aePos . ' ' . (string)($ae['document_number'] ?? ''));
+                                    ?>
+                                    <label class="nm-emp-pick__row" data-search="<?php echo htmlspecialchars($aeSearch, ENT_QUOTES, 'UTF-8'); ?>">
+                                        <input type="checkbox" name="employee_ids[]" value="<?php echo (int)$ae['id']; ?>" class="run-emp-cb" checked>
+                                        <span><?php echo htmlspecialchars($aeName); ?></span>
+                                        <?php if ($aePos !== ''): ?><span class="meta"><?php echo htmlspecialchars($aePos); ?></span><?php endif; ?>
+                                    </label>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                </div>
                 <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="include_prima" value="1" <?php echo in_array((int)date('n'), [6, 12], true) ? 'checked' : ''; ?>> Incluir prima de servicios <?php echo nmTip('Paga la prima del semestre: (salario + auxilio de transporte si aplica) × % de Parámetros → Provisiones × 6 meses (8,33% = medio mes). Se paga normalmente en junio y diciembre.'); ?></label></div>
                 <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="include_cesantias" value="1"> Incluir cesantías e intereses <?php echo nmTip('Provisión mensual según Parámetros → Provisiones (cesantías % de salario + auxilio de transporte si aplica, + intereses anuales ÷ 12). Se registra en contabilidad y no suma al neto a pagar.'); ?></label></div>
                 <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="include_vacaciones" value="1"> Incluir provisión de vacaciones <?php echo nmTip('Provisión mensual: salario × % de vacaciones de Parámetros → Provisiones. Se contabiliza (510539 / 261015) y no suma al neto a pagar.'); ?></label></div>
@@ -1158,9 +1228,9 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
                 <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="schedule_rno" value="1" <?php echo $hasNightSchedules ? 'checked' : ''; ?>> Precargar recargo nocturno según horario <?php echo nmTip('Para empleados con horario asignado, llena las horas RNO del periodo (horas nocturnas semanales × días ÷ 7). Puede ajustarlas luego en el detalle.'); ?></label></div>
                 <div class="form-group full" style="margin:0;"><label class="nm-check"><input type="checkbox" name="schedule_ot" value="1" <?php echo $hasOvertimeSchedules ? 'checked' : ''; ?>> Precargar horas extra según horario <?php echo nmTip('Para empleados con horario asignado, las horas de cada día que superan la jornada máxima diaria (Parámetros) se cargan como HED/HEN, o HEDD/HEND si es domingo (semanales × días ÷ 7). Las horas nocturnas que ya son extra no se duplican como RNO. Puede ajustarlas luego en el detalle.'); ?></label></div>
                 <div class="form-group full"><label>Notas</label><input class="form-control" name="notes"></div>
-                <p class="full" style="font-size:12px;color:var(--color-text-secondary);margin:0;">Tras crear el borrador, capture horas extras en el detalle (tabla masiva o botón HE por empleado).</p>
+                <p class="full" style="font-size:12px;color:var(--color-text-secondary);margin:0;">Tras crear el borrador, capture horas extras en la tabla masiva del detalle.</p>
             </div></div>
-            <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="document.getElementById('runModal').style.display='none'">Cancelar</button><button type="submit" class="btn btn-primary">Calcular</button></div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="closeRunModal()" title="Cerrar sin crear">Cancelar</button><button type="submit" class="btn btn-primary" title="Calcular borrador con los empleados y opciones seleccionados">Calcular</button></div>
         </form>
     </div>
 </div>
@@ -1182,35 +1252,8 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
                 </div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" onclick="document.getElementById('incapacityModal').style.display='none'">Cerrar</button>
-                <button type="submit" class="btn btn-primary">Recalcular</button>
-            </div>
-        </form>
-    </div>
-</div>
-<div id="overtimeModal" class="modal-overlay" style="display:none;">
-    <div class="modal-content neumorphic" style="max-width:560px;">
-        <div class="modal-header"><h3>Horas extras y recargos</h3><button type="button" class="modal-close" onclick="document.getElementById('overtimeModal').style.display='none'">&times;</button></div>
-        <form method="POST" action="<?php echo $base; ?>?action=save_overtime" data-ajax="true">
-            <?php echo \SoftNova\Core\csrf_field(); ?>
-            <input type="hidden" name="item_id" id="otItemId">
-            <input type="hidden" name="run_id" id="otRunId">
-            <div class="modal-body">
-                <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 12px;">
-                    Horas del periodo. Valor = (salario ÷ horas mensuales) × factor de recargo (Parámetros).
-                </p>
-                <div class="nm-modal-grid">
-                    <div class="form-group"><label>HE diurnas (HED) <?php echo nmTip('Horas extra entre ' . (int)($params['night_end_hour'] ?? 6) . ':00 y ' . (int)($params['night_start_hour'] ?? 19) . ':00.'); ?></label><input class="form-control" type="number" min="0" step="0.25" name="overtime_day_hours" id="otDayHours" value="0"></div>
-                    <div class="form-group"><label>HE nocturnas (HEN) <?php echo nmTip('Horas extra en horario nocturno.'); ?></label><input class="form-control" type="number" min="0" step="0.25" name="overtime_night_hours" id="otNightHours" value="0"></div>
-                    <div class="form-group"><label>Recargo noct. ord. (RNO) <?php echo nmTip('Horas de la jornada normal en horario nocturno. Solo se paga el % de recargo.'); ?></label><input class="form-control" type="number" min="0" step="0.25" name="night_surcharge_hours" id="otRnoHours" value="0"></div>
-                    <div class="form-group"><label>Dominical / festivo ord. <?php echo nmTip('Horas ordinarias trabajadas en domingo o festivo.'); ?></label><input class="form-control" type="number" min="0" step="0.25" name="dominical_hours" id="otDomHours" value="0"></div>
-                    <div class="form-group"><label>HE dom. diurna (HEDD)</label><input class="form-control" type="number" min="0" step="0.25" name="overtime_dom_day_hours" id="otHeddHours" value="0"></div>
-                    <div class="form-group"><label>HE dom. nocturna (HEND)</label><input class="form-control" type="number" min="0" step="0.25" name="overtime_dom_night_hours" id="otHendHours" value="0"></div>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" onclick="document.getElementById('overtimeModal').style.display='none'">Cerrar</button>
-                <button type="submit" class="btn btn-primary">Recalcular</button>
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('incapacityModal').style.display='none'" title="Cerrar sin guardar">Cerrar</button>
+                <button type="submit" class="btn btn-primary" title="Guardar días/tipo de incapacidad y recalcular salario, aportes y neto">Recalcular</button>
             </div>
         </form>
     </div>
@@ -1499,6 +1542,74 @@ function closeScheduleModal() { document.getElementById('scheduleModal').style.d
     form.addEventListener('change', nmScheduleMetrics);
 })();
 
+/* ── Empleados en Nueva liquidación ── */
+(function () {
+    var pick = document.getElementById('runEmpPick');
+    if (!pick) return;
+    var form = pick.closest('form');
+    var search = document.getElementById('runEmpSearch');
+    var all = document.getElementById('runEmpAll');
+    var count = document.getElementById('runEmpCount');
+    function visibleRows() {
+        return Array.prototype.filter.call(pick.querySelectorAll('.nm-emp-pick__row'), function (row) {
+            return row.style.display !== 'none';
+        });
+    }
+    function refresh() {
+        var boxes = pick.querySelectorAll('.run-emp-cb');
+        var n = pick.querySelectorAll('.run-emp-cb:checked').length;
+        if (count) count.textContent = n + ' sel.';
+        var vis = visibleRows();
+        if (all) {
+            all.checked = vis.length > 0 && vis.every(function (row) {
+                var cb = row.querySelector('.run-emp-cb');
+                return cb && cb.checked;
+            });
+            all.indeterminate = !all.checked && vis.some(function (row) {
+                var cb = row.querySelector('.run-emp-cb');
+                return cb && cb.checked;
+            });
+        }
+        return boxes.length ? n : 0;
+    }
+    if (all) {
+        all.addEventListener('change', function () {
+            visibleRows().forEach(function (row) {
+                var cb = row.querySelector('.run-emp-cb');
+                if (cb) cb.checked = all.checked;
+            });
+            refresh();
+        });
+    }
+    pick.addEventListener('change', function (e) {
+        if (e.target && e.target.classList.contains('run-emp-cb')) refresh();
+    });
+    if (search) {
+        search.addEventListener('input', function () {
+            var q = search.value.trim().toLowerCase();
+            pick.querySelectorAll('.nm-emp-pick__row').forEach(function (row) {
+                row.style.display = !q || (row.getAttribute('data-search') || '').indexOf(q) !== -1 ? '' : 'none';
+            });
+            refresh();
+        });
+    }
+    if (form) {
+        form.addEventListener('submit', function (e) {
+            if (refresh() <= 0) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (typeof showAlert === 'function') {
+                    showAlert('Seleccione al menos un empleado para liquidar', 'warning');
+                } else {
+                    alert('Seleccione al menos un empleado para liquidar');
+                }
+                return false;
+            }
+        }, true);
+    }
+    refresh();
+})();
+
 /* ── Asignación masiva ── */
 (function () {
     var form = document.getElementById('assignForm');
@@ -1526,6 +1637,19 @@ function closeScheduleModal() { document.getElementById('scheduleModal').style.d
     });
     refresh();
 })();
+
+/* ── Nueva liquidación ── */
+function openRunModal() {
+    var modal = document.getElementById('runModal');
+    if (!modal) return;
+    modal.style.display = 'flex';
+    var year = modal.querySelector('input[name="period_year"]');
+    if (year && year.focus) setTimeout(function() { year.focus(); }, 50);
+}
+function closeRunModal() {
+    var modal = document.getElementById('runModal');
+    if (modal) modal.style.display = 'none';
+}
 
 /* ── Empleados / liquidación ── */
 function openEmployeeModal() {
@@ -1567,16 +1691,5 @@ function editIncapacity(itemId, runId, days, type) {
     document.getElementById('incDays').value = days || 0;
     document.getElementById('incType').value = type || 'enfermedad';
     document.getElementById('incapacityModal').style.display = 'flex';
-}
-function editOvertime(itemId, runId, data) {
-    document.getElementById('otItemId').value = itemId;
-    document.getElementById('otRunId').value = runId;
-    document.getElementById('otDayHours').value = data.day || 0;
-    document.getElementById('otNightHours').value = data.night || 0;
-    document.getElementById('otRnoHours').value = data.rno || 0;
-    document.getElementById('otDomHours').value = data.dom || 0;
-    document.getElementById('otHeddHours').value = data.hedd || 0;
-    document.getElementById('otHendHours').value = data.hend || 0;
-    document.getElementById('overtimeModal').style.display = 'flex';
 }
 </script>

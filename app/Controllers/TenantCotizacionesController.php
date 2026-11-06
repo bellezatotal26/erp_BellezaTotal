@@ -384,6 +384,10 @@ class TenantCotizacionesController extends TenantController
             if ($paymentType === 'credit' && $initialPayment >= (float)$quote['total']) {
                 $paymentStatus = 'paid';
             }
+            // Crédito sin abono: medio documental «credit» (el cobro real va en abonos).
+            if ($paymentType === 'credit' && $initialPayment <= 0.009) {
+                $paymentMethod = 'credit';
+            }
 
             $hasDocType = false;
             try {

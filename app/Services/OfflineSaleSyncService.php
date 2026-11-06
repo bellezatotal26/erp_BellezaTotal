@@ -971,15 +971,25 @@ class OfflineSaleSyncService
         }
 
         $paidNow = $paymentType === 'credit' ? $initialPayment : $total;
-        $payPlan = SalePaymentSplitter::resolve(
-            $payload['payment_splits'] ?? [],
-            $paymentMethod,
-            $paidNow,
-            $this->db
-        );
-        $paymentMethod = $payPlan['method'];
-        if ($payPlan['label'] !== '' && str_contains($payPlan['label'], 'Mixto')) {
-            $notes = $notes !== '' ? ($notes . ' · ' . $payPlan['label']) : $payPlan['label'];
+        if ($paymentType === 'credit' && $paidNow <= 0.009) {
+            $paymentMethod = 'credit';
+            $payPlan = [
+                'method' => 'credit',
+                'splits' => [],
+                'cash_total' => 0.0,
+                'label' => '',
+            ];
+        } else {
+            $payPlan = SalePaymentSplitter::resolve(
+                $payload['payment_splits'] ?? [],
+                $paymentMethod,
+                $paidNow,
+                $this->db
+            );
+            $paymentMethod = $payPlan['method'];
+            if ($payPlan['label'] !== '' && str_contains($payPlan['label'], 'Mixto')) {
+                $notes = $notes !== '' ? ($notes . ' · ' . $payPlan['label']) : $payPlan['label'];
+            }
         }
 
         $customerId = $payload['customer_id'];

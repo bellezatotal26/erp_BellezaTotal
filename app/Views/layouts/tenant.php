@@ -467,6 +467,7 @@
                 if (type === 'sale') return 'V';
                 if (type === 'inventory') return 'I';
                 if (type === 'news') return 'N';
+                if (type === 'payroll') return 'N';
                 return '!';
             }
             

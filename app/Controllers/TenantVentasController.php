@@ -1631,15 +1631,27 @@ class TenantVentasController extends TenantController
         }
 
         $paidNow = $paymentType === 'credit' ? $initialPayment : $total;
-        try {
-            $payPlan = SalePaymentSplitter::resolve($paymentSplitsRaw, $paymentMethod, $paidNow, $this->db);
-        } catch (\InvalidArgumentException $e) {
-            $this->respond(false, $e->getMessage(), '/app/ventas');
-            return;
-        }
-        $paymentMethod = $payPlan['method'];
-        if ($payPlan['label'] !== '' && str_contains($payPlan['label'], 'Mixto')) {
-            $notes = $notes !== '' ? ($notes . ' · ' . $payPlan['label']) : $payPlan['label'];
+        // Crédito sin abono inicial: no hay medio de cobro (aún no se sabe cómo pagará).
+        // Se guarda como 'credit' (CxC); el medio real se registra en cada abono.
+        if ($paymentType === 'credit' && $paidNow <= 0.009) {
+            $paymentMethod = 'credit';
+            $payPlan = [
+                'method' => 'credit',
+                'splits' => [],
+                'cash_total' => 0.0,
+                'label' => '',
+            ];
+        } else {
+            try {
+                $payPlan = SalePaymentSplitter::resolve($paymentSplitsRaw, $paymentMethod, $paidNow, $this->db);
+            } catch (\InvalidArgumentException $e) {
+                $this->respond(false, $e->getMessage(), '/app/ventas');
+                return;
+            }
+            $paymentMethod = $payPlan['method'];
+            if ($payPlan['label'] !== '' && str_contains($payPlan['label'], 'Mixto')) {
+                $notes = $notes !== '' ? ($notes . ' · ' . $payPlan['label']) : $payPlan['label'];
+            }
         }
 
         $cashDueForChange = (float)($payPlan['cash_total'] ?? 0);
@@ -2039,7 +2051,10 @@ class TenantVentasController extends TenantController
         $saleId = (int)$this->request->post('sale_id');
         $amount = \SoftNova\Core\parse_money($this->request->post('amount'));
         $method = \SoftNova\Services\PaymentMethodCatalog::normalize($this->request->post('payment_method', 'cash'));
-        $notes = $this->request->post('notes', 'Abono');
+        $notes = trim((string)$this->request->post('notes', 'Abono'));
+        if ($notes === '') {
+            $notes = 'Abono';
+        }
         
         if ($amount <= 0) {
             $this->respond(false, 'El monto debe ser mayor a cero', '/app/ventas');

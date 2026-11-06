@@ -481,7 +481,11 @@ function handleAjaxSubmit(form) {
         }
         
         if (data.success) {
-            showAlert(data.message, 'success');
+            var sticky = !!data.sticky_alert;
+            showAlert(data.message, 'success', sticky ? { sticky: true, persist: true } : undefined);
+            if (sticky && typeof ringNotificationBell === 'function') {
+                ringNotificationBell();
+            }
             if (form) form.classList.add('ajax-success-flash');
             if (data.pdf_url) {
                 try {
@@ -516,7 +520,7 @@ function handleAjaxSubmit(form) {
             // y deja el botón en btn-loading para siempre. Forzar recarga en ese caso.
             setTimeout(function() {
                 navigateAfterAjaxSuccess(data.redirect || '');
-            }, data.pdf_url ? 1200 : 700);
+            }, data.pdf_url ? 1200 : (sticky ? 900 : 700));
         } else {
             if (window.SeriMoney && typeof SeriMoney.restoreForm === 'function') {
                 SeriMoney.restoreForm(form);
@@ -706,8 +710,16 @@ function clearSearch() {
     if (input) input.focus();
 }
 
-// Muestra una alerta tipo toast (notificación animada)
-function showAlert(message, type) {
+var SERI_STICKY_ALERT_KEY = 'seri_sticky_alert_v1';
+
+/**
+ * Alerta tipo toast.
+ * opts.sticky = true → permanece hasta que el usuario cierre con la X
+ * opts.persist = true → sobrevive a redirecciones (sessionStorage)
+ */
+function showAlert(message, type, opts) {
+    opts = opts || {};
+    var sticky = !!opts.sticky;
     var container = document.querySelector('.toast-container');
     if (!container) {
         container = document.createElement('div');
@@ -715,12 +727,56 @@ function showAlert(message, type) {
         document.body.appendChild(container);
     }
     var toast = document.createElement('div');
-    toast.className = 'toast toast-' + (type || 'info') + (type === 'success' ? ' toast-bounce' : '');
+    toast.className = 'toast toast-' + (type || 'info')
+        + (type === 'success' && !sticky ? ' toast-bounce' : '')
+        + (sticky ? ' toast-sticky' : '');
     var labels = { success: 'OK', error: 'Error', warning: 'Aviso', info: 'Info' };
-    toast.innerHTML = '<strong style="opacity:0.9;">' + (labels[type] || 'Info') + '</strong><span>' + esc(message || '') + '</span>';
+    toast.innerHTML = '<strong style="opacity:0.9;">' + (labels[type] || 'Info') + '</strong>'
+        + '<span class="toast-msg">' + esc(message || '') + '</span>'
+        + (sticky
+            ? '<button type="button" class="toast-close" title="Cerrar" aria-label="Cerrar">&times;</button>'
+            : '');
     container.appendChild(toast);
+
+    if (sticky) {
+        var closeBtn = toast.querySelector('.toast-close');
+        if (closeBtn) {
+            closeBtn.addEventListener('click', function() {
+                toast.remove();
+                try { sessionStorage.removeItem(SERI_STICKY_ALERT_KEY); } catch (e) {}
+            });
+        }
+        if (opts.persist) {
+            try {
+                sessionStorage.setItem(SERI_STICKY_ALERT_KEY, JSON.stringify({
+                    message: String(message || ''),
+                    type: String(type || 'info'),
+                    at: Date.now()
+                }));
+            } catch (e) {}
+        }
+        return toast;
+    }
+
     setTimeout(function() { toast.remove(); }, 5000);
+    return toast;
 }
+
+function restoreStickyAlertFromStorage() {
+    try {
+        var raw = sessionStorage.getItem(SERI_STICKY_ALERT_KEY);
+        if (!raw) return;
+        sessionStorage.removeItem(SERI_STICKY_ALERT_KEY);
+        var data = JSON.parse(raw);
+        if (!data || !data.message) return;
+        // Solo restaurar si es reciente (evita toasts viejos al volver días después)
+        if (data.at && (Date.now() - data.at) > 10 * 60 * 1000) return;
+        showAlert(data.message, data.type || 'success', { sticky: true });
+        if (typeof ringNotificationBell === 'function') ringNotificationBell();
+    } catch (e) {}
+}
+
+document.addEventListener('DOMContentLoaded', restoreStickyAlertFromStorage);
 
 /**
  * Intenta compartir un PDF con la app nativa (móvil → WhatsApp app).

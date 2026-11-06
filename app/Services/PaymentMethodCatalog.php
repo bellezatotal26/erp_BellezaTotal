@@ -68,6 +68,13 @@ class PaymentMethodCatalog
                 'affects_cash' => false,
                 'group' => 'mixed',
             ],
+            // Estado documental: venta a crédito sin cobro aún (no es medio de cobro).
+            'credit' => [
+                'label' => 'Crédito',
+                'account' => 'receivable',
+                'affects_cash' => false,
+                'group' => 'credit',
+            ],
         ];
     }
 
@@ -126,6 +133,9 @@ class PaymentMethodCatalog
         if ($method === 'inventory_loss') {
             return 'Pérdida inventario';
         }
+        if ($method === 'credit') {
+            return 'Crédito';
+        }
         if ($method === 'other' || $method === '__other__') {
             return 'Otro';
         }
@@ -170,8 +180,8 @@ class PaymentMethodCatalog
         $html = '';
         $seen = [];
         foreach (self::all() as $code => $meta) {
-            if ($code === 'mixed') {
-                // "Pago mixto" no se elige como medio unitario en el select.
+            if ($code === 'mixed' || $code === 'credit') {
+                // Mixto se arma con splits; crédito no es medio de cobro (queda CxC).
                 continue;
             }
             $seen[$code] = true;

@@ -103,12 +103,65 @@ class TenantClientesController extends TenantController
             return;
         }
         
-        $purchases = $this->query(
-            "SELECT s.*, u.name as user_name FROM sales s LEFT JOIN users u ON s.user_id = u.id
-             WHERE s.customer_id = ? AND s.status = 'completed' ORDER BY s.created_at DESC LIMIT 20",
-            [$id]
-        )->fetchAll();
-        
+        // Incluir crédito/pendiente: antes solo 'completed' y las ventas a crédito no salían.
+        try {
+            $purchases = $this->query(
+                "SELECT s.id, s.invoice_number, s.sale_date, s.created_at, s.total, s.payment_method,
+                        s.payment_status, s.status, u.name AS user_name,
+                        COALESCE(p.paid_amount, 0) AS paid_amount,
+                        COALESCE(cn.credit_note_total, 0) AS credit_note_total
+                 FROM sales s
+                 LEFT JOIN users u ON s.user_id = u.id
+                 LEFT JOIN (
+                    SELECT sale_id, COALESCE(SUM(amount), 0) AS paid_amount
+                    FROM sale_payments
+                    GROUP BY sale_id
+                 ) p ON p.sale_id = s.id
+                 LEFT JOIN (
+                    SELECT sale_id, COALESCE(SUM(total), 0) AS credit_note_total
+                    FROM sale_credit_notes
+                    WHERE status = 'posted'
+                    GROUP BY sale_id
+                 ) cn ON cn.sale_id = s.id
+                 WHERE s.customer_id = ?
+                   AND (s.status IS NULL OR s.status = '' OR s.status <> 'cancelled')
+                 ORDER BY COALESCE(s.sale_date, s.created_at) DESC, s.id DESC
+                 LIMIT 50",
+                [$id]
+            )->fetchAll();
+        } catch (\Throwable $e) {
+            $purchases = $this->query(
+                "SELECT s.id, s.invoice_number, s.sale_date, s.created_at, s.total, s.payment_method,
+                        s.payment_status, s.status, u.name AS user_name,
+                        COALESCE(p.paid_amount, 0) AS paid_amount,
+                        0 AS credit_note_total
+                 FROM sales s
+                 LEFT JOIN users u ON s.user_id = u.id
+                 LEFT JOIN (
+                    SELECT sale_id, COALESCE(SUM(amount), 0) AS paid_amount
+                    FROM sale_payments
+                    GROUP BY sale_id
+                 ) p ON p.sale_id = s.id
+                 WHERE s.customer_id = ?
+                   AND (s.status IS NULL OR s.status = '' OR s.status <> 'cancelled')
+                 ORDER BY COALESCE(s.sale_date, s.created_at) DESC, s.id DESC
+                 LIMIT 50",
+                [$id]
+            )->fetchAll();
+        }
+
+        foreach ($purchases as &$row) {
+            $total = round((float)($row['total'] ?? 0), 2);
+            $paid = round((float)($row['paid_amount'] ?? 0), 2);
+            $credited = round((float)($row['credit_note_total'] ?? 0), 2);
+            $net = max(0.0, round($total - $credited, 2));
+            $balance = max(0.0, round($net - $paid, 2));
+            $row['paid_amount'] = $paid;
+            $row['credit_note_total'] = $credited;
+            $row['balance_due'] = $balance;
+        }
+        unset($row);
+
         $this->json(['customer' => $customer, 'purchases' => $purchases]);
     }
     

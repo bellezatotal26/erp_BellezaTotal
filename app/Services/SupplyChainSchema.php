@@ -442,6 +442,13 @@ class SupplyChainSchema
         self::addIndexIfMissing($db, 'products', 'idx_products_next_expiry', '(next_expiry_date)');
         self::addIndexIfMissing($db, 'products', 'idx_products_barcode', '(barcode)');
         self::addIndexIfMissing($db, 'cash_movements', 'idx_cm_accounting', '(accounting_entry_id)');
+
+        // Dcto % / IVA % deben conservar 2 decimales (p. ej. 14.30). Tablas antiguas podían ser INT.
+        self::ensureColumnDecimal($db, 'purchase_invoice_import_items', 'discount_pct', 'DECIMAL(5,2) NOT NULL DEFAULT 0.00');
+        self::ensureColumnDecimal($db, 'purchase_invoice_import_items', 'tax_rate', 'DECIMAL(5,2) NOT NULL DEFAULT 0.00');
+        self::ensureColumnDecimal($db, 'purchase_invoice_imports', 'early_payment_discount_pct', 'DECIMAL(5,2) NOT NULL DEFAULT 0.00');
+        self::ensureColumnDecimal($db, 'purchase_invoice_imports', 'commercial_discount_pct', 'DECIMAL(5,2) NOT NULL DEFAULT 0.00');
+        self::ensureColumnDecimal($db, 'supplier_payments', 'discount_pct', 'DECIMAL(5,2) NOT NULL DEFAULT 0');
     }
 
     private static function ensureReplenishmentDraftTable(\PDO $db): void
@@ -486,6 +493,28 @@ class SupplyChainSchema
                 return;
             }
             $db->exec("ALTER TABLE `{$table}` ADD INDEX `{$name}` {$columns}");
+        } catch (\Throwable $e) {
+            // silencioso
+        }
+    }
+
+    /**
+     * Si la columna existe pero no es DECIMAL con escala ≥ 2, la convierte.
+     * Evita que 14.30 se trunque a 14 en instalaciones antiguas (INT / DECIMAL sin decimales).
+     */
+    private static function ensureColumnDecimal(\PDO $db, string $table, string $column, string $definition): void
+    {
+        try {
+            $stmt = $db->query("SHOW COLUMNS FROM `{$table}` LIKE " . $db->quote($column));
+            $col = $stmt ? $stmt->fetch(\PDO::FETCH_ASSOC) : false;
+            if (!$col) {
+                return;
+            }
+            $type = strtolower((string)($col['Type'] ?? ''));
+            if (preg_match('/^decimal\(\d+,\s*([2-9]|\d{2,})\)/', $type)) {
+                return;
+            }
+            $db->exec("ALTER TABLE `{$table}` MODIFY COLUMN `{$column}` {$definition}");
         } catch (\Throwable $e) {
             // silencioso
         }

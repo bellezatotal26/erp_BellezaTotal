@@ -105,6 +105,15 @@ class TenantPrestamosController extends TenantController
         $canCreate = TenantMiddleware::canDo('create', 'prestamos');
         $canEdit = TenantMiddleware::canDo('edit', 'prestamos');
 
+        $negativeStockProducts = $this->query(
+            "SELECT id, code, name, stock, COALESCE(barcode,'') AS barcode,
+                    COALESCE(ownership,'owned') AS ownership
+             FROM products
+             WHERE status = 'active' AND product_type = 'product' AND stock < 0
+             ORDER BY stock ASC, name ASC
+             LIMIT 150"
+        )->fetchAll();
+
         $ownedSql = ConsignmentService::ownedOnlySql('products');
         $products = $this->query(
             "SELECT id, code, name, stock, COALESCE(barcode,'') AS barcode,
@@ -149,6 +158,7 @@ class TenantPrestamosController extends TenantController
             'filterOptions' => $trace->filterOptions(),
             'loanSummary' => $trace->summary(),
             'stockAlert' => $alert,
+            'negativeStockProducts' => $negativeStockProducts,
             'products' => $products,
             'canCreate' => $canCreate,
             'canEdit' => $canEdit,
