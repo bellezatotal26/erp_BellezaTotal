@@ -409,6 +409,11 @@ class SupplyChainSchema
             // Efectivo: 1 = sale del cajón POS; 0 = otro origen (no descuenta caja)
             ['supplier_payments', 'cash_from_drawer', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER payment_method'],
             ['supplier_payments', 'cash_source_note', 'VARCHAR(255) NULL AFTER cash_from_drawer'],
+            // Misma lógica al pagar la factura completa al recibir (payment_mode = cash)
+            ['purchase_orders', 'cash_from_drawer', 'TINYINT(1) NULL AFTER payment_mode'],
+            ['purchase_orders', 'cash_source_note', 'VARCHAR(255) NULL AFTER cash_from_drawer'],
+            ['purchase_invoice_imports', 'cash_from_drawer', 'TINYINT(1) NULL AFTER payment_mode'],
+            ['purchase_invoice_imports', 'cash_source_note', 'VARCHAR(255) NULL AFTER cash_from_drawer'],
             // Valor neto de la factura física usado como base del abono + dcto. pronto pago aplicado al pagar
             ['supplier_payments', 'invoice_value', 'DECIMAL(14,2) NULL AFTER cash_source_note'],
             ['supplier_payments', 'discount_pct', 'DECIMAL(5,2) NOT NULL DEFAULT 0 AFTER invoice_value'],

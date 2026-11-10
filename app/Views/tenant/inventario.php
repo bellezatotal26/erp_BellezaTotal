@@ -68,8 +68,8 @@ function fmtI(float $a, array $c): string
 }
 
 /**
- * Utilidad unitaria y % de ganancia sobre el costo.
- * % = (venta − compra) / compra × 100. Sin costo → pct null.
+ * Utilidad unitaria y margen % sobre el precio de venta.
+ * % = (venta − compra) / venta × 100. Sin venta → pct null.
  *
  * @return array{profit:float,pct:?float,has_cost:bool}
  */
@@ -78,12 +78,13 @@ function invUnitMargin(float $cost, float $sale): array
     $cost = round(max(0, $cost), 2);
     $sale = round(max(0, $sale), 2);
     $profit = round($sale - $cost, 2);
-    if ($cost < 0.01) {
+    // has_cost se reutiliza como “hay base para %” (precio de venta).
+    if ($sale < 0.01) {
         return ['profit' => $profit, 'pct' => null, 'has_cost' => false];
     }
     return [
         'profit' => $profit,
-        'pct' => round(($profit / $cost) * 100, 1),
+        'pct' => round(($profit / $sale) * 100, 1),
         'has_cost' => true,
     ];
 }
@@ -96,13 +97,13 @@ function invMarginHtml(float $cost, float $sale, array $currency): string
         return '<div class="inv-margin inv-margin--muted">Util. —</div>';
     }
     if (!$m['has_cost']) {
-        return '<div class="inv-margin inv-margin--muted" title="Defina precio de compra para calcular el % de ganancia">Util. '
+        return '<div class="inv-margin inv-margin--muted" title="Defina precio de venta para calcular el margen %">Util. '
             . htmlspecialchars(fmtI($m['profit'], $currency))
             . ' · % n/d</div>';
     }
     $cls = $m['profit'] > 0.009 ? 'inv-margin--ok' : ($m['profit'] < -0.009 ? 'inv-margin--bad' : 'inv-margin--muted');
     $pct = ($m['pct'] >= 0 ? '+' : '') . number_format((float)$m['pct'], 1, ',', '.') . '%';
-    $title = 'Utilidad unitaria = venta − compra. % ganancia sobre costo = utilidad / compra × 100';
+    $title = 'Utilidad unitaria = venta − compra. Margen % sobre venta = utilidad / venta × 100';
     return '<div class="inv-margin ' . $cls . '" title="' . htmlspecialchars($title) . '">Util. '
         . htmlspecialchars(fmtI($m['profit'], $currency))
         . ' · ' . htmlspecialchars($pct) . '</div>';
@@ -251,11 +252,11 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
             <input type="text" name="q" id="invSearchQ" value="<?php echo htmlspecialchars($filters['q'] ?? ''); ?>" class="form-control" placeholder="Nombre, SKU o EAN… busca al escribir (SKU, EAN, nombre)" autocomplete="off">
         </div>
         <div class="form-group" style="margin:0;">
-            <label style="font-size:12px;" title="Muestra productos con utilidad igual o menor al % digitado. % sobre el costo: (venta − compra) ÷ compra × 100. Los productos sin precio de compra quedan fuera.">Utilidad hasta %</label>
+            <label style="font-size:12px;" title="Muestra productos con margen igual o menor al % digitado. Margen sobre venta: (venta − compra) ÷ venta × 100. Los productos sin precio de venta quedan fuera.">Utilidad hasta %</label>
             <input type="number" name="margin_max" step="0.1" min="-100" max="10000"
                    value="<?php echo $marginMaxFilter !== null ? htmlspecialchars(rtrim(rtrim(number_format((float)$marginMaxFilter, 2, '.', ''), '0'), '.')) : ''; ?>"
                    class="form-control" style="width:120px;" placeholder="Ej: 30"
-                   title="Muestra productos con utilidad igual o menor al % digitado. % sobre el costo: (venta − compra) ÷ compra × 100. Los productos sin precio de compra quedan fuera.">
+                   title="Muestra productos con margen igual o menor al % digitado. Margen sobre venta: (venta − compra) ÷ venta × 100. Los productos sin precio de venta quedan fuera.">
             <?php if ($marginMaxFilter !== null): ?>
                 <small style="display:block;color:#6b7280;margin-top:2px;">hasta <?php echo htmlspecialchars(number_format((float)$marginMaxFilter, 1, ',', '.')); ?>%</small>
             <?php endif; ?>
@@ -619,7 +620,7 @@ $exportCountQuery = http_build_query(array_merge(['action' => 'export_count'], $
                     <th><?php $viewInstance->partial('sortable_th', ['label' => 'Stock', 'column' => 'stock', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
                     <th>Vence</th>
                     <th><?php $viewInstance->partial('sortable_th', ['label' => 'P. Compra', 'column' => 'cost', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
-                    <th title="Precio de venta, utilidad unitaria y % de ganancia sobre el costo"><?php $viewInstance->partial('sortable_th', ['label' => 'P. Venta / Util.', 'column' => 'price', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
+                    <th title="Precio de venta, utilidad unitaria y margen % sobre la venta"><?php $viewInstance->partial('sortable_th', ['label' => 'P. Venta / Util.', 'column' => 'price', 'filters' => $filters, 'baseUrl' => $invBase]); ?></th>
                     <th>Acciones</th>
                 </tr>
                 <tr class="inv-list-filters">
@@ -920,7 +921,7 @@ if ($paginationTotal > 0):
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>Precio Compra <span class="field-tip" data-tip="Costo sin IVA. Base para calcular utilidad y % de ganancia.">?</span></label>
+                    <label>Precio Compra <span class="field-tip" data-tip="Costo sin IVA. Se resta del precio de venta para obtener la utilidad y el margen %.">?</span></label>
                     <input type="text" inputmode="decimal" name="purchase_price" id="prodPcompra" class="form-control money-input" data-money="1" placeholder="0" oninput="updateProdMarginHint()">
                 </div>
                 <div class="form-group">
@@ -928,7 +929,7 @@ if ($paginationTotal > 0):
                     <input type="text" inputmode="decimal" name="sale_price" id="prodPventa" required class="form-control money-input" data-money="1" placeholder="0" oninput="updateProdMarginHint()">
                 </div>
                 <div class="form-group" style="grid-column:1/-1;">
-                    <div id="prodMarginHint" class="inv-margin-hint" aria-live="polite">Utilidad y % de ganancia aparecerán al indicar compra y venta.</div>
+                    <div id="prodMarginHint" class="inv-margin-hint" aria-live="polite">Utilidad y margen % aparecerán al indicar compra y venta.</div>
                 </div>
                 <div class="form-group">
                     <label>IVA venta (%) <span class="field-tip" data-tip="Tasa de IVA de este producto (0 = exento, 5, 19…). Si deja vacío al crear, usa la tasa de Configuración.">?</span></label>

@@ -19,17 +19,17 @@ function invFmtMoney(n) {
     return curSym + ' ' + n.toFixed(curDec);
 }
 
-/** Utilidad unitaria y % sobre costo. */
+/** Utilidad unitaria y margen % sobre precio de venta. */
 function invUnitMargin(cost, sale) {
     cost = Math.max(0, Number(cost) || 0);
     sale = Math.max(0, Number(sale) || 0);
     var profit = Math.round((sale - cost) * 100) / 100;
-    if (cost < 0.01) {
+    if (sale < 0.01) {
         return { profit: profit, pct: null, hasCost: false };
     }
     return {
         profit: profit,
-        pct: Math.round((profit / cost) * 1000) / 10,
+        pct: Math.round((profit / sale) * 1000) / 10,
         hasCost: true
     };
 }
@@ -37,9 +37,9 @@ function invUnitMargin(cost, sale) {
 function marginLine(cost, sale) {
     var m = invUnitMargin(cost, sale);
     if (!m.hasCost && sale < 0.01) return '—';
-    if (!m.hasCost) return invFmtMoney(m.profit) + ' · % n/d (sin costo)';
+    if (!m.hasCost) return invFmtMoney(m.profit) + ' · % n/d (sin venta)';
     var sign = m.pct >= 0 ? '+' : '';
-    return invFmtMoney(m.profit) + ' · ' + sign + String(m.pct).replace('.', ',') + '% s/costo';
+    return invFmtMoney(m.profit) + ' · ' + sign + String(m.pct).replace('.', ',') + '% s/venta';
 }
 
 function updateProdMarginHint() {
@@ -51,18 +51,18 @@ function updateProdMarginHint() {
     el.classList.remove('inv-margin--ok', 'inv-margin--bad', 'inv-margin--muted');
     if (!m.hasCost && sale < 0.01 && cost < 0.01) {
         el.classList.add('inv-margin--muted');
-        el.textContent = 'Utilidad y % de ganancia aparecerán al indicar compra y venta.';
+        el.textContent = 'Utilidad y margen % aparecerán al indicar compra y venta.';
         return;
     }
     if (!m.hasCost) {
         el.classList.add('inv-margin--muted');
-        el.textContent = 'Utilidad: ' + invFmtMoney(m.profit) + ' · % n/d (indique precio de compra).';
+        el.textContent = 'Utilidad: ' + invFmtMoney(m.profit) + ' · % n/d (indique precio de venta).';
         return;
     }
     el.classList.add(m.profit > 0.009 ? 'inv-margin--ok' : (m.profit < -0.009 ? 'inv-margin--bad' : 'inv-margin--muted'));
     var sign = m.pct >= 0 ? '+' : '';
     el.textContent = 'Utilidad unitaria: ' + invFmtMoney(m.profit)
-        + ' · Ganancia: ' + sign + String(m.pct).replace('.', ',') + '% sobre el costo';
+        + ' · Margen: ' + sign + String(m.pct).replace('.', ',') + '% sobre la venta';
 }
 
 // Funciones del modal de producto

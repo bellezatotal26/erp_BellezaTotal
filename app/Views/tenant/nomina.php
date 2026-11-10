@@ -57,100 +57,139 @@ $hasOvertimeSchedules = (bool)array_filter($schedules, static fn ($s) => (float)
 <?php echo flashMessage(); ?>
 
 <style>
-.nm-tabs{display:flex;gap:4px;flex-wrap:wrap;padding:4px;margin-bottom:18px;border-radius:12px;background:var(--color-secondary);border:1px solid var(--color-border);width:fit-content;max-width:100%}
-.nm-tabs a{display:inline-flex;align-items:center;gap:8px;padding:9px 16px;border-radius:9px;font-size:14px;font-weight:600;color:var(--color-text-secondary);text-decoration:none;transition:background .15s,color .15s}
-.nm-tabs a:hover{color:var(--color-text-primary)}
-.nm-tabs a.active{background:var(--color-white);color:var(--color-accent-text, var(--color-primary));box-shadow:0 1px 4px rgba(0,0,0,.08)}
-.nm-tabs .nm-count{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--color-border);color:var(--color-text-secondary)}
-.nm-tabs a.active .nm-count{background:var(--color-primary);color:#fff}
-.nm-tip{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;margin-left:6px;border-radius:50%;background:var(--color-border);color:var(--color-text-secondary);font:italic 700 11px/1 Georgia,serif;cursor:help;vertical-align:middle;flex-shrink:0;user-select:none}
-.nm-tip:hover,.nm-tip:focus{background:var(--color-primary);color:#fff;outline:none}
-.nm-tip-pop{position:fixed;z-index:20000;max-width:300px;padding:9px 12px;border-radius:8px;background:#1f2937;color:#f9fafb;font-size:12px;line-height:1.45;box-shadow:0 8px 24px rgba(0,0,0,.25);pointer-events:none;display:none}
-.nm-section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:14px}
-.nm-section-head h3{margin:0 0 4px;font-size:17px}
-.nm-section-head p{margin:0;font-size:13px;color:var(--color-text-secondary)}
-.nm-param-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
-.nm-group{background:var(--color-white);border:1px solid var(--color-border);border-top:3px solid var(--acc,#0D7C4A);border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:12px}
+/* ── Nómina UI corporativa (inspiración Alegra: limpia, monocromática teal/slate) ── */
+.nm-shell{--nm:#0F766E;--nm-soft:#ECFDF8;--nm-ink:#0F172A;--nm-muted:#64748B;--nm-line:#E2E8F0;--nm-card:#fff;--nm-bg:#F8FAFC;--nm-warn:#B45309;--nm-ok:#0F766E}
+.nm-shell .card.neumorphic{box-shadow:none;border:1px solid var(--nm-line);border-radius:14px;background:var(--nm-card)}
+.nm-shell .card.neumorphic .card-header{border-bottom:1px solid var(--nm-line);padding:14px 18px;background:transparent}
+.nm-shell .card.neumorphic .card-header h3{margin:0;font-size:16px;font-weight:650;color:var(--nm-ink)}
+.nm-shell .card.neumorphic .card-body{padding:16px 18px}
+.nm-hero{margin:0 0 18px}
+.nm-hero h2{margin:0 0 4px;font-size:22px;font-weight:700;color:var(--nm-ink);letter-spacing:-.02em}
+.nm-hero p{margin:0;font-size:13px;color:var(--nm-muted)}
+.nm-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:18px}
+@media (max-width:960px){.nm-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:520px){.nm-kpis{grid-template-columns:1fr}}
+.nm-kpi-card{background:var(--nm-card);border:1px solid var(--nm-line);border-radius:14px;padding:16px 18px;display:flex;flex-direction:column;gap:6px;min-height:92px}
+.nm-kpi-card .lbl{font-size:12px;font-weight:600;color:var(--nm-muted);letter-spacing:.02em}
+.nm-kpi-card .val{font-size:22px;font-weight:700;color:var(--nm-ink);font-variant-numeric:tabular-nums;line-height:1.15}
+.nm-kpi-card.accent{background:linear-gradient(180deg,var(--nm-soft),#fff);border-color:#99F6E4}
+.nm-kpi-card.accent .val{color:var(--nm)}
+.nm-tabs{display:flex;gap:0;flex-wrap:wrap;margin:0 0 20px;padding:0;border-bottom:1px solid var(--nm-line);width:100%;background:transparent;border-radius:0}
+.nm-tabs a{display:inline-flex;align-items:center;gap:8px;padding:12px 16px;margin-bottom:-1px;border-radius:0;border-bottom:2px solid transparent;font-size:14px;font-weight:600;color:var(--nm-muted);text-decoration:none;transition:color .15s,border-color .15s;background:transparent;box-shadow:none}
+.nm-tabs a:hover{color:var(--nm-ink);background:transparent}
+.nm-tabs a.active{background:transparent;color:var(--nm);border-bottom-color:var(--nm);box-shadow:none}
+.nm-tabs .nm-count{font-size:11px;padding:1px 7px;border-radius:999px;background:#F1F5F9;color:var(--nm-muted);font-weight:700}
+.nm-tabs a.active .nm-count{background:var(--nm-soft);color:var(--nm)}
+.nm-tip{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;margin-left:6px;border-radius:50%;background:#F1F5F9;color:var(--nm-muted);border:1px solid var(--nm-line);font:600 10px/1 system-ui,sans-serif;cursor:help;vertical-align:middle;flex-shrink:0;user-select:none}
+.nm-tip:hover,.nm-tip:focus{background:var(--nm);border-color:var(--nm);color:#fff;outline:none}
+.nm-tip-pop{position:fixed;z-index:20000;max-width:300px;padding:9px 12px;border-radius:8px;background:#0F172A;color:#F8FAFC;font-size:12px;line-height:1.45;box-shadow:0 10px 28px rgba(15,23,42,.22);pointer-events:none;display:none}
+.nm-section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.nm-section-head h3{margin:0 0 4px;font-size:18px;font-weight:700;color:var(--nm-ink);letter-spacing:-.01em}
+.nm-section-head p{margin:0;font-size:13px;color:var(--nm-muted);max-width:640px}
+.nm-toolbar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:end;justify-content:space-between}
+.nm-toolbar .form-group label{font-size:12px;font-weight:600;color:var(--nm-muted)}
+.nm-param-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+.nm-group{background:var(--nm-card);border:1px solid var(--nm-line);border-radius:14px;padding:18px 18px 16px;display:flex;flex-direction:column;gap:14px;box-shadow:0 1px 0 rgba(15,23,42,.02)}
 .nm-group.wide{grid-column:1/-1}
-.nm-group-head h4{margin:0;font-size:15px;display:flex;align-items:center;gap:8px}
-.nm-group-head h4 .nm-num{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:6px;background:var(--acc);color:#fff;font-size:12px}
-.nm-group-head p{margin:4px 0 0;font-size:12px;color:var(--color-text-secondary)}
-.nm-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
-.nm-field label{display:flex;align-items:center;font-size:12px;font-weight:600;margin-bottom:5px;color:var(--color-text-primary)}
+.nm-group-head{padding-bottom:10px;border-bottom:1px solid var(--nm-line)}
+.nm-group-head h4{margin:0;font-size:15px;font-weight:700;color:var(--nm-ink);display:flex;align-items:center;gap:8px}
+.nm-group-head h4 .nm-num{display:none}
+.nm-group-head p{margin:4px 0 0;font-size:12px;color:var(--nm-muted);line-height:1.45}
+.nm-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px 14px}
+.nm-field label{display:flex;align-items:center;font-size:12px;font-weight:600;margin-bottom:6px;color:var(--nm-ink)}
+.nm-shell .form-control{border-radius:10px;border-color:var(--nm-line);min-height:40px;background:#fff}
+.nm-shell .form-control:focus{border-color:var(--nm);box-shadow:0 0 0 3px rgba(15,118,110,.12)}
 .nm-input{position:relative;display:flex;align-items:center}
 .nm-input .form-control{width:100%}
-.nm-input .nm-affix{position:absolute;font-size:12px;font-weight:600;color:var(--color-text-secondary);pointer-events:none}
-.nm-input.suffix .nm-affix{right:10px}.nm-input.suffix .form-control{padding-right:30px}
-.nm-input.prefix .nm-affix{left:10px}.nm-input.prefix .form-control{padding-left:24px}
+.nm-input .nm-affix{position:absolute;font-size:12px;font-weight:600;color:var(--nm-muted);pointer-events:none}
+.nm-input.suffix .nm-affix{right:12px}.nm-input.suffix .form-control{padding-right:34px}
+.nm-input.prefix .nm-affix{left:12px}.nm-input.prefix .form-control{padding-left:26px}
 .nm-commission-table td{vertical-align:middle}.nm-commission-table .nm-input{max-width:240px}
-.nm-input .form-control.nm-changed{border-color:var(--color-warning);box-shadow:0 0 0 3px rgba(245,158,11,.18)}
-.nm-preview{display:flex;flex-wrap:wrap;gap:6px;padding-top:10px;border-top:1px dashed var(--color-border);font-size:12px;color:var(--color-text-secondary)}
-.nm-preview b{color:var(--color-text-primary)}
-.nm-pill{padding:3px 9px;border-radius:999px;background:var(--color-secondary);border:1px solid var(--color-border)}
-.nm-savebar{position:sticky;bottom:0;z-index:5;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px;padding:12px 16px;border-radius:12px;background:var(--color-white);border:1px solid var(--color-border);box-shadow:0 -4px 16px rgba(0,0,0,.06)}
-.nm-savebar .nm-note{font-size:12px;color:var(--color-text-secondary)}
-.nm-footnote{font-size:12px;color:var(--color-text-secondary);margin-top:12px;line-height:1.5}
+.nm-input .form-control.nm-changed{border-color:#F59E0B;box-shadow:0 0 0 3px rgba(245,158,11,.15)}
+.nm-preview{display:flex;flex-wrap:wrap;gap:6px;padding-top:12px;border-top:1px solid var(--nm-line);font-size:12px;color:var(--nm-muted)}
+.nm-preview b{color:var(--nm-ink)}
+.nm-pill{padding:4px 10px;border-radius:999px;background:#F8FAFC;border:1px solid var(--nm-line);color:var(--nm-muted);font-size:12px}
+.nm-pill b{color:var(--nm-ink);font-weight:700}
+.nm-savebar{position:sticky;bottom:0;z-index:5;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px;padding:14px 16px;border-radius:14px;background:rgba(255,255,255,.96);border:1px solid var(--nm-line);backdrop-filter:blur(8px);box-shadow:0 -8px 24px rgba(15,23,42,.06)}
+.nm-savebar .nm-note{font-size:12px;color:var(--nm-muted)}
+.nm-footnote{font-size:12px;color:var(--nm-muted);margin-top:14px;line-height:1.55}
 .nm-sched-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;margin-bottom:18px}
-.nm-sched-card{background:var(--color-white);border:1px solid var(--color-border);border-left:4px solid var(--sc);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.nm-sched-card{background:var(--nm-card);border:1px solid var(--nm-line);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:10px}
+.nm-sched-card{border-left:3px solid var(--sc,var(--nm))}
 .nm-sched-top{display:flex;align-items:center;gap:8px}
-.nm-sched-top strong{flex:1;font-size:15px}
-.nm-badge{font-size:12px;font-weight:600;padding:3px 9px;border-radius:999px;background:var(--color-secondary);border:1px solid var(--color-border)}
-.nm-badge.warn{background:rgba(245,158,11,.12);border-color:var(--color-warning);color:var(--dmc-B45309, #b45309)}
+.nm-sched-top strong{flex:1;font-size:15px;color:var(--nm-ink)}
+.nm-badge{font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;background:#F8FAFC;border:1px solid var(--nm-line);color:var(--nm-muted)}
+.nm-badge.warn{background:#FFFBEB;border-color:#FDE68A;color:var(--nm-warn)}
 .nm-week{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
-.nm-day{text-align:center;border-radius:8px;padding:6px 2px;font-size:10px;line-height:1.3;background:var(--color-secondary);color:var(--color-text-secondary);border:1px solid var(--color-border)}
+.nm-day{text-align:center;border-radius:8px;padding:6px 2px;font-size:10px;line-height:1.3;background:#F8FAFC;color:var(--nm-muted);border:1px solid var(--nm-line)}
 .nm-day b{display:block;font-size:12px;margin-bottom:2px}
-.nm-day.on{background:color-mix(in srgb,var(--sc) 14%,transparent);border-color:color-mix(in srgb,var(--sc) 45%,transparent);color:var(--color-text-primary)}
-.nm-sched-meta{display:flex;flex-wrap:wrap;gap:6px;font-size:12px;color:var(--color-text-secondary)}
-.nm-warn{margin:0;padding:8px 10px 8px 26px;border-radius:8px;background:rgba(245,158,11,.1);color:var(--dmc-B45309, #b45309);font-size:12px;line-height:1.5}
+.nm-day.on{background:var(--nm-soft);border-color:#99F6E4;color:var(--nm-ink)}
+.nm-sched-meta{display:flex;flex-wrap:wrap;gap:6px;font-size:12px;color:var(--nm-muted)}
+.nm-warn{margin:0;padding:10px 12px;border-radius:10px;background:#FFFBEB;color:var(--nm-warn);font-size:12px;line-height:1.5;border:1px solid #FDE68A}
 .nm-actions{display:flex;gap:6px;justify-content:flex-end}
-.nm-empty{padding:28px;text-align:center;border:2px dashed var(--color-border);border-radius:12px;color:var(--color-text-secondary);font-size:14px}
-.nm-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 10px;border-radius:999px;background:color-mix(in srgb,var(--sc,#64748B) 12%,transparent);border:1px solid color-mix(in srgb,var(--sc,#64748B) 40%,transparent);white-space:nowrap}
-.nm-chip-empty{--sc:#94A3B8;color:var(--color-text-secondary)}
-.nm-dot{width:8px;height:8px;border-radius:50%;background:var(--sc)}
-.nm-assign-bar{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px}
+.nm-empty{padding:40px 24px;text-align:center;border:1px dashed var(--nm-line);border-radius:14px;color:var(--nm-muted);font-size:14px;background:#fff}
+.nm-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 10px;border-radius:999px;background:#F8FAFC;border:1px solid var(--nm-line);white-space:nowrap;color:var(--nm-ink)}
+.nm-chip-empty{color:var(--nm-muted)}
+.nm-dot{width:8px;height:8px;border-radius:50%;background:var(--sc,var(--nm))}
+.nm-assign-bar{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px;padding:12px;border:1px solid var(--nm-line);border-radius:12px;background:#fff}
 .nm-assign-bar .form-group{margin:0}
 .nm-week-editor{width:100%;border-collapse:collapse}
-.nm-week-editor th{font-size:11px;text-transform:uppercase;text-align:left;padding:6px}
-.nm-week-editor td{padding:4px 6px;border-top:1px solid var(--color-border)}
+.nm-week-editor th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;text-align:left;padding:8px 6px;color:var(--nm-muted)}
+.nm-week-editor td{padding:6px;border-top:1px solid var(--nm-line)}
 .nm-week-editor tr.off td:not(:first-child){opacity:.4}
 .nm-week-editor input[type=time]{min-width:100px}
 .nm-week-editor input[type=number]{width:80px}
 .nm-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-top:12px}
-.nm-summary div{padding:8px 10px;border-radius:8px;background:var(--color-secondary);border:1px solid var(--color-border);font-size:12px;color:var(--color-text-secondary)}
-.nm-summary b{display:block;font-size:16px;color:var(--color-text-primary)}
+.nm-summary div{padding:10px 12px;border-radius:10px;background:#F8FAFC;border:1px solid var(--nm-line);font-size:12px;color:var(--nm-muted)}
+.nm-summary b{display:block;font-size:16px;color:var(--nm-ink);margin-top:2px}
 .nm-templates{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
 .nm-modal-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
 .nm-modal-grid .full{grid-column:1/-1}
-.nm-check{display:flex;align-items:center;gap:8px;font-size:13px}
-.nm-emp-pick{border:1px solid var(--color-border);border-radius:10px;overflow:hidden;background:var(--color-secondary,#f8fafc)}
-.nm-emp-pick__bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;border-bottom:1px solid var(--color-border);background:var(--color-white)}
+.nm-check{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--nm-ink)}
+.nm-emp-pick{border:1px solid var(--nm-line);border-radius:12px;overflow:hidden;background:#F8FAFC}
+.nm-emp-pick__bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px;border-bottom:1px solid var(--nm-line);background:#fff}
 .nm-emp-pick__bar .form-control{flex:1 1 160px;min-width:140px}
 .nm-emp-pick__list{max-height:180px;overflow:auto;padding:6px 8px;display:flex;flex-direction:column;gap:2px}
-.nm-emp-pick__row{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;font-size:13px;cursor:pointer}
-.nm-emp-pick__row:hover{background:rgba(13,124,74,.08)}
-.nm-emp-pick__row .meta{margin-left:auto;font-size:11px;color:var(--color-text-secondary);white-space:nowrap}
-.nm-emp-pick__empty{padding:12px;font-size:13px;color:var(--color-text-secondary);text-align:center}
+.nm-emp-pick__row{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:8px;font-size:13px;cursor:pointer}
+.nm-emp-pick__row:hover{background:var(--nm-soft)}
+.nm-emp-pick__row .meta{margin-left:auto;font-size:11px;color:var(--nm-muted);white-space:nowrap}
+.nm-emp-pick__empty{padding:12px;font-size:13px;color:var(--nm-muted);text-align:center}
 .nm-void-form{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0}
 .nm-void-form .form-control{width:auto;min-width:150px;max-width:260px}
+.nm-shell .table-container{border:1px solid var(--nm-line);border-radius:12px;overflow:auto;background:#fff}
+.nm-shell table{border-collapse:separate;border-spacing:0;width:100%}
+.nm-shell thead th{background:#F8FAFC;color:var(--nm-muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:700;border-bottom:1px solid var(--nm-line);padding:10px 12px}
+.nm-shell tbody td{padding:11px 12px;border-bottom:1px solid #F1F5F9;color:var(--nm-ink);font-size:13px}
+.nm-shell tbody tr:hover td{background:#F8FAFC}
+.nm-shell .btn-primary{background:var(--nm);border-color:var(--nm)}
+.nm-shell .btn-primary:hover{filter:brightness(.95)}
+.nm-shell .btn-secondary{background:#fff;border-color:var(--nm-line);color:var(--nm-ink)}
+.nm-shell .btn-secondary:hover{background:#F8FAFC}
+.nm-panel{background:#fff;border:1px solid var(--nm-line);border-radius:14px;padding:16px 18px;margin-bottom:14px}
 </style>
 
-<div class="stats-grid">
-    <div class="stat-card neumorphic"><h4>Empleados activos</h4><div class="stat-value"><?php echo (int)$activeCount; ?></div></div>
-    <div class="stat-card neumorphic"><h4>Nómina neta del mes</h4><div class="stat-value" style="color:var(--color-accent-text, var(--color-primary));"><?php echo fmtN((float)$monthPayroll, $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>SMMLV configurado</h4><div class="stat-value" style="font-size:18px;"><?php echo fmtN((float)($params['smmlv'] ?? 0), $currency); ?></div></div>
-    <div class="stat-card neumorphic"><h4>Horarios</h4><div class="stat-value" style="font-size:18px;"><?php echo (int)$scheduleCount; ?></div></div>
+<div class="nm-shell">
+<div class="nm-hero">
+    <h2>Nómina</h2>
+    <p>Liquidación, seguridad social y prestaciones de su equipo.</p>
+</div>
+<div class="nm-kpis">
+    <div class="nm-kpi-card"><span class="lbl">Empleados activos</span><span class="val"><?php echo (int)$activeCount; ?></span></div>
+    <div class="nm-kpi-card accent"><span class="lbl">Nómina neta del mes</span><span class="val" style="font-size:18px;"><?php echo fmtN((float)$monthPayroll, $currency); ?></span></div>
+    <div class="nm-kpi-card"><span class="lbl">SMMLV configurado</span><span class="val" style="font-size:18px;"><?php echo fmtN((float)($params['smmlv'] ?? 0), $currency); ?></span></div>
+    <div class="nm-kpi-card"><span class="lbl">Horarios</span><span class="val"><?php echo (int)$scheduleCount; ?></span></div>
 </div>
 
 <nav class="nm-tabs">
     <a class="<?php echo $tab === 'employees' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=employees" title="Alta y edición de empleados, salarios y horarios">Empleados</a>
     <a class="<?php echo $tab === 'schedules' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=schedules" title="Turnos semanales y asignación a empleados">Horarios <span class="nm-count"><?php echo (int)$scheduleCount; ?></span></a>
-    <a class="<?php echo in_array($tab, ['runs', 'run_detail'], true) ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=runs" title="Crear, revisar y contabilizar liquidaciones mensuales">Liquidaciones</a>
+    <a class="<?php echo in_array($tab, ['runs', 'run_detail', 'pila'], true) ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=runs" title="Crear, revisar y contabilizar liquidaciones mensuales">Liquidaciones</a>
     <a class="<?php echo $tab === 'payments' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=payments" title="Pagar saldos de seguridad social, parafiscales y prestaciones">Pagos de nómina</a>
     <a class="<?php echo $tab === 'params' ? 'active' : ''; ?>" href="<?php echo $base; ?>?tab=params" title="SMMLV, aportes, recargos, jornada y comisiones">Parámetros</a>
 </nav>
 
 <?php if ($tab === 'employees'): ?>
-<div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:end;justify-content:space-between;">
+<div class="nm-toolbar">
     <form method="GET" action="<?php echo $base; ?>" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;">
         <input type="hidden" name="tab" value="employees">
         <div class="form-group" style="margin:0;"><label>Buscar</label><input class="form-control" name="q" value="<?php echo htmlspecialchars($q); ?>" placeholder="Nombre, cédula, cargo"></div>
@@ -396,8 +435,8 @@ $accountingEntry = $accountingEntry ?? null;
 $paymentEntry = $paymentEntry ?? null;
 $accrualDate = \SoftNova\Services\AccountingService::payrollAccrualDate($run);
 
-$sumCols = ['salary_base', 'transport_aid', 'other_earnings', 'incapacity_pay', 'prima', 'commission_amount',
-    'health_employee', 'pension_employee', 'other_deductions',
+$sumCols = ['salary_base', 'transport_aid', 'other_earnings', 'incapacity_pay', 'vacation_pay', 'prima', 'commission_amount',
+    'health_employee', 'pension_employee', 'fsp_employee', 'other_deductions',
     'health_employer', 'pension_employer', 'arl_employer', 'caja_employer', 'sena_employer', 'icbf_employer',
     'cesantias', 'cesantias_interest', 'vacation_provision'];
 $tot = array_fill_keys($sumCols, 0.0);
@@ -408,20 +447,22 @@ foreach ($items as $it) {
 }
 $quincenas = \SoftNova\Services\PayrollService::quincenasInPeriod((int)($run['days_worked'] ?? 30));
 $runSections = [
-    ['Devengado', 'Lo que gana el empleado en el periodo.', '#0D7C4A', [
-        ['Salarios (días trabajados)', $tot['salary_base'], null],
-        ['Auxilio de transporte', $tot['transport_aid'], 'Proporcional a los días trabajados; solo salarios hasta 2 SMMLV. No es base de aportes.'],
+    ['Devengado', 'Lo que gana el empleado en el periodo.', '#0F766E', [
+        ['Salarios (días laborados)', $tot['salary_base'], 'Días del periodo menos incapacidad, no remunerados y vacaciones disfrutadas.'],
+        ['Vacaciones disfrutadas', $tot['vacation_pay'], 'Días de vacaciones pagados al 100% del salario diario.'],
+        ['Auxilio de transporte', $tot['transport_aid'], 'Proporcional a los días laborados; solo salarios hasta 2 SMMLV. No es base de aportes.'],
         ['Horas extras y recargos', $tot['other_earnings'], 'HED, HEN, RNO, dominicales, HEDD y HEND. Sí son base de aportes.'],
         ['Incapacidades', $tot['incapacity_pay'], 'Días 1 y 2 al 100%; desde el día 3 al % de Parámetros (laboral: 100%).'],
         ['Prima de servicios', $tot['prima'], 'Solo si la liquidación incluye prima (normalmente junio y diciembre).'],
         ['Comisiones fijas', $tot['commission_amount'], 'Pago no salarial: valor quincenal × ' . $quincenas . ' quincena(s) de este periodo. No genera aportes.'],
     ], (float)$run['gross_total'], 'Total devengado'],
-    ['Deducciones al empleado', 'Se descuentan del devengado y se pagan a seguridad social.', '#F59E0B', [
+    ['Deducciones al empleado', 'Se descuentan del devengado (seguridad social, FSP y otras).', '#475569', [
         ['Salud (EPS)', $tot['health_employee'], null],
         ['Pensión', $tot['pension_employee'], null],
-        ['Otras deducciones', $tot['other_deductions'], null],
+        ['FSP', $tot['fsp_employee'], 'Fondo de Solidaridad Pensional cuando el IBC supera 4 SMMLV.'],
+        ['Otras deducciones', $tot['other_deductions'], 'Préstamos, libranzas, embargos u otros descuentos capturados en novedades.'],
     ], (float)$run['deductions_total'], 'Total deducciones'],
-    ['Aportes de la empresa', 'Costo a cargo del empleador. No afecta el neto.', '#EF4444', [
+    ['Aportes de la empresa', 'Costo a cargo del empleador. No afecta el neto.', '#0E7490', [
         ['Salud empresa', $tot['health_employer'], null],
         ['Pensión empresa', $tot['pension_employer'], null],
         ['ARL', $tot['arl_employer'], null],
@@ -429,7 +470,7 @@ $runSections = [
         ['SENA', $tot['sena_employer'], null],
         ['ICBF', $tot['icbf_employer'], null],
     ], (float)$run['employer_total'] + (float)($run['parafiscal_total'] ?? 0), 'Total aportes'],
-    ['Provisiones', 'Prestaciones que se reservan para pagar después. No afecta el neto.', '#0EA5E9', [
+    ['Provisiones', 'Prestaciones que se reservan para pagar después. No afecta el neto.', '#334155', [
         ['Cesantías', $tot['cesantias'], 'Se consignan al fondo de cesantías (cuenta 261005).'],
         ['Intereses sobre cesantías', $tot['cesantias_interest'], 'Se pagan al empleado en enero.'],
         ['Vacaciones', $tot['vacation_provision'], 'Se pagan cuando el empleado disfruta sus vacaciones (cuenta 261015).'],
@@ -439,13 +480,13 @@ $aportesTotal = $runSections[2][4];
 $provTotal = $runSections[3][4];
 $companyCost = (float)$run['gross_total'] + $aportesTotal + $provTotal;
 $costParts = [
-    ['Neto a empleados', (float)$run['net_total'], '#0D7C4A'],
-    ['Deducciones (seg. social)', (float)$run['deductions_total'], '#F59E0B'],
-    ['Aportes empresa', $aportesTotal, '#EF4444'],
-    ['Provisiones', $provTotal, '#0EA5E9'],
+    ['Neto a empleados', (float)$run['net_total'], '#0F766E'],
+    ['Deducciones (seg. social)', (float)$run['deductions_total'], '#475569'],
+    ['Aportes empresa', $aportesTotal, '#0E7490'],
+    ['Provisiones', $provTotal, '#334155'],
 ];
 $runStatusInfo = [
-    'draft' => ['Borrador', 'warn', 'Puede ajustar incapacidades y horas extras antes de contabilizar.'],
+    'draft' => ['Borrador', 'warn', 'Puede ajustar incapacidades, novedades (días no remunerados / vacaciones / otras deducciones) y horas extras antes de contabilizar.'],
     'paid' => ['Pagada', 'ok', 'Contabilizada y marcada como pagada. El gasto quedó en Gastos por el costo total de la empresa y solo se corrige desde aquí con «Anular pago».'],
     'posted' => ['Contabilizada', 'ok', 'Asiento contable generado.'],
     'cancelled' => ['Cancelada', 'off', 'Esta liquidación no se contabiliza. Puede crear una nueva para el mismo periodo.'],
@@ -462,48 +503,48 @@ $includes = [
 ?>
 <style>
 .nm-run-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}
-.nm-run-head h3{margin:0;font-size:19px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.nm-run-head small{font-size:13px;font-weight:500;color:var(--color-text-secondary)}
-.nm-status{font-size:12px;font-weight:700;padding:4px 10px;border-radius:999px;border:1px solid}
-.nm-status.warn{background:rgba(245,158,11,.12);border-color:#F59E0B;color:var(--dmc-B45309, #B45309)}
-.nm-status.ok{background:rgba(13,124,74,.1);border-color:#0D7C4A;color:var(--dmc-0D7C4A, #0D7C4A)}
-.nm-status.off{background:var(--color-secondary);border-color:var(--color-border);color:var(--color-text-secondary)}
-.nm-run-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;font-size:12px;color:var(--color-text-secondary)}
-.nm-inc{padding:3px 9px;border-radius:999px;font-size:12px;border:1px solid var(--color-border)}
-.nm-inc.on{background:rgba(13,124,74,.08);border-color:rgba(13,124,74,.4);color:var(--dmc-0D7C4A, #0D7C4A)}
-.nm-inc.no{color:var(--color-text-secondary);text-decoration:line-through;opacity:.7}
-.nm-run-banner{margin-top:12px;padding:10px 14px;border-radius:10px;font-size:13px;background:var(--color-secondary);border:1px solid var(--color-border);color:var(--color-text-secondary)}
-.nm-run-banner.warn{background:rgba(245,158,11,.08);border-color:rgba(245,158,11,.4);color:var(--dmc-92400E, #92400E)}
+.nm-run-head h3{margin:0;font-size:19px;font-weight:700;color:var(--nm-ink,#0F172A);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.nm-run-head small{font-size:13px;font-weight:500;color:var(--nm-muted,#64748B)}
+.nm-status{font-size:11px;font-weight:700;padding:4px 10px;border-radius:999px;border:1px solid;letter-spacing:.02em}
+.nm-status.warn{background:#FFFBEB;border-color:#FDE68A;color:#B45309}
+.nm-status.ok{background:#ECFDF8;border-color:#99F6E4;color:#0F766E}
+.nm-status.off{background:#F8FAFC;border-color:#E2E8F0;color:#64748B}
+.nm-run-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;font-size:12px;color:var(--nm-muted,#64748B)}
+.nm-inc{padding:3px 9px;border-radius:999px;font-size:12px;border:1px solid #E2E8F0;background:#F8FAFC}
+.nm-inc.on{background:#ECFDF8;border-color:#99F6E4;color:#0F766E}
+.nm-inc.no{color:#94A3B8;text-decoration:line-through;opacity:.75}
+.nm-run-banner{margin-top:12px;padding:12px 14px;border-radius:12px;font-size:13px;background:#F8FAFC;border:1px solid #E2E8F0;color:#64748B;line-height:1.5}
+.nm-run-banner.warn{background:#FFFBEB;border-color:#FDE68A;color:#92400E}
 .nm-flow{display:grid;grid-template-columns:1fr auto 1fr auto 1.2fr;gap:10px;align-items:stretch;margin-top:16px}
-.nm-flow .op{align-self:center;font-size:22px;font-weight:700;color:var(--color-text-secondary)}
-.nm-kpi{padding:14px 16px;border-radius:12px;background:var(--color-white);border:1px solid var(--color-border);border-left:4px solid var(--k)}
-.nm-kpi span{display:block;font-size:12px;color:var(--color-text-secondary)}
-.nm-kpi b{display:block;font-size:20px;margin-top:4px;color:var(--color-text-primary)}
-.nm-kpi.main{background:color-mix(in srgb,var(--k) 8%,var(--color-white))}
-.nm-kpi.main b{font-size:24px;color:var(--k)}
+.nm-flow .op{align-self:center;font-size:20px;font-weight:600;color:#94A3B8}
+.nm-kpi{padding:16px;border-radius:14px;background:#fff;border:1px solid #E2E8F0}
+.nm-kpi span{display:block;font-size:12px;font-weight:600;color:#64748B}
+.nm-kpi b{display:block;font-size:20px;margin-top:6px;color:#0F172A;font-variant-numeric:tabular-nums}
+.nm-kpi.main{background:linear-gradient(180deg,#ECFDF8,#fff);border-color:#99F6E4}
+.nm-kpi.main b{font-size:24px;color:#0F766E}
 .nm-seg-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:16px}
 @media (min-width:1400px){.nm-seg-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media (max-width:700px){.nm-seg-grid{grid-template-columns:1fr}}
-.nm-seg{border:1px solid var(--color-border);border-top:3px solid var(--k);border-radius:12px;padding:12px 14px;background:var(--color-white);display:flex;flex-direction:column}
-.nm-seg h4{margin:0;font-size:14px}
-.nm-seg p{margin:2px 0 10px;font-size:11px;color:var(--color-text-secondary)}
-.nm-seg-row{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:5px 0;font-size:13px;border-bottom:1px dashed var(--color-border)}
-.nm-seg-row.zero{color:var(--color-text-secondary);opacity:.6}
+.nm-seg{border:1px solid #E2E8F0;border-radius:14px;padding:14px 16px;background:#fff;display:flex;flex-direction:column}
+.nm-seg h4{margin:0;font-size:14px;font-weight:700;color:#0F172A}
+.nm-seg p{margin:4px 0 12px;font-size:12px;color:#64748B;line-height:1.4}
+.nm-seg-row{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:6px 0;font-size:13px;border-bottom:1px solid #F1F5F9}
+.nm-seg-row.zero{color:#94A3B8}
 .nm-seg-row .amt{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
-.nm-seg-row .bar{grid-column:1/-1;height:4px;border-radius:4px;background:var(--color-secondary);overflow:hidden}
-.nm-seg-row .bar i{display:block;height:100%;background:var(--k)}
-.nm-seg-total{display:flex;justify-content:space-between;margin-top:auto;padding-top:9px;font-weight:700;font-size:14px}
-.nm-seg-total b{color:var(--k)}
-.nm-cost{margin-top:16px;padding:14px 16px;border-radius:12px;background:var(--color-secondary);border:1px solid var(--color-border)}
-.nm-cost-head{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:13px}
-.nm-cost-head b{font-size:18px}
-.nm-cost-bar{display:flex;height:14px;border-radius:7px;overflow:hidden;margin:10px 0 8px;background:var(--color-border)}
+.nm-seg-row .bar{grid-column:1/-1;height:3px;border-radius:3px;background:#F1F5F9;overflow:hidden}
+.nm-seg-row .bar i{display:block;height:100%;background:var(--k,#0F766E);opacity:.85}
+.nm-seg-total{display:flex;justify-content:space-between;margin-top:auto;padding-top:10px;font-weight:700;font-size:14px;border-top:1px solid #E2E8F0}
+.nm-seg-total b{color:#0F172A}
+.nm-cost{margin-top:16px;padding:16px;border-radius:14px;background:#fff;border:1px solid #E2E8F0}
+.nm-cost-head{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:13px;color:#64748B}
+.nm-cost-head b{font-size:18px;color:#0F172A}
+.nm-cost-bar{display:flex;height:10px;border-radius:6px;overflow:hidden;margin:12px 0 10px;background:#F1F5F9}
 .nm-cost-bar i{display:block;height:100%}
-.nm-cost-legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--color-text-secondary)}
+.nm-cost-legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:#64748B}
 .nm-cost-legend span::before{content:'';display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;background:var(--k);vertical-align:-1px}
 @media (max-width:760px){.nm-flow{grid-template-columns:1fr}.nm-flow .op{display:none}}
 .nm-run-table td{white-space:nowrap;font-variant-numeric:tabular-nums}
-.nm-run-table thead tr.grp th{padding:6px 8px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;text-align:center;color:#fff;border-bottom:3px solid var(--g,transparent)}
+.nm-run-table thead tr.grp th{padding:7px 8px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;text-align:center;color:#64748B;background:#F8FAFC;border-bottom:2px solid var(--g,#E2E8F0)}
 </style>
 <div style="margin-bottom:12px;"><a class="btn btn-secondary" href="<?php echo $base; ?>?tab=runs" title="Volver al listado de liquidaciones">← Volver</a></div>
 <div class="card neumorphic" style="margin-bottom:16px;">
@@ -544,11 +585,11 @@ $includes = [
         <?php endif; ?>
 
         <div class="nm-flow">
-            <div class="nm-kpi" style="--k:#0D7C4A"><span>Total devengado</span><b><?php echo fmtN((float)$run['gross_total'], $currency); ?></b></div>
+            <div class="nm-kpi" style="--k:#0F766E"><span>Total devengado</span><b><?php echo fmtN((float)$run['gross_total'], $currency); ?></b></div>
             <div class="op">−</div>
-            <div class="nm-kpi" style="--k:#F59E0B"><span>Deducciones al empleado</span><b><?php echo fmtN((float)$run['deductions_total'], $currency); ?></b></div>
+            <div class="nm-kpi" style="--k:#475569"><span>Deducciones al empleado</span><b><?php echo fmtN((float)$run['deductions_total'], $currency); ?></b></div>
             <div class="op">=</div>
-            <div class="nm-kpi main" style="--k:#0D7C4A"><span>Neto a pagar a empleados</span><b><?php echo fmtN((float)$run['net_total'], $currency); ?></b></div>
+            <div class="nm-kpi main" style="--k:#0F766E"><span>Neto a pagar a empleados</span><b><?php echo fmtN((float)$run['net_total'], $currency); ?></b></div>
         </div>
 
         <div class="nm-seg-grid">
@@ -589,6 +630,8 @@ $includes = [
 
         <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
             <a class="btn btn-secondary" target="_blank" href="<?php echo $base; ?>?action=pdf&amp;id=<?php echo (int)$run['id']; ?>" title="Descargar PDF de la liquidación con todos los empleados y totales">PDF liquidación</a>
+            <a class="btn btn-secondary" href="<?php echo $base; ?>?action=export_run_cost&amp;id=<?php echo (int)$run['id']; ?>" title="CSV detallado: devengados, deducciones, aportes, provisiones y costo empresa por empleado">CSV costo empresa</a>
+            <a class="btn btn-secondary" href="<?php echo $base; ?>?action=pila_preview&amp;id=<?php echo (int)$run['id']; ?>" title="Validar afiliaciones e IBC y descargar archivo para el operador PILA">PILA / seguridad social</a>
         <?php if (($run['status'] ?? '') === 'draft' && $canEdit): ?>
                 <form method="POST" action="<?php echo $base; ?>?action=pay_run" data-ajax="true" style="display:inline;">
                     <?php echo \SoftNova\Core\csrf_field(); ?>
@@ -617,17 +660,17 @@ $includes = [
         <thead>
             <tr class="grp">
                 <th colspan="3"></th>
-                <th colspan="5" style="--g:#34D399">Devengado</th>
-                <th colspan="2" style="--g:#FBBF24">Deducciones</th>
+                <th colspan="5" style="--g:#0F766E">Devengado</th>
+                <th colspan="2" style="--g:#64748B">Deducciones</th>
                 <th></th>
-                <th style="--g:#38BDF8">No afecta neto</th>
+                <th style="--g:#94A3B8">No afecta neto</th>
                 <th></th>
             </tr>
             <tr><th>Empleado</th><th>Días</th><th>Inc.</th>
-                <th>Salario + aux. <?php echo nmTip('Salario de los días trabajados + auxilio de transporte + pago de incapacidad.'); ?></th>
+                <th>Salario + aux. <?php echo nmTip('Salario laborado + vacaciones disfrutadas + auxilio + incapacidad.'); ?></th>
                 <th>HE / rec. <?php echo nmTip('Valor de horas extras y recargos (HED, HEN, RNO, Dom., HEDD, HEND). Edítelos en la captura masiva debajo.'); ?></th>
                 <th>Comisión</th><th>Prima</th><th>Total</th>
-                <th>Salud</th><th>Pensión</th><th>Neto</th>
+                <th>Salud</th><th>Pensión+FSP</th><th>Neto</th>
                 <th>Provisiones <?php echo nmTip('Cesantías + intereses + vacaciones de este empleado.'); ?></th><th></th></tr>
         </thead>
         <tbody>
@@ -636,11 +679,16 @@ $includes = [
             $otTotal = (float)($it['other_earnings'] ?? 0);
             $commissionAmt = (float)($it['commission_amount'] ?? 0);
             $primaAmt = (float)($it['prima'] ?? 0);
-            $basePay = (float)$it['salary_base'] + (float)($it['transport_aid'] ?? 0) + (float)($it['incapacity_pay'] ?? 0);
+            $basePay = (float)$it['salary_base'] + (float)($it['vacation_pay'] ?? 0) + (float)($it['transport_aid'] ?? 0) + (float)($it['incapacity_pay'] ?? 0);
             $provAmt = (float)($it['cesantias'] ?? 0) + (float)($it['cesantias_interest'] ?? 0) + (float)($it['vacation_provision'] ?? 0);
+            $pensionFsp = (float)$it['pension_employee'] + (float)($it['fsp_employee'] ?? 0);
+            $novHint = [];
+            if ((int)($it['unpaid_days'] ?? 0) > 0) { $novHint[] = (int)$it['unpaid_days'] . ' no rem.'; }
+            if ((int)($it['vacation_days'] ?? 0) > 0) { $novHint[] = (int)$it['vacation_days'] . ' vac.'; }
+            if ((float)($it['other_deductions'] ?? 0) > 0) { $novHint[] = 'otras ded.'; }
             ?>
             <tr>
-                <td><?php echo htmlspecialchars($it['employee_name']); ?></td>
+                <td><?php echo htmlspecialchars($it['employee_name']); ?><?php if ($novHint): ?><br><small style="color:var(--color-text-secondary);"><?php echo htmlspecialchars(implode(' · ', $novHint)); ?></small><?php endif; ?></td>
                 <td><?php echo (int)$it['days_worked']; ?></td>
                 <td><?php echo (int)($it['incapacity_days'] ?? 0) ?: '-'; ?></td>
                 <td><?php echo fmtN($basePay, $currency); ?></td>
@@ -649,13 +697,14 @@ $includes = [
                 <td><?php echo $primaAmt > 0 ? fmtN($primaAmt, $currency) : '-'; ?></td>
                 <td><strong><?php echo fmtN((float)($it['gross_pay'] ?? 0), $currency); ?></strong></td>
                 <td><?php echo fmtN((float)$it['health_employee'], $currency); ?></td>
-                <td><?php echo fmtN((float)$it['pension_employee'], $currency); ?></td>
+                <td><?php echo fmtN($pensionFsp, $currency); ?></td>
                 <td><strong style="color:var(--color-accent-text, var(--color-primary));"><?php echo fmtN((float)$it['net_pay'], $currency); ?></strong></td>
                 <td style="color:var(--color-text-secondary);"><?php echo $provAmt > 0 ? fmtN($provAmt, $currency) : '-'; ?></td>
                 <td style="white-space:nowrap;">
                     <a class="btn btn-sm btn-secondary" target="_blank" href="<?php echo $base; ?>?action=payslip&amp;run_id=<?php echo (int)$run['id']; ?>&amp;item_id=<?php echo (int)$it['id']; ?>" title="Comprobante de pago (payslip) de este empleado">PDF</a>
                     <?php if (($run['status'] ?? '') === 'draft' && $canEdit): ?>
                         <button type="button" class="btn btn-sm btn-secondary" title="Registrar o ajustar días de incapacidad de este empleado" onclick="editIncapacity(<?php echo (int)$it['id']; ?>,<?php echo (int)$run['id']; ?>,<?php echo (int)($it['incapacity_days'] ?? 0); ?>,'<?php echo htmlspecialchars($it['incapacity_type'] ?? 'enfermedad', ENT_QUOTES); ?>')">Inc.</button>
+                        <button type="button" class="btn btn-sm btn-secondary" title="Novedades: días no remunerados, vacaciones disfrutadas y otras deducciones" onclick="editNovelties(<?php echo (int)$it['id']; ?>,<?php echo (int)$run['id']; ?>,<?php echo (int)($it['unpaid_days'] ?? 0); ?>,<?php echo (int)($it['vacation_days'] ?? 0); ?>,<?php echo htmlspecialchars(json_encode((float)($it['other_deductions'] ?? 0)), ENT_QUOTES); ?>)">Nov.</button>
                     <?php endif; ?>
                 </td>
             </tr>
@@ -708,10 +757,126 @@ $includes = [
     </div>
     <?php endif; ?>
     <p class="nm-footnote">
-        En borrador ajuste incapacidad por empleado y las horas extras en la captura masiva.
-        Cesantías y vacaciones (si se incluyen) son provisiones contables (261005 y 261015) y <strong>no aumentan el neto a pagar</strong>.
+        En borrador ajuste incapacidad (Inc.), novedades (Nov.: días no remunerados, vacaciones disfrutadas, otras deducciones) y horas extras en la captura masiva.
+        Cesantías y provisión de vacaciones (si se incluyen) son provisiones contables (261005 y 261015) y <strong>no aumentan el neto a pagar</strong>.
         Al pagar se genera asiento (sueldos, HE, comisiones, aportes, parafiscales y provisiones) y queda en auditoría.
         <strong>La nómina no descuenta el cajón físico de Caja/POS</strong>.
+    </p>
+    </div>
+</div>
+
+<?php elseif ($tab === 'pila' && !empty($pila)): ?>
+<?php
+$pilaRun = $pila['run'];
+$pilaRows = $pila['rows'];
+$pilaIssues = $pila['issues'];
+$pilaTotals = $pila['totals'];
+$pilaReady = !empty($pila['ready']);
+$errorN = count(array_filter($pilaIssues, static fn ($i) => ($i['level'] ?? '') === 'error'));
+$warnN = count($pilaIssues) - $errorN;
+$monthNames = [1 => 'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+$pilaPeriodName = ($monthNames[(int)($pilaRun['period_month'] ?? 0)] ?? '') . ' ' . (int)($pilaRun['period_year'] ?? 0);
+?>
+<div style="margin-bottom:12px;"><a class="btn btn-secondary" href="<?php echo $base; ?>?tab=runs&amp;action=run_detail&amp;id=<?php echo (int)$pilaRun['id']; ?>" title="Volver al detalle de la liquidación">← Volver a liquidación</a></div>
+<div class="card neumorphic" style="margin-bottom:16px;">
+    <div class="card-body">
+        <div class="nm-run-head">
+            <div>
+                <h3>PILA · <?php echo htmlspecialchars($pilaPeriodName); ?> <small><?php echo htmlspecialchars((string)$pilaRun['run_number']); ?></small>
+                    <span class="nm-status <?php echo $pilaReady ? 'ok' : 'warn'; ?>"><?php echo $pilaReady ? 'Lista para exportar' : 'Revisar datos'; ?></span>
+                </h3>
+                <div class="nm-run-meta">
+                    <span class="nm-pill">Aportante: <b><?php echo htmlspecialchars(($pila['company']['nit'] ?: 'sin NIT') . ' · ' . ($pila['company']['name'] ?? '')); ?></b></span>
+                    <span class="nm-pill">Empleados: <b><?php echo (int)$pilaTotals['employees']; ?></b></span>
+                    <span class="nm-pill">Total estimado PILA: <b><?php echo fmtN((float)$pilaTotals['pila_total'], $currency); ?></b></span>
+                </div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <a class="btn btn-secondary" href="<?php echo $base; ?>?action=export_pila&amp;id=<?php echo (int)$pilaRun['id']; ?>&amp;format=csv" title="CSV con campos PILA para revisar o cargar en el operador">Descargar CSV</a>
+                <a class="btn btn-secondary" href="<?php echo $base; ?>?action=export_pila&amp;id=<?php echo (int)$pilaRun['id']; ?>&amp;format=txt" title="Archivo TXT separado por | para operadores / revisión">Descargar TXT</a>
+            </div>
+        </div>
+        <div class="nm-run-banner <?php echo $errorN > 0 ? 'warn' : ''; ?>" style="margin-top:12px;">
+            Este archivo <strong>no reemplaza</strong> la liquidación web del operador: sirva para armar o validar la planilla tipo E.
+            Complete EPS/AFP/ARL/Caja en cada empleado. El NIT de la empresa se toma de Configuración.
+            Luego registre el pago real en <strong>Pagos de nómina</strong> (tarjeta PILA).
+            <?php if ($pila['company']['nit'] === ''): ?>
+                <br><strong>Falta el NIT de la empresa</strong> en Configuración → datos de la empresa.
+            <?php endif; ?>
+        </div>
+        <?php if ($pilaIssues): ?>
+            <div style="margin-top:12px;padding:10px 12px;border-radius:10px;border:1px solid var(--color-border);background:var(--color-secondary);">
+                <strong><?php echo $errorN; ?> error(es)</strong><?php if ($warnN > 0): ?> · <?php echo $warnN; ?> aviso(s)<?php endif; ?>
+                <ul style="margin:8px 0 0;padding-left:18px;font-size:13px;">
+                    <?php foreach (array_slice($pilaIssues, 0, 40) as $iss): ?>
+                        <li style="<?php echo ($iss['level'] ?? '') === 'error' ? 'color:var(--dmc-B45309,#B45309);' : ''; ?>">
+                            <strong><?php echo htmlspecialchars($iss['employee']); ?>:</strong> <?php echo htmlspecialchars($iss['message']); ?>
+                        </li>
+                    <?php endforeach; ?>
+                    <?php if (count($pilaIssues) > 40): ?><li>… y <?php echo count($pilaIssues) - 40; ?> más</li><?php endif; ?>
+                </ul>
+            </div>
+        <?php endif; ?>
+        <div class="nm-seg-grid" style="margin-top:14px;">
+            <?php
+            $pilaSegs = [
+                ['Aportes empleado', '#475569', [
+                    ['Salud', $pilaTotals['health_emp']],
+                    ['Pensión', $pilaTotals['pension_emp']],
+                    ['FSP', $pilaTotals['fsp']],
+                ]],
+                ['Aportes empresa', '#0F766E', [
+                    ['Salud', $pilaTotals['health_er']],
+                    ['Pensión', $pilaTotals['pension_er']],
+                    ['ARL', $pilaTotals['arl']],
+                    ['Caja', $pilaTotals['caja']],
+                    ['SENA', $pilaTotals['sena']],
+                    ['ICBF', $pilaTotals['icbf']],
+                ]],
+            ];
+            foreach ($pilaSegs as [$title, $color, $rows]): ?>
+                <section class="nm-seg" style="--k:<?php echo $color; ?>">
+                    <h4><?php echo htmlspecialchars($title); ?></h4>
+                    <?php foreach ($rows as [$lab, $amt]): ?>
+                        <div class="nm-seg-row <?php echo $amt > 0 ? '' : 'zero'; ?>">
+                            <span><?php echo htmlspecialchars($lab); ?></span>
+                            <span class="amt"><?php echo fmtN((float)$amt, $currency); ?></span>
+                        </div>
+                    <?php endforeach; ?>
+                </section>
+            <?php endforeach; ?>
+        </div>
+    </div>
+</div>
+<div class="card neumorphic">
+    <div class="card-header"><h3>Detalle por cotizante</h3></div>
+    <div class="card-body"><div class="table-container"><table class="nm-run-table">
+        <thead>
+            <tr><th>Empleado</th><th>Doc</th><th>Tipo</th><th>EPS</th><th>AFP</th><th>ARL</th><th>Caja</th><th>Días</th><th>IBC</th><th>Total línea</th><th>114-1</th><th></th></tr>
+        </thead>
+        <tbody>
+        <?php foreach ($pilaRows as $pr): ?>
+            <tr style="<?php echo $pr['issues'] ? 'background:rgba(245,158,11,.06);' : ''; ?>">
+                <td><?php echo htmlspecialchars($pr['employee_name']); ?></td>
+                <td><?php echo htmlspecialchars($pr['document_type'] . ' ' . $pr['document_number']); ?></td>
+                <td><?php echo htmlspecialchars($pr['cotizante_type'] . '/' . $pr['cotizante_subtype']); ?></td>
+                <td><?php echo htmlspecialchars($pr['eps_code'] ?: '—'); ?></td>
+                <td><?php echo htmlspecialchars($pr['afp_code'] ?: '—'); ?></td>
+                <td><?php echo htmlspecialchars($pr['arl_code'] ?: '—'); ?></td>
+                <td><?php echo htmlspecialchars($pr['caja_code'] ?: '—'); ?></td>
+                <td><?php echo (int)$pr['days_cotizados']; ?></td>
+                <td><?php echo fmtN((float)$pr['ibc'], $currency); ?></td>
+                <td><strong><?php echo fmtN((float)$pr['pila_line_total'], $currency); ?></strong></td>
+                <td><?php echo $pr['exempt_1141']; ?></td>
+                <td><?php if ($pr['issues']): ?><span class="badge" title="<?php echo htmlspecialchars(implode(' · ', $pr['issues'])); ?>">Revisar</span><?php else: ?><span class="badge badge-success">OK</span><?php endif; ?></td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table></div>
+    <p class="nm-footnote">
+        Complete afiliaciones en <a href="<?php echo $base; ?>?tab=employees">Empleados</a>.
+        Si el operador rechaza el archivo, use el CSV como guía de valores y liquide en su portal (SOI / miplanilla / etc.).
+        El pago de la planilla se registra después en Pagos de nómina → Usar saldos.
     </p>
     </div>
 </div>
@@ -753,20 +918,21 @@ foreach ($liabilities as $li) {
 }
 ?>
 <style>
-.nm-liab-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;margin-bottom:16px}
-.nm-liab-row{display:grid;grid-template-columns:1fr auto 170px;gap:10px;align-items:center;padding:7px 0;border-bottom:1px dashed var(--color-border);font-size:13px}
-.nm-liab-row .acc{font-size:11px;color:var(--color-text-secondary)}
-.nm-liab-row .bal{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-.nm-liab-row .bal.neg{color:var(--dmc-B45309, #B45309)}
-.nm-liab-row .bal.zero{color:var(--color-text-secondary)}
+.nm-liab-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:14px;margin-bottom:16px}
+.nm-liab-row{display:grid;grid-template-columns:1fr auto 170px;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid #F1F5F9;font-size:13px}
+.nm-liab-row .acc{font-size:11px;color:#64748B}
+.nm-liab-row .bal{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;font-weight:600;color:#0F172A}
+.nm-liab-row .bal.neg{color:#B45309}
+.nm-liab-row .bal.zero{color:#94A3B8;font-weight:500}
 .nm-liab-foot{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}
-.nm-liab-total{display:flex;justify-content:space-between;align-items:center;margin-top:10px;font-weight:700}
-.nm-liab-lines{margin:0;padding-left:16px;font-size:12px}
+.nm-liab-total{display:flex;justify-content:space-between;align-items:center;margin-top:12px;padding-top:12px;border-top:1px solid #E2E8F0;font-weight:700;color:#0F172A}
+.nm-liab-lines{margin:0;padding-left:16px;font-size:12px;color:#64748B}
 @media (max-width:560px){.nm-liab-grid{grid-template-columns:1fr}.nm-liab-row{grid-template-columns:1fr 130px}.nm-liab-row .bal{grid-column:1/-1;text-align:left}}
 </style>
 <div class="nm-run-banner" style="margin:0 0 16px;">
     Aquí se registran los pagos de lo que la nómina dejó <strong>por pagar</strong>: planilla PILA (salud, pensión, ARL, caja, SENA, ICBF),
     consignación de cesantías, intereses, vacaciones pagadas y salarios pendientes.
+    Para armar la planilla del operador, abra la liquidación del mes y use <strong>PILA / seguridad social</strong> (export CSV/TXT).
     <strong>Salarios por pagar (neto pendiente)</strong> es el dinero que aún se le debe a los empleados (cuenta 250505): si al liquidar usó «Contabilizar y pagar», ese saldo queda en $0.
     El pago <strong>no genera gasto</strong> (el costo ya se registró al liquidar la nómina): solo baja el pasivo contra banco o caja de nómina.
     No registre estos pagos en Gastos porque el costo quedaría duplicado.
@@ -919,42 +1085,47 @@ foreach ($liabilities as $li) {
 <?php elseif ($tab === 'params'): ?>
 <?php
 $paramGroups = [
-    ['title' => 'Salario base', 'desc' => 'Valores de referencia del año.', 'acc' => '#0D7C4A', 'preview' => 'base', 'fields' => [
+    ['title' => 'Salario base', 'desc' => 'Valores de referencia del año.', 'acc' => '#0F766E', 'preview' => 'base', 'fields' => [
         ['smmlv', 'SMMLV', 'money', 'Salario Mínimo Mensual Legal Vigente. Define el tope del auxilio de transporte (hasta 2 SMMLV). Valor 2026: $1.750.905.'],
         ['transport_aid', 'Auxilio de transporte', 'money', 'Se paga proporcional a los días trabajados a quienes ganan hasta 2 SMMLV y tienen la casilla activa. No es base de aportes. Valor 2026: $249.095.'],
     ]],
-    ['title' => 'Jornada laboral', 'desc' => 'Base del valor hora y de la validación de horarios.', 'acc' => '#6366F1', 'preview' => 'hour', 'fields' => [
+    ['title' => 'Jornada laboral', 'desc' => 'Base del valor hora y de la validación de horarios.', 'acc' => '#0F766E', 'preview' => 'hour', 'fields' => [
         ['payroll_monthly_hours', 'Horas mensuales', 'h', 'Divisor del valor hora: salario ÷ horas mensuales. Con jornada de 42 h/semana (desde 15-jul-2026) son 210 h/mes.'],
         ['max_weekly_hours', 'Jornada máx. semanal', 'h', 'Límite legal semanal (Ley 2101: 42 h desde jul-2026). Se usa para alertar en Horarios cuando un turno lo supera.'],
         ['max_daily_hours', 'Jornada máx. diaria', 'h', 'Horas ordinarias por día. Si un día del horario del empleado (descontando el descanso) supera este valor, el exceso cuenta como hora extra: diurna o nocturna según la ventana nocturna, y dominical si es domingo. Se puede precargar al crear la liquidación.'],
         ['night_start_hour', 'Inicio nocturno', 'hour', 'Hora (0-23) en que empieza el trabajo nocturno. Desde el 25-dic-2025 es a las 19:00 (Ley 2466 de 2025).'],
         ['night_end_hour', 'Fin nocturno', 'hour', 'Hora (0-23) en que termina el trabajo nocturno. Normalmente 6:00.'],
     ]],
-    ['title' => 'Aportes del empleado', 'desc' => 'Se descuentan del devengado sobre el IBC (salario + HE/recargos, sin auxilio).', 'acc' => '#F59E0B', 'preview' => 'emp', 'fields' => [
+    ['title' => 'Aportes del empleado', 'desc' => 'Se descuentan del devengado sobre el IBC (salario + HE/recargos, sin auxilio).', 'acc' => '#0F766E', 'preview' => 'emp', 'fields' => [
         ['health_employee_rate', 'Salud', 'pct', 'Descuento de salud (EPS) al empleado. Normal: 4%.'],
         ['pension_employee_rate', 'Pensión', 'pct', 'Descuento de pensión al empleado. Normal: 4%.'],
     ]],
-    ['title' => 'Aportes del empleador', 'desc' => 'Costo de la empresa; no afecta el neto del empleado.', 'acc' => '#EF4444', 'preview' => 'er', 'fields' => [
-        ['health_employer_rate', 'Salud', 'pct', 'Aporte de salud del empleador: 8,5%. Puede ser 0% si la empresa aplica la exoneración del art. 114-1 E.T. (salarios menores a 10 SMMLV).'],
+    ['title' => 'Aportes del empleador', 'desc' => 'Costo de la empresa; no afecta el neto del empleado.', 'acc' => '#0F766E', 'preview' => 'er', 'fields' => [
+        ['health_employer_rate', 'Salud', 'pct', 'Aporte de salud del empleador: 8,5%. Puede quedar en 0% con exoneración 114-1 (automática o por empleado).'],
         ['pension_employer_rate', 'Pensión', 'pct', 'Aporte de pensión del empleador: 12%.'],
-        ['arl_employer_rate', 'ARL', 'pct', 'Según clase de riesgo: I 0,522% · II 1,044% · III 2,436% · IV 4,350% · V 6,960%. Se calcula siempre.'],
+        ['arl_employer_rate', 'ARL (por defecto)', 'pct', 'Tasa global si el empleado no tiene ARL propia. Clases: I 0,522% · II 1,044% · III 2,436% · IV 4,350% · V 6,960%.'],
+        ['auto_exempt_1141', 'Exoneración 114-1 automática', 'toggle', 'Si el salario del empleado es menor a 10 SMMLV, pone en 0% salud empleador, SENA e ICBF (la caja sí se calcula). Puede forzar por empleado.'],
     ]],
-    ['title' => 'Parafiscales', 'desc' => 'Solo se liquidan si la liquidación tiene marcada la opción «Parafiscales».', 'acc' => '#8B5CF6', 'preview' => 'para', 'fields' => [
+    ['title' => 'Parafiscales', 'desc' => 'Solo se liquidan si la liquidación tiene marcada la opción «Parafiscales».', 'acc' => '#0F766E', 'preview' => 'para', 'fields' => [
         ['caja_employer_rate', 'Caja compensación', 'pct', 'Caja de Compensación Familiar: 4%.'],
-        ['sena_employer_rate', 'SENA', 'pct', 'SENA: 2%. Use 0% si la empresa aplica la exoneración del art. 114-1 E.T.'],
-        ['icbf_employer_rate', 'ICBF', 'pct', 'ICBF: 3%. Use 0% si la empresa aplica la exoneración del art. 114-1 E.T.'],
+        ['sena_employer_rate', 'SENA', 'pct', 'SENA: 2%. Queda en 0% con exoneración 114-1.'],
+        ['icbf_employer_rate', 'ICBF', 'pct', 'ICBF: 3%. Queda en 0% con exoneración 114-1.'],
     ]],
-    ['title' => 'Incapacidades', 'desc' => 'Pago de días de incapacidad por enfermedad general.', 'acc' => '#06B6D4', 'preview' => null, 'fields' => [
+    ['title' => 'FSP e IBC', 'desc' => 'Fondo de Solidaridad Pensional y tope de base de cotización.', 'acc' => '#0F766E', 'preview' => null, 'fields' => [
+        ['fsp_rate', 'FSP (si IBC > 4 SMMLV)', 'pct', 'Fondo de Solidaridad Pensional. Se descuenta al empleado cuando el IBC supera 4 SMMLV. Valor típico: 1%.'],
+        ['ibc_cap_smmlv', 'Tope IBC (× SMMLV)', 'num', 'Máximo de IBC en salarios mínimos (legal: 25). Recorta la base de aportes si el IBC lo supera.'],
+    ]],
+    ['title' => 'Incapacidades', 'desc' => 'Pago de días de incapacidad por enfermedad general.', 'acc' => '#0F766E', 'preview' => null, 'fields' => [
         ['incapacity_rate', '% desde el día 3', 'pct', 'Los días 1 y 2 los paga el empleador al 100%. Desde el día 3 se paga este porcentaje (EPS: 66,67%). La incapacidad laboral (ARL) siempre se paga al 100%.'],
     ]],
-    ['title' => 'Provisiones', 'desc' => 'Prestaciones sociales como % mensual. Cesantías y prima se calculan sobre salario + auxilio de transporte (si aplica); vacaciones solo sobre el salario. Se aplican según las casillas de la nueva liquidación.', 'acc' => '#0EA5E9', 'preview' => 'prov', 'fields' => [
+    ['title' => 'Provisiones', 'desc' => 'Prestaciones sociales como % mensual. Cesantías y prima se calculan sobre salario + auxilio de transporte (si aplica); vacaciones solo sobre el salario. Se aplican según las casillas de la nueva liquidación.', 'acc' => '#0F766E', 'preview' => 'prov', 'fields' => [
         ['cesantias_rate', 'Cesantías', 'pct', 'Provisión mensual de cesantías sobre salario + auxilio de transporte: 8,33% (un mes por año). Se contabiliza en 261005 y no suma al neto a pagar.'],
         ['cesantias_interest_rate', 'Intereses s/ cesantías', 'pct', 'Porcentaje ANUAL sobre las cesantías: 12%. Cada mes se provisiona la doceava parte (≈1% de las cesantías).'],
         ['prima_rate', 'Prima de servicios', 'pct', 'Equivalente mensual de la prima: 8,33% sobre salario + auxilio de transporte. Cuando la liquidación incluye prima (junio y diciembre) se paga este % × 6 meses (medio mes) y sí suma al neto.'],
         ['vacation_rate', 'Vacaciones', 'pct', 'Provisión mensual de vacaciones: 4,17% (15 días hábiles por año), solo sobre el salario. Se contabiliza en 510539 contra 261015 y no suma al neto a pagar.'],
         ['prestaciones_include_transport', 'Auxilio de transporte en base de cesantías y prima', 'toggle', 'Por ley (Ley 1 de 1963, art. 7) el auxilio de transporte se suma a la base de cesantías, intereses y prima de quienes lo reciben (salario hasta 2 SMMLV y casilla activa en el empleado). Se suma el auxilio mensual completo. Desmarque solo si su contador lo indica.'],
     ]],
-    ['title' => 'Horas extras y recargos', 'desc' => 'Porcentaje adicional sobre el valor hora ordinario.', 'acc' => '#EC4899', 'preview' => 'ot', 'wide' => true, 'fields' => [
+    ['title' => 'Horas extras y recargos', 'desc' => 'Porcentaje adicional sobre el valor hora ordinario.', 'acc' => '#0F766E', 'preview' => 'ot', 'wide' => true, 'fields' => [
         ['overtime_day_rate', 'HE diurna (HED)', 'pct', 'Hora extra diurna: hora ordinaria + 25%.'],
         ['overtime_night_rate', 'HE nocturna (HEN)', 'pct', 'Hora extra nocturna: hora ordinaria + 75%.'],
         ['night_surcharge_rate', 'Recargo nocturno (RNO)', 'pct', 'Recargo nocturno ordinario: solo el 35% adicional por horas de la jornada normal trabajadas en horario nocturno. Se puede precargar desde el horario del empleado.'],
@@ -986,9 +1157,9 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
     <?php echo \SoftNova\Core\csrf_field(); ?>
     <div class="nm-param-grid">
         <?php foreach ($paramGroups as $gi => $g): ?>
-            <section class="nm-group <?php echo !empty($g['wide']) ? 'wide' : ''; ?>" style="--acc:<?php echo $g['acc']; ?>">
+            <section class="nm-group <?php echo !empty($g['wide']) ? 'wide' : ''; ?>">
                 <div class="nm-group-head">
-                    <h4><span class="nm-num"><?php echo $gi + 1; ?></span><?php echo htmlspecialchars($g['title']); ?></h4>
+                    <h4><?php echo htmlspecialchars($g['title']); ?></h4>
                     <p><?php echo htmlspecialchars($g['desc']); ?></p>
                 </div>
                 <div class="nm-fields">
@@ -1034,9 +1205,9 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
                 <?php endif; ?>
             </section>
         <?php endforeach; ?>
-        <section class="nm-group wide" style="--acc:#14B8A6">
+        <section class="nm-group wide">
             <div class="nm-group-head">
-                <h4><span class="nm-num"><?php echo count($paramGroups) + 1; ?></span>Comisiones fijas</h4>
+                <h4>Comisiones fijas</h4>
                 <p>Valor fijo por quincena para cada empleado activo. Una liquidación mensual (más de 15 días) paga 2 quincenas; una de 15 días o menos, 1. Se suma al neto como pago no salarial: no es base de salud, pensión, ARL, parafiscales ni prestaciones.</p>
             </div>
             <?php if ($commissionEmployees === []): ?>
@@ -1091,6 +1262,7 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
     Verifique los valores con su contador antes de liquidar.
 </p>
 <?php endif; ?>
+</div><!-- /.nm-shell -->
 
 <?php if ($canCreate || $canEdit): ?>
 <div id="employeeModal" class="modal-overlay" style="display:none;">
@@ -1122,6 +1294,59 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
                 <div class="form-group"><label>Teléfono</label><input class="form-control" name="phone" id="empPhone"></div>
                 <div class="form-group"><label>Estado</label><select class="form-control" name="status" id="empStatus"><option value="active">Activo</option><option value="inactive">Inactivo</option></select></div>
                 <div class="form-group" style="align-self:end;"><label class="nm-check"><input type="checkbox" name="has_transport_aid" id="empTransport" value="1" checked> Auxilio de transporte <?php echo nmTip('Solo se paga si el salario es de hasta 2 SMMLV, aunque la casilla esté marcada.'); ?></label></div>
+                <div class="form-group"><label>ARL % <?php echo nmTip('Tasa del empleado según clase de riesgo. Vacío = usa el % global de Parámetros. Clases: I 0,522 · II 1,044 · III 2,436 · IV 4,350 · V 6,960.'); ?></label>
+                    <input class="form-control" type="number" min="0" max="100" step="0.001" name="arl_rate" id="empArl" placeholder="Ej. 0.522" list="arlClassList">
+                    <datalist id="arlClassList">
+                        <?php foreach (\SoftNova\Services\PayrollService::ARL_RISK_CLASSES as $cls => $rate): ?>
+                            <option value="<?php echo htmlspecialchars((string)$rate); ?>">Clase <?php echo $cls; ?></option>
+                        <?php endforeach; ?>
+                    </datalist>
+                </div>
+                <div class="form-group" style="align-self:end;"><label class="nm-check"><input type="checkbox" name="exempt_1141" id="empExempt1141" value="1"> Forzar exoneración 114-1 <?php echo nmTip('Pone en 0% salud empleador, SENA e ICBF para este empleado. Si Parámetros tiene exoneración automática, ya aplica a salarios &lt; 10 SMMLV.'); ?></label></div>
+                <?php $pilaCats = $pilaCatalogs ?? \SoftNova\Services\PayrollPilaService::catalogs(); ?>
+                <div class="form-group full" style="margin:4px 0 0;padding-top:10px;border-top:1px dashed var(--color-border);font-size:12px;color:var(--color-text-secondary);">Afiliaciones PILA (obligatorias para exportar planilla)</div>
+                <div class="form-group"><label>EPS <?php echo nmTip('Código PILA de la EPS del empleado (ej. EPS010 Sura).'); ?></label>
+                    <select class="form-control" name="eps_code" id="empEps">
+                        <option value="">— Seleccione —</option>
+                        <?php foreach ($pilaCats['eps'] as $code => $label): ?>
+                            <option value="<?php echo htmlspecialchars($code); ?>"><?php echo htmlspecialchars($code . ' · ' . $label); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group"><label>AFP / Pensión <?php echo nmTip('Código PILA del fondo de pensiones (ej. 230301 Porvenir, 25-14 Colpensiones).'); ?></label>
+                    <select class="form-control" name="afp_code" id="empAfp">
+                        <option value="">— Seleccione —</option>
+                        <?php foreach ($pilaCats['afp'] as $code => $label): ?>
+                            <option value="<?php echo htmlspecialchars($code); ?>"><?php echo htmlspecialchars($code . ' · ' . $label); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group"><label>ARL (administradora) <?php echo nmTip('Código PILA de la ARL (ej. 14-11 Sura). Distinto del % de tarifa de riesgo.'); ?></label>
+                    <select class="form-control" name="arl_code" id="empArlCode">
+                        <option value="">— Seleccione —</option>
+                        <?php foreach ($pilaCats['arl'] as $code => $label): ?>
+                            <option value="<?php echo htmlspecialchars($code); ?>"><?php echo htmlspecialchars($code . ' · ' . $label); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group"><label>Caja de compensación <?php echo nmTip('Código PILA de la CCF (ej. CCF24 Compensar).'); ?></label>
+                    <select class="form-control" name="caja_code" id="empCaja">
+                        <option value="">— Seleccione —</option>
+                        <?php foreach ($pilaCats['caja'] as $code => $label): ?>
+                            <option value="<?php echo htmlspecialchars($code); ?>"><?php echo htmlspecialchars($code . ' · ' . $label); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group"><label>Tipo cotizante <?php echo nmTip('Por defecto 1 = Dependiente. Use 12/19 para aprendices SENA.'); ?></label>
+                    <select class="form-control" name="cotizante_type" id="empCotType">
+                        <?php foreach ($pilaCats['cotizante_type'] as $code => $label): ?>
+                            <option value="<?php echo htmlspecialchars($code); ?>"><?php echo htmlspecialchars($label); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="form-group"><label>Subtipo <?php echo nmTip('Normalmente 00. Consulte con su operador si aplica otro subtipo.'); ?></label>
+                    <input class="form-control" name="cotizante_subtype" id="empCotSub" maxlength="2" value="00" placeholder="00">
+                </div>
                 <div class="form-group full"><label>Notas</label><textarea class="form-control" name="notes" id="empNotes" rows="2"></textarea></div>
             </div></div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" onclick="closeEmployeeModal()" title="Cerrar sin guardar">Cancelar</button><button type="submit" class="btn btn-primary" title="Guardar empleado (alta o cambios)">Guardar</button></div>
@@ -1138,7 +1363,7 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
             <div class="modal-body">
                 <div class="nm-modal-grid" style="margin-bottom:12px;">
                     <div class="form-group" style="margin:0;"><label>Nombre *</label><input class="form-control" name="name" id="schName" maxlength="80" required placeholder="Ej. Turno mañana"></div>
-                    <div class="form-group" style="margin:0;"><label>Color</label><input class="form-control" type="color" name="color" id="schColor" value="#6366f1" style="height:38px;padding:4px;"></div>
+                    <div class="form-group" style="margin:0;"><label>Color</label><input class="form-control" type="color" name="color" id="schColor" value="#0F766E" style="height:38px;padding:4px;"></div>
                 </div>
                 <div class="nm-templates">
                     <span style="font-size:12px;color:var(--color-text-secondary);align-self:center;">Plantillas:</span>
@@ -1254,6 +1479,26 @@ $commissionEmployees = array_values(array_filter($employees ?? [], static fn ($e
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('incapacityModal').style.display='none'" title="Cerrar sin guardar">Cerrar</button>
                 <button type="submit" class="btn btn-primary" title="Guardar días/tipo de incapacidad y recalcular salario, aportes y neto">Recalcular</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div id="noveltiesModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:460px;">
+        <div class="modal-header"><h3>Novedades del empleado</h3><button type="button" class="modal-close" onclick="document.getElementById('noveltiesModal').style.display='none'" title="Cerrar">&times;</button></div>
+        <form method="POST" action="<?php echo $base; ?>?action=save_novelties" data-ajax="true">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="item_id" id="novItemId">
+            <input type="hidden" name="run_id" id="novRunId">
+            <div class="modal-body">
+                <div class="form-group"><label>Días no remunerados <?php echo nmTip('Suspensión, licencia no remunerada u otros días sin pago. Reducen salario y auxilio.'); ?></label><input class="form-control" type="number" min="0" max="31" name="unpaid_days" id="novUnpaid"></div>
+                <div class="form-group"><label>Días de vacaciones disfrutadas <?php echo nmTip('Vacaciones tomadas en el periodo. Se pagan al 100% del salario diario y entran al IBC.'); ?></label><input class="form-control" type="number" min="0" max="31" name="vacation_days" id="novVacDays"></div>
+                <div class="form-group"><label>Otras deducciones <?php echo nmTip('Préstamos, libranzas, embargos u otros descuentos. Se restan del neto.'); ?></label><div class="nm-input prefix"><span class="nm-affix">$</span><input class="form-control" type="text" inputmode="decimal" data-money="1" name="other_deductions" id="novOtherDed" placeholder="0"></div></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('noveltiesModal').style.display='none'" title="Cerrar sin guardar">Cerrar</button>
+                <button type="submit" class="btn btn-primary" title="Guardar novedades y recalcular la línea">Recalcular</button>
             </div>
         </form>
     </div>
@@ -1529,7 +1774,7 @@ function openScheduleModal(id) {
     document.getElementById('scheduleModalTitle').textContent = s ? 'Editar horario' : 'Nuevo horario';
     document.getElementById('schId').value = s ? s.id : 0;
     document.getElementById('schName').value = s ? s.name : '';
-    document.getElementById('schColor').value = s ? s.color : '#6366f1';
+    document.getElementById('schColor').value = s ? s.color : '#0F766E';
     document.getElementById('schNotes').value = s ? s.notes : '';
     if (s) nmSetDays(s.days); else nmTemplate('salon');
     document.getElementById('scheduleModal').style.display = 'flex';
@@ -1655,10 +1900,14 @@ function closeRunModal() {
 function openEmployeeModal() {
     document.getElementById('employeeModalTitle').textContent = 'Nuevo empleado';
     document.getElementById('empId').value = '0';
-    ['empDoc','empFirst','empLast','empPos','empSalary','empHire','empBank','empEmail','empPhone','empNotes'].forEach(function(id){ var el=document.getElementById(id); if(el) el.value=''; });
+    ['empDoc','empFirst','empLast','empPos','empSalary','empHire','empBank','empEmail','empPhone','empNotes','empArl'].forEach(function(id){ var el=document.getElementById(id); if(el) el.value=''; });
     document.getElementById('empTransport').checked = true;
+    document.getElementById('empExempt1141').checked = false;
     document.getElementById('empStatus').value = 'active';
     document.getElementById('empSchedule').value = '0';
+    ['empEps','empAfp','empArlCode','empCaja'].forEach(function(id){ var el=document.getElementById(id); if(el) el.value=''; });
+    document.getElementById('empCotType').value = '1';
+    document.getElementById('empCotSub').value = '00';
     document.getElementById('employeeModal').style.display = 'flex';
 }
 function editEmployee(e) {
@@ -1678,6 +1927,14 @@ function editEmployee(e) {
     document.getElementById('empPhone').value = e.phone || '';
     document.getElementById('empStatus').value = e.status || 'active';
     document.getElementById('empTransport').checked = String(e.has_transport_aid) === '1';
+    document.getElementById('empExempt1141').checked = String(e.exempt_1141) === '1';
+    document.getElementById('empArl').value = (e.arl_rate !== null && e.arl_rate !== undefined && e.arl_rate !== '') ? e.arl_rate : '';
+    document.getElementById('empEps').value = e.eps_code || '';
+    document.getElementById('empAfp').value = e.afp_code || '';
+    document.getElementById('empArlCode').value = e.arl_code || '';
+    document.getElementById('empCaja').value = e.caja_code || '';
+    document.getElementById('empCotType').value = e.cotizante_type || '1';
+    document.getElementById('empCotSub').value = e.cotizante_subtype || '00';
     document.getElementById('empNotes').value = e.notes || '';
     var sch = document.getElementById('empSchedule');
     sch.value = e.schedule_id ? String(e.schedule_id) : '0';
@@ -1691,5 +1948,14 @@ function editIncapacity(itemId, runId, days, type) {
     document.getElementById('incDays').value = days || 0;
     document.getElementById('incType').value = type || 'enfermedad';
     document.getElementById('incapacityModal').style.display = 'flex';
+}
+function editNovelties(itemId, runId, unpaid, vacDays, otherDed) {
+    document.getElementById('novItemId').value = itemId;
+    document.getElementById('novRunId').value = runId;
+    document.getElementById('novUnpaid').value = unpaid || 0;
+    document.getElementById('novVacDays').value = vacDays || 0;
+    var od = parseFloat(otherDed) || 0;
+    document.getElementById('novOtherDed').value = window.SeriMoney ? SeriMoney.format(od) : od;
+    document.getElementById('noveltiesModal').style.display = 'flex';
 }
 </script>

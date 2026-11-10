@@ -531,7 +531,8 @@ class TenantVentasController extends TenantController
 
     /**
      * Utilidad bruta de la venta: lo cobrado por productos (total sin domicilio al cliente)
-     * menos el costo de lo vendido. Solo para quien ve reportes o contabilidad.
+     * menos el costo de lo vendido. Margen % = utilidad / venta × 100 (sobre venta).
+     * Solo para quien ve reportes o contabilidad.
      *
      * @return array{revenue:float,cost:float,profit:float,margin_pct:float,items_without_cost:int}|null
      */

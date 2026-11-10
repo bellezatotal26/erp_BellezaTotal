@@ -807,7 +807,7 @@ function viewDetail(id) {
             var pfColor = pfProfit < 0 ? '#DC2626' : '#059669';
             h += '<div style="grid-column:1 / -1;padding:8px 10px;border-radius:8px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);">' +
                 '<strong>Utilidad de la venta:</strong> <span style="color:' + pfColor + ';font-weight:700;">' + moneyVal(pfProfit) + '</span>' +
-                ' <span style="color:var(--color-text-secondary);">(' + String(pf.margin_pct).replace('.', ',') + '% de margen)</span>' +
+                ' <span style="color:var(--color-text-secondary);">(' + String(pf.margin_pct).replace('.', ',') + '% de margen sobre venta)</span>' +
                 '<div style="font-size:12px;color:var(--color-text-secondary);margin-top:2px;">Venta de productos ' + moneyVal(pf.revenue) +
                 ' − Costo ' + moneyVal(pf.cost) + '</div>';
             if (parseInt(pf.items_without_cost, 10) > 0) {

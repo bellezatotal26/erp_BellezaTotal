@@ -295,7 +295,7 @@ class TenantInventarioController extends TenantController
         $stockFilter = (string)$this->request->get('stock_state', '');
         $channelFilter = (string)$this->request->get('channel', '');
         $locationFilter = trim((string)$this->request->get('location', ''));
-        // Utilidad hasta % (sobre costo, la misma que muestra el listado): igual o menor.
+        // Utilidad hasta % (margen sobre venta, la misma que muestra el listado): igual o menor.
         $marginMaxRaw = trim((string)$this->request->get('margin_max', ''));
         $marginMax = null;
         if ($marginMaxRaw !== '' && is_numeric(str_replace(',', '.', $marginMaxRaw))) {
@@ -344,9 +344,9 @@ class TenantInventarioController extends TenantController
             $params[] = $locationFilter;
         }
         if ($marginMax !== null) {
-            // Sin precio de compra no hay % calculable: quedan fuera.
-            $where[] = "p.purchase_price > 0
-                AND ((COALESCE(p.sale_price, 0) - p.purchase_price) / p.purchase_price * 100) <= ?";
+            // Sin precio de venta no hay margen % calculable: quedan fuera.
+            $where[] = "COALESCE(p.sale_price, 0) > 0
+                AND ((COALESCE(p.sale_price, 0) - COALESCE(p.purchase_price, 0)) / p.sale_price * 100) <= ?";
             $params[] = $marginMax;
         }
         if ($filters['q'] !== '') {
@@ -2505,7 +2505,7 @@ class TenantInventarioController extends TenantController
         return 'uploads/products/' . $filename;
     }
     
-    /** Utilidad hasta % pedida por GET (sobre costo), o null si no aplica. */
+    /** Utilidad hasta % pedida por GET (margen sobre venta), o null si no aplica. */
     private function marginMaxFromRequest(): ?float
     {
         $raw = trim((string)$this->request->get('margin_max', ''));
@@ -2559,8 +2559,8 @@ class TenantInventarioController extends TenantController
             $params[] = $locationFilter;
         }
         if ($marginMax !== null) {
-            $where[] = "p.purchase_price > 0
-                AND ((COALESCE(p.sale_price, 0) - p.purchase_price) / p.purchase_price * 100) <= ?";
+            $where[] = "COALESCE(p.sale_price, 0) > 0
+                AND ((COALESCE(p.sale_price, 0) - COALESCE(p.purchase_price, 0)) / p.sale_price * 100) <= ?";
             $params[] = $marginMax;
         }
         if ($filters['q'] !== '') {
@@ -2669,8 +2669,8 @@ class TenantInventarioController extends TenantController
             $params[] = $locationFilter;
         }
         if ($marginMax !== null) {
-            $where[] = "p.purchase_price > 0
-                AND ((COALESCE(p.sale_price, 0) - p.purchase_price) / p.purchase_price * 100) <= ?";
+            $where[] = "COALESCE(p.sale_price, 0) > 0
+                AND ((COALESCE(p.sale_price, 0) - COALESCE(p.purchase_price, 0)) / p.sale_price * 100) <= ?";
             $params[] = $marginMax;
         }
         if ($filters['q'] !== '') {

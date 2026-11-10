@@ -379,13 +379,19 @@ class CashService
         ];
     }
 
+    /**
+     * @param bool $allowClosedSession Si true, permite anotar en una caja ya cerrada
+     *        (p. ej. anulación admin/gerente de compra en efectivo del cajón) y
+     *        recalcula expected_amount / difference_amount del informe de esa caja.
+     */
     public function registerMovement(
         float $amount,
         string $description,
         string $type = 'income',
         string $referenceType = 'sale',
         ?int $referenceId = null,
-        ?int $sessionId = null
+        ?int $sessionId = null,
+        bool $allowClosedSession = false
     ): bool {
         if ($amount <= 0) {
             return false;
@@ -396,6 +402,7 @@ class CashService
         }
 
         try {
+            $sessionWasClosed = false;
             if ($sessionId === null || $sessionId <= 0) {
                 $openSession = $this->getOpenSession();
                 if (!$openSession) {
@@ -403,11 +410,19 @@ class CashService
                 }
                 $sessionId = (int)$openSession['id'];
             } else {
-                $open = $this->query(
-                    "SELECT id FROM cash_sessions WHERE id = ? AND status = 'open' LIMIT 1",
+                $sessionRow = $this->query(
+                    "SELECT id, status FROM cash_sessions WHERE id = ? LIMIT 1",
                     [$sessionId]
                 )->fetch();
-                if (!$open) {
+                if (!$sessionRow) {
+                    return false;
+                }
+                $status = (string)($sessionRow['status'] ?? '');
+                if ($status === 'open') {
+                    // ok
+                } elseif ($allowClosedSession && $status === 'closed') {
+                    $sessionWasClosed = true;
+                } else {
                     return false;
                 }
             }
@@ -436,10 +451,51 @@ class CashService
                     [$sessionId, $type, $amount, $description, $referenceType, $referenceId]
                 );
             }
+
+            if ($sessionWasClosed) {
+                $this->refreshClosedSessionArqueo($sessionId);
+            }
             return true;
         } catch (\Exception $e) {
             error_log('CashService::registerMovement error: ' . $e->getMessage());
             return false;
+        }
+    }
+
+    /**
+     * Tras un movimiento post-cierre: alinea expected_amount / difference_amount
+     * para que el informe de esa caja cerrada refleje el ajuste.
+     */
+    public function refreshClosedSessionArqueo(int $sessionId): void
+    {
+        if ($sessionId <= 0) {
+            return;
+        }
+        try {
+            $session = $this->query(
+                "SELECT * FROM cash_sessions WHERE id = ? AND status = 'closed' LIMIT 1",
+                [$sessionId]
+            )->fetch();
+            if (!$session) {
+                return;
+            }
+            $expected = $this->expectedCashForSession($session);
+            $counted = isset($session['closing_amount']) && $session['closing_amount'] !== null
+                ? round((float)$session['closing_amount'], 2)
+                : $expected;
+            $difference = round($counted - $expected, 2);
+            try {
+                $this->query(
+                    "UPDATE cash_sessions
+                     SET expected_amount = ?, difference_amount = ?
+                     WHERE id = ? AND status = 'closed'",
+                    [$expected, $difference, $sessionId]
+                );
+            } catch (\Throwable $e) {
+                // Columnas aún no migradas en algún tenant viejo.
+            }
+        } catch (\Throwable $e) {
+            error_log('CashService::refreshClosedSessionArqueo: ' . $e->getMessage());
         }
     }
     

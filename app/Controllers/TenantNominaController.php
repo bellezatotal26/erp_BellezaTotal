@@ -4,6 +4,7 @@ namespace SoftNova\Controllers;
 
 use SoftNova\Core\TenantController;
 use SoftNova\Core\TenantMiddleware;
+use SoftNova\Services\PayrollPilaService;
 use SoftNova\Services\PayrollService;
 use SoftNova\Services\PdfService;
 use SoftNova\Services\TenantOpsSchema;
@@ -41,6 +42,7 @@ class TenantNominaController extends TenantController
                 'cancel_liability_payment' => $this->cancelLiabilityPayment(),
                 'save_params' => $this->saveParams(),
                 'save_incapacity' => $this->saveIncapacity(),
+                'save_novelties' => $this->saveNovelties(),
                 'save_overtime' => $this->saveOvertime(),
                 'save_overtime_bulk' => $this->saveOvertimeBulk(),
                 'save_schedule' => $this->saveSchedule(),
@@ -69,6 +71,18 @@ class TenantNominaController extends TenantController
         }
         if ($action === 'export_runs') {
             $this->exportRuns();
+            return;
+        }
+        if ($action === 'export_run_cost') {
+            $this->exportRunCost();
+            return;
+        }
+        if ($action === 'pila_preview') {
+            $this->pilaPreview();
+            return;
+        }
+        if ($action === 'export_pila') {
+            $this->exportPila();
             return;
         }
 
@@ -152,6 +166,7 @@ class TenantNominaController extends TenantController
             'monthPayroll' => $monthPayroll,
             'liabilities' => $liabilities,
             'liabilityPayments' => $liabilityPayments,
+            'pilaCatalogs' => PayrollPilaService::catalogs(),
         ]));
     }
 
@@ -344,6 +359,14 @@ class TenantNominaController extends TenantController
                 'payment_method' => $this->request->post('payment_method', 'transfer'),
                 'bank_account' => $this->request->post('bank_account', ''),
                 'has_transport_aid' => $this->request->post('has_transport_aid', '0') === '1',
+                'arl_rate' => $this->request->post('arl_rate', ''),
+                'exempt_1141' => $this->request->post('exempt_1141', '0') === '1',
+                'eps_code' => $this->request->post('eps_code', ''),
+                'afp_code' => $this->request->post('afp_code', ''),
+                'arl_code' => $this->request->post('arl_code', ''),
+                'caja_code' => $this->request->post('caja_code', ''),
+                'cotizante_type' => $this->request->post('cotizante_type', '1'),
+                'cotizante_subtype' => $this->request->post('cotizante_subtype', '00'),
                 'status' => $this->request->post('status', 'active'),
                 'notes' => $this->request->post('notes', ''),
                 'schedule_id' => (int)$this->request->post('schedule_id', 0),
@@ -428,6 +451,96 @@ class TenantNominaController extends TenantController
         } catch (\Throwable $e) {
             $this->respond(false, $e->getMessage(), '/app/nomina?tab=runs');
         }
+    }
+
+    private function saveNovelties(): void
+    {
+        TenantMiddleware::authorize('nomina', 'edit');
+        try {
+            $itemId = (int)$this->request->post('item_id', 0);
+            $runId = (int)$this->request->post('run_id', 0);
+            $rawOther = preg_replace('/[^\d.,\-]/', '', trim((string)$this->request->post('other_deductions', '0'))) ?? '0';
+            if ($rawOther !== '' && str_contains($rawOther, ',')) {
+                $other = (float)str_replace(['.', ','], ['', '.'], $rawOther);
+            } elseif ($rawOther !== '') {
+                $other = (float)$rawOther;
+            } else {
+                $other = 0.0;
+            }
+            $this->payroll->updateItemNovelties($itemId, [
+                'unpaid_days' => (int)$this->request->post('unpaid_days', 0),
+                'vacation_days' => (int)$this->request->post('vacation_days', 0),
+                'other_deductions' => max(0.0, $other),
+            ]);
+            $this->respond(true, 'Novedades actualizadas', '/app/nomina?tab=runs&action=run_detail&id=' . $runId);
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/nomina?tab=runs');
+        }
+    }
+
+    private function exportRunCost(): void
+    {
+        TenantMiddleware::authorize('nomina', 'view');
+        $runId = (int)$this->request->get('id', 0);
+        $detail = $this->payroll->runDetail($runId);
+        if (!$detail) {
+            $this->respond(false, 'Liquidación no encontrada', '/app/nomina?tab=runs');
+            return;
+        }
+        $run = $detail['run'];
+        $items = $detail['items'];
+        $period = sprintf('%04d-%02d', (int)$run['period_year'], (int)$run['period_month']);
+        $rows = [];
+        foreach ($items as $it) {
+            $employer = (float)($it['health_employer'] ?? 0) + (float)($it['pension_employer'] ?? 0)
+                + (float)($it['arl_employer'] ?? 0) + (float)($it['caja_employer'] ?? 0)
+                + (float)($it['sena_employer'] ?? 0) + (float)($it['icbf_employer'] ?? 0);
+            $prov = (float)($it['cesantias'] ?? 0) + (float)($it['cesantias_interest'] ?? 0)
+                + (float)($it['vacation_provision'] ?? 0);
+            $ded = (float)($it['health_employee'] ?? 0) + (float)($it['pension_employee'] ?? 0)
+                + (float)($it['fsp_employee'] ?? 0) + (float)($it['other_deductions'] ?? 0);
+            $company = (float)($it['gross_pay'] ?? 0) + $employer + $prov;
+            $rows[] = [
+                $it['employee_name'] ?? '',
+                (int)($it['days_worked'] ?? 0),
+                (int)($it['unpaid_days'] ?? 0),
+                (int)($it['vacation_days'] ?? 0),
+                (int)($it['incapacity_days'] ?? 0),
+                number_format((float)($it['salary_base'] ?? 0), 2, '.', ''),
+                number_format((float)($it['vacation_pay'] ?? 0), 2, '.', ''),
+                number_format((float)($it['transport_aid'] ?? 0), 2, '.', ''),
+                number_format((float)($it['other_earnings'] ?? 0), 2, '.', ''),
+                number_format((float)($it['incapacity_pay'] ?? 0), 2, '.', ''),
+                number_format((float)($it['commission_amount'] ?? 0), 2, '.', ''),
+                number_format((float)($it['prima'] ?? 0), 2, '.', ''),
+                number_format((float)($it['gross_pay'] ?? 0), 2, '.', ''),
+                number_format((float)($it['health_employee'] ?? 0), 2, '.', ''),
+                number_format((float)($it['pension_employee'] ?? 0), 2, '.', ''),
+                number_format((float)($it['fsp_employee'] ?? 0), 2, '.', ''),
+                number_format((float)($it['other_deductions'] ?? 0), 2, '.', ''),
+                number_format($ded, 2, '.', ''),
+                number_format((float)($it['net_pay'] ?? 0), 2, '.', ''),
+                number_format((float)($it['health_employer'] ?? 0), 2, '.', ''),
+                number_format((float)($it['pension_employer'] ?? 0), 2, '.', ''),
+                number_format((float)($it['arl_employer'] ?? 0), 2, '.', ''),
+                number_format((float)($it['caja_employer'] ?? 0), 2, '.', ''),
+                number_format((float)($it['sena_employer'] ?? 0), 2, '.', ''),
+                number_format((float)($it['icbf_employer'] ?? 0), 2, '.', ''),
+                number_format($employer, 2, '.', ''),
+                number_format((float)($it['cesantias'] ?? 0), 2, '.', ''),
+                number_format((float)($it['cesantias_interest'] ?? 0), 2, '.', ''),
+                number_format((float)($it['vacation_provision'] ?? 0), 2, '.', ''),
+                number_format($prov, 2, '.', ''),
+                number_format($company, 2, '.', ''),
+            ];
+        }
+        $this->exportCsv('costo_nomina_' . $period . '_' . date('Ymd_His') . '.csv', [
+            'Empleado', 'Dias laborados', 'Dias no remunerados', 'Dias vacaciones', 'Dias incapacidad',
+            'Salario', 'Vacaciones pagadas', 'Auxilio transporte', 'HE/recargos', 'Incapacidad', 'Comision', 'Prima',
+            'Total devengado', 'Salud emp', 'Pension emp', 'FSP', 'Otras deducciones', 'Total deducciones', 'Neto',
+            'Salud empresa', 'Pension empresa', 'ARL', 'Caja', 'SENA', 'ICBF', 'Total aportes empresa',
+            'Cesantias', 'Intereses cesantias', 'Prov. vacaciones', 'Total provisiones', 'Costo empresa',
+        ], $rows);
     }
 
     private function saveOvertime(): void
@@ -675,6 +788,67 @@ class TenantNominaController extends TenantController
         }
     }
 
+    private function pilaPreview(): void
+    {
+        TenantMiddleware::authorize('nomina', 'view');
+        $id = (int)$this->request->get('id', 0);
+        try {
+            $bundle = (new PayrollPilaService($this->db))->buildFromRun($id);
+        } catch (\Throwable $e) {
+            $this->respond(false, $e->getMessage(), '/app/nomina?tab=runs');
+            return;
+        }
+        $schedules = [];
+        try {
+            $schedules = $this->payroll->schedules();
+        } catch (\Throwable $e) {
+            $schedules = [];
+        }
+        $this->view('tenant.nomina', $this->tenantViewData([
+            'tab' => 'pila',
+            'employees' => [],
+            'activeEmployees' => [],
+            'runs' => [],
+            'params' => $this->payroll->params(),
+            'schedules' => $schedules,
+            'scheduleCount' => count($schedules),
+            'detail' => null,
+            'pila' => $bundle,
+            'pilaCatalogs' => PayrollPilaService::catalogs(),
+            'q' => '',
+            'statusFilter' => '',
+            'activeCount' => $this->payroll->countEmployees('active'),
+            'monthPayroll' => $this->payroll->monthNetPayroll((int)date('Y'), (int)date('n')),
+        ]));
+    }
+
+    private function exportPila(): void
+    {
+        TenantMiddleware::authorize('nomina', 'view');
+        $id = (int)$this->request->get('id', 0);
+        $format = (string)$this->request->get('format', 'csv') === 'txt' ? 'txt' : 'csv';
+        $this->prepareExportResponse();
+        try {
+            $svc = new PayrollPilaService($this->db);
+            $bundle = $svc->buildFromRun($id);
+            $period = preg_replace('/\W+/', '', (string)$bundle['period']) ?: date('Ym');
+            if ($format === 'txt') {
+                $body = $svc->plainText($bundle);
+                header('Content-Type: text/plain; charset=utf-8');
+                header('Content-Disposition: attachment; filename="pila_' . $period . '_' . date('Ymd_His') . '.txt"');
+                echo $body;
+                exit;
+            }
+            $this->exportCsv(
+                'pila_' . $period . '_' . date('Ymd_His') . '.csv',
+                $svc->csvHeaders(),
+                $svc->csvRows($bundle)
+            );
+        } catch (\Throwable $e) {
+            $this->exportError('No se pudo exportar PILA', $e);
+        }
+    }
+
     private function runDetail(): void
     {
         $id = (int)$this->request->get('id', 0);
@@ -721,6 +895,7 @@ class TenantNominaController extends TenantController
             'detail' => $detail,
             'accountingEntry' => $accountingEntry,
             'paymentEntry' => $paymentEntry,
+            'pilaCatalogs' => PayrollPilaService::catalogs(),
             'q' => '',
             'statusFilter' => '',
             'activeCount' => count($activeEmployees),

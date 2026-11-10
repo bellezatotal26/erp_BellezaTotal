@@ -98,6 +98,9 @@ class PayrollService
         'prima_rate' => '8.33',
         'vacation_rate' => '4.17',
         'prestaciones_include_transport' => '1',
+        'auto_exempt_1141' => '1',
+        'fsp_rate' => '1',
+        'ibc_cap_smmlv' => '25',
         'payroll_monthly_hours' => '210',
         'max_weekly_hours' => '42',
         'max_daily_hours' => '8',
@@ -109,6 +112,15 @@ class PayrollService
         'dominical_rate' => '90',
         'overtime_dom_day_rate' => '115',
         'overtime_dom_night_rate' => '165',
+    ];
+
+    /** Clases de riesgo ARL (tasa % sobre IBC). */
+    public const ARL_RISK_CLASSES = [
+        'I' => 0.522,
+        'II' => 1.044,
+        'III' => 2.436,
+        'IV' => 4.350,
+        'V' => 6.960,
     ];
 
     /** Tipos de pago de pasivos laborales. */
@@ -149,6 +161,9 @@ class PayrollService
         'prima_rate' => [0, 100],
         'vacation_rate' => [0, 100],
         'prestaciones_include_transport' => [0, 1],
+        'auto_exempt_1141' => [0, 1],
+        'fsp_rate' => [0, 10],
+        'ibc_cap_smmlv' => [1, 50],
         'payroll_monthly_hours' => [1, 400],
         'max_weekly_hours' => [1, 80],
         'max_daily_hours' => [1, 24],
@@ -165,7 +180,7 @@ class PayrollService
     /** Porcentajes que por ley llevan decimales (8,5 % · 0,522 % · 66,67 % · 8,33 % · 4,17 %); el resto se guarda entero. */
     public const DECIMAL_RATE_KEYS = [
         'health_employer_rate', 'arl_employer_rate', 'incapacity_rate',
-        'cesantias_rate', 'prima_rate', 'vacation_rate',
+        'cesantias_rate', 'prima_rate', 'vacation_rate', 'fsp_rate',
     ];
 
     /**
@@ -426,6 +441,10 @@ class PayrollService
             throw new \InvalidArgumentException('Documento y nombre son obligatorios');
         }
         $salary = max(0, (float)($data['salary'] ?? 0));
+        $arlRate = null;
+        if (array_key_exists('arl_rate', $data) && $data['arl_rate'] !== '' && $data['arl_rate'] !== null) {
+            $arlRate = max(0.0, min(100.0, (float)$data['arl_rate']));
+        }
         $fields = [
             $docType, $doc, $first, $last,
             trim((string)($data['email'] ?? '')) ?: null,
@@ -437,6 +456,14 @@ class PayrollService
             trim((string)($data['payment_method'] ?? 'transfer')) ?: 'transfer',
             trim((string)($data['bank_account'] ?? '')) ?: null,
             !empty($data['has_transport_aid']) ? 1 : 0,
+            $arlRate,
+            !empty($data['exempt_1141']) ? 1 : 0,
+            strtoupper(substr(trim((string)($data['eps_code'] ?? '')), 0, 20)),
+            strtoupper(substr(trim((string)($data['afp_code'] ?? '')), 0, 20)),
+            strtoupper(substr(trim((string)($data['arl_code'] ?? '')), 0, 20)),
+            strtoupper(substr(trim((string)($data['caja_code'] ?? '')), 0, 20)),
+            preg_replace('/\D+/', '', (string)($data['cotizante_type'] ?? '1')) ?: '1',
+            str_pad(substr(preg_replace('/\D+/', '', (string)($data['cotizante_subtype'] ?? '00')) ?: '00', 0, 2), 2, '0', STR_PAD_LEFT),
             in_array(($data['status'] ?? 'active'), ['active', 'inactive'], true) ? $data['status'] : 'active',
             trim((string)($data['notes'] ?? '')) ?: null,
             $this->validScheduleId((int)($data['schedule_id'] ?? 0)),
@@ -446,7 +473,9 @@ class PayrollService
             $this->query(
                 "UPDATE employees SET document_type=?, document_number=?, first_name=?, last_name=?,
                     email=?, phone=?, position_title=?, hire_date=?, salary=?, contract_type=?,
-                    payment_method=?, bank_account=?, has_transport_aid=?, status=?, notes=?, schedule_id=?
+                    payment_method=?, bank_account=?, has_transport_aid=?, arl_rate=?, exempt_1141=?,
+                    eps_code=?, afp_code=?, arl_code=?, caja_code=?, cotizante_type=?, cotizante_subtype=?,
+                    status=?, notes=?, schedule_id=?
                  WHERE id=?",
                 array_merge($fields, [$id])
             );
@@ -456,8 +485,10 @@ class PayrollService
         $this->query(
             "INSERT INTO employees
                 (document_type, document_number, first_name, last_name, email, phone, position_title,
-                 hire_date, salary, contract_type, payment_method, bank_account, has_transport_aid, status, notes, schedule_id)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 hire_date, salary, contract_type, payment_method, bank_account, has_transport_aid,
+                 arl_rate, exempt_1141, eps_code, afp_code, arl_code, caja_code, cotizante_type, cotizante_subtype,
+                 status, notes, schedule_id)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             $fields
         );
         return (int)$this->db->lastInsertId();
@@ -834,7 +865,12 @@ class PayrollService
     }
 
     /**
-     * @param array{include_prima?:bool,include_cesantias?:bool,include_parafiscales?:bool,incapacity?:array<int,array{days?:int,type?:string}>,overtime?:array<int|string,array{day_hours?:float,night_hours?:float,dominical_hours?:float}>} $options
+     * @param array{
+     *   include_prima?:bool,include_cesantias?:bool,include_vacaciones?:bool,include_parafiscales?:bool,
+     *   incapacity?:array<int|string,array{days?:int,type?:string}>,
+     *   overtime?:array<int|string,array{day_hours?:float,night_hours?:float,dominical_hours?:float}>,
+     *   novelties?:array<int|string,array{unpaid_days?:int,vacation_days?:int,other_deductions?:float}>
+     * } $options
      * @return array<string,float|int|string>
      */
     public function calculateEmployeeLine(array $employee, int $daysWorked = 30, array $options = []): array
@@ -843,13 +879,22 @@ class PayrollService
         $periodDays = max(1, min(31, $daysWorked));
         $empId = (int)$employee['id'];
         $incCfg = $options['incapacity'][$empId] ?? $options['incapacity'][(string)$empId] ?? [];
+        $novCfg = $options['novelties'][$empId] ?? $options['novelties'][(string)$empId] ?? [];
         $incapDays = max(0, min($periodDays, (int)($incCfg['days'] ?? 0)));
         $incapType = (string)($incCfg['type'] ?? 'enfermedad');
-        $workedDays = max(0, $periodDays - $incapDays);
+        $unpaidDays = max(0, min($periodDays, (int)($novCfg['unpaid_days'] ?? 0)));
+        $vacationDays = max(0, min($periodDays, (int)($novCfg['vacation_days'] ?? 0)));
+        // Días con salario ordinario: periodo − incapacidad − no remunerados − vacaciones disfrutadas.
+        $remaining = max(0, $periodDays - $incapDays);
+        $unpaidDays = min($unpaidDays, $remaining);
+        $remaining -= $unpaidDays;
+        $vacationDays = min($vacationDays, $remaining);
+        $workedDays = max(0, $remaining - $vacationDays);
 
         $salary = (float)$employee['salary'];
         $daily = $salary / 30;
         $base = round($daily * $workedDays, 2);
+        $vacationPay = round($daily * $vacationDays, 2);
 
         $otCfg = $options['overtime'][$empId] ?? $options['overtime'][(string)$empId] ?? [];
         $ot = $this->calculateOvertime($salary, $otCfg, $p);
@@ -865,6 +910,7 @@ class PayrollService
 
         $transportEligible = !empty($employee['has_transport_aid']) && $salary <= ($p['smmlv'] * 2);
         $transport = 0.0;
+        // Auxilio solo sobre días efectivamente laborados (no vacaciones ni incapacidad ni no remunerados).
         if ($transportEligible && $workedDays > 0) {
             $transport = round(((float)$p['transport_aid'] / 30) * $workedDays, 2);
         }
@@ -895,28 +941,54 @@ class PayrollService
             $vacation = round($salary * self::provisionFraction((float)$p['vacation_rate']), 2);
         }
 
-        // Base cotización: salario + HE/dominicales (sin auxilio transporte ni prima)
-        $ibcBase = $base > 0 ? $base : round($daily * max(1, $incapDays > 0 ? min($incapDays, $periodDays) : $periodDays), 2);
+        // Base cotización: salario + vacaciones pagadas + HE/dominicales (sin auxilio transporte ni prima)
+        $ibcBase = ($base + $vacationPay) > 0
+            ? ($base + $vacationPay)
+            : round($daily * max(1, $incapDays > 0 ? min($incapDays, $periodDays) : $periodDays), 2);
         $ibc = round($ibcBase + $ot['total'], 2);
+        // Tope IBC (25 SMMLV por defecto).
+        $ibcCap = round((float)$p['smmlv'] * max(1.0, (float)($p['ibc_cap_smmlv'] ?? 25)), 2);
+        if ($ibcCap > 0 && $ibc > $ibcCap) {
+            $ibc = $ibcCap;
+        }
 
         $healthEmp = round($ibc * (float)$p['health_employee_rate'] / 100, 2);
         $pensionEmp = round($ibc * (float)$p['pension_employee_rate'] / 100, 2);
-        $healthEr = round($ibc * (float)$p['health_employer_rate'] / 100, 2);
+
+        // FSP: 1% del IBC cuando supera 4 SMMLV (simplificado; tramos altos se dejan para fase PILA).
+        $fsp = 0.0;
+        $fspFloor = (float)$p['smmlv'] * 4;
+        if ($ibc > $fspFloor && (float)($p['fsp_rate'] ?? 0) > 0) {
+            $fsp = round($ibc * (float)$p['fsp_rate'] / 100, 2);
+        }
+
+        // Exoneración art. 114-1 E.T.: salario < 10 SMMLV → salud empleador, SENA e ICBF en 0.
+        $exempt1141 = !empty($employee['exempt_1141'])
+            || (!empty($p['auto_exempt_1141']) && $salary > 0 && $salary < ((float)$p['smmlv'] * 10));
+        $healthErRate = $exempt1141 ? 0.0 : (float)$p['health_employer_rate'];
+        $healthEr = round($ibc * $healthErRate / 100, 2);
         $pensionEr = round($ibc * (float)$p['pension_employer_rate'] / 100, 2);
-        $arl = round($ibc * (float)$p['arl_employer_rate'] / 100, 2);
+
+        $arlRate = isset($employee['arl_rate']) && $employee['arl_rate'] !== null && $employee['arl_rate'] !== ''
+            ? (float)$employee['arl_rate']
+            : (float)$p['arl_employer_rate'];
+        $arl = round($ibc * max(0.0, $arlRate) / 100, 2);
 
         $caja = $sena = $icbf = 0.0;
         if (!empty($options['include_parafiscales'])) {
             $caja = round($ibc * (float)$p['caja_employer_rate'] / 100, 2);
-            $sena = round($ibc * (float)$p['sena_employer_rate'] / 100, 2);
-            $icbf = round($ibc * (float)$p['icbf_employer_rate'] / 100, 2);
+            $senaRate = $exempt1141 ? 0.0 : (float)$p['sena_employer_rate'];
+            $icbfRate = $exempt1141 ? 0.0 : (float)$p['icbf_employer_rate'];
+            $sena = round($ibc * $senaRate / 100, 2);
+            $icbf = round($ibc * $icbfRate / 100, 2);
         }
 
         // Comisión fija no salarial por quincena, fuera del IBC (no genera aportes ni prestaciones).
         $commission = max(0.0, round((float)($employee['fixed_commission'] ?? 0) * self::quincenasInPeriod($periodDays), 2));
+        $otherDed = max(0.0, round((float)($novCfg['other_deductions'] ?? 0), 2));
 
-        $gross = round($base + $transport + $prima + $incapPay + $ot['total'] + $commission, 2);
-        $deductions = round($healthEmp + $pensionEmp, 2);
+        $gross = round($base + $vacationPay + $transport + $prima + $incapPay + $ot['total'] + $commission, 2);
+        $deductions = round($healthEmp + $pensionEmp + $fsp + $otherDed, 2);
         $net = round($gross - $deductions, 2);
         $name = trim(($employee['first_name'] ?? '') . ' ' . ($employee['last_name'] ?? ''));
 
@@ -925,6 +997,9 @@ class PayrollService
             'employee_name' => $name,
             'salary_base' => $base,
             'days_worked' => $workedDays,
+            'unpaid_days' => $unpaidDays,
+            'vacation_days' => $vacationDays,
+            'vacation_pay' => $vacationPay,
             'incapacity_days' => $incapDays,
             'incapacity_pay' => $incapPay,
             'incapacity_type' => $incapDays > 0 ? $incapType : '',
@@ -947,9 +1022,11 @@ class PayrollService
             'overtime_dom_night_hours' => $ot['dom_night_hours'],
             'overtime_dom_night_amount' => $ot['dom_night_amount'],
             'other_earnings' => $ot['total'],
+            'ibc' => $ibc,
             'health_employee' => $healthEmp,
             'pension_employee' => $pensionEmp,
-            'other_deductions' => 0.0,
+            'fsp_employee' => $fsp,
+            'other_deductions' => $otherDed,
             'health_employer' => $healthEr,
             'pension_employer' => $pensionEr,
             'arl_employer' => $arl,
@@ -1083,16 +1160,17 @@ class PayrollService
         $ins = $this->db->prepare(
             "INSERT INTO payroll_items
                 (payroll_run_id, employee_id, employee_name, salary_base, days_worked, incapacity_days,
-                 incapacity_pay, incapacity_type, transport_aid, commission_amount, prima, cesantias, cesantias_interest,
+                 incapacity_pay, incapacity_type, unpaid_days, vacation_days, vacation_pay,
+                 transport_aid, commission_amount, prima, cesantias, cesantias_interest,
                  vacation_provision,
-                 other_earnings, overtime_day_hours, overtime_day_amount, overtime_night_hours, overtime_night_amount,
+                 other_earnings, ibc, overtime_day_hours, overtime_day_amount, overtime_night_hours, overtime_night_amount,
                  night_surcharge_hours, night_surcharge_amount,
                  dominical_hours, dominical_amount,
                  overtime_dom_day_hours, overtime_dom_day_amount, overtime_dom_night_hours, overtime_dom_night_amount,
-                 health_employee, pension_employee, other_deductions,
+                 health_employee, pension_employee, fsp_employee, other_deductions,
                  health_employer, pension_employer, arl_employer, caja_employer, sena_employer, icbf_employer,
                  gross_pay, net_pay)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
 
         $gross = $ded = $net = $employer = $primaT = $cesT = $vacT = $incT = $paraT = $otT = $comT = 0.0;
@@ -1101,21 +1179,22 @@ class PayrollService
             $ins->execute([
                 $runId, $line['employee_id'], $line['employee_name'], $line['salary_base'], $line['days_worked'],
                 $line['incapacity_days'], $line['incapacity_pay'], $line['incapacity_type'],
+                $line['unpaid_days'], $line['vacation_days'], $line['vacation_pay'],
                 $line['transport_aid'], $line['commission_amount'], $line['prima'], $line['cesantias'], $line['cesantias_interest'],
                 $line['vacation_provision'],
-                $line['other_earnings'], $line['overtime_day_hours'], $line['overtime_day_amount'],
+                $line['other_earnings'], $line['ibc'], $line['overtime_day_hours'], $line['overtime_day_amount'],
                 $line['overtime_night_hours'], $line['overtime_night_amount'],
                 $line['night_surcharge_hours'], $line['night_surcharge_amount'],
                 $line['dominical_hours'], $line['dominical_amount'],
                 $line['overtime_dom_day_hours'], $line['overtime_dom_day_amount'],
                 $line['overtime_dom_night_hours'], $line['overtime_dom_night_amount'],
-                $line['health_employee'], $line['pension_employee'], $line['other_deductions'],
+                $line['health_employee'], $line['pension_employee'], $line['fsp_employee'], $line['other_deductions'],
                 $line['health_employer'], $line['pension_employer'], $line['arl_employer'],
                 $line['caja_employer'], $line['sena_employer'], $line['icbf_employer'],
                 $line['gross_pay'], $line['net_pay'],
             ]);
             $gross += $line['gross_pay'];
-            $ded += $line['health_employee'] + $line['pension_employee'] + $line['other_deductions'];
+            $ded += $line['health_employee'] + $line['pension_employee'] + $line['fsp_employee'] + $line['other_deductions'];
             $net += $line['net_pay'];
             $employer += $line['health_employer'] + $line['pension_employer'] + $line['arl_employer'];
             $paraT += $line['caja_employer'] + $line['sena_employer'] + $line['icbf_employer'];
@@ -1137,12 +1216,18 @@ class PayrollService
         );
     }
 
-    /** Recalcula una línea en borrador conservando incapacidad y HE/dominicales salvo override. */
+    /**
+     * Recalcula una línea en borrador conservando incapacidad, HE y novedades salvo override.
+     * @param array{days?:int,type?:string}|null $incapOverride
+     * @param array{day_hours?:float,night_hours?:float,night_surcharge_hours?:float,dominical_hours?:float,dom_day_hours?:float,dom_night_hours?:float}|null $otOverride
+     * @param array{unpaid_days?:int,vacation_days?:int,other_deductions?:float}|null $novOverride
+     */
     private function recalcPayrollItem(
         int $itemId,
         ?array $incapOverride = null,
         ?array $otOverride = null,
-        bool $recalcTotals = true
+        bool $recalcTotals = true,
+        ?array $novOverride = null
     ): void
     {
         $item = $this->query(
@@ -1176,6 +1261,11 @@ class PayrollService
             'dom_day_hours' => (float)($item['overtime_dom_day_hours'] ?? 0),
             'dom_night_hours' => (float)($item['overtime_dom_night_hours'] ?? 0),
         ];
+        $nov = $novOverride ?? [
+            'unpaid_days' => (int)($item['unpaid_days'] ?? 0),
+            'vacation_days' => (int)($item['vacation_days'] ?? 0),
+            'other_deductions' => (float)($item['other_deductions'] ?? 0),
+        ];
 
         $line = $this->calculateEmployeeLine($emp, (int)$item['run_days'], [
             'include_prima' => !empty($item['include_prima']),
@@ -1184,26 +1274,32 @@ class PayrollService
             'include_parafiscales' => !empty($item['include_parafiscales']),
             'incapacity' => [(int)$emp['id'] => ['days' => $incapDays, 'type' => $incapType]],
             'overtime' => [(int)$emp['id'] => $ot],
+            'novelties' => [(int)$emp['id'] => $nov],
         ]);
         $this->query(
             "UPDATE payroll_items SET salary_base=?, days_worked=?, incapacity_days=?, incapacity_pay=?, incapacity_type=?,
-                transport_aid=?, commission_amount=?, prima=?, cesantias=?, cesantias_interest=?, vacation_provision=?, other_earnings=?,
+                unpaid_days=?, vacation_days=?, vacation_pay=?,
+                transport_aid=?, commission_amount=?, prima=?, cesantias=?, cesantias_interest=?, vacation_provision=?,
+                other_earnings=?, ibc=?,
                 overtime_day_hours=?, overtime_day_amount=?, overtime_night_hours=?, overtime_night_amount=?,
                 night_surcharge_hours=?, night_surcharge_amount=?,
                 dominical_hours=?, dominical_amount=?,
                 overtime_dom_day_hours=?, overtime_dom_day_amount=?, overtime_dom_night_hours=?, overtime_dom_night_amount=?,
-                health_employee=?, pension_employee=?, health_employer=?, pension_employer=?, arl_employer=?,
+                health_employee=?, pension_employee=?, fsp_employee=?, other_deductions=?,
+                health_employer=?, pension_employer=?, arl_employer=?,
                 caja_employer=?, sena_employer=?, icbf_employer=?, gross_pay=?, net_pay=? WHERE id=?",
             [
                 $line['salary_base'], $line['days_worked'], $line['incapacity_days'], $line['incapacity_pay'], $line['incapacity_type'],
+                $line['unpaid_days'], $line['vacation_days'], $line['vacation_pay'],
                 $line['transport_aid'], $line['commission_amount'], $line['prima'], $line['cesantias'], $line['cesantias_interest'],
-                $line['vacation_provision'], $line['other_earnings'],
+                $line['vacation_provision'], $line['other_earnings'], $line['ibc'],
                 $line['overtime_day_hours'], $line['overtime_day_amount'], $line['overtime_night_hours'], $line['overtime_night_amount'],
                 $line['night_surcharge_hours'], $line['night_surcharge_amount'],
                 $line['dominical_hours'], $line['dominical_amount'],
                 $line['overtime_dom_day_hours'], $line['overtime_dom_day_amount'],
                 $line['overtime_dom_night_hours'], $line['overtime_dom_night_amount'],
-                $line['health_employee'], $line['pension_employee'], $line['health_employer'], $line['pension_employer'],
+                $line['health_employee'], $line['pension_employee'], $line['fsp_employee'], $line['other_deductions'],
+                $line['health_employer'], $line['pension_employer'],
                 $line['arl_employer'], $line['caja_employer'], $line['sena_employer'], $line['icbf_employer'],
                 $line['gross_pay'], $line['net_pay'], $itemId,
             ]
@@ -1211,6 +1307,19 @@ class PayrollService
         if ($recalcTotals) {
             $this->recalcRunTotals((int)$item['payroll_run_id']);
         }
+    }
+
+    /**
+     * Actualiza novedades de un ítem en borrador (días no remunerados, vacaciones disfrutadas, otras deducciones).
+     * @param array{unpaid_days?:int,vacation_days?:int,other_deductions?:float} $novelties
+     */
+    public function updateItemNovelties(int $itemId, array $novelties): void
+    {
+        $this->recalcPayrollItem($itemId, null, null, true, [
+            'unpaid_days' => max(0, (int)($novelties['unpaid_days'] ?? 0)),
+            'vacation_days' => max(0, (int)($novelties['vacation_days'] ?? 0)),
+            'other_deductions' => max(0.0, (float)($novelties['other_deductions'] ?? 0)),
+        ]);
     }
 
     /** Actualiza incapacidad de un ítem en borrador y recalcula la línea. */
@@ -1341,7 +1450,8 @@ class PayrollService
     private function recalcRunTotals(int $runId): void
     {
         $sum = $this->query(
-            "SELECT COALESCE(SUM(gross_pay),0) g, COALESCE(SUM(health_employee+pension_employee+other_deductions),0) d,
+            "SELECT COALESCE(SUM(gross_pay),0) g,
+                    COALESCE(SUM(health_employee+pension_employee+COALESCE(fsp_employee,0)+other_deductions),0) d,
                     COALESCE(SUM(net_pay),0) n,
                     COALESCE(SUM(health_employer+pension_employer+arl_employer),0) e,
                     COALESCE(SUM(prima),0) p, COALESCE(SUM(cesantias+cesantias_interest),0) c,

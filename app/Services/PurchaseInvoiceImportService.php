@@ -446,6 +446,7 @@ class PurchaseInvoiceImportService
         $paymentMode = in_array($meta['payment_mode'] ?? '', ['payable', 'cash', 'transfer', 'card'], true)
             ? (string)$meta['payment_mode']
             : 'payable';
+        [$cashFromDrawer, $cashSourceNote] = $this->normalizeCashSourceMeta($meta, $paymentMode);
         $earlyPct = isset($meta['early_payment_discount_pct']) && $meta['early_payment_discount_pct'] !== ''
             ? max(0, min(100, round((float)$meta['early_payment_discount_pct'], 2)))
             : 0.0;
@@ -573,8 +574,54 @@ class PurchaseInvoiceImportService
                 // Columna aún no migrada.
             }
         }
+        $this->persistImportCashSource($importId, $cashFromDrawer, $cashSourceNote);
 
         return $importId;
+    }
+
+    /**
+     * @return array{0:?int,1:?string} [cash_from_drawer (1/0/null), note]
+     */
+    private function normalizeCashSourceMeta(array $meta, string $paymentMode): array
+    {
+        if ($paymentMode !== 'cash') {
+            return [null, null];
+        }
+        $source = strtolower(trim((string)($meta['cash_source'] ?? '')));
+        if ($source === '' && array_key_exists('cash_from_drawer', $meta)) {
+            $source = ((int)$meta['cash_from_drawer'] === 0) ? 'other' : 'drawer';
+        }
+        if ($source !== 'drawer' && $source !== 'other') {
+            // Compat: sin dato → cajón (comportamiento histórico).
+            $source = 'drawer';
+        }
+        $fromDrawer = $source !== 'other';
+        $note = trim((string)($meta['cash_source_note'] ?? ''));
+        if (!$fromDrawer) {
+            if (mb_strlen($note) < 5) {
+                throw new \InvalidArgumentException(
+                    'Indique de dónde salió el efectivo (mín. 5 caracteres) cuando no descuenta del cajón.'
+                );
+            }
+            $note = substr($note, 0, 255);
+        } else {
+            $note = null;
+        }
+        return [$fromDrawer ? 1 : 0, $note];
+    }
+
+    private function persistImportCashSource(int $importId, ?int $cashFromDrawer, ?string $cashSourceNote): void
+    {
+        try {
+            $this->query(
+                "UPDATE purchase_invoice_imports
+                 SET cash_from_drawer = ?, cash_source_note = ?
+                 WHERE id = ?",
+                [$cashFromDrawer, $cashSourceNote, $importId]
+            );
+        } catch (\Throwable $e) {
+            // Columnas aún no migradas.
+        }
     }
 
     public static function normalizeDocumentKind(string $kind): string
@@ -3518,14 +3565,16 @@ class PurchaseInvoiceImportService
             }
         }
 
+        $paymentModeHdr = in_array($meta['payment_mode'] ?? '', ['payable', 'cash', 'transfer', 'card'], true)
+            ? (string)$meta['payment_mode']
+            : 'payable';
+        [$cashFromDrawerHdr, $cashSourceNoteHdr] = $this->normalizeCashSourceMeta($meta, $paymentModeHdr);
         $headerParams = [
             !empty($meta['supplier_id']) ? (int)$meta['supplier_id'] : null,
             substr(trim((string)($meta['invoice_number'] ?? '')), 0, 80),
             $this->normalizeDate($meta['invoice_date'] ?? null),
             $this->normalizeDate($meta['due_date'] ?? null),
-            in_array($meta['payment_mode'] ?? '', ['payable', 'cash', 'transfer', 'card'], true)
-                ? (string)$meta['payment_mode']
-                : 'payable',
+            $paymentModeHdr,
             isset($meta['early_payment_discount_pct']) && $meta['early_payment_discount_pct'] !== ''
                 ? max(0, min(100, round((float)$meta['early_payment_discount_pct'], 2)))
                 : 0.0,
@@ -3599,6 +3648,13 @@ class PurchaseInvoiceImportService
             } catch (\Throwable $e) {
                 // Columna aún no migrada.
             }
+        }
+        if (array_key_exists('cash_source', $meta)
+            || array_key_exists('cash_from_drawer', $meta)
+            || array_key_exists('cash_source_note', $meta)
+            || array_key_exists('payment_mode', $meta)
+        ) {
+            $this->persistImportCashSource($importId, $cashFromDrawerHdr, $cashSourceNoteHdr);
         }
 
         // IVA personalizado (F. Normal): monto exacto de la factura → 240802 al confirmar.
@@ -4159,12 +4215,25 @@ class PurchaseInvoiceImportService
             }
         }
 
+        $payModeConfirm = (string)($import['payment_mode'] ?? 'payable');
+        $cashOpts = [];
+        if ($payModeConfirm === 'cash') {
+            $fromDrawer = !array_key_exists('cash_from_drawer', $import)
+                || $import['cash_from_drawer'] === null
+                || $import['cash_from_drawer'] === ''
+                || (int)$import['cash_from_drawer'] === 1;
+            $cashOpts = [
+                'cash_from_drawer' => $fromDrawer,
+                'cash_source_note' => (string)($import['cash_source_note'] ?? ''),
+            ];
+        }
         $purchasing->receiveOrder(
             $orderId,
             $fechaBodega,
             (string)($import['invoice_number'] ?? ''),
-            (string)($import['payment_mode'] ?? 'payable'),
-            'Ingreso por factura importada'
+            $payModeConfirm,
+            'Ingreso por factura importada',
+            $cashOpts
         );
 
         $reviewNotes = trim((string)($import['review_notes'] ?? ''));
@@ -4406,7 +4475,7 @@ class PurchaseInvoiceImportService
 
     /**
      * Crea el producto de una línea sin coincidencia. El precio de venta se
-     * estima con el margen configurado para que quede vendible de inmediato.
+     * estima con el margen sobre venta configurado para que quede vendible de inmediato.
      * El IVA (tax_rate) tipifica el producto para ventas; el purchase_price es el valor total de compra.
      */
     private function createProductFromLine(array $item, bool $vatInCost = false): int
@@ -4438,7 +4507,7 @@ class PurchaseInvoiceImportService
         }
         $precioVenta = !empty($item['sale_price']) && (float)$item['sale_price'] > 0
             ? round((float)$item['sale_price'], 2)
-            : round($purchasePrice * (1 + $this->defaultMarginPct() / 100), 2);
+            : $this->salePriceFromMarginOnSale($purchasePrice, $this->defaultMarginPct());
         TaxService::ensureSchema($this->db);
 
         $this->query(
@@ -5469,10 +5538,29 @@ class PurchaseInvoiceImportService
                 "SELECT setting_value FROM settings WHERE setting_key = 'default_margin_pct' LIMIT 1"
             )->fetchColumn();
             $margen = (float)$valor;
-            return $margen > 0 ? min(500, $margen) : 30.0;
+            // Margen sobre venta: tope < 100% (si fuera 100% el costo sería $0).
+            return $margen > 0 ? min(99.0, $margen) : 30.0;
         } catch (\Throwable $e) {
             return 30.0;
         }
+    }
+
+    /**
+     * Precio de venta a partir del costo con margen % sobre la venta.
+     * venta = costo / (1 − margen/100). Ej.: margen 30% → venta = costo / 0,70.
+     */
+    private function salePriceFromMarginOnSale(float $cost, float $marginPct): float
+    {
+        $cost = round(max(0, $cost), 2);
+        $marginPct = max(0.0, min(99.0, $marginPct));
+        if ($cost < 0.01) {
+            return 0.0;
+        }
+        $factor = 1 - ($marginPct / 100);
+        if ($factor < 0.01) {
+            $factor = 0.01;
+        }
+        return round($cost / $factor, 2);
     }
 
     private function refreshTotals(int $importId): void

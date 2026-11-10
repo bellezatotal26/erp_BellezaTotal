@@ -43,6 +43,7 @@ $canCreate = \SoftNova\Core\TenantMiddleware::canDo('create', 'compras');
 $needBarcode = !$creditNotesPanel;
 $canEdit = \SoftNova\Core\TenantMiddleware::canDo('edit', 'compras');
 $canDelete = \SoftNova\Core\TenantMiddleware::canDo('delete', 'compras');
+$canManageInvoices = \SoftNova\Core\TenantMiddleware::isManagement();
 $comprasBase = $viewInstance->route('app/compras');
 
 if (!function_exists('fmtC')) {
@@ -874,6 +875,33 @@ function openPurchaseLimitModal() {
                             <td style="font-size:12px;"><?php echo htmlspecialchars($o['accounting_entry_id'] ? ('#' . $o['accounting_entry_id']) : '—'); ?></td>
                             <td class="table-actions" style="white-space:nowrap;">
                                 <button type="button" class="btn btn-sm btn-secondary" onclick="viewPurchase(<?php echo (int)$o['id']; ?>)" title="Ver detalle, historial y trazabilidad">Ver</button>
+                                <?php if (!$isVoided && $canManageInvoices && $canEdit): ?>
+                                    <?php
+                                    $editPayload = htmlspecialchars(json_encode([
+                                        'id' => (int)$o['id'],
+                                        'order' => (string)$o['order_number'],
+                                        'invoice' => (string)($o['invoice_number'] ?? ''),
+                                        'invoice_date' => !empty($o['invoice_date']) ? substr((string)$o['invoice_date'], 0, 10) : '',
+                                        'invoice_due_date' => !empty($o['invoice_due_date']) ? substr((string)$o['invoice_due_date'], 0, 10) : '',
+                                        'due_date' => !empty($o['due_date']) ? substr((string)$o['due_date'], 0, 10) : '',
+                                        'warehouse_date' => !empty($o['warehouse_date']) ? substr((string)$o['warehouse_date'], 0, 10) : '',
+                                        'payment_mode' => (string)($o['payment_mode'] ?? 'payable'),
+                                        'cash_from_drawer' => array_key_exists('cash_from_drawer', $o) && $o['cash_from_drawer'] !== null && $o['cash_from_drawer'] !== ''
+                                            ? (int)$o['cash_from_drawer']
+                                            : null,
+                                        'cash_source_note' => (string)($o['cash_source_note'] ?? ''),
+                                        'paid_total' => (float)($o['paid_total'] ?? 0),
+                                        'credit_total' => (float)($o['credit_total'] ?? 0),
+                                        'lock_payment' => (
+                                            ((string)($o['payment_mode'] ?? '') === 'payable' && (float)($o['paid_total'] ?? 0) > 0.009)
+                                            || (float)($o['credit_total'] ?? 0) > 0.009
+                                        ),
+                                    ], JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP), ENT_QUOTES);
+                                    ?>
+                                    <button type="button" class="btn btn-sm btn-secondary"
+                                            onclick="openEditInvoiceModal(<?php echo $editPayload; ?>)"
+                                            title="Editar fechas y forma de pago (solo admin/gerencia)">Editar</button>
+                                <?php endif; ?>
                                 <?php
                                 $hasObs = trim((string)($o['review_notes'] ?? '')) !== '';
                                 $obsPayload = htmlspecialchars(json_encode([
@@ -1101,13 +1129,34 @@ function openPurchaseLimitModal() {
                     </div>
                 </div>
                 <div class="form-group" style="margin:0;">
-                    <label>Pago / contrapartida * <span class="field-tip" data-tip="Crédito = queda por pagar (220505). Efectivo/transferencia/tarjeta = sale de caja o bancos al recibir." tabindex="0">?</span></label>
-                    <select name="payment_mode" class="form-control" required>
+                    <label>Pago / contrapartida * <span class="field-tip" data-tip="Crédito = queda por pagar (220505). Efectivo: indique cajón u otro origen. Transferencia/tarjeta = bancos." tabindex="0">?</span></label>
+                    <select name="payment_mode" id="receivePaymentMode" class="form-control" required onchange="syncInvoiceCashSourceUi('receive')">
                         <option value="payable">Por pagar (220505) + IVA descontable</option>
-                        <option value="cash">Efectivo (sale del cajón)</option>
+                        <option value="cash">Efectivo</option>
                         <option value="transfer">Transferencia</option>
                         <option value="card">Tarjeta</option>
                     </select>
+                </div>
+            </div>
+            <div id="receiveCashSourceWrap" class="form-group" style="display:none;border-radius:10px;">
+                <label>Origen del efectivo * <span class="field-tip" data-tip="Caja: descuenta el cajón abierto. Otro: no toca la caja; asiento a bancos." tabindex="0">?</span></label>
+                <div style="display:flex;flex-wrap:wrap;gap:14px;margin:6px 0 8px;">
+                    <label style="display:flex;align-items:center;gap:6px;font-weight:500;cursor:pointer;">
+                        <input type="radio" name="cash_source" id="receiveCashDrawer" value="drawer" onchange="syncInvoiceCashSourceUi('receive')">
+                        Caja (descuenta del cajón)
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-weight:500;cursor:pointer;">
+                        <input type="radio" name="cash_source" id="receiveCashOther" value="other" onchange="syncInvoiceCashSourceUi('receive')">
+                        Otro (no descuenta de caja)
+                    </label>
+                </div>
+                <p id="receiveCashOriginWarn" style="display:none;font-size:12.5px;font-weight:600;color:var(--dmc-B45309, #B45309);margin:0 0 8px;">
+                    Elija el origen del efectivo: de este dato depende el saldo del cajón.
+                </p>
+                <div id="receiveCashOtherWrap" style="display:none;">
+                    <label for="receiveCashSourceNote">¿De dónde salió el efectivo? *</label>
+                    <textarea name="cash_source_note" id="receiveCashSourceNote" class="form-control" rows="2"
+                              placeholder="Ej: caja fuerte, retiro bancario, fondos del dueño…" maxlength="255"></textarea>
                 </div>
             </div>
             <div class="form-group">
@@ -1118,7 +1167,7 @@ function openPurchaseLimitModal() {
                 <label>Notas <span class="field-tip" data-tip="Comentarios de la recepción (faltantes, novedades, calidad)." tabindex="0">?</span></label>
                 <input type="text" name="notes" class="form-control">
             </div>
-            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 8px;">Si elige <strong>Efectivo</strong>, debe haber una caja abierta: el total se registra como egreso en Caja.</p>
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 8px;">Si elige <strong>Efectivo → Caja</strong>, debe haber una caja abierta: el total se registra como egreso en Caja.</p>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" onclick="document.getElementById('receiveModal').style.display='none'">Cancelar</button>
                 <button type="submit" class="btn btn-success">Recibir y contabilizar</button>
@@ -1154,6 +1203,83 @@ function openPurchaseLimitModal() {
         </form>
     </div>
 </div>
+
+<?php if ($canManageInvoices && $canEdit): ?>
+<!-- Modal editar factura recibida (admin / gerencia) -->
+<div id="editInvoiceModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content neumorphic" style="max-width:560px;max-height:90vh;overflow-y:auto;">
+        <div class="modal-header">
+            <h3>Editar factura</h3>
+            <button type="button" class="modal-close" onclick="document.getElementById('editInvoiceModal').style.display='none'">&times;</button>
+        </div>
+        <form method="POST" action="<?php echo $viewInstance->route('app/compras'); ?>?action=update_received_invoice" data-ajax="true" id="editInvoiceForm">
+            <?php echo \SoftNova\Core\csrf_field(); ?>
+            <input type="hidden" name="id" id="editInvId" value="">
+            <p id="editInvLabel" style="font-weight:600;margin-bottom:12px;"></p>
+            <p style="font-size:12px;color:var(--color-text-secondary);margin:0 0 12px;">
+                Corrige fechas y forma de pago. No modifica productos, costos ni inventario.
+                La recepción de bodega no se cambia aquí (define el asiento e inventario).
+            </p>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                <div class="form-group" style="margin:0;grid-column:1/-1;">
+                    <label>N° factura proveedor</label>
+                    <input type="text" name="invoice_number" id="editInvNumber" class="form-control" maxlength="80">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>Fecha de factura</label>
+                    <input type="date" name="invoice_date" id="editInvDate" class="form-control">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>Vence en factura</label>
+                    <input type="date" name="invoice_due_date" id="editInvDuePrinted" class="form-control">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>Vence pago (CxP)</label>
+                    <input type="date" name="due_date" id="editInvDueCxp" class="form-control">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label>Forma de pago</label>
+                    <select name="payment_mode" id="editInvPaymentMode" class="form-control" onchange="syncInvoiceCashSourceUi('edit')">
+                        <option value="payable">Crédito (CxP)</option>
+                        <option value="cash">Efectivo</option>
+                        <option value="transfer">Transferencia</option>
+                        <option value="card">Tarjeta</option>
+                    </select>
+                    <small id="editInvPaymentLock" style="display:none;color:var(--dmc-B45309, #B45309);">
+                        Forma de pago bloqueada: hay abonos o notas de crédito.
+                    </small>
+                </div>
+            </div>
+            <div id="editCashSourceWrap" class="form-group" style="display:none;border-radius:10px;margin-top:12px;">
+                <label>Origen del efectivo *</label>
+                <div style="display:flex;flex-wrap:wrap;gap:14px;margin:6px 0 8px;">
+                    <label style="display:flex;align-items:center;gap:6px;font-weight:500;cursor:pointer;">
+                        <input type="radio" name="cash_source" id="editCashDrawer" value="drawer" onchange="syncInvoiceCashSourceUi('edit')">
+                        Caja (descuenta del cajón)
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-weight:500;cursor:pointer;">
+                        <input type="radio" name="cash_source" id="editCashOther" value="other" onchange="syncInvoiceCashSourceUi('edit')">
+                        Otro (no descuenta de caja)
+                    </label>
+                </div>
+                <p id="editCashOriginWarn" style="display:none;font-size:12.5px;font-weight:600;color:var(--dmc-B45309, #B45309);margin:0 0 8px;">
+                    Elija el origen del efectivo.
+                </p>
+                <div id="editCashOtherWrap" style="display:none;">
+                    <label for="editCashSourceNote">¿De dónde salió el efectivo? *</label>
+                    <textarea name="cash_source_note" id="editCashSourceNote" class="form-control" rows="2" maxlength="255"
+                              placeholder="Ej: caja fuerte, retiro bancario…"></textarea>
+                </div>
+            </div>
+            <p id="editInvWhHint" style="font-size:12px;color:var(--color-text-secondary);margin:10px 0 0;"></p>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('editInvoiceModal').style.display='none'">Cancelar</button>
+                <button type="submit" class="btn btn-primary" id="editInvSubmitBtn">Guardar cambios</button>
+            </div>
+        </form>
+    </div>
+</div>
+<?php endif; ?>
 
 <!-- Modal Abono a proveedor -->
 <div id="payModal" class="modal-overlay" style="display:none;">
@@ -1676,13 +1802,34 @@ function openPurchaseLimitModal() {
                         </div>
                     </div>
                     <div class="form-group">
-                        <label>Forma de pago <span class="field-tip" data-tip="Crédito deja saldo por pagar. Efectivo/transferencia/tarjeta liquidan al confirmar el ingreso." tabindex="0">?</span></label>
-                        <select name="payment_mode" class="form-control">
+                        <label>Forma de pago <span class="field-tip" data-tip="Crédito deja saldo por pagar. Efectivo: indique si sale del cajón u otro origen. Transferencia/tarjeta liquidan desde bancos." tabindex="0">?</span></label>
+                        <select name="payment_mode" id="uploadPaymentMode" class="form-control" onchange="syncInvoiceCashSourceUi('upload')">
                             <option value="payable">Crédito (cuenta por pagar)</option>
                             <option value="cash">Efectivo</option>
                             <option value="transfer">Transferencia</option>
                             <option value="card">Tarjeta</option>
                         </select>
+                    </div>
+                    <div id="uploadCashSourceWrap" class="form-group" style="display:none;border-radius:10px;">
+                        <label>Origen del efectivo * <span class="field-tip" data-tip="Caja: descuenta el cajón abierto (110505). Otro: no toca la caja; el asiento usa bancos (111005)." tabindex="0">?</span></label>
+                        <div style="display:flex;flex-wrap:wrap;gap:14px;margin:6px 0 8px;">
+                            <label style="display:flex;align-items:center;gap:6px;font-weight:500;cursor:pointer;">
+                                <input type="radio" name="cash_source" id="uploadCashDrawer" value="drawer" onchange="syncInvoiceCashSourceUi('upload')">
+                                Caja (descuenta del cajón)
+                            </label>
+                            <label style="display:flex;align-items:center;gap:6px;font-weight:500;cursor:pointer;">
+                                <input type="radio" name="cash_source" id="uploadCashOther" value="other" onchange="syncInvoiceCashSourceUi('upload')">
+                                Otro (no descuenta de caja)
+                            </label>
+                        </div>
+                        <p id="uploadCashOriginWarn" style="display:none;font-size:12.5px;font-weight:600;color:var(--dmc-B45309, #B45309);margin:0 0 8px;">
+                            Elija el origen del efectivo: de este dato depende el saldo del cajón.
+                        </p>
+                        <div id="uploadCashOtherWrap" style="display:none;">
+                            <label for="uploadCashSourceNote">¿De dónde salió el efectivo? *</label>
+                            <textarea name="cash_source_note" id="uploadCashSourceNote" class="form-control" rows="2"
+                                      placeholder="Ej: caja fuerte, retiro bancario, fondos del dueño…" maxlength="255"></textarea>
+                        </div>
                     </div>
                     <input type="hidden" name="early_payment_discount_pct" value="0">
                     <div class="form-group">
@@ -1996,7 +2143,7 @@ window.poProducts = <?php echo json_encode(array_map(static function ($p) {
         'tax_rate' => (float)($p['tax_rate'] ?? 0),
     ];
 }, $products), JSON_UNESCAPED_UNICODE); ?>;
-window.poMarginWarnPct = 10;
+window.poMarginWarnPct = 27;
 window.poDefaultTaxRate = <?php echo json_encode((float)($defaultTaxRate ?? 0)); ?>;
 window.comprasBase = <?php echo json_encode($comprasBase); ?>;
 var comprasBase = window.comprasBase;
@@ -2992,11 +3139,27 @@ function renderInvoiceReview(imp, items) {
             : (imp.commercial_discount_amount != null && imp.commercial_discount_amount !== '' ? imp.commercial_discount_amount : '0')) +
          '" placeholder="$ monto" oninput="recalcInvoiceReviewTotals()" autocomplete="off">' +
          '</div></div>';
-    h += '<div class="form-group" style="margin:0;"><label>Forma de pago' + tip('Crédito = CxP. Efectivo sale del cajón; transferencia/tarjeta de bancos.') + '</label><select name="payment_mode" class="form-control">';
-    [['payable','Crédito (CxP)'],['cash','Efectivo (sale del cajón)'],['transfer','Transferencia'],['card','Tarjeta']].forEach(function(o) {
+    h += '<div class="form-group" style="margin:0;"><label>Forma de pago' + tip('Crédito = CxP. Efectivo: elija cajón u otro origen. Transferencia/tarjeta = bancos.') + '</label><select name="payment_mode" id="reviewPaymentMode" class="form-control" onchange="syncInvoiceCashSourceUi(\'review\')">';
+    [['payable','Crédito (CxP)'],['cash','Efectivo'],['transfer','Transferencia'],['card','Tarjeta']].forEach(function(o) {
         h += '<option value="' + o[0] + '"' + (imp.payment_mode === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
     });
     h += '</select></div>';
+    var cashDrawerSel = String(imp.cash_from_drawer) === '0' ? false : (String(imp.cash_from_drawer) === '1');
+    var cashOtherSel = String(imp.cash_from_drawer) === '0';
+    var cashChosen = cashDrawerSel || cashOtherSel;
+    h += '<div id="reviewCashSourceWrap" class="form-group" style="margin:0;grid-column:1/-1;display:' + (imp.payment_mode === 'cash' ? '' : 'none') + ';border-radius:10px;">' +
+         '<label>Origen del efectivo *' + tip('Caja: descuenta el cajón. Otro: no toca la caja; asiento a bancos (111005).') + '</label>' +
+         '<div style="display:flex;flex-wrap:wrap;gap:14px;margin:6px 0 8px;">' +
+         '<label style="display:flex;align-items:center;gap:6px;font-weight:500;cursor:pointer;">' +
+         '<input type="radio" name="cash_source" id="reviewCashDrawer" value="drawer"' + (cashDrawerSel ? ' checked' : '') + ' onchange="syncInvoiceCashSourceUi(\'review\')"> Caja (descuenta del cajón)</label>' +
+         '<label style="display:flex;align-items:center;gap:6px;font-weight:500;cursor:pointer;">' +
+         '<input type="radio" name="cash_source" id="reviewCashOther" value="other"' + (cashOtherSel ? ' checked' : '') + ' onchange="syncInvoiceCashSourceUi(\'review\')"> Otro (no descuenta de caja)</label>' +
+         '</div>' +
+         '<p id="reviewCashOriginWarn" style="display:' + (imp.payment_mode === 'cash' && !cashChosen ? '' : 'none') + ';font-size:12.5px;font-weight:600;color:var(--dmc-B45309, #B45309);margin:0 0 8px;">Elija el origen del efectivo: de este dato depende el saldo del cajón.</p>' +
+         '<div id="reviewCashOtherWrap" style="display:' + (cashOtherSel ? '' : 'none') + ';">' +
+         '<label for="reviewCashSourceNote">¿De dónde salió el efectivo? *</label>' +
+         '<textarea name="cash_source_note" id="reviewCashSourceNote" class="form-control" rows="2" maxlength="255" placeholder="Ej: caja fuerte, retiro bancario…">' +
+         esc(imp.cash_source_note || '') + '</textarea></div></div>';
     h += '<div class="form-group" style="margin:0;grid-column:1/-1;"><label>Nota / observación' +
          tip('Queda guardada en el Detalle de compra y en el historial de movimientos (trazabilidad).') + '</label>' +
          '<textarea name="review_notes" id="reviewNotes" class="form-control" rows="2" maxlength="2000" ' +
@@ -3078,7 +3241,7 @@ function renderInvoiceReview(imp, items) {
          '<th style="' + thStyle + '">Dcto %</th>' +
          '<th style="' + thStyle + '" title="Lote arriba · Vencimiento abajo">Lote / Vence</th>' +
          '<th style="' + thStyle + '" title="Precio de costo con el que queda el producto en inventario (y valor de la entrada en kardex). Vacío = automático: costo factura con descuento, + IVA en F. Normal">Costo inventario</th>' +
-         '<th style="' + thStyle + '" title="Precio de venta del catálogo (se autocompleta al emparejar). Se compara con el costo para alertar margen bajo o pérdida.">P. venta</th>' +
+         '<th style="' + thStyle + '" title="Precio de venta del catálogo (se autocompleta al emparejar). Margen % = (P. venta − costo) ÷ P. venta × 100.">P. venta</th>' +
          '<th style="' + thStyle + '">Total</th>' +
          '<th style="' + thStyle + '"></th>' +
          '</tr></thead><tbody>';
@@ -3223,6 +3386,7 @@ function renderInvoiceReview(imp, items) {
         reviewWh.onchange = function() { poRemember(reviewWh.value); };
     }
     poBindDueCalc('reviewWarehouseDate', 'reviewPaymentTermDays', 'reviewDueDate', 'reviewInvoiceDueDate', 'reviewInvoiceDate');
+    syncInvoiceCashSourceUi('review');
     document.getElementById('invoiceReviewModal').style.display = 'flex';
     poSyncInvoiceModalScrollLock();
 }
@@ -3577,6 +3741,9 @@ function confirmInvoiceReceive() {
     if (wh && invDateEl && !poEnsureWarehouseNotBeforeInvoice(invDateEl, wh)) {
         return false;
     }
+    if (!assertInvoiceCashSource('review')) {
+        return false;
+    }
     // Recalcular CxP antes de enviar (bodega+días o = vence factura).
     poSyncDueDates(
         document.getElementById('reviewWarehouseDate'),
@@ -3924,7 +4091,7 @@ function refreshInvoiceInvCostHint(tr, qty, lineBase, action, taxPct, vatInCost,
     return effective;
 }
 
-/** Alerta costo inventario vs P. venta: rojo si costo ≥ venta; ámbar si margen < poMarginWarnPct. No bloquea confirmar. */
+/** Alerta costo inventario vs P. venta: rojo si costo ≥ venta; ámbar si margen sobre venta < poMarginWarnPct. No bloquea confirmar. */
 function refreshInvoiceMarginHint(tr, effectiveCost, action) {
     var hint = tr ? tr.querySelector('.inv-margin-hint') : null;
     if (!hint) return null;
@@ -3938,18 +4105,18 @@ function refreshInvoiceMarginHint(tr, effectiveCost, action) {
     var saleEl = tr.querySelector('input[name$="[sale_price]"]');
     var sale = saleEl ? invoiceParseMoneyVal(saleEl.value) : 0;
     var cost = parseFloat(effectiveCost) || 0;
-    if (!(cost > 0.009)) {
-        hint.textContent = '';
-        hint.style.color = '';
-        hint.style.fontWeight = '';
-        hint.title = '';
-        return null;
-    }
     if (!(sale > 0.009)) {
         hint.textContent = 'Sin P. venta';
         hint.style.color = 'var(--color-text-secondary)';
         hint.style.fontWeight = '';
         hint.title = 'Indique P. venta o empareje un producto del catálogo.';
+        return null;
+    }
+    if (!(cost > 0.009)) {
+        hint.textContent = '';
+        hint.style.color = '';
+        hint.style.fontWeight = '';
+        hint.title = '';
         return null;
     }
     if (cost >= sale - 0.009) {
@@ -3959,19 +4126,20 @@ function refreshInvoiceMarginHint(tr, effectiveCost, action) {
         hint.title = 'El costo de inventario es igual o mayor al precio de venta (sin utilidad).';
         return 'loss';
     }
-    var margin = ((sale - cost) / cost) * 100;
-    var warnPct = parseFloat(window.poMarginWarnPct) || 10;
+    // Margen % sobre venta = (venta − costo) / venta × 100 (misma lógica que Inventario / Ventas).
+    var margin = ((sale - cost) / sale) * 100;
+    var warnPct = parseFloat(window.poMarginWarnPct) || 27;
     if (margin < warnPct) {
-        hint.textContent = 'Margen ' + margin.toFixed(1) + '% (< ' + warnPct + '%)';
+        hint.textContent = 'Margen ' + margin.toFixed(1) + '%';
         hint.style.color = 'var(--dmc-B45309, #B45309)';
         hint.style.fontWeight = '600';
-        hint.title = 'Utilidad sobre costo por debajo del ' + warnPct + '%. Puede confirmar igual.';
+        hint.title = 'Margen sobre venta menor a ' + warnPct.toFixed(1) + '%. Puede confirmar igual.';
         return 'low';
     }
     hint.textContent = 'Margen ' + margin.toFixed(1) + '%';
     hint.style.color = 'var(--dmc-047857, #047857)';
     hint.style.fontWeight = '500';
-    hint.title = '';
+    hint.title = 'Margen sobre venta = (P. venta − costo) / P. venta × 100';
     return 'ok';
 }
 
@@ -4131,7 +4299,7 @@ function recalcInvoiceReviewTotals() {
 
     var marginSummary = body.querySelector('#invMarginSummary');
     if (marginSummary) {
-        var warnPct = parseFloat(window.poMarginWarnPct) || 10;
+        var warnPct = parseFloat(window.poMarginWarnPct) || 27;
         var parts = [];
         if (marginLoss > 0) {
             parts.push('<span style="color:var(--dmc-DC2626, #DC2626);font-weight:700;">' + marginLoss + ' con costo ≥ P. venta</span>');
@@ -4143,9 +4311,9 @@ function recalcInvoiceReviewTotals() {
             marginSummary.innerHTML = 'Costo inventario vs P. venta: ' + parts.join(' · ') +
                 ' <span style="color:var(--color-text-secondary);font-weight:400;">(aviso; puede confirmar igual)</span>';
         } else if (marginOk > 0) {
-            marginSummary.innerHTML = '<span style="color:var(--dmc-047857, #047857);">Márgenes costo vs P. venta en rango (≥ ' + warnPct + '%)</span>';
+            marginSummary.innerHTML = '<span style="color:var(--dmc-047857, #047857);">Márgenes sobre venta en rango (≥ ' + warnPct + '%)</span>';
         } else {
-            marginSummary.innerHTML = '<span style="color:var(--color-text-secondary);">Empareje productos o indique P. venta para revisar margen sobre costo</span>';
+            marginSummary.innerHTML = '<span style="color:var(--color-text-secondary);">Empareje productos o indique P. venta para revisar margen sobre venta</span>';
         }
     }
 }
@@ -5180,7 +5348,149 @@ function openReceiveModal(id, number) {
     if (comPct) comPct.value = '';
     var comAmt = document.getElementById('receiveCommercialAmt');
     if (comAmt) comAmt.value = '';
+    syncInvoiceCashSourceUi('receive');
     document.getElementById('receiveModal').style.display = 'flex';
+}
+
+/** Origen efectivo en carga/recepción/edición de factura (misma lógica que abonos). */
+function syncInvoiceCashSourceUi(scope) {
+    var map = {
+        upload: {
+            mode: 'uploadPaymentMode', wrap: 'uploadCashSourceWrap', other: 'uploadCashOtherWrap',
+            warn: 'uploadCashOriginWarn', drawer: 'uploadCashDrawer', otherR: 'uploadCashOther', note: 'uploadCashSourceNote'
+        },
+        receive: {
+            mode: 'receivePaymentMode', wrap: 'receiveCashSourceWrap', other: 'receiveCashOtherWrap',
+            warn: 'receiveCashOriginWarn', drawer: 'receiveCashDrawer', otherR: 'receiveCashOther', note: 'receiveCashSourceNote'
+        },
+        review: {
+            mode: 'reviewPaymentMode', wrap: 'reviewCashSourceWrap', other: 'reviewCashOtherWrap',
+            warn: 'reviewCashOriginWarn', drawer: 'reviewCashDrawer', otherR: 'reviewCashOther', note: 'reviewCashSourceNote'
+        },
+        edit: {
+            mode: 'editInvPaymentMode', wrap: 'editCashSourceWrap', other: 'editCashOtherWrap',
+            warn: 'editCashOriginWarn', drawer: 'editCashDrawer', otherR: 'editCashOther', note: 'editCashSourceNote'
+        }
+    };
+    var ids = map[scope];
+    if (!ids) return;
+    var modeEl = document.getElementById(ids.mode);
+    var wrap = document.getElementById(ids.wrap);
+    if (!modeEl || !wrap) return;
+    var isCash = String(modeEl.value || '') === 'cash';
+    wrap.style.display = isCash ? '' : 'none';
+    var drawerRadio = document.getElementById(ids.drawer);
+    var otherRadio = document.getElementById(ids.otherR);
+    var otherWrap = document.getElementById(ids.other);
+    var warn = document.getElementById(ids.warn);
+    var note = document.getElementById(ids.note);
+    var isOther = isCash && otherRadio && otherRadio.checked;
+    var isDrawer = isCash && drawerRadio && drawerRadio.checked;
+    var noneChosen = isCash && !isOther && !isDrawer;
+    if (otherWrap) otherWrap.style.display = isOther ? '' : 'none';
+    if (warn) warn.style.display = noneChosen ? '' : 'none';
+    if (noneChosen) {
+        wrap.style.background = 'rgba(245, 158, 11, 0.10)';
+        wrap.style.border = '1px solid var(--dmc-B45309, #B45309)';
+        wrap.style.padding = '10px 12px';
+    } else {
+        wrap.style.background = '';
+        wrap.style.border = '';
+        wrap.style.padding = '';
+    }
+    if (note) {
+        if (isOther) note.setAttribute('required', 'required');
+        else {
+            note.removeAttribute('required');
+            if (!isCash) note.value = '';
+        }
+    }
+    if (!isCash) {
+        if (drawerRadio) drawerRadio.checked = false;
+        if (otherRadio) otherRadio.checked = false;
+    }
+}
+
+function assertInvoiceCashSource(scope) {
+    var modeId = ({ upload: 'uploadPaymentMode', receive: 'receivePaymentMode', review: 'reviewPaymentMode', edit: 'editInvPaymentMode' })[scope];
+    var modeEl = document.getElementById(modeId);
+    if (!modeEl || String(modeEl.value || '') !== 'cash') return true;
+    var prefix = ({ upload: 'upload', receive: 'receive', review: 'review', edit: 'edit' })[scope];
+    var drawer = document.getElementById(prefix === 'edit' ? 'editCashDrawer' : (prefix + 'CashDrawer'));
+    var other = document.getElementById(prefix === 'edit' ? 'editCashOther' : (prefix + 'CashOther'));
+    var note = document.getElementById(prefix === 'edit' ? 'editCashSourceNote' : (prefix + 'CashSourceNote'));
+    if (!(drawer && drawer.checked) && !(other && other.checked)) {
+        if (typeof showAlert === 'function') showAlert('Indique el origen del efectivo (Caja u Otro).', 'error');
+        else alert('Indique el origen del efectivo (Caja u Otro).');
+        syncInvoiceCashSourceUi(scope);
+        return false;
+    }
+    if (other && other.checked) {
+        var txt = note ? String(note.value || '').trim() : '';
+        if (txt.length < 5) {
+            if (typeof showAlert === 'function') showAlert('Indique de dónde salió el efectivo (mín. 5 caracteres).', 'error');
+            else alert('Indique de dónde salió el efectivo (mín. 5 caracteres).');
+            if (note) note.focus();
+            return false;
+        }
+    }
+    return true;
+}
+
+function openEditInvoiceModal(data) {
+    var modal = document.getElementById('editInvoiceModal');
+    if (!modal || !data) return;
+    document.getElementById('editInvId').value = data.id || 0;
+    document.getElementById('editInvLabel').textContent =
+        (data.order || '') + (data.invoice ? (' · Factura ' + data.invoice) : '');
+    document.getElementById('editInvNumber').value = data.invoice || '';
+    document.getElementById('editInvDate').value = data.invoice_date || '';
+    document.getElementById('editInvDuePrinted').value = data.invoice_due_date || '';
+    document.getElementById('editInvDueCxp').value = data.due_date || '';
+    var modeEl = document.getElementById('editInvPaymentMode');
+    modeEl.value = data.payment_mode || 'payable';
+    var lock = !!data.lock_payment;
+    modeEl.disabled = lock;
+    var lockHint = document.getElementById('editInvPaymentLock');
+    if (lockHint) lockHint.style.display = lock ? '' : 'none';
+    var drawer = document.getElementById('editCashDrawer');
+    var other = document.getElementById('editCashOther');
+    var note = document.getElementById('editCashSourceNote');
+    if (drawer) drawer.checked = false;
+    if (other) other.checked = false;
+    if (note) note.value = data.cash_source_note || '';
+    if (String(data.payment_mode || '') === 'cash') {
+        if (data.cash_from_drawer === 0) {
+            if (other) other.checked = true;
+        } else if (data.cash_from_drawer === 1) {
+            if (drawer) drawer.checked = true;
+        }
+    }
+    if (lock) {
+        // Mantener el valor aunque el select esté disabled: campo hidden.
+        var hidden = document.getElementById('editInvPaymentModeHidden');
+        if (!hidden) {
+            hidden = document.createElement('input');
+            hidden.type = 'hidden';
+            hidden.name = 'payment_mode';
+            hidden.id = 'editInvPaymentModeHidden';
+            modeEl.parentNode.appendChild(hidden);
+        }
+        hidden.value = modeEl.value;
+        modeEl.removeAttribute('name');
+    } else {
+        var oldHidden = document.getElementById('editInvPaymentModeHidden');
+        if (oldHidden) oldHidden.remove();
+        modeEl.setAttribute('name', 'payment_mode');
+    }
+    var wh = document.getElementById('editInvWhHint');
+    if (wh) {
+        wh.textContent = data.warehouse_date
+            ? ('Recepción de bodega (no editable aquí): ' + data.warehouse_date)
+            : '';
+    }
+    syncInvoiceCashSourceUi('edit');
+    modal.style.display = 'flex';
 }
 
 function syncPayCashSourceUi() {
@@ -5504,7 +5814,7 @@ document.addEventListener('DOMContentLoaded', function () {
     if (payForm) payForm.addEventListener('submit', function (ev) {
         var methodEl = document.getElementById('payMethod');
         if (methodEl && String(methodEl.value || '') === 'cash'
-            && !document.querySelector('input[name="cash_source"]:checked')) {
+            && !document.querySelector('#payModal input[name="cash_source"]:checked')) {
             ev.preventDefault();
             syncPayCashSourceUi();
             var wrapEl = document.getElementById('payCashSourceWrap');
@@ -5520,7 +5830,19 @@ document.addEventListener('DOMContentLoaded', function () {
             if (err) err.style.display = 'block';
         }
     });
+    var receiveForm = document.querySelector('#receiveModal form');
+    if (receiveForm) receiveForm.addEventListener('submit', function (ev) {
+        if (!assertInvoiceCashSource('receive')) ev.preventDefault();
+    });
+    var editInvForm = document.getElementById('editInvoiceForm');
+    if (editInvForm) editInvForm.addEventListener('submit', function (ev) {
+        if (!assertInvoiceCashSource('edit')) ev.preventDefault();
+    });
+    var uploadForm = document.querySelector('#invoiceUploadModal form, form[action*="invoice_import"]');
+    // Validación fina al confirmar revisión; en carga inicial el origen se pide al confirmar.
     syncPayCashSourceUi();
+    syncInvoiceCashSourceUi('upload');
+    syncInvoiceCashSourceUi('receive');
 });
 
 function voidReceivedOrder(id, number, opts) {
@@ -5529,8 +5851,9 @@ function voidReceivedOrder(id, number, opts) {
     if (!reason) {
         reason = prompt(
             'Anular factura/OC ' + (number || '') + ' por error.\n'
-            + 'Se revierte el inventario y el asiento contable (no se genera nota crédito).\n'
-            + 'Si se pagó con efectivo del cajón, el dinero vuelve a la caja abierta.\n'
+            + 'Se revierte inventario, asiento contable y trazabilidad (sin nota crédito).\n'
+            + 'Efectivo del cajón: el dinero vuelve a esa caja del día (admin/gerente también si ya está cerrada).\n'
+            + 'Otros medios: no tocan el cajón.\n'
             + 'Si hay abonos, se cancelan y se revierten automáticamente.\n\n'
             + 'Motivo de anulación:',
             'Error de recepción'

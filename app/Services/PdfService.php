@@ -2017,7 +2017,7 @@ class PdfService
                 <tr><td>− Costo de ventas</td><td style="text-align:right;">' . $fmt($profit['cost']) . '</td></tr>
                 <tr style="border-top:2px solid ' . $pColor . ';font-weight:700;color:' . $pColor . ';">
                     <td>Utilidad bruta</td>
-                    <td style="text-align:right;">' . $fmt($pv) . ' (' . number_format((float)$profit['margin_pct'], 1, ',', '.') . '%)</td>
+                    <td style="text-align:right;">' . $fmt($pv) . ' (' . number_format((float)$profit['margin_pct'], 1, ',', '.') . '% margen sobre venta)</td>
                 </tr>
             </table>'
             . ($noCost > 0

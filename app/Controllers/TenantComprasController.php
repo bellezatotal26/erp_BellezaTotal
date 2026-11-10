@@ -92,6 +92,15 @@ class TenantComprasController extends TenantController
             $this->saveReviewNotes();
             return;
         }
+        if ($action === 'update_received_invoice' && $this->request->method() === 'POST') {
+            if (!TenantMiddleware::isManagement()) {
+                $this->respond(false, 'Solo administrador o gerencia puede editar facturas recibidas.', '/app/compras?action=facturas');
+                return;
+            }
+            TenantMiddleware::authorize('compras', 'edit');
+            $this->updateReceivedInvoice();
+            return;
+        }
         if ($action === 'credit_note' && $this->request->method() === 'POST') {
             TenantMiddleware::authorize('compras', 'edit');
             $this->creditNote();
@@ -484,6 +493,8 @@ class TenantComprasController extends TenantController
                     'payment_term_days' => $this->request->post('payment_term_days', ''),
                     'warehouse_date' => (string)$this->request->post('warehouse_date', ''),
                     'payment_mode' => (string)$this->request->post('payment_mode', 'payable'),
+                    'cash_source' => (string)$this->request->post('cash_source', ''),
+                    'cash_source_note' => (string)$this->request->post('cash_source_note', ''),
                     'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
                     'commercial_discount_pct' => $this->request->post('commercial_discount_pct', ''),
                     'commercial_discount_amount' => $this->request->post('commercial_discount_amount', ''),
@@ -1018,6 +1029,8 @@ class TenantComprasController extends TenantController
         }
 
         try {
+            $paymentMode = (string)$this->request->post('payment_mode', 'payable');
+            $cashMeta = $this->requireCashSourceForPaymentMode($paymentMode);
             $service = $this->invoiceImports();
             $service->updateHeader($importId, [
                 'supplier_id' => (int)$this->request->post('supplier_id', 0) ?: null,
@@ -1026,7 +1039,10 @@ class TenantComprasController extends TenantController
                 'due_date' => (string)$this->request->post('due_date', ''),
                 'invoice_due_date' => (string)$this->request->post('invoice_due_date', ''),
                 'warehouse_date' => (string)$this->request->post('warehouse_date', ''),
-                'payment_mode' => (string)$this->request->post('payment_mode', 'payable'),
+                'payment_mode' => $paymentMode,
+                'cash_source' => $cashMeta['cash_source'],
+                'cash_from_drawer' => $cashMeta['cash_from_drawer'],
+                'cash_source_note' => $cashMeta['cash_source_note'],
                 'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
                 'commercial_discount_pct' => $this->request->post('commercial_discount_pct', ''),
                 'commercial_discount_amount' => $this->request->post('commercial_discount_amount', ''),
@@ -1110,6 +1126,7 @@ class TenantComprasController extends TenantController
                 throw new \RuntimeException('Solo se pueden guardar borradores pendientes');
             }
 
+            $paymentModeDraft = (string)$this->request->post('payment_mode', 'payable');
             $service->updateHeader($importId, [
                 'supplier_id' => (int)$this->request->post('supplier_id', 0) ?: null,
                 'invoice_number' => (string)$this->request->post('invoice_number', ''),
@@ -1117,7 +1134,9 @@ class TenantComprasController extends TenantController
                 'due_date' => (string)$this->request->post('due_date', ''),
                 'invoice_due_date' => (string)$this->request->post('invoice_due_date', ''),
                 'warehouse_date' => (string)$this->request->post('warehouse_date', ''),
-                'payment_mode' => (string)$this->request->post('payment_mode', 'payable'),
+                'payment_mode' => $paymentModeDraft,
+                'cash_source' => (string)$this->request->post('cash_source', ''),
+                'cash_source_note' => (string)$this->request->post('cash_source_note', ''),
                 'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
                 'commercial_discount_pct' => $this->request->post('commercial_discount_pct', ''),
                 'commercial_discount_amount' => $this->request->post('commercial_discount_amount', ''),
@@ -2462,13 +2481,8 @@ class TenantComprasController extends TenantController
         }
         try {
             $orderId = (int)$this->request->post('id', 0);
-            if ((string)$this->request->post('payment_mode', 'payable') === 'cash'
-                && !(new \SoftNova\Services\CashService($this->db))->getOpenSession()
-            ) {
-                throw new \RuntimeException(
-                    'Para pagar en efectivo desde el cajón debe haber una caja abierta. Abra la caja o elija otra forma de pago.'
-                );
-            }
+            $paymentModeRecv = (string)$this->request->post('payment_mode', 'payable');
+            $cashMetaRecv = $this->requireCashSourceForPaymentMode($paymentModeRecv);
             $invoiceDateRecv = trim((string)$this->request->post('invoice_date', ''));
             $warehouseDateRecv = trim((string)$this->request->post('warehouse_date', date('Y-m-d')));
             if ($invoiceDateRecv !== '' && $warehouseDateRecv !== ''
@@ -2500,8 +2514,12 @@ class TenantComprasController extends TenantController
                 $orderId,
                 $warehouseDateRecv !== '' ? $warehouseDateRecv : date('Y-m-d'),
                 trim((string)$this->request->post('invoice_number', '')),
-                (string)$this->request->post('payment_mode', 'payable'),
-                trim((string)$this->request->post('notes', ''))
+                $paymentModeRecv,
+                trim((string)$this->request->post('notes', '')),
+                [
+                    'cash_from_drawer' => $cashMetaRecv['cash_from_drawer'],
+                    'cash_source_note' => $cashMetaRecv['cash_source_note'],
+                ]
             );
             $invoiceFile = $this->storeInvoiceUpload();
             if ($invoiceFile === false) {
@@ -2529,14 +2547,25 @@ class TenantComprasController extends TenantController
         }
     }
 
+    /**
+     * @param array{cash_from_drawer?:bool|null,cash_source_note?:string} $cashOptions
+     */
     private function doReceive(
         int $orderId,
         string $warehouseDate,
         string $invoiceNumber,
         string $paymentMode,
-        string $notes
+        string $notes,
+        array $cashOptions = []
     ): array {
-        $result = $this->purchasing->receiveOrder($orderId, $warehouseDate, $invoiceNumber, $paymentMode, $notes);
+        $result = $this->purchasing->receiveOrder(
+            $orderId,
+            $warehouseDate,
+            $invoiceNumber,
+            $paymentMode,
+            $notes,
+            $cashOptions
+        );
         $out = is_array($result) ? $result : [];
         $out['accounting_ok'] = true;
         try {
@@ -2578,7 +2607,9 @@ class TenantComprasController extends TenantController
     }
 
     /**
-     * Anula factura/OC ya recibida por error: NC total + salida stock + asiento + status cancelled.
+     * Anula factura/OC ya recibida por error: salida stock + asiento + status cancelled.
+     * Efectivo del cajón: admin/gerente pueden anular con caja cerrada (reintegro a la caja del día).
+     * Otros medios: no tocan caja; sí inventario/contabilidad/trazabilidad.
      */
     private function voidReceived(): void
     {
@@ -2588,7 +2619,9 @@ class TenantComprasController extends TenantController
         $orderId = (int)$this->request->post('id', 0);
         $reason = trim((string)$this->request->post('reason', ''));
         try {
-            $this->purchasing->assertCashDrawerForReversal($orderId);
+            $allowClosedCash = TenantMiddleware::isManagement();
+            $cashOpts = ['allow_closed_origin' => $allowClosedCash];
+            $this->purchasing->assertCashDrawerForReversal($orderId, $allowClosedCash);
             $result = $this->purchasing->voidReceivedOrder($orderId, $reason);
 
             // Reverso contable/caja de abonos que se cancelaron al anular.
@@ -2616,7 +2649,7 @@ class TenantComprasController extends TenantController
                     error_log('Reverso abono proveedor #' . $payId . ': ' . $e->getMessage());
                 }
                 try {
-                    $this->purchasing->syncCashReverseForSupplierPayment($payId);
+                    $this->purchasing->syncCashReverseForSupplierPayment($payId, $cashOpts);
                 } catch (\Throwable $e) {
                     error_log('Reverso caja abono #' . $payId . ': ' . $e->getMessage());
                 }
@@ -2640,7 +2673,7 @@ class TenantComprasController extends TenantController
                     );
                     error_log('Contabilidad anulación OC ' . $orderId . ': ' . $e->getMessage());
                 }
-                $cashNote = $this->purchasing->syncCashForVoidedOrder($orderId);
+                $cashNote = $this->purchasing->syncCashForVoidedOrder($orderId, $cashOpts);
             } elseif (!empty($result['credit_note_id'])) {
                 try {
                     $this->accounting->postPurchaseCreditNote((int)$result['credit_note_id']);
@@ -2654,7 +2687,7 @@ class TenantComprasController extends TenantController
                     );
                     error_log('Contabilidad anulación OC/NC ' . $result['credit_note_id'] . ': ' . $e->getMessage());
                 }
-                $cashNote = $this->purchasing->syncCashForCreditNote((int)$result['credit_note_id']);
+                $cashNote = $this->purchasing->syncCashForCreditNote((int)$result['credit_note_id'], $cashOpts);
             }
 
             if (!empty($result['direct'])) {
@@ -2800,5 +2833,96 @@ class TenantComprasController extends TenantController
             'original' => (string)($_FILES[$field]['name'] ?? $filename),
             'mime' => $mime,
         ];
+    }
+
+    /**
+     * Valida origen de efectivo (igual que abonos): drawer|other.
+     *
+     * @return array{cash_source:string,cash_from_drawer:?bool,cash_source_note:string}
+     */
+    private function requireCashSourceForPaymentMode(string $paymentMode): array
+    {
+        if ($paymentMode !== 'cash') {
+            return [
+                'cash_source' => '',
+                'cash_from_drawer' => null,
+                'cash_source_note' => '',
+            ];
+        }
+        $cashSource = strtolower(trim((string)$this->request->post('cash_source', '')));
+        if ($cashSource !== 'drawer' && $cashSource !== 'other') {
+            throw new \RuntimeException(
+                'Debe indicar el origen del efectivo (Caja u Otro) para registrar el pago.'
+            );
+        }
+        $cashFromDrawer = $cashSource !== 'other';
+        $cashSourceNote = trim((string)$this->request->post('cash_source_note', ''));
+        if (!$cashFromDrawer && mb_strlen($cashSourceNote) < 5) {
+            throw new \InvalidArgumentException(
+                'Indique de dónde salió el efectivo (mín. 5 caracteres) cuando no descuenta del cajón.'
+            );
+        }
+        if ($cashFromDrawer && !(new \SoftNova\Services\CashService($this->db))->getOpenSession()) {
+            throw new \RuntimeException(
+                'Para pagar en efectivo desde el cajón debe haber una caja abierta. Abra la caja o elija «Otro» / otra forma de pago.'
+            );
+        }
+        return [
+            'cash_source' => $cashSource,
+            'cash_from_drawer' => $cashFromDrawer,
+            'cash_source_note' => $cashFromDrawer ? '' : $cashSourceNote,
+        ];
+    }
+
+    /** Edición de factura recibida: fechas, N° y forma de pago (solo admin/gerencia). */
+    private function updateReceivedInvoice(): void
+    {
+        if (!$this->validateCsrfOrFail('/app/compras?action=facturas')) {
+            return;
+        }
+        $orderId = (int)$this->request->post('id', 0);
+        if ($orderId <= 0) {
+            $this->respond(false, 'Factura no válida', '/app/compras?action=facturas');
+            return;
+        }
+        try {
+            $paymentMode = (string)$this->request->post('payment_mode', 'payable');
+            $cashMeta = $this->requireCashSourceForPaymentMode($paymentMode);
+            $result = $this->purchasing->updateReceivedInvoiceMeta($orderId, [
+                'invoice_number' => trim((string)$this->request->post('invoice_number', '')),
+                'invoice_date' => trim((string)$this->request->post('invoice_date', '')),
+                'invoice_due_date' => trim((string)$this->request->post('invoice_due_date', '')),
+                'due_date' => trim((string)$this->request->post('due_date', '')),
+                'payment_mode' => $paymentMode,
+                'cash_from_drawer' => $cashMeta['cash_from_drawer'],
+                'cash_source_note' => $cashMeta['cash_source_note'],
+            ]);
+            $msg = 'Factura actualizada';
+            if (!empty($result['payment_changed'])) {
+                $msg .= ' · forma de pago aplicada en contabilidad'
+                    . (!empty($result['accounting_entry_id'])
+                        ? (' (asiento #' . (int)$result['accounting_entry_id'] . ')')
+                        : '')
+                    . ' y trazabilidad';
+            }
+            if (!empty($result['cash_note'])) {
+                $msg .= '. ' . $result['cash_note'];
+            }
+            $this->respond(true, $msg, '/app/compras?action=facturas');
+        } catch (\Throwable $e) {
+            error_log('updateReceivedInvoice #' . $orderId . ': ' . $e->getMessage());
+            $msg = $this->clientErrorMessage($e, 'No se pudo editar la factura');
+            if ($msg === 'No se pudo editar la factura') {
+                if ($e instanceof \PDOException) {
+                    $msg = 'No se pudo editar la factura por un conflicto de datos/contabilidad. '
+                        . 'Si cambió la forma de pago, revise Contabilidad → Periodos o use «Sincronizar».';
+                } elseif (trim($e->getMessage()) !== '') {
+                    // Mensaje de negocio que el filtro censuró (p. ej. por longitud): acortar.
+                    $raw = trim($e->getMessage());
+                    $msg = function_exists('mb_substr') ? mb_substr($raw, 0, 220) : substr($raw, 0, 220);
+                }
+            }
+            $this->respond(false, $msg, '/app/compras?action=facturas');
+        }
     }
 }

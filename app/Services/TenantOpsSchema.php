@@ -298,6 +298,23 @@ class TenantOpsSchema
         self::addColumnIfMissing($db, 'payroll_runs', 'vacation_total', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER cesantias_total');
         self::addColumnIfMissing($db, 'payroll_runs', 'include_vacaciones', 'TINYINT(1) NOT NULL DEFAULT 0 AFTER include_cesantias');
 
+        // Fase 1: ARL por empleado, exoneración 114-1, novedades y FSP.
+        self::addColumnIfMissing($db, 'employees', 'arl_rate', 'DECIMAL(8,4) NULL AFTER has_transport_aid');
+        self::addColumnIfMissing($db, 'employees', 'exempt_1141', 'TINYINT(1) NOT NULL DEFAULT 0 AFTER arl_rate');
+        self::addColumnIfMissing($db, 'payroll_items', 'unpaid_days', 'TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER incapacity_type');
+        self::addColumnIfMissing($db, 'payroll_items', 'vacation_days', 'TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER unpaid_days');
+        self::addColumnIfMissing($db, 'payroll_items', 'vacation_pay', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER vacation_days');
+        self::addColumnIfMissing($db, 'payroll_items', 'fsp_employee', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER pension_employee');
+        self::addColumnIfMissing($db, 'payroll_items', 'ibc', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER other_earnings');
+
+        // Fase 2: afiliaciones PILA en el empleado.
+        self::addColumnIfMissing($db, 'employees', 'eps_code', "VARCHAR(20) NOT NULL DEFAULT '' AFTER exempt_1141");
+        self::addColumnIfMissing($db, 'employees', 'afp_code', "VARCHAR(20) NOT NULL DEFAULT '' AFTER eps_code");
+        self::addColumnIfMissing($db, 'employees', 'arl_code', "VARCHAR(20) NOT NULL DEFAULT '' AFTER afp_code");
+        self::addColumnIfMissing($db, 'employees', 'caja_code', "VARCHAR(20) NOT NULL DEFAULT '' AFTER arl_code");
+        self::addColumnIfMissing($db, 'employees', 'cotizante_type', "VARCHAR(5) NOT NULL DEFAULT '1' AFTER caja_code");
+        self::addColumnIfMissing($db, 'employees', 'cotizante_subtype', "VARCHAR(5) NOT NULL DEFAULT '00' AFTER cotizante_type");
+
         // Pagos de pasivos laborales (PILA, parafiscales, cesantías, intereses, vacaciones, salarios por pagar).
         try {
             self::ensurePayrollPaymentTables($db);

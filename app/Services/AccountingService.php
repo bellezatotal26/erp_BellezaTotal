@@ -683,6 +683,40 @@ class AccountingService
         return (int)$this->db->lastInsertId();
     }
 
+    /**
+     * Libera colisiones de uq_accounting_source al reemitir (p. ej. edición de forma de pago).
+     * Devuelve $baseEvent si está libre; si no, {$baseEvent}_2, _3…
+     */
+    public function allocateSourceEvent(string $sourceType, int $sourceId, string $baseEvent): string
+    {
+        $base = substr(trim($baseEvent), 0, 40);
+        if ($base === '' || $sourceId <= 0) {
+            return $base !== '' ? $base : 'event';
+        }
+        $taken = $this->query(
+            "SELECT 1 FROM accounting_entries
+             WHERE source_type = ? AND source_id = ? AND source_event = ?
+             LIMIT 1",
+            [$sourceType, $sourceId, $base]
+        )->fetchColumn();
+        if (!$taken) {
+            return $base;
+        }
+        for ($i = 2; $i < 1000; $i++) {
+            $candidate = substr($base . '_' . $i, 0, 50);
+            $taken = $this->query(
+                "SELECT 1 FROM accounting_entries
+                 WHERE source_type = ? AND source_id = ? AND source_event = ?
+                 LIMIT 1",
+                [$sourceType, $sourceId, $candidate]
+            )->fetchColumn();
+            if (!$taken) {
+                return $candidate;
+            }
+        }
+        return substr($base . '_' . time(), 0, 50);
+    }
+
     public function postEntry(
         string $date,
         string $description,
@@ -1230,13 +1264,14 @@ class AccountingService
         $sum = $this->query(
             "SELECT
                 COALESCE(SUM(salary_base + transport_aid + COALESCE(prima,0)
-                    + COALESCE(incapacity_pay,0) + other_earnings),0) labor,
+                    + COALESCE(incapacity_pay,0) + COALESCE(vacation_pay,0) + other_earnings),0) labor,
                 COALESCE(SUM(COALESCE(cesantias,0)),0) cesantias,
                 COALESCE(SUM(COALESCE(cesantias_interest,0)),0) cesantias_interest,
                 COALESCE(SUM(COALESCE(commission_amount,0)),0) commission,
                 COALESCE(SUM(COALESCE(vacation_provision,0)),0) vacation,
                 COALESCE(SUM(health_employee),0) health_emp,
-                COALESCE(SUM(pension_employee),0) pension_emp,
+                COALESCE(SUM(pension_employee + COALESCE(fsp_employee,0)),0) pension_emp,
+                COALESCE(SUM(COALESCE(other_deductions,0)),0) other_ded,
                 COALESCE(SUM(health_employer),0) health_er,
                 COALESCE(SUM(pension_employer),0) pension_er,
                 COALESCE(SUM(COALESCE(arl_employer,0)),0) arl,
@@ -1250,7 +1285,7 @@ class AccountingService
 
         $out = [];
         foreach (['labor', 'cesantias', 'cesantias_interest', 'commission', 'vacation', 'health_emp', 'pension_emp',
-            'health_er', 'pension_er', 'arl', 'caja', 'sena', 'icbf', 'net'] as $k) {
+            'other_ded', 'health_er', 'pension_er', 'arl', 'caja', 'sena', 'icbf', 'net'] as $k) {
             $out[$k] = round((float)($sum[$k] ?? 0), 2);
         }
         $out['employer_cost'] = round(
@@ -1302,6 +1337,7 @@ class AccountingService
         $vacation = $t['vacation'];
         $healthEmp = $t['health_emp'];
         $pensionEmp = $t['pension_emp'];
+        $otherDed = $t['other_ded'] ?? 0.0;
         $healthEr = $t['health_er'];
         $pensionEr = $t['pension_er'];
         $arl = $t['arl'];
@@ -1376,7 +1412,16 @@ class AccountingService
             $lines[] = $this->line($this->setting('health_payable_account', '237005'), 0, $healthPay, 'Salud por pagar');
         }
         if ($pensionPay > 0) {
-            $lines[] = $this->line($this->setting('pension_payable_account', '238030'), 0, $pensionPay, 'Pensión por pagar');
+            $lines[] = $this->line($this->setting('pension_payable_account', '238030'), 0, $pensionPay, 'Pensión / FSP por pagar');
+        }
+        if ($otherDed > 0) {
+            // Retenciones varias (préstamos, libranzas, embargos): quedan por pagar / cruzar.
+            $lines[] = $this->line(
+                $this->setting('payroll_payable_account', '250505'),
+                0,
+                $otherDed,
+                'Otras deducciones de nómina'
+            );
         }
         if ($arl > 0) {
             $lines[] = $this->line($this->setting('arl_payable_account', '237010'), 0, $arl, 'ARL por pagar');
@@ -2082,11 +2127,14 @@ class AccountingService
     {
         return [
             'purchases' => [
+                // Cualquier asiento original posted (received / received_2…) cuenta;
+                // evita re-postear tras edición de forma de pago.
                 'sql' => "SELECT o.id
                           FROM purchase_orders o
                           LEFT JOIN accounting_entries e
                             ON e.source_type = 'purchase_order' AND e.source_id = o.id
-                               AND e.source_event = 'received'
+                               AND e.status = 'posted'
+                               AND e.reversal_of_id IS NULL
                           WHERE o.status = 'received' AND o.accounting_entry_id IS NULL AND e.id IS NULL
                           ORDER BY o.id",
                 'post' => fn(int $id): ?int => $this->postPurchaseOrder($id),
@@ -2252,7 +2300,8 @@ class AccountingService
         }
         $date = substr($date, 0, 10);
         if ($this->isPeriodClosed($date)) {
-            return $this->reverseSource('purchase_order', $orderId, $reason);
+            // Periodo del asiento original cerrado: intentar hoy (si está abierto).
+            return $this->reverseSource('purchase_order', $orderId, $reason, date('Y-m-d'));
         }
         return $this->reverseSource('purchase_order', $orderId, $reason, $date, 'void_');
     }
@@ -4529,13 +4578,22 @@ class AccountingService
             : date('Y-m-d', strtotime((string)$order['order_date']));
 
         $paymentMode = (string)($order['payment_mode'] ?? 'payable');
+        $cashFromDrawer = !array_key_exists('cash_from_drawer', $order)
+            || $order['cash_from_drawer'] === null
+            || $order['cash_from_drawer'] === ''
+            || (int)$order['cash_from_drawer'] === 1;
+        // Efectivo fuera del cajón → bancos (111005), igual que abonos.
         $creditCode = match ($paymentMode) {
-            'cash' => $this->setting('cash_account', '110505'),
+            'cash' => $cashFromDrawer
+                ? $this->setting('cash_account', '110505')
+                : $this->setting('bank_account', '111005'),
             'transfer', 'card' => $this->setting('bank_account', '111005'),
             default => $this->setting('payable_account', '220505'),
         };
         $creditLabel = match ($paymentMode) {
-            'cash' => 'Pago compra en efectivo',
+            'cash' => $cashFromDrawer
+                ? 'Pago compra en efectivo (cajón)'
+                : 'Pago compra en efectivo (fuera del cajón)',
             'transfer', 'card' => 'Pago compra transferencia/tarjeta',
             default => 'Factura proveedor por pagar',
         };
@@ -4626,14 +4684,34 @@ class AccountingService
             $order['supplier_name'] ?? null
         );
 
-        $entryId = $this->postEntry(
-            $date,
-            'Compra ' . $label,
-            $lines,
-            'purchase_order',
-            $orderId,
-            'received'
-        );
+        // Tras anular/reeditar, 'received' sigue ocupado por el asiento reversed:
+        // se asigna received_2, received_3… (uq_accounting_source).
+        $sourceEvent = $this->allocateSourceEvent('purchase_order', $orderId, 'received');
+        try {
+            $entryId = $this->postEntry(
+                $date,
+                'Compra ' . $label,
+                $lines,
+                'purchase_order',
+                $orderId,
+                $sourceEvent
+            );
+        } catch (\PDOException $e) {
+            // Carrera o asiento residual: reintentar con otro source_event libre.
+            $sourceEvent = $this->allocateSourceEvent(
+                'purchase_order',
+                $orderId,
+                'received_' . substr((string)time(), -6)
+            );
+            $entryId = $this->postEntry(
+                $date,
+                'Compra ' . $label,
+                $lines,
+                'purchase_order',
+                $orderId,
+                $sourceEvent
+            );
+        }
 
         $this->query(
             "UPDATE purchase_orders SET accounting_entry_id = ? WHERE id = ?",

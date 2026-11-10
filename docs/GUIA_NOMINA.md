@@ -1,208 +1,310 @@
-# Guía sencilla: módulo de Nómina (Seri ERP)
+# Guía de uso: módulo de Nómina (Seri ERP)
 
-Documento para quien **no ha usado software de nómina**. Explica qué hace cada pestaña, en qué orden trabajar y qué significa lo contable, sin jerga innecesaria.
-
----
-
-## 1. Idea general (en una frase)
-
-La nómina calcula **cuánto le corresponde a cada empleado** en un mes, **cuánto cuesta a la empresa** (aportes, prestaciones) y **registra eso en contabilidad**. Luego, aparte, se pagan cosas como la planilla PILA o las cesantías al fondo.
-
-Piensa en tres momentos distintos:
-
-| Momento | Qué es | Dónde en el sistema |
-|--------|--------|---------------------|
-| **Preparar** | Datos base: empleados, turnos, % legales | Parámetros → Horarios → Empleados |
-| **Liquidar** | Calcular el mes y contabilizar | Liquidaciones |
-| **Pagar terceros** | EPS, pensión, fondo de cesantías, etc. | Pagos de nómina |
+Documento para operar el módulo **sin experiencia previa en software de nómina**.  
+Incluye lo entregado hasta **Fase 2** (liquidación mejorada + PILA operativa).  
+La **nómina electrónica DIAN** y el **portal del empleado** aún no están; se evalúan con el cliente.
 
 ---
 
-## 2. Orden recomendado la primera vez
+## 1. Idea general
 
-Siga este orden; no empiece por “Liquidaciones”.
+La nómina hace tres cosas distintas:
+
+1. **Calcula** cuánto gana cada empleado (devengado), qué se le descuenta y cuánto cuesta a la empresa.  
+2. **Contabiliza** ese costo (gastos + deudas) y marca el **neto** como pagado al empleado.  
+3. **Ayuda a pagar terceros** (PILA, fondo de cesantías) y a **armar la planilla** para el operador.
+
+| Momento | Qué es | Dónde |
+|--------|--------|--------|
+| Preparar | Parámetros legales, turnos, fichas de empleados (incl. afiliaciones) | Parámetros → Horarios → Empleados |
+| Liquidar | Calcular el mes, novedades, HE, revisar y contabilizar | Liquidaciones |
+| PILA | Validar y exportar datos para el operador | Detalle → **PILA / seguridad social** |
+| Pagar terceros | Bajar pasivos ya causados (planilla, fondo, etc.) | Pagos de nómina |
+
+---
+
+## 2. Orden la primera vez
+
+No empiece por liquidar.
 
 ```
-1. Parámetros     → 2. Horarios     → 3. Empleados
-         ↓
-4. Liquidaciones (borrador → revisar → Contabilizar y pagar)
-         ↓
-5. Pagos de nómina (PILA / prestaciones, cuando corresponda)
+1. Configuración (NIT empresa)
+2. Parámetros de nómina
+3. Horarios (opcional pero útil)
+4. Empleados (salario + afiliaciones PILA)
+5. Liquidaciones (borrador → revisar → Contabilizar y pagar)
+6. PILA / seguridad social (export CSV/TXT)
+7. Pagos de nómina (cuando pague la planilla o el fondo)
 ```
 
-### Paso 1 — Parámetros
-Aquí viven los **números de la ley y de la empresa**: SMMLV, auxilio de transporte, % de salud/pensión, ARL, parafiscales, cesantías, prima, vacaciones, horas extras, etc.
+### 2.1 Configuración de la empresa
+En **Configuración** del ERP complete al menos:
 
-- Si no está seguro, use los valores sugeridos del sistema (botón de sugerencia / valores por defecto Colombia).
-- Pase el cursor por el ícono **i** de cada campo: ahí está la explicación corta.
-- **No los cambie a diario.** Se revisan al inicio de año o cuando cambie la norma / el contador lo indique.
+- Razón social  
+- **NIT** (`company_nit`)
 
-### Paso 2 — Horarios
-Plantillas de turno (ej. “Lun–Vie 8:00–17:00”, “Turno noche”).
+Sin NIT, el export PILA avisa el faltante.
 
-- Sirven para **estimar** horas nocturnas y extras.
-- Al crear la liquidación puede **precargar** esas horas; después las puede ajustar a mano.
+### 2.2 Parámetros
+Pestaña **Parámetros**. Valores de ley / empresa: SMMLV, auxilio, aportes, parafiscales, provisiones, HE, FSP, tope IBC, exoneración 114-1, etc.
 
-### Paso 3 — Empleados
-Ficha de cada persona: documento, salario, si recibe auxilio de transporte, horario, comisión, etc.
+- Use el ícono **i** en cada campo.  
+- Botón **Sugerir valores legales 2026** para rellenar bases y recargos (revise y guarde).  
+- No los cambie a diario: inicio de año o cuando el contador lo indique.
 
-- Sin empleados activos **no hay liquidación**.
-- El salario y el horario son lo que más impacta el cálculo.
+Bloques importantes recientes:
 
-### Paso 4 — Liquidaciones
-Aquí se “cierra el mes” de uno o varios empleados.
+| Bloque | Para qué |
+|--------|----------|
+| Exoneración 114-1 automática | Si el salario &lt; 10 SMMLV → salud empleador, SENA e ICBF en 0 % (la caja sí se calcula) |
+| FSP | % (típicamente 1 %) cuando el IBC &gt; 4 SMMLV |
+| Tope IBC | Máximo en SMMLV (legal: 25) |
+| ARL (por defecto) | % global si el empleado no tiene tasa propia |
 
-1. **Nueva liquidación** → elija año/mes, días, empleados y casillas (prima, cesantías, vacaciones, parafiscales…).
-2. Queda en **borrador**: aún puede editar HE, incapacidades, etc.
-3. Revise totales (bruto, deducciones, neto, costo empresa).
-4. Pulse **Contabilizar y pagar** cuando esté correcto (acción definitiva).
+### 2.3 Horarios
+Plantillas de turno (ej. L–V 8:00–17:00). Sirven para **precargar** RNO / HE al crear la liquidación; luego se ajustan a mano.
 
-### Paso 5 — Pagos de nómina
-No es el sueldo del empleado (eso ya salió con “Contabilizar y pagar”).  
-Aquí paga lo que la empresa **aún debe a terceros** o prestaciones pendientes:
+### 2.4 Empleados
+Datos laborales **y** afiliaciones para PILA:
 
-- Planilla **PILA** (salud, pensión, ARL, caja, SENA, ICBF).
-- **Cesantías** al fondo, intereses, vacaciones, y solo si aplica el **neto pendiente** de salarios.
+**Datos básicos:** documento, nombre, cargo, salario, contrato, horario, medio de pago, auxilio de transporte, estado.
 
----
+**Riesgo / exoneración:**
 
-## 3. Qué hace cada pestaña
+- **ARL %** — tasa de la clase de riesgo del empleado (vacío = usa el % global de Parámetros).  
+- **Forzar exoneración 114-1** — opcional; si Parámetros tiene automática, ya aplica a salarios &lt; 10 SMMLV.
 
-### Empleados
-Alta / edición / estado activo. Datos que alimentan el cálculo (salario, auxilio, horario, comisiones).
+**Afiliaciones PILA (obligatorias para exportar bien):**
 
-### Horarios
-Turnos reutilizables. Se asignan al empleado. Opcional pero muy útil si hay turnos nocturnos o extras fijas.
+| Campo | Ejemplo |
+|-------|---------|
+| EPS | EPS010 · Sura |
+| AFP / Pensión | 230301 · Porvenir · o 25-14 Colpensiones |
+| ARL (administradora) | 14-11 · Sura *(código, no el %)* |
+| Caja | CCF24 · Compensar |
+| Tipo cotizante | 1 · Dependiente (12/19 aprendices) |
+| Subtipo | Normalmente `00` |
 
-### Liquidaciones
-El corazón del módulo: una liquidación = un periodo (mes) + un conjunto de empleados.
-
-Estados típicos:
-
-- **Borrador** → se puede editar o cancelar.
-- **Pagada / contabilizada** → ya generó asiento; no la “deshaga” a la ligera (hay anulación controlada si aplica).
-
-### Pagos de nómina
-Registro de pagos de **pasivos** ya causados.  
-**No genera gasto nuevo** (el gasto se registró al liquidar): solo baja la deuda contra banco o caja de nómina.
-
-### Parámetros
-Configuración legal/operativa. Es el “motor” de porcentajes y bases.
+Las comisiones fijas quincenales se editan en **Parámetros** (sección comisiones), no en el modal del empleado.
 
 ---
 
-## 4. Palabras que confunden (glosario corto)
+## 3. Liquidaciones (cómo se usa el mes)
 
-| Término | Significado simple |
-|--------|---------------------|
-| **Bruto / devengado** | Lo ganado antes de descuentos (salario, HE, prima si aplica…). |
-| **Deducciones** | Lo que se quita al empleado (salud 4%, pensión 4%, etc.). |
-| **Neto** | Lo que realmente se le gira al empleado (bruto − deducciones). |
-| **Costo empresa** | Neto + aportes del empleador + parafiscales + provisiones. Es lo que “cuesta” la nómina a la compañía. |
-| **Contabilizar** | Crear el asiento contable (gasto + deudas). |
-| **Contabilizar y pagar** | Contabiliza **y** registra que el neto ya se pagó al empleado (sale de banco / caja nómina). |
-| **Provisión** | Guardar mensualmente un pedazo de cesantías/vacaciones para no pagar todo de golpe después. **No aumenta el neto** del mes. |
-| **Prima** | Prestación que **sí se paga al empleado** (suele ser junio y diciembre). |
-| **PILA** | Planilla con la que se pagan seguridad social y parafiscales a las entidades. |
-| **Salarios por pagar (neto pendiente)** | Cuenta **250505**: neto del empleado **aún no desembolsado**. Si usó “Contabilizar y pagar”, normalmente está en **$0**. |
+### 3.1 Crear
+**Liquidaciones → Nueva liquidación**
+
+1. Elija empleados (uno o varios).  
+2. Año / mes / días / fecha y medio de pago del neto.  
+3. Casillas:
+
+| Casilla | Efecto | Cuándo |
+|--------|--------|--------|
+| Prima | Suma al neto | Junio / diciembre (o cuando corresponda) |
+| Cesantías e intereses | Provisión contable; **no** suma al neto | Si provisiona mes a mes |
+| Provisión vacaciones | Provisión contable; **no** suma al neto | Igual |
+| Parafiscales | Caja, SENA, ICBF | Casi siempre |
+| Precargar RNO / HE | Trae horas del horario | Si el turno refleja la realidad |
+
+La **ARL** se calcula siempre.
+
+4. **Calcular** → queda en **borrador**.
+
+### 3.2 Revisar el borrador
+En el detalle verá:
+
+- Totales: devengado − deducciones = **neto**  
+- Segmentos: aportes empresa, provisiones, **costo total empresa**  
+- Tabla por empleado  
+
+Botones útiles en borrador:
+
+| Botón | Qué hace |
+|-------|----------|
+| **Inc.** | Días y tipo de incapacidad (enfermedad / laboral) |
+| **Nov.** | Novedades del periodo (ver §4) |
+| Captura masiva HE | HED, HEN, RNO, Dom., HEDD, HEND |
+| **CSV costo empresa** | Excel/CSV para contador/auditoría |
+| **PILA / seguridad social** | Validar y exportar planilla (§5) |
+| **PDF liquidación** / **PDF** por empleado | Comprobantes internos |
+| **Contabilizar y pagar** | Cierra: asiento + neto pagado |
+| **Cancelar borrador** | Descarta sin asiento |
+
+### 3.3 Estados
+
+| Estado | Significado |
+|--------|-------------|
+| Borrador | Editable (Inc., Nov., HE) |
+| Pagada / Contabilizada | Ya hay asiento; anulación solo con motivo |
+| Cancelada | No se usa; puede crear otra del mismo periodo |
 
 ---
 
-## 5. Flujo mensual típico (organización práctica)
+## 4. Novedades y reglas de cálculo (Fase 1)
 
-### Cada mes
-1. Verifique que empleados y salarios estén al día.
-2. Si hubo turnos especiales / HE reales, prepárelas (horario o captura masiva en el detalle).
-3. **Nueva liquidación** del mes (todos o los que correspondan).
-4. En el detalle: revise HE, incapacidades, totales.
-5. **Contabilizar y pagar** (cuando el dinero del neto ya salió o sale ese día).
-6. Cuando pague la **planilla PILA**, vaya a **Pagos de nómina** → tarjeta PILA → “Usar saldos” → Registrar pago.
-7. Cuando consigne **cesantías** al fondo (o pague intereses/vacaciones), use la tarjeta **Prestaciones y salarios por pagar**.
+En el detalle, botón **Nov.** por empleado (solo borrador):
 
-### Junio y diciembre
-- Marque **Incluir prima de servicios** en la nueva liquidación (el sistema suele sugerirlo esos meses).
+| Campo | Efecto |
+|-------|--------|
+| **Días no remunerados** | Bajan salario y auxilio (suspensión / licencia no remunerada) |
+| **Días de vacaciones disfrutadas** | Se pagan al 100 % del día y entran al IBC |
+| **Otras deducciones** | Préstamos, libranzas, embargos → bajan el neto |
 
-### Enero (o cuando pague intereses de cesantías)
-- Use **Pagos de nómina** → Intereses sobre cesantías (si hay saldo).
+Otras reglas automáticas:
 
-### Inicio de año
-- Actualice **SMMLV** y **auxilio de transporte** en Parámetros.
+- **FSP:** si IBC &gt; 4 SMMLV, se descuenta el % de Parámetros (suele ser 1 %).  
+- **Tope IBC:** no cotiza por encima de N × SMMLV (por defecto 25).  
+- **Exoneración 114-1:** automática y/o forzada en el empleado.  
+- **Incapacidad:** días 1–2 al 100 %; desde el día 3 al % de Parámetros (laboral: 100 %).  
+- **Auxilio de transporte:** solo si casilla activa y salario ≤ 2 SMMLV; proporcional a días **laborados**.  
+- **Comisión fija:** no es base de aportes (fuera del IBC).
 
 ---
 
-## 6. Contabilidad: qué pasa “por detrás” (versión simple)
+## 5. PILA operativa (Fase 2)
+
+Objetivo: sacar del ERP un archivo con lo necesario para liquidar la planilla **tipo E** en el operador (SOI, miplanilla, etc.), y después registrar el pago en Seri.
+
+### 5.1 Antes de exportar
+1. Empleados con EPS / AFP / ARL / Caja.  
+2. NIT de la empresa en Configuración.  
+3. Liquidación del periodo ya calculada (idealmente revisada).
+
+### 5.2 Pantalla PILA
+Desde el detalle: **PILA / seguridad social**.
+
+Verá:
+
+- Si está **Lista para exportar** o **Revisar datos**  
+- Errores/avisos (falta EPS, IBC en cero, días fuera de 1–30, sin NIT…)  
+- Totales de aportes empleado y empresa  
+- Tabla por cotizante (días, IBC, códigos, total línea, 114-1)
+
+### 5.3 Descargas
+
+| Archivo | Uso |
+|---------|-----|
+| **CSV** | Revisar en Excel o cargar/asistirse en el operador |
+| **TXT** | Separado por `\|`, útil para revisión o integraciones simples |
+
+Incluye periodo, NIT, documento, tipo cotizante, códigos, días cotizados, IBC, aportes y observaciones de validación.
+
+### 5.4 Qué NO es (importante)
+- **No** es el archivo fijo completo del Anexo Técnico 2 de MinSalud (eso lo arma el operador al liquidar).  
+- **No** transmite a la DIAN (nómina electrónica = fase futura).  
+- **No** paga sola: después de pagar en el banco/operador, registre el egreso en **Pagos de nómina**.
+
+### 5.5 Después de pagar la planilla
+**Pagos de nómina → Seguridad social y parafiscales (PILA)**
+
+1. **Usar saldos** (o digite valores).  
+2. Fecha, medio, referencia (Nº planilla).  
+3. **Registrar pago** → baja el pasivo (no crea gasto nuevo; el costo ya se causó al liquidar).
+
+Para cesantías al fondo, intereses o vacaciones pagadas: tarjeta **Prestaciones y salarios por pagar**.
+
+**Salarios por pagar (neto pendiente)** = cuenta 250505. Si usó *Contabilizar y pagar*, suele estar en **$0**.
+
+---
+
+## 6. Contabilidad (versión simple)
 
 Al **Contabilizar y pagar**:
 
-1. Se registra el **gasto** de nómina (cuentas 5105xx: sueldos, aportes, provisiones…).
-2. Se registran las **deudas** (pasivos): EPS, pensión, ARL, caja, cesantías, etc.
-3. El **neto** del empleado sale de **banco** o **caja de nómina (110510)** — **no** del cajón del POS de ventas.
+1. Gasto de nómina (5105xx: sueldos, aportes, provisiones…).  
+2. Pasivos (EPS, pensión/FSP, ARL, caja, SENA, ICBF, cesantías…).  
+3. Neto al empleado desde **banco** o **caja de nómina 110510** — **nunca** el cajón POS.
 
 Por eso:
 
-- No vuelva a registrar el sueldo como “gasto” en el módulo de Gastos (se duplicaría).
-- En **Pagos de nómina** solo está “apagando” las deudas (PILA, fondo, etc.), no creando costo nuevo.
+- No vuelva a registrar el sueldo en **Gastos** (duplicaría el costo).  
+- **Pagos de nómina** solo apaga deudas ya causadas.  
+- Otras deducciones quedan como retención por cruzar (pasivo).
 
 ---
 
-## 7. Casillas al crear la liquidación (qué marcar)
-
-| Casilla | ¿Qué hace? | ¿Cuándo marcarla? |
-|--------|------------|-------------------|
-| **Prima** | Paga prima al empleado (suma al neto) | Junio y diciembre (o cuando corresponda) |
-| **Cesantías e intereses** | Provisiona el mes (contabilidad); **no** suma al neto | Si quiere provisionar mes a mes (recomendado con contador) |
-| **Vacaciones (provisión)** | Provisiona vacaciones; **no** suma al neto | Igual: si provisiona mensualmente |
-| **Parafiscales** | Calcula caja, SENA, ICBF | Casi siempre (salvo indicación del contador / exoneración) |
-| **Precargar HE según horario** | Trae extras/nocturnas del turno | Si los horarios reflejan la realidad |
-
-La **ARL** se calcula siempre (no depende de la casilla de parafiscales).
-
----
-
-## 8. Errores frecuentes
-
-1. **Empezar por liquidar sin parámetros ni empleados** → resultados vacíos o incorrectos.
-2. **Registrar el sueldo otra vez en Gastos** → costo duplicado.
-3. **Confundir “Pagos de nómina” con pagar el sueldo** → el sueldo va en “Contabilizar y pagar”; PILA/fondo van en Pagos de nómina.
-4. **Asustarse porque “Salarios por pagar” está en $0** → es normal si ya pagó el neto al liquidar.
-5. **Marcar prima todos los meses** → la prima no es mensual; es semestral (en la práctica junio/diciembre).
-6. **Usar el cajón POS para nómina** → el módulo usa caja de nómina / banco a propósito, separado de la caja de ventas.
-
----
-
-## 9. Mini checklist antes de contabilizar
-
-- [ ] Parámetros del año correctos (SMMLV, auxilio, %).
-- [ ] Empleados activos con salario y (si aplica) horario.
-- [ ] Periodo y días correctos en la liquidación.
-- [ ] HE / incapacidades revisadas en el detalle.
-- [ ] Casillas de prima / provisiones según el mes.
-- [ ] Medio y fecha de pago del neto acordes a la realidad.
-- [ ] Confirmación: “Contabilizar y pagar” (acción que genera asiento).
-
----
-
-## 10. Resumen visual del ciclo
+## 7. Flujo mensual resumido
 
 ```
-Parámetros + Horarios + Empleados
-              │
-              ▼
-     Nueva liquidación (borrador)
-              │
-              ▼
-   Ajustar HE / incapacidades
-              │
-              ▼
-     Contabilizar y pagar
-       ├─► Gasto en contabilidad
-       ├─► Neto al empleado (banco / caja nómina)
-       └─► Deudas PILA / prestaciones
-              │
-              ▼
-   Pagos de nómina (cuando pague planilla o fondo)
+Empleados al día (salario + afiliaciones)
+        │
+        ▼
+Nueva liquidación → borrador
+        │
+        ├─ Inc. / Nov. / HE masivas
+        ├─ CSV costo empresa (opcional)
+        └─ PILA / seguridad social → CSV/TXT → operador
+        │
+        ▼
+Contabilizar y pagar  →  neto al empleado + asiento
+        │
+        ▼
+Pagos de nómina       →  cuando pague PILA o fondo
 ```
+
+### Junio / diciembre
+Marque **Incluir prima**.
+
+### Enero
+Intereses de cesantías en Pagos de nómina (si hay saldo). Actualice SMMLV y auxilio en Parámetros a inicio de año.
 
 ---
 
-Si algo no cuadra con lo que indica el contador de la empresa, **prevalece el criterio del contador** sobre esta guía: el sistema aplica reglas generales Colombia y parámetros editables.
+## 8. Glosario corto
+
+| Término | Significado |
+|--------|-------------|
+| Devengado / bruto | Lo ganado antes de descuentos |
+| Deducciones | Salud, pensión, FSP, otras |
+| Neto | Lo que se gira al empleado |
+| IBC | Base de cotización (salario + vacaciones pagadas + HE, con tope) |
+| Costo empresa | Devengado + aportes patronales/parafiscales + provisiones |
+| Provisión | Reserva (cesantías/vacaciones); no aumenta el neto del mes |
+| Prima | Prestación que sí se paga al empleado (semestral) |
+| PILA | Planilla de seguridad social y parafiscales |
+| Contabilizar y pagar | Asiento + neto marcado como pagado |
+
+---
+
+## 9. Checklist antes de contabilizar
+
+- [ ] Parámetros del año (SMMLV, auxilio, %, FSP, 114-1)  
+- [ ] Empleados activos con salario  
+- [ ] Afiliaciones PILA si va a exportar planilla  
+- [ ] NIT en Configuración  
+- [ ] Periodo y días correctos  
+- [ ] Inc. / Nov. / HE revisadas  
+- [ ] Casillas de prima / provisiones según el mes  
+- [ ] Fecha y medio de pago del neto acordes a la realidad  
+- [ ] (Opcional) CSV costo + validación PILA sin errores críticos  
+
+---
+
+## 10. Errores frecuentes
+
+1. Liquidar sin parámetros / empleados / afiliaciones.  
+2. Registrar el sueldo otra vez en Gastos.  
+3. Confundir **Pagos de nómina** con pagar el sueldo (el sueldo va en Contabilizar y pagar).  
+4. Asustarse si “Salarios por pagar” está en $0 (normal tras Contabilizar y pagar).  
+5. Marcar prima todos los meses.  
+6. Usar el cajón POS para nómina.  
+7. Exportar PILA sin EPS/AFP/ARL y esperar que el operador la acepte.  
+8. Creer que el CSV/TXT de Seri ya es “nómina electrónica DIAN”.
+
+---
+
+## 11. Alcance actual vs pendiente
+
+| Capacidad | Estado |
+|-----------|--------|
+| Cálculo automático (devengados, deducciones, prestaciones) | Sí (Fase 1) |
+| Novedades, FSP, 114-1, ARL por empleado, CSV costo | Sí (Fase 1) |
+| Afiliaciones + validación + export PILA operativo | Sí (Fase 2) |
+| Pago de pasivos PILA / prestaciones en el ERP | Sí |
+| Documento soporte nómina electrónica DIAN (XML/CUNE) | Pendiente (consulta cliente) |
+| Portal de autogestión del empleado | Pendiente |
+| Reportes legales ampliados (cert. 220, etc.) | Parcial / pendiente |
+
+---
+
+Si algo no cuadra con lo que indique el **contador** de la empresa, prevalece su criterio: el sistema aplica reglas generales Colombia y parámetros editables.

@@ -1281,12 +1281,16 @@ class PurchasingService
         }
     }
 
+    /**
+     * @param array{cash_from_drawer?:bool|null,cash_source_note?:string} $cashOptions
+     */
     public function receiveOrder(
         int $orderId,
         string $warehouseDate,
         string $invoiceNumber,
         string $paymentMode,
-        string $notes = ''
+        string $notes = '',
+        array $cashOptions = []
     ): array {
         $order = $this->getOrder($orderId);
         if (!$order) {
@@ -1297,6 +1301,24 @@ class PurchasingService
         }
         if (!in_array($paymentMode, ['payable', 'cash', 'transfer', 'card'], true)) {
             $paymentMode = 'payable';
+        }
+        $cashFromDrawer = null;
+        $cashSourceNote = null;
+        if ($paymentMode === 'cash') {
+            $cashFromDrawer = array_key_exists('cash_from_drawer', $cashOptions)
+                ? (bool)$cashOptions['cash_from_drawer']
+                : true;
+            $cashSourceNote = trim((string)($cashOptions['cash_source_note'] ?? ''));
+            if (!$cashFromDrawer && mb_strlen($cashSourceNote) < 5) {
+                throw new \InvalidArgumentException(
+                    'Indique de dónde salió el efectivo (mín. 5 caracteres) cuando no descuenta del cajón.'
+                );
+            }
+            if ($cashFromDrawer) {
+                $cashSourceNote = null;
+            } else {
+                $cashSourceNote = substr($cashSourceNote, 0, 255);
+            }
         }
 
         $stock = new StockService($this->db);
@@ -1406,26 +1428,53 @@ class PurchasingService
                 );
             }
 
-            $upd = $this->query(
-                "UPDATE purchase_orders
-                 SET status = 'received',
-                     warehouse_date = ?,
-                     invoice_number = ?,
-                     payment_mode = ?,
-                     notes = CASE WHEN ? = '' THEN notes ELSE CONCAT(IFNULL(notes,''), IF(notes IS NULL OR notes='', '', ' | '), ?) END,
-                     received_at = NOW(),
-                     received_by = ?
-                 WHERE id = ? AND status IN ('draft', 'ordered')",
-                [
-                    $warehouseDate,
-                    $invoiceNumber !== '' ? $invoiceNumber : null,
-                    $paymentMode,
-                    $notes,
-                    $notes,
-                    $_SESSION['tenant_user_id'] ?? null,
-                    $orderId,
-                ]
-            );
+            try {
+                $upd = $this->query(
+                    "UPDATE purchase_orders
+                     SET status = 'received',
+                         warehouse_date = ?,
+                         invoice_number = ?,
+                         payment_mode = ?,
+                         cash_from_drawer = ?,
+                         cash_source_note = ?,
+                         notes = CASE WHEN ? = '' THEN notes ELSE CONCAT(IFNULL(notes,''), IF(notes IS NULL OR notes='', '', ' | '), ?) END,
+                         received_at = NOW(),
+                         received_by = ?
+                     WHERE id = ? AND status IN ('draft', 'ordered')",
+                    [
+                        $warehouseDate,
+                        $invoiceNumber !== '' ? $invoiceNumber : null,
+                        $paymentMode,
+                        $paymentMode === 'cash' ? ($cashFromDrawer ? 1 : 0) : null,
+                        $paymentMode === 'cash' ? $cashSourceNote : null,
+                        $notes,
+                        $notes,
+                        $_SESSION['tenant_user_id'] ?? null,
+                        $orderId,
+                    ]
+                );
+            } catch (\Throwable $e) {
+                $upd = $this->query(
+                    "UPDATE purchase_orders
+                     SET status = 'received',
+                         warehouse_date = ?,
+                         invoice_number = ?,
+                         payment_mode = ?,
+                         notes = CASE WHEN ? = '' THEN notes ELSE CONCAT(IFNULL(notes,''), IF(notes IS NULL OR notes='', '', ' | '), ?) END,
+                         received_at = NOW(),
+                         received_by = ?
+                     WHERE id = ? AND status IN ('draft', 'ordered')",
+                    [
+                        $warehouseDate,
+                        $invoiceNumber !== '' ? $invoiceNumber : null,
+                        $paymentMode,
+                        $notes,
+                        $notes,
+                        $_SESSION['tenant_user_id'] ?? null,
+                        $orderId,
+                    ]
+                );
+            }
             if ($upd->rowCount() < 1) {
                 throw new \RuntimeException('La orden ya fue recibida por otro proceso');
             }
@@ -1774,6 +1823,17 @@ class PurchasingService
         if ((string)($order['payment_mode'] ?? '') !== 'cash') {
             return '';
         }
+        // Efectivo fuera del cajón: no descuenta la caja abierta.
+        if (array_key_exists('cash_from_drawer', $order)
+            && $order['cash_from_drawer'] !== null
+            && $order['cash_from_drawer'] !== ''
+            && (int)$order['cash_from_drawer'] === 0
+        ) {
+            $src = trim((string)($order['cash_source_note'] ?? ''));
+            return $src !== ''
+                ? 'Efectivo fuera del cajón (' . $src . '): no se descontó de la caja abierta.'
+                : 'Efectivo fuera del cajón: no se descontó de la caja abierta.';
+        }
         $total = round((float)($order['total'] ?? 0), 2);
         if ($total <= 0.009) {
             return '';
@@ -1829,10 +1889,13 @@ class PurchasingService
 
     /**
      * Ingreso a caja cuando una NC revierte una compra pagada en efectivo.
+     *
+     * @param array{allow_closed_origin?:bool} $opts
      * @return string Nota UI
      */
-    public function syncCashForCreditNote(int $creditNoteId): string
+    public function syncCashForCreditNote(int $creditNoteId, array $opts = []): string
     {
+        $allowClosedOrigin = !empty($opts['allow_closed_origin']);
         $note = $this->query(
             "SELECT cn.id, cn.total, cn.credit_number, cn.status, cn.purchase_order_id,
                     po.payment_mode, po.order_number
@@ -1856,18 +1919,38 @@ class PurchasingService
         if ($total <= 0.009) {
             return '';
         }
+        $originSessionId = $orderId > 0 ? $this->originCashSessionIdForPurchaseOrder($orderId) : 0;
+        $target = $this->resolveCashReversalSession($originSessionId, $allowClosedOrigin);
         $label = 'Reverso anulación compra ' . ($note['credit_number'] ?? ('#' . $creditNoteId))
             . (!empty($note['order_number']) ? ' / OC ' . $note['order_number'] : '');
-        return $this->postCashMovement($total, $label, 'income', 'purchase_credit_note', $creditNoteId);
+        if (!empty($target['closed'])) {
+            $label .= ' · ajuste post-cierre';
+        }
+        $msg = $this->postCashMovement(
+            $total,
+            $label,
+            'income',
+            'purchase_credit_note',
+            $creditNoteId,
+            $target['session_id'],
+            !empty($target['closed'])
+        );
+        if ($msg === 'Ingreso a caja registrado.' && !empty($target['closed'])) {
+            return 'El reintegro quedó en la caja del día original (ya cerrada) y se actualizó su informe.';
+        }
+        return $msg;
     }
 
     /**
      * Anulación (sin NC) de una OC pagada con efectivo del cajón: devuelve al cajón lo que salió.
-     * Si la caja del egreso sigue abierta, vuelve a esa misma caja (neto $0);
-     * si ya se cerró, entra como ingreso en la caja abierta actual.
+     * Preferencia: misma caja del egreso (aunque esté cerrada si allow_closed_origin);
+     * si no, caja abierta actual.
+     *
+     * @param array{allow_closed_origin?:bool} $opts
      */
-    public function syncCashForVoidedOrder(int $orderId): string
+    public function syncCashForVoidedOrder(int $orderId, array $opts = []): string
     {
+        $allowClosedOrigin = !empty($opts['allow_closed_origin']);
         $order = $this->query(
             "SELECT po.order_number, po.payment_mode, s.name supplier_name
              FROM purchase_orders po
@@ -1875,14 +1958,20 @@ class PurchasingService
              WHERE po.id = ?",
             [$orderId]
         )->fetch();
-        if (!$order || (string)($order['payment_mode'] ?? '') !== 'cash') {
+        // No exige payment_mode=cash: al editar el medio primero se revierte caja y luego se cambia.
+        if (!$order) {
             return '';
         }
         try {
             $out = $this->query(
-                "SELECT COALESCE(SUM(amount), 0) AS total, MAX(cash_session_id) AS session_id
+                "SELECT
+                    COALESCE(SUM(CASE WHEN reference_type = 'purchase_order' AND type = 'expense' THEN amount ELSE 0 END), 0)
+                    - COALESCE(SUM(CASE WHEN reference_type = 'purchase_order_cancel' AND type = 'income' THEN amount ELSE 0 END), 0)
+                        AS total,
+                    MAX(CASE WHEN reference_type = 'purchase_order' AND type = 'expense' THEN cash_session_id END) AS session_id
                  FROM cash_movements
-                 WHERE reference_type = 'purchase_order' AND reference_id = ? AND type = 'expense'",
+                 WHERE reference_id = ?
+                   AND reference_type IN ('purchase_order', 'purchase_order_cancel')",
                 [$orderId]
             )->fetch() ?: [];
         } catch (\Throwable $e) {
@@ -1890,24 +1979,30 @@ class PurchasingService
         }
         $amount = round((float)($out['total'] ?? 0), 2);
         if ($amount <= 0.009) {
-            return 'La compra no tuvo egreso de cajón; no se movió la caja.';
+            // Sin egreso de cajón (transferencia/tarjeta/crédito/efectivo fuera): no hay nada que reintegrar.
+            return '';
         }
-        $sessionId = null;
-        $originSession = (int)($out['session_id'] ?? 0);
-        if ($originSession > 0) {
-            $open = $this->query(
-                "SELECT id FROM cash_sessions WHERE id = ? AND status = 'open' LIMIT 1",
-                [$originSession]
-            )->fetchColumn();
-            if ($open) {
-                $sessionId = $originSession;
-            }
-        }
+
+        $target = $this->resolveCashReversalSession((int)($out['session_id'] ?? 0), $allowClosedOrigin);
         $label = 'Devolución anulación OC ' . ($order['order_number'] ?? ('#' . $orderId))
             . (!empty($order['supplier_name']) ? ' · ' . $order['supplier_name'] : '');
-        $note = $this->postCashMovement($amount, $label, 'income', 'purchase_order_cancel', $orderId, $sessionId);
+        if (!empty($target['closed'])) {
+            $label .= ' · ajuste post-cierre';
+        }
+        $note = $this->postCashMovement(
+            $amount,
+            $label,
+            'income',
+            'purchase_order_cancel',
+            $orderId,
+            $target['session_id'],
+            !empty($target['closed'])
+        );
         if ($note === 'Ingreso a caja registrado.') {
-            return $sessionId !== null
+            if (!empty($target['closed'])) {
+                return 'El reintegro quedó en la caja del día original (ya cerrada) y se actualizó su informe.';
+            }
+            return $target['session_id'] !== null
                 ? 'El dinero volvió a la caja del día.'
                 : 'El dinero entró como ingreso en la caja abierta.';
         }
@@ -1915,29 +2010,489 @@ class PurchasingService
     }
 
     /**
-     * Si la compra salió del cajón, reversarla (anulación o NC) exige una caja abierta
-     * donde reingresar el efectivo; si no, el cajón y la contabilidad quedan descuadrados.
+     * Resuelve a qué sesión de caja postear un reintegro.
+     * @return array{session_id:?int,closed:bool}
      */
-    public function assertCashDrawerForReversal(int $orderId): void
+    private function resolveCashReversalSession(int $originSessionId, bool $allowClosedOrigin): array
+    {
+        if ($originSessionId > 0) {
+            try {
+                $status = (string)$this->query(
+                    "SELECT status FROM cash_sessions WHERE id = ? LIMIT 1",
+                    [$originSessionId]
+                )->fetchColumn();
+            } catch (\Throwable $e) {
+                $status = '';
+            }
+            if ($status === 'open') {
+                return ['session_id' => $originSessionId, 'closed' => false];
+            }
+            if ($allowClosedOrigin && $status === 'closed') {
+                return ['session_id' => $originSessionId, 'closed' => true];
+            }
+        }
+        return ['session_id' => null, 'closed' => false];
+    }
+
+    /**
+     * Si la compra salió del cajón, reversarla exige caja abierta — salvo admin/gerente
+     * con allowClosedForManagement, que puede reintegrar a la caja de origen ya cerrada.
+     * Otros medios de pago (transferencia, tarjeta, crédito, efectivo fuera del cajón)
+     * no pasan por esta validación.
+     */
+    public function assertCashDrawerForReversal(int $orderId, bool $allowClosedForManagement = false): void
     {
         try {
-            $mode = (string)$this->query(
-                "SELECT payment_mode FROM purchase_orders WHERE id = ?",
+            $row = $this->query(
+                "SELECT payment_mode, cash_from_drawer FROM purchase_orders WHERE id = ?",
                 [$orderId]
-            )->fetchColumn();
+            )->fetch() ?: [];
+            $mode = (string)($row['payment_mode'] ?? '');
+            // Sin columna o null = comportamiento histórico (cajón).
+            $fromDrawer = !array_key_exists('cash_from_drawer', $row)
+                || $row['cash_from_drawer'] === null
+                || $row['cash_from_drawer'] === ''
+                || (int)$row['cash_from_drawer'] === 1;
         } catch (\Throwable $e) {
-            return;
+            try {
+                $mode = (string)$this->query(
+                    "SELECT payment_mode FROM purchase_orders WHERE id = ?",
+                    [$orderId]
+                )->fetchColumn();
+                $fromDrawer = true;
+            } catch (\Throwable $e2) {
+                return;
+            }
         }
-        if ($mode !== 'cash' || !$this->hasCashMovementRef('purchase_order', $orderId)) {
+        if ($mode !== 'cash' || !$fromDrawer || !$this->hasCashMovementRef('purchase_order', $orderId)) {
             return;
         }
         if ((new CashService($this->db))->getOpenSession()) {
             return;
         }
+
+        $originSessionId = $this->originCashSessionIdForPurchaseOrder($orderId);
+        if (
+            $allowClosedForManagement
+            && \SoftNova\Core\TenantMiddleware::isManagement()
+            && $originSessionId > 0
+        ) {
+            return;
+        }
+
         throw new \RuntimeException(
             'Esta compra se pagó con efectivo del cajón. Abra la caja antes de anularla o hacerle nota crédito, '
             . 'para que el dinero se reintegre al cajón.'
+            . ($originSessionId > 0
+                ? ' (Admin/Gerencia pueden anular aunque esa caja esté cerrada: el reintegro queda en el informe de ese día.)'
+                : '')
         );
+    }
+
+    private function originCashSessionIdForPurchaseOrder(int $orderId): int
+    {
+        if ($orderId <= 0) {
+            return 0;
+        }
+        try {
+            return (int)$this->query(
+                "SELECT cash_session_id FROM cash_movements
+                 WHERE reference_type = 'purchase_order' AND reference_id = ? AND type = 'expense'
+                 ORDER BY id DESC LIMIT 1",
+                [$orderId]
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Edición de factura recibida (fechas / N° / forma de pago). Solo metadatos +
+     * reemisión contable/caja si cambia el medio. No toca inventario ni totales.
+     *
+     * @param array{
+     *   invoice_number?:string,
+     *   invoice_date?:string,
+     *   invoice_due_date?:string,
+     *   due_date?:string,
+     *   payment_mode?:string,
+     *   cash_from_drawer?:bool|null,
+     *   cash_source_note?:string
+     * } $meta
+     * @return array{order_id:int,payment_changed:bool,cash_note:string}
+     */
+    public function updateReceivedInvoiceMeta(int $orderId, array $meta): array
+    {
+        SupplyChainSchema::ensure($this->db);
+        $order = $this->getOrder($orderId);
+        if (!$order) {
+            throw new \RuntimeException('Factura/OC no encontrada');
+        }
+        if (($order['status'] ?? '') !== 'received') {
+            throw new \RuntimeException('Solo se pueden editar facturas ya recibidas (no anuladas ni en borrador)');
+        }
+        if (!empty($order['voided_at'])) {
+            throw new \RuntimeException('No se puede editar una factura anulada');
+        }
+
+        $invoiceNumber = array_key_exists('invoice_number', $meta)
+            ? trim((string)$meta['invoice_number'])
+            : (string)($order['invoice_number'] ?? '');
+        $invoiceDate = array_key_exists('invoice_date', $meta)
+            ? $this->validExpiry($meta['invoice_date'] ?? null)
+            : ($order['invoice_date'] ?? null);
+        $invoiceDue = array_key_exists('invoice_due_date', $meta)
+            ? $this->validExpiry($meta['invoice_due_date'] ?? null)
+            : ($order['invoice_due_date'] ?? null);
+        $dueDate = array_key_exists('due_date', $meta)
+            ? $this->validExpiry($meta['due_date'] ?? null)
+            : ($order['due_date'] ?? null);
+
+        $warehouseDate = !empty($order['warehouse_date'])
+            ? substr((string)$order['warehouse_date'], 0, 10)
+            : '';
+        if ($invoiceDate && $warehouseDate !== '' && $warehouseDate < substr((string)$invoiceDate, 0, 10)) {
+            throw new \RuntimeException(
+                'La fecha de factura no puede ser posterior a la recepción de bodega (' . $warehouseDate . ').'
+            );
+        }
+
+        if ($invoiceNumber !== '') {
+            $dup = $this->query(
+                "SELECT id, order_number FROM purchase_orders
+                 WHERE supplier_id = ? AND invoice_number = ? AND id <> ?
+                   AND status NOT IN ('cancelled')
+                 LIMIT 1",
+                [(int)($order['supplier_id'] ?? 0), $invoiceNumber, $orderId]
+            )->fetch();
+            if ($dup) {
+                throw new \RuntimeException(
+                    'Ya existe la factura ' . $invoiceNumber . ' del proveedor en '
+                    . (string)($dup['order_number'] ?? ('#' . (int)$dup['id']))
+                );
+            }
+        }
+
+        $oldMode = (string)($order['payment_mode'] ?? 'payable');
+        $newMode = array_key_exists('payment_mode', $meta)
+            ? (string)$meta['payment_mode']
+            : $oldMode;
+        if (!in_array($newMode, ['payable', 'cash', 'transfer', 'card'], true)) {
+            $newMode = $oldMode;
+        }
+
+        $oldDrawer = !array_key_exists('cash_from_drawer', $order)
+            || $order['cash_from_drawer'] === null
+            || $order['cash_from_drawer'] === ''
+            || (int)$order['cash_from_drawer'] === 1;
+        $newDrawer = $oldDrawer;
+        $newNote = trim((string)($order['cash_source_note'] ?? ''));
+        if ($newMode === 'cash') {
+            if (array_key_exists('cash_from_drawer', $meta)) {
+                $newDrawer = (bool)$meta['cash_from_drawer'];
+            }
+            if (array_key_exists('cash_source_note', $meta)) {
+                $newNote = trim((string)$meta['cash_source_note']);
+            }
+            if (!$newDrawer && mb_strlen($newNote) < 5) {
+                throw new \InvalidArgumentException(
+                    'Indique de dónde salió el efectivo (mín. 5 caracteres) cuando no descuenta del cajón.'
+                );
+            }
+            if ($newDrawer) {
+                $newNote = '';
+            }
+        } else {
+            $newDrawer = true;
+            $newNote = '';
+        }
+
+        $paymentChanged = ($newMode !== $oldMode)
+            || ($newMode === 'cash' && $oldMode === 'cash' && $newDrawer !== $oldDrawer)
+            || ($newMode === 'cash' && !$newDrawer && $newNote !== trim((string)($order['cash_source_note'] ?? '')));
+
+        if ($paymentChanged) {
+            $paidAbonos = (float)$this->query(
+                "SELECT COALESCE(SUM(amount), 0) FROM supplier_payments
+                 WHERE purchase_order_id = ? AND status = 'applied'",
+                [$orderId]
+            )->fetchColumn();
+            if ($paidAbonos > 0.009) {
+                throw new \RuntimeException(
+                    'No se puede cambiar la forma de pago: la factura ya tiene abonos. Anule o corrija los abonos primero.'
+                );
+            }
+            try {
+                $ncCount = (int)$this->query(
+                    "SELECT COUNT(*) FROM purchase_credit_notes
+                     WHERE purchase_order_id = ? AND status = 'posted'",
+                    [$orderId]
+                )->fetchColumn();
+            } catch (\Throwable $e) {
+                $ncCount = 0;
+            }
+            if ($ncCount > 0) {
+                throw new \RuntimeException(
+                    'No se puede cambiar la forma de pago: la factura tiene notas de crédito.'
+                );
+            }
+            // Si salía del cajón (antes) y hay movimiento: caja abierta, o admin/gerente
+            // reintegrando a la caja de origen aunque esté cerrada.
+            $allowClosedCash = \SoftNova\Core\TenantMiddleware::isManagement();
+            if ($oldMode === 'cash' && $oldDrawer && $this->hasCashMovementRef('purchase_order', $orderId)) {
+                $this->assertCashDrawerForReversal($orderId, $allowClosedCash);
+            }
+            // Si el nuevo medio es efectivo del cajón, también debe haber caja abierta.
+            if ($newMode === 'cash' && $newDrawer && !(new CashService($this->db))->getOpenSession()) {
+                throw new \RuntimeException(
+                    'Para registrar el pago en efectivo desde el cajón debe haber una caja abierta.'
+                );
+            }
+        } else {
+            $allowClosedCash = false;
+        }
+
+        $cashNote = '';
+        $accounting = new AccountingService($this->db);
+        $modeLabels = [
+            'payable' => 'Crédito (CxP)',
+            'cash' => 'Efectivo',
+            'transfer' => 'Transferencia',
+            'card' => 'Tarjeta',
+        ];
+        $modeDetail = static function (string $mode, bool $drawer, string $note) use ($modeLabels): string {
+            $label = $modeLabels[$mode] ?? $mode;
+            if ($mode === 'cash') {
+                $label .= $drawer
+                    ? ' · cajón (110505)'
+                    : (' · fuera del cajón / bancos (111005)'
+                        . ($note !== '' ? (': ' . $note) : ''));
+            } elseif ($mode === 'transfer' || $mode === 'card') {
+                $label .= ' · bancos (111005)';
+            } else {
+                $label .= ' · 220505';
+            }
+            return $label;
+        };
+
+        // Si cambia el medio: anular asiento vigente → reintegrar caja (si aplica) → UPDATE → reemitir.
+        // No se tragan errores: un fallo a medias deja caja/contabilidad descuadrados.
+        if ($paymentChanged) {
+            try {
+                $accounting->voidPurchaseOrderEntry(
+                    $orderId,
+                    'Edición forma de pago OC ' . (string)($order['order_number'] ?? ('#' . $orderId))
+                        . ' · ' . ($modeLabels[$oldMode] ?? $oldMode)
+                        . ' → ' . ($modeLabels[$newMode] ?? $newMode)
+                );
+            } catch (\Throwable $e) {
+                error_log('Reverso asiento al editar OC ' . $orderId . ': ' . $e->getMessage());
+                $hint = $e instanceof \PDOException
+                    ? 'conflicto o periodo cerrado en Contabilidad'
+                    : $e->getMessage();
+                throw new \RuntimeException(
+                    'No se pudo revertir el asiento contable anterior: ' . $hint
+                );
+            }
+            try {
+                if ($oldMode === 'cash' && $oldDrawer) {
+                    $cashNote = $this->syncCashForVoidedOrder($orderId, [
+                        'allow_closed_origin' => !empty($allowClosedCash),
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                error_log('Reverso caja al editar OC ' . $orderId . ': ' . $e->getMessage());
+                throw $e;
+            }
+        }
+
+        $this->db->beginTransaction();
+        try {
+            try {
+                $this->query(
+                    "UPDATE purchase_orders SET
+                        invoice_number = ?,
+                        invoice_date = ?,
+                        invoice_due_date = ?,
+                        due_date = ?,
+                        payment_mode = ?,
+                        cash_from_drawer = ?,
+                        cash_source_note = ?
+                     WHERE id = ? AND status = 'received'",
+                    [
+                        $invoiceNumber !== '' ? substr($invoiceNumber, 0, 80) : null,
+                        $invoiceDate,
+                        $invoiceDue,
+                        $dueDate,
+                        $newMode,
+                        $newMode === 'cash' ? ($newDrawer ? 1 : 0) : null,
+                        $newMode === 'cash' && !$newDrawer ? substr($newNote, 0, 255) : null,
+                        $orderId,
+                    ]
+                );
+            } catch (\Throwable $e) {
+                $this->query(
+                    "UPDATE purchase_orders SET
+                        invoice_number = ?,
+                        invoice_date = ?,
+                        invoice_due_date = ?,
+                        due_date = ?,
+                        payment_mode = ?
+                     WHERE id = ? AND status = 'received'",
+                    [
+                        $invoiceNumber !== '' ? substr($invoiceNumber, 0, 80) : null,
+                        $invoiceDate,
+                        $invoiceDue,
+                        $dueDate,
+                        $newMode,
+                        $orderId,
+                    ]
+                );
+            }
+
+            if ($paymentChanged) {
+                $this->query(
+                    "UPDATE purchase_orders SET accounting_entry_id = NULL WHERE id = ?",
+                    [$orderId]
+                );
+            }
+
+            $this->db->commit();
+        } catch (\Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
+
+        try {
+            $this->refreshPaymentStatus($orderId);
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        $newEntryId = null;
+        if ($paymentChanged) {
+            try {
+                $newEntryId = $accounting->postPurchaseOrder($orderId);
+            } catch (\Throwable $e) {
+                $accounting->enqueuePending(
+                    'post_purchase_order',
+                    'purchase_order',
+                    $orderId,
+                    $e->getMessage()
+                );
+                $hint = $e instanceof \PDOException
+                    ? 'conflicto al reemitir el asiento (revise Contabilidad → Sincronizar)'
+                    : $e->getMessage();
+                // Evitar filtrar por clientErrorMessage (SQLSTATE → fallback genérico).
+                throw new \RuntimeException(
+                    'Datos guardados, pero el asiento contable quedó pendiente: ' . $hint
+                );
+            }
+            try {
+                $cashNote2 = $this->syncCashForReceivedOrder($orderId);
+                if ($cashNote2 !== '') {
+                    $cashNote = trim($cashNote . ' ' . $cashNote2);
+                }
+            } catch (\Throwable $e) {
+                error_log('Caja al reeditar OC ' . $orderId . ': ' . $e->getMessage());
+                throw new \RuntimeException(
+                    'Asiento actualizado, pero falló el movimiento de caja: ' . $e->getMessage()
+                );
+            }
+        }
+
+        $oldInv = trim((string)($order['invoice_number'] ?? ''));
+        $oldInvDate = substr(trim((string)($order['invoice_date'] ?? '')), 0, 10);
+        $oldDue = substr(trim((string)($order['due_date'] ?? '')), 0, 10);
+        $metaChanged = $paymentChanged
+            || $invoiceNumber !== $oldInv
+            || substr((string)($invoiceDate ?? ''), 0, 10) !== $oldInvDate
+            || substr((string)($dueDate ?? ''), 0, 10) !== $oldDue;
+
+        if ($metaChanged) {
+            $detailParts = [];
+            if ($invoiceNumber !== $oldInv) {
+                $detailParts[] = 'N° '
+                    . ($oldInv !== '' ? $oldInv : '—')
+                    . ' → '
+                    . ($invoiceNumber !== '' ? $invoiceNumber : '—');
+            }
+            if (substr((string)($invoiceDate ?? ''), 0, 10) !== $oldInvDate) {
+                $detailParts[] = 'Fecha factura '
+                    . ($oldInvDate !== '' ? $oldInvDate : '—')
+                    . ' → '
+                    . (substr((string)($invoiceDate ?? ''), 0, 10) ?: '—');
+            }
+            if (substr((string)($dueDate ?? ''), 0, 10) !== $oldDue) {
+                $detailParts[] = 'Vencimiento '
+                    . ($oldDue !== '' ? $oldDue : '—')
+                    . ' → '
+                    . (substr((string)($dueDate ?? ''), 0, 10) ?: '—');
+            }
+            if ($paymentChanged) {
+                $detailParts[] = 'Pago: '
+                    . $modeDetail($oldMode, $oldDrawer, trim((string)($order['cash_source_note'] ?? '')))
+                    . ' → '
+                    . $modeDetail($newMode, $newDrawer, $newNote);
+                if ($newEntryId) {
+                    $detailParts[] = 'Asiento reemitido #' . (int)$newEntryId;
+                }
+                if ($cashNote !== '') {
+                    $detailParts[] = $cashNote;
+                }
+            }
+            try {
+                (new PurchaseInvoiceImportService($this->db))->logLifecycleEvent(
+                    !empty($order['invoice_import_id']) ? (int)$order['invoice_import_id'] : null,
+                    $orderId,
+                    $paymentChanged ? 'payment_mode_edited' : 'invoice_meta_edited',
+                    $paymentChanged ? 'Forma de pago corregida' : 'Factura editada',
+                    implode(' · ', $detailParts),
+                    [
+                        'old_payment_mode' => $oldMode,
+                        'new_payment_mode' => $newMode,
+                        'cash_from_drawer' => $newMode === 'cash' ? ($newDrawer ? 1 : 0) : null,
+                        'accounting_entry_id' => $newEntryId,
+                        'payment_changed' => $paymentChanged,
+                    ]
+                );
+            } catch (\Throwable $e) {
+                error_log('Lifecycle edición OC ' . $orderId . ': ' . $e->getMessage());
+            }
+        }
+
+        TenantAuditService::safeLog(
+            $this->db,
+            'edit',
+            'compras',
+            'Factura editada: ' . (string)($order['order_number'] ?? ('#' . $orderId))
+                . ($invoiceNumber !== '' ? (' / ' . $invoiceNumber) : '')
+                . ($paymentChanged
+                    ? (' · pago ' . ($modeLabels[$oldMode] ?? $oldMode)
+                        . '→' . ($modeLabels[$newMode] ?? $newMode))
+                    : ''),
+            'purchase_order',
+            $orderId,
+            [
+                'invoice_number' => $invoiceNumber,
+                'invoice_date' => $invoiceDate,
+                'due_date' => $dueDate,
+                'payment_mode' => $newMode,
+                'old_payment_mode' => $oldMode,
+                'cash_from_drawer' => $newMode === 'cash' ? ($newDrawer ? 1 : 0) : null,
+                'payment_changed' => $paymentChanged,
+                'accounting_entry_id' => $newEntryId,
+            ]
+        );
+
+        return [
+            'order_id' => $orderId,
+            'payment_changed' => $paymentChanged,
+            'cash_note' => $cashNote,
+            'accounting_entry_id' => $newEntryId,
+        ];
     }
 
     /**
@@ -2212,9 +2767,12 @@ class PurchasingService
 
     /**
      * Devuelve a caja el egreso de un abono a proveedor (tras cancelarlo en anulación).
+     *
+     * @param array{allow_closed_origin?:bool} $opts
      */
-    public function syncCashReverseForSupplierPayment(int $paymentId): string
+    public function syncCashReverseForSupplierPayment(int $paymentId, array $opts = []): string
     {
+        $allowClosedOrigin = !empty($opts['allow_closed_origin']);
         $payment = $this->query(
             "SELECT sp.id, sp.amount, sp.payment_method, sp.status, sp.cash_from_drawer,
                     po.order_number, s.name supplier_name
@@ -2244,10 +2802,37 @@ class PurchasingService
         if ($amount <= 0.009) {
             return '';
         }
+        $originSessionId = 0;
+        try {
+            $originSessionId = (int)$this->query(
+                "SELECT cash_session_id FROM cash_movements
+                 WHERE reference_type = 'supplier_payment' AND reference_id = ? AND type = 'expense'
+                 ORDER BY id DESC LIMIT 1",
+                [$paymentId]
+            )->fetchColumn();
+        } catch (\Throwable $e) {
+            $originSessionId = 0;
+        }
+        $target = $this->resolveCashReversalSession($originSessionId, $allowClosedOrigin);
         $label = 'Reverso abono proveedor'
             . (!empty($payment['order_number']) ? ' OC ' . $payment['order_number'] : '')
             . (!empty($payment['supplier_name']) ? ' · ' . $payment['supplier_name'] : '');
-        return $this->postCashMovement($amount, $label, 'income', 'supplier_payment_cancel', $paymentId);
+        if (!empty($target['closed'])) {
+            $label .= ' · ajuste post-cierre';
+        }
+        $msg = $this->postCashMovement(
+            $amount,
+            $label,
+            'income',
+            'supplier_payment_cancel',
+            $paymentId,
+            $target['session_id'],
+            !empty($target['closed'])
+        );
+        if ($msg === 'Ingreso a caja registrado.' && !empty($target['closed'])) {
+            return 'El reintegro del abono quedó en la caja del día original (ya cerrada) y se actualizó su informe.';
+        }
+        return $msg;
     }
 
     /**
@@ -2300,7 +2885,8 @@ class PurchasingService
         string $type,
         string $referenceType,
         int $referenceId,
-        ?int $sessionId = null
+        ?int $sessionId = null,
+        bool $allowClosedSession = false
     ): string {
         $amount = round(max(0, $amount), 2);
         if ($amount <= 0.009 || $referenceId <= 0) {
@@ -2310,11 +2896,23 @@ class PurchasingService
             return '';
         }
         $cash = new CashService($this->db);
-        if (!$cash->getOpenSession()) {
+        // Con sesión de origen cerrada (admin/gerente) no hace falta caja abierta.
+        if (!$allowClosedSession && !$cash->getOpenSession()) {
             return 'Aviso: no hay caja abierta; el movimiento de efectivo no se registró en el cajón (sí en contabilidad).';
         }
+        if ($allowClosedSession && ($sessionId === null || $sessionId <= 0) && !$cash->getOpenSession()) {
+            return 'Aviso: no hay caja de origen ni caja abierta; el movimiento de efectivo no se registró en el cajón.';
+        }
         try {
-            $ok = $cash->registerMovement($amount, $description, $type, $referenceType, $referenceId, $sessionId);
+            $ok = $cash->registerMovement(
+                $amount,
+                $description,
+                $type,
+                $referenceType,
+                $referenceId,
+                $sessionId,
+                $allowClosedSession
+            );
             if ($ok === false) {
                 return 'Aviso: no se pudo registrar el movimiento en caja física.';
             }
@@ -2330,6 +2928,24 @@ class PurchasingService
     private function hasCashMovementRef(string $referenceType, int $referenceId): bool
     {
         try {
+            // Compra: neto expense − cancel. Permite re-egresar o re-reintegrar tras editar forma de pago.
+            if ($referenceType === 'purchase_order' || $referenceType === 'purchase_order_cancel') {
+                $net = (float)$this->query(
+                    "SELECT
+                        COALESCE(SUM(CASE WHEN reference_type = 'purchase_order' AND type = 'expense' THEN amount ELSE 0 END), 0)
+                        - COALESCE(SUM(CASE WHEN reference_type = 'purchase_order_cancel' AND type = 'income' THEN amount ELSE 0 END), 0)
+                     FROM cash_movements
+                     WHERE reference_id = ?
+                       AND reference_type IN ('purchase_order', 'purchase_order_cancel')",
+                    [$referenceId]
+                )->fetchColumn();
+                $net = round($net, 2);
+                // expense: "ya hay egreso activo" si neto > 0
+                // cancel: "ya reintegrado" si neto <= 0 (nada pendiente por devolver)
+                return $referenceType === 'purchase_order'
+                    ? ($net > 0.009)
+                    : ($net <= 0.009);
+            }
             $n = (int)$this->query(
                 "SELECT COUNT(*) FROM cash_movements
                  WHERE reference_type = ? AND reference_id = ?",
@@ -3238,6 +3854,7 @@ class PurchasingService
                 ['reason' => $fullReason, 'direct' => true],
                 'warning'
             );
+            $this->logVoidLifecycle($order, $orderId, $reason, true, $reversedPayments);
 
             return [
                 'credit_note_id' => 0,
@@ -3253,6 +3870,7 @@ class PurchasingService
 
         if ($alreadyFullyCredited) {
             $this->finalizeVoidedOrder($orderId, $reason);
+            $this->logVoidLifecycle($order, $orderId, $reason, false, $reversedPayments);
             return [
                 'credit_note_id' => 0,
                 'credit_number' => '',
@@ -3291,6 +3909,7 @@ class PurchasingService
             ],
             'warning'
         );
+        $this->logVoidLifecycle($order, $orderId, $reason, false, $reversedPayments, (string)($result['credit_number'] ?? ''));
 
         return [
             'credit_note_id' => (int)$result['credit_note_id'],
@@ -3301,6 +3920,45 @@ class PurchasingService
             'already_credited' => false,
             'reversed_payments' => $reversedPayments,
         ];
+    }
+
+    /**
+     * @param array<string,mixed> $order
+     * @param list<array{id:int,amount?:float,payment_method?:string}> $reversedPayments
+     */
+    private function logVoidLifecycle(
+        array $order,
+        int $orderId,
+        string $reason,
+        bool $direct,
+        array $reversedPayments = [],
+        string $creditNumber = ''
+    ): void {
+        $mode = (string)($order['payment_mode'] ?? 'payable');
+        $detail = 'Motivo: ' . $reason
+            . ' · Medio: ' . $mode
+            . ($direct ? ' · Reverso directo (inventario + contabilidad)' : '')
+            . ($creditNumber !== '' ? (' · NC ' . $creditNumber) : '');
+        if ($reversedPayments !== []) {
+            $detail .= ' · Abonos revertidos: ' . count($reversedPayments);
+        }
+        try {
+            (new PurchaseInvoiceImportService($this->db))->logLifecycleEvent(
+                !empty($order['invoice_import_id']) ? (int)$order['invoice_import_id'] : null,
+                $orderId,
+                'invoice_voided',
+                'Factura anulada',
+                $detail,
+                [
+                    'payment_mode' => $mode,
+                    'direct' => $direct,
+                    'credit_number' => $creditNumber !== '' ? $creditNumber : null,
+                    'reversed_payments' => count($reversedPayments),
+                ]
+            );
+        } catch (\Throwable $e) {
+            error_log('Lifecycle anulación OC ' . $orderId . ': ' . $e->getMessage());
+        }
     }
 
     /** @param list<array{id:int,amount?:float,payment_method?:string}> $payments */
@@ -4037,13 +4695,23 @@ class PurchasingService
         // Medio de pago elegido: en compras a crédito se ve en cada abono; en
         // las de contado vive en payment_mode de la orden y se muestra aquí.
         $payMode = (string)($order['payment_mode'] ?? 'payable');
+        $cashDrawer = !array_key_exists('cash_from_drawer', $order)
+            || $order['cash_from_drawer'] === null
+            || $order['cash_from_drawer'] === ''
+            || (int)$order['cash_from_drawer'] === 1;
+        $cashNoteTxt = trim((string)($order['cash_source_note'] ?? ''));
         $payModeLabels = [
-            'cash' => 'Efectivo · sale del cajón (110505)',
+            'cash' => $cashDrawer
+                ? 'Efectivo · sale del cajón (110505)'
+                : ('Efectivo · fuera del cajón / bancos (111005)'
+                    . ($cashNoteTxt !== '' ? (': ' . $cashNoteTxt) : '')),
             'transfer' => 'Transferencia · bancos (111005)',
             'card' => 'Tarjeta · bancos (111005)',
             'payable' => 'Crédito · cuenta por pagar (220505), se paga con abonos',
         ];
         $order['payment_mode_label'] = $payModeLabels[$payMode] ?? $payMode;
+        // Estado vigente del pago de contado. Si hubo corrección, el hito
+        // payment_mode_edited (lifecycle) documenta el cambio old→new.
         if (in_array($payMode, ['cash', 'transfer', 'card'], true)
             && ($order['status'] ?? '') === 'received'
             && (float)($order['total'] ?? 0) > 0.009) {
@@ -4051,7 +4719,9 @@ class PurchasingService
                 $events,
                 (string)($order['received_at'] ?? $order['warehouse_date'] ?? $createdAt),
                 'payment',
-                'Pago de contado al recibir',
+                !empty($loggedTypes['payment_mode_edited'])
+                    ? 'Pago de contado (vigente)'
+                    : 'Pago de contado al recibir',
                 trim(
                     $payModeLabels[$payMode]
                     . (!empty($order['accounting_entry_number'])
