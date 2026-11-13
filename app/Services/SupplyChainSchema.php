@@ -420,6 +420,9 @@ class SupplyChainSchema
             ['supplier_payments', 'discount_amount', 'DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER discount_pct'],
             // Base efectiva de la CxP cuando la factura del proveedor difiere del total del sistema
             ['purchase_orders', 'supplier_invoice_value', 'DECIMAL(14,2) NULL AFTER total'],
+            // Ajuste ± al valor neto (redondeo de % de dcto. vs total impreso del proveedor)
+            ['purchase_orders', 'net_adjustment', 'DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER commercial_discount_amount'],
+            ['purchase_invoice_imports', 'net_adjustment', 'DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER commercial_discount_amount'],
         ] as [$table, $column, $definition]) {
             self::addColumnIfMissing($db, $table, $column, $definition);
         }

@@ -898,6 +898,8 @@ class PurchaseInvoiceImportService
             // Total de línea neto. F. Electrónica: el IVA ya va en unit_cost.
             // F. Normal: IVA en tax_rate → se suma al subtotal (no al total de línea).
             $totalLinea = round($cantidad * $costo * (1 - $descuento / 100), 2);
+            // String con 2 decimales: evita truncar 14.30→14 o 0.10→0 en columnas INT residuales.
+            $descuentoSql = number_format($descuento, 2, '.', '');
 
             // P. venta: el del archivo manda; si viene vacío y hay match, el del catálogo.
             $salePrice = isset($item['sale_price']) && (float)$item['sale_price'] > 0
@@ -930,7 +932,7 @@ class PurchaseInvoiceImportService
                 $cantidad,
                 $costo,
                 $impuesto,
-                $descuento,
+                $descuentoSql,
                 $totalLinea,
                 $autoMatch ? ($match['product_id'] ?? null) : null,
                 $autoMatch ? ($match['match_type'] ?? 'none') : 'none',
@@ -1806,17 +1808,22 @@ class PurchaseInvoiceImportService
             $invCost = 0.0;
         }
 
+        $discRaw = $this->csvValue($campos, $mapa, 'discount_pct');
+        $qty = $this->toQuantity($this->csvValue($campos, $mapa, 'quantity'));
+        $lineTotal = $this->toNumber($this->csvValue($campos, $mapa, 'line_total'));
+        $discountPct = $this->normalizeDiscountPctValue($discRaw, $qty, $unitCost, $lineTotal);
+
         $fila = [
             'raw_line' => implode($separador, $campos),
             'supplier_sku' => $sku,
             'barcode' => $barcode,
             'description' => $this->csvValue($campos, $mapa, 'description'),
-            'quantity' => $this->toQuantity($this->csvValue($campos, $mapa, 'quantity')),
+            'quantity' => $qty,
             'bonus_qty' => $this->toQuantity($this->csvValue($campos, $mapa, 'bonus_qty')),
             'unit_cost' => $unitCost,
             'tax_rate' => $taxRate,
-            'discount_pct' => $this->toNumber($this->csvValue($campos, $mapa, 'discount_pct')),
-            'line_total' => $this->toNumber($this->csvValue($campos, $mapa, 'line_total')),
+            'discount_pct' => $discountPct,
+            'line_total' => $lineTotal,
             'lot_code' => $this->csvValue($campos, $mapa, 'lot_code'),
             'expiry_date' => $this->normalizeDate($this->csvValue($campos, $mapa, 'expiry_date')),
             'sale_price' => $this->toNumber($this->csvValue($campos, $mapa, 'sale_price')),
@@ -1993,7 +2000,13 @@ class PurchaseInvoiceImportService
                 'iva', 'impuesto', 'tax', 'tax_rate', 'porcentaje_iva', 'pctiva', 'porciva',
                 'tarifaiva', 'taxpercent', 'taxpct', 'iva%', 'tax%',
             ],
-            'discount_pct' => ['descuento', 'discount', 'dcto', 'descuento_pct', 'porcdescuento'],
+            'discount_pct' => [
+                'descuento_pct', 'descuentopct', 'descuento_porcentaje', 'descuentoporcentaje',
+                'porcentaje_descuento', 'porcentajedescuento', 'porc_descuento', 'porcdescuento',
+                'pct_descuento', 'pctdescuento', 'dto_pct', 'dtopct', 'dcto_pct', 'dctopct',
+                'descuento', 'discount', 'discount_pct', 'discountpct', 'dcto', 'dto',
+                'descuento%', 'dcto%', 'dto%', '%descuento', '%dcto',
+            ],
             'line_total' => [
                 'total_linea', 'line_total', 'valor_total', 'valortotal', 'importe',
                 'subtotal', 'totalitem', 'valortot', 'neto', 'total', 'linetotal',
@@ -2049,6 +2062,25 @@ class PurchaseInvoiceImportService
                     }
                     if ($clave === 'description' && in_array($normalizado, ['proveedor', 'cliente', 'factura', 'vendor'], true)) {
                         continue;
+                    }
+                    // "Descuento" / "Descuento_pct" no debe mapearse a descripción por el alias "desc".
+                    if ($clave === 'description' && (
+                        str_contains($normalizado, 'descuento')
+                        || str_contains($normalizado, 'discount')
+                        || $normalizado === 'dcto'
+                        || $normalizado === 'dto'
+                        || str_starts_with($normalizado, 'dcto')
+                        || str_starts_with($normalizado, 'dto')
+                    )) {
+                        continue;
+                    }
+                    // Preferir encabezados explícitos de % descuento.
+                    if ($clave === 'discount_pct' && (
+                        str_contains($normalizado, 'pct')
+                        || str_contains($normalizado, 'porc')
+                        || str_contains($normalizado, 'percent')
+                    )) {
+                        $score += 25;
                     }
                     // Preferir "price" exacto sobre "precio" genérico confuso.
                     if ($clave === 'unit_cost' && $normalizado === 'price') {
@@ -2154,6 +2186,40 @@ class PurchaseInvoiceImportService
     /** @return array<string,int> */
     private function defaultPositionalMap(int $n): array
     {
+        // Plantilla Seri: Referencia, EAN, Descripcion, Cantidad, Bonif, Costo_factura,
+        // IVA, Descuento_pct, Total_linea, Lote, Vencimiento, Costo_inventario, Precio_venta
+        if ($n >= 13) {
+            return [
+                'supplier_sku' => 0,
+                'barcode' => 1,
+                'description' => 2,
+                'quantity' => 3,
+                'bonus_qty' => 4,
+                'unit_cost' => 5,
+                'tax_rate' => 6,
+                'discount_pct' => 7,
+                'line_total' => 8,
+                'lot_code' => 9,
+                'expiry_date' => 10,
+                'inventory_cost' => 11,
+                'sale_price' => 12,
+            ];
+        }
+        if ($n >= 11) {
+            return [
+                'supplier_sku' => 0,
+                'barcode' => 1,
+                'description' => 2,
+                'quantity' => 3,
+                'bonus_qty' => 4,
+                'unit_cost' => 5,
+                'tax_rate' => 6,
+                'discount_pct' => 7,
+                'line_total' => 8,
+                'lot_code' => 9,
+                'expiry_date' => 10,
+            ];
+        }
         // Formato típico export proveedor: #, Ref, EAN, Description, Qty, Price, Tax%, TaxVal, Total
         if ($n >= 9) {
             return [
@@ -2163,6 +2229,7 @@ class PurchaseInvoiceImportService
                 'quantity' => 4,
                 'unit_cost' => 5,
                 'tax_rate' => 6,
+                'discount_pct' => 7,
                 'line_total' => $n - 1,
             ];
         }
@@ -2174,6 +2241,7 @@ class PurchaseInvoiceImportService
                 'quantity' => 3,
                 'unit_cost' => 4,
                 'tax_rate' => 5,
+                'discount_pct' => 6,
                 'line_total' => $n - 1,
             ];
         }
@@ -2214,6 +2282,64 @@ class PurchaseInvoiceImportService
     }
 
     /**
+     * Normaliza el % de descuento de línea.
+     * - Excel a menudo guarda 10% como 0.1 → se escala a 10.
+     * - Si el % viene vacío/0 pero Total_linea es menor que qty×costo, se infiere el %.
+     * - Valores con signo % explícito (ej. 0,5%) se respetan sin escalar.
+     */
+    private function normalizeDiscountPctValue(
+        string $raw,
+        float $qty,
+        float $cost,
+        float $total
+    ): float {
+        $raw = trim(html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $hadPctSign = str_contains($raw, '%');
+        $disc = max(0.0, $this->toNumber($raw));
+
+        // Excel / Sheets: celda con formato % almacena fracción (0.1 = 10%).
+        if (!$hadPctSign && $disc > 0.0 && $disc <= 1.00001) {
+            $gross = ($qty > 0.0 && $cost > 0.0) ? round($qty * $cost, 2) : 0.0;
+            $asFraction = $gross > 0.0 ? round($gross * (1.0 - $disc), 2) : 0.0;
+            $asPercent = $gross > 0.0 ? round($gross * (1.0 - $disc / 100.0), 2) : 0.0;
+            $tol = $gross > 0.0 ? max(1.0, $gross * 0.02) : 1.0;
+            $matchFraction = $total > 0.0 && $asFraction > 0.0 && abs($total - $asFraction) <= $tol;
+            $matchPercent = $total > 0.0 && $asPercent > 0.0 && abs($total - $asPercent) <= $tol;
+            $totalLooksGross = $total <= 0.0 || ($gross > 0.0 && abs($total - $gross) <= $tol);
+
+            if ($matchFraction && !$matchPercent) {
+                $disc = round($disc * 100.0, 4);
+            } elseif ($matchFraction && $matchPercent) {
+                // Ambos encajan (totales chicos): preferir interpretación % de factura (×100).
+                $disc = round($disc * 100.0, 4);
+            } elseif ($totalLooksGross) {
+                // Total aún sin descontar (plantilla) o vacío: 0.1 → 10%.
+                $disc = round($disc * 100.0, 4);
+            }
+        }
+
+        if ($disc > 100.0) {
+            // Monto en pesos pegado por error en columna %: no inventar un 100%.
+            $disc = 0.0;
+        }
+
+        $disc = round(max(0.0, min(100.0, $disc)), 2);
+
+        // Inferir desde Total_linea si el % quedó en 0.
+        if ($disc <= 0.009 && $qty > 0.0 && $cost > 0.0 && $total > 0.0) {
+            $gross = round($qty * $cost, 2);
+            if ($gross > 0.009 && $total < ($gross - max(0.5, $gross * 0.002))) {
+                $inferred = (1.0 - ($total / $gross)) * 100.0;
+                if ($inferred >= 0.01 && $inferred <= 100.0) {
+                    $disc = round($inferred, 2);
+                }
+            }
+        }
+
+        return $disc;
+    }
+
+    /**
      * Completa cantidad/costo cuando el CSV trae solo total o valores incompletos.
      *
      * @param array<string,mixed> $fila
@@ -2225,7 +2351,29 @@ class PurchaseInvoiceImportService
         $cost = (float)($fila['unit_cost'] ?? 0);
         $total = (float)($fila['line_total'] ?? 0);
         $tax = max(0, (float)($fila['tax_rate'] ?? 0));
-        $disc = max(0, min(100, (float)($fila['discount_pct'] ?? 0)));
+        $disc = max(0.0, min(100.0, (float)($fila['discount_pct'] ?? 0)));
+        // Fracción Excel residual (0.1) si el total encaja mejor como (1 - fracción).
+        if ($disc > 0.0 && $disc <= 1.00001 && $qty > 0.0 && $cost > 0.0 && $total > 0.0) {
+            $gross = round($qty * $cost, 2);
+            $tol = max(1.0, $gross * 0.02);
+            $asFraction = round($gross * (1.0 - $disc), 2);
+            $asPercent = round($gross * (1.0 - $disc / 100.0), 2);
+            $matchFraction = abs($total - $asFraction) <= $tol;
+            $matchPercent = abs($total - $asPercent) <= $tol;
+            if ($matchFraction && !$matchPercent) {
+                $disc = round($disc * 100.0, 2);
+            }
+        }
+        // Inferir % si sigue en 0 y el total viene descontado.
+        if ($disc <= 0.009 && $qty > 0.0 && $cost > 0.0 && $total > 0.0) {
+            $gross = round($qty * $cost, 2);
+            if ($gross > 0.009 && $total < ($gross - max(0.5, $gross * 0.002))) {
+                $inferred = (1.0 - ($total / $gross)) * 100.0;
+                if ($inferred >= 0.01 && $inferred <= 100.0) {
+                    $disc = round($inferred, 2);
+                }
+            }
+        }
 
         // Si el "costo" es un EAN numérico, invalidar.
         if ($cost > 0 && $this->looksLikeBarcode((string)(int)round($cost)) && $cost > 1.0e9) {
@@ -2725,7 +2873,8 @@ class PurchaseInvoiceImportService
             (float)($import['early_payment_discount_pct'] ?? 0),
             (float)($import['commercial_discount_pct'] ?? 0),
             (float)($import['commercial_discount_amount'] ?? 0),
-            $taxFinal
+            $taxFinal,
+            (float)($import['net_adjustment'] ?? 0)
         );
     }
 
@@ -2784,12 +2933,20 @@ class PurchaseInvoiceImportService
             if ($itemId <= 0 || !is_array($row)) {
                 continue;
             }
+            $qtyUpd = $this->toQuantity((string)($row['quantity'] ?? '0'));
+            $costUpd = $this->toNumber((string)($row['unit_cost'] ?? '0'));
+            $totalUpd = $this->toNumber((string)($row['line_total'] ?? '0'));
             $row = $this->normalizeInvoiceLineAmounts([
-                'quantity' => $this->toQuantity((string)($row['quantity'] ?? '0')),
-                'unit_cost' => $this->toNumber((string)($row['unit_cost'] ?? '0')),
+                'quantity' => $qtyUpd,
+                'unit_cost' => $costUpd,
                 'tax_rate' => $this->toNumber((string)($row['tax_rate'] ?? '0')),
-                'discount_pct' => $this->toNumber((string)($row['discount_pct'] ?? '0')),
-                'line_total' => $this->toNumber((string)($row['line_total'] ?? '0')),
+                'discount_pct' => $this->normalizeDiscountPctValue(
+                    (string)($row['discount_pct'] ?? '0'),
+                    $qtyUpd,
+                    $costUpd,
+                    $totalUpd
+                ),
+                'line_total' => $totalUpd,
                 'description' => $row['description'] ?? '',
             ] + $row);
             $cantidad = round(max(0, (float)($row['quantity'] ?? 0)), 3);
@@ -3584,6 +3741,9 @@ class PurchaseInvoiceImportService
             isset($meta['commercial_discount_amount']) && $meta['commercial_discount_amount'] !== ''
                 ? max(0, round((float)$meta['commercial_discount_amount'], 2))
                 : 0.0,
+            isset($meta['net_adjustment']) && $meta['net_adjustment'] !== '' && $meta['net_adjustment'] !== null
+                ? round(\SoftNova\Core\parse_money($meta['net_adjustment']), 2)
+                : 0.0,
             $importId,
         ];
         // Si hay monto $, anula % para que al confirmar no se recalcule mal.
@@ -3602,7 +3762,8 @@ class PurchaseInvoiceImportService
                     payment_mode = ?,
                     early_payment_discount_pct = ?,
                     commercial_discount_pct = ?,
-                    commercial_discount_amount = ?
+                    commercial_discount_amount = ?,
+                    net_adjustment = ?
                  WHERE id = ? AND status = 'pending'",
                 [
                     $headerParams[0],
@@ -3615,28 +3776,58 @@ class PurchaseInvoiceImportService
                     $headerParams[6],
                     $headerParams[7],
                     $headerParams[8],
+                    $headerParams[9],
                 ]
             );
         } catch (\Throwable $e) {
-            $this->query(
-                "UPDATE purchase_invoice_imports SET
-                    supplier_id = COALESCE(?, supplier_id),
-                    invoice_number = COALESCE(NULLIF(?, ''), invoice_number),
-                    invoice_date = COALESCE(?, invoice_date),
-                    due_date = COALESCE(?, due_date),
-                    payment_mode = ?,
-                    early_payment_discount_pct = ?
-                 WHERE id = ? AND status = 'pending'",
-                [
-                    $headerParams[0],
-                    $headerParams[1],
-                    $headerParams[2],
-                    $headerParams[3],
-                    $headerParams[4],
-                    $headerParams[5],
-                    $headerParams[8],
-                ]
-            );
+            // Fallback: installs sin net_adjustment / columnas comerciales nuevas.
+            try {
+                $this->query(
+                    "UPDATE purchase_invoice_imports SET
+                        supplier_id = COALESCE(?, supplier_id),
+                        invoice_number = COALESCE(NULLIF(?, ''), invoice_number),
+                        invoice_date = COALESCE(?, invoice_date),
+                        due_date = COALESCE(?, due_date),
+                        warehouse_date = COALESCE(?, warehouse_date),
+                        payment_mode = ?,
+                        early_payment_discount_pct = ?,
+                        commercial_discount_pct = ?,
+                        commercial_discount_amount = ?
+                     WHERE id = ? AND status = 'pending'",
+                    [
+                        $headerParams[0],
+                        $headerParams[1],
+                        $headerParams[2],
+                        $headerParams[3],
+                        $this->normalizeDate($meta['warehouse_date'] ?? null),
+                        $headerParams[4],
+                        $headerParams[5],
+                        $headerParams[6],
+                        $headerParams[7],
+                        $headerParams[9],
+                    ]
+                );
+            } catch (\Throwable $e2) {
+                $this->query(
+                    "UPDATE purchase_invoice_imports SET
+                        supplier_id = COALESCE(?, supplier_id),
+                        invoice_number = COALESCE(NULLIF(?, ''), invoice_number),
+                        invoice_date = COALESCE(?, invoice_date),
+                        due_date = COALESCE(?, due_date),
+                        payment_mode = ?,
+                        early_payment_discount_pct = ?
+                     WHERE id = ? AND status = 'pending'",
+                    [
+                        $headerParams[0],
+                        $headerParams[1],
+                        $headerParams[2],
+                        $headerParams[3],
+                        $headerParams[4],
+                        $headerParams[5],
+                        $headerParams[9],
+                    ]
+                );
+            }
         }
 
         if (array_key_exists('invoice_due_date', $meta)) {
@@ -4139,7 +4330,8 @@ class PurchaseInvoiceImportService
                     false,
                     (float)($import['commercial_discount_pct'] ?? 0),
                     (float)($import['commercial_discount_amount'] ?? 0),
-                    $isCustomVat
+                    $isCustomVat,
+                    (float)($import['net_adjustment'] ?? 0)
                 );
                 $this->query(
                     "UPDATE purchase_orders SET origin = 'invoice_import', invoice_import_id = ?,
@@ -4165,6 +4357,7 @@ class PurchaseInvoiceImportService
                     'early_payment_discount_pct' => $import['early_payment_discount_pct'] ?? 0,
                     'commercial_discount_pct' => $import['commercial_discount_pct'] ?? 0,
                     'commercial_discount_amount' => $import['commercial_discount_amount'] ?? 0,
+                    'net_adjustment' => $import['net_adjustment'] ?? 0,
                 ], $isCustomVat);
                 $this->query(
                     "UPDATE purchase_orders SET origin = COALESCE(NULLIF(origin,''), 'invoice_import'),
@@ -4192,7 +4385,8 @@ class PurchaseInvoiceImportService
                 false, // no forzar descuento aliado sobre el total de factura
                 (float)($import['commercial_discount_pct'] ?? 0),
                 (float)($import['commercial_discount_amount'] ?? 0),
-                $isCustomVat
+                $isCustomVat,
+                (float)($import['net_adjustment'] ?? 0)
             );
 
             $this->query(
@@ -4323,6 +4517,7 @@ class PurchaseInvoiceImportService
         } catch (\Throwable $e) {
             // ignore
         }
+        $netAdjConfirm = round((float)($import['net_adjustment'] ?? 0), 2);
         $this->logLifecycleEvent(
             $importId,
             $orderId,
@@ -4331,7 +4526,12 @@ class PurchaseInvoiceImportService
             trim(
                 'Se generó la OC, se actualizó inventario y contabilidad'
                 . ($reviewNotes !== '' ? (' · Con observación') : '')
-            )
+                . (abs($netAdjConfirm) > 0.009
+                    ? (' · Ajuste neto ' . ($netAdjConfirm < 0 ? '−' : '+')
+                        . number_format(abs($netAdjConfirm), 2, ',', '.'))
+                    : '')
+            ),
+            abs($netAdjConfirm) > 0.009 ? ['net_adjustment' => $netAdjConfirm] : []
         );
 
         return [
@@ -5686,12 +5886,13 @@ class PurchaseInvoiceImportService
                         COALESCE(early_payment_discount_pct, 0) AS early_payment_discount_pct,
                         COALESCE(commercial_discount_pct, 0) AS commercial_discount_pct,
                         COALESCE(commercial_discount_amount, 0) AS commercial_discount_amount,
+                        COALESCE(net_adjustment, 0) AS net_adjustment,
                         COALESCE(apply_product_vat, 0) AS apply_product_vat
                  FROM purchase_invoice_imports WHERE id = ? LIMIT 1",
                 [$importId]
             )->fetch();
         } catch (\Throwable $e) {
-            // Instalaciones sin tax_override_amount: misma lógica con columnas base.
+            // Instalaciones sin tax_override_amount / net_adjustment: misma lógica con columnas base.
             try {
                 $row = $this->query(
                     "SELECT subtotal, tax_total,
@@ -5716,6 +5917,80 @@ class PurchaseInvoiceImportService
             "UPDATE purchase_invoice_imports SET total = ? WHERE id = ?",
             [$disc['total'], $importId]
         );
+    }
+
+    /**
+     * Fija el valor neto al esperado por el usuario (pie de revisión) y recalcula
+     * net_adjustment contra el subtotal/IVA ya redondeados en servidor.
+     * Evita el desfase de centavos (JS vs SUM(ROUND(...)) por línea) en el listado.
+     */
+    public function reconcileNetToExpected(int $importId, mixed $expectedRaw): ?array
+    {
+        if ($expectedRaw === null || $expectedRaw === '') {
+            return null;
+        }
+        $expected = round(\SoftNova\Core\parse_money($expectedRaw), 2);
+        if ($expected < 0) {
+            return null;
+        }
+
+        // Asegurar subtotal/IVA al día antes de derivar el ajuste.
+        $this->refreshTotals($importId);
+
+        try {
+            $row = $this->query(
+                "SELECT subtotal, tax_total, tax_override_amount,
+                        COALESCE(early_payment_discount_pct, 0) AS early_payment_discount_pct,
+                        COALESCE(commercial_discount_pct, 0) AS commercial_discount_pct,
+                        COALESCE(commercial_discount_amount, 0) AS commercial_discount_amount,
+                        COALESCE(apply_product_vat, 0) AS apply_product_vat
+                 FROM purchase_invoice_imports WHERE id = ? AND status = 'pending' LIMIT 1",
+                [$importId]
+            )->fetch();
+        } catch (\Throwable $e) {
+            try {
+                $row = $this->query(
+                    "SELECT subtotal, tax_total,
+                            COALESCE(early_payment_discount_pct, 0) AS early_payment_discount_pct,
+                            COALESCE(commercial_discount_pct, 0) AS commercial_discount_pct,
+                            COALESCE(commercial_discount_amount, 0) AS commercial_discount_amount,
+                            COALESCE(apply_product_vat, 0) AS apply_product_vat
+                     FROM purchase_invoice_imports WHERE id = ? AND status = 'pending' LIMIT 1",
+                    [$importId]
+                )->fetch();
+            } catch (\Throwable $e2) {
+                return null;
+            }
+        }
+        if (!$row) {
+            return null;
+        }
+
+        // Total sin ajuste (= lo que el servidor calcula con redondeo por línea).
+        $row['net_adjustment'] = 0;
+        $before = self::resolveImportDisplayTotals($row);
+        $beforeTotal = (float)$before['total'];
+        $adj = round($expected - $beforeTotal, 2);
+
+        try {
+            $this->query(
+                "UPDATE purchase_invoice_imports
+                 SET net_adjustment = ?, total = ?
+                 WHERE id = ? AND status = 'pending'",
+                [$adj, max(0, $expected), $importId]
+            );
+        } catch (\Throwable $e) {
+            $this->query(
+                "UPDATE purchase_invoice_imports SET total = ? WHERE id = ? AND status = 'pending'",
+                [max(0, $expected), $importId]
+            );
+        }
+
+        return [
+            'total_before_adjustment' => $beforeTotal,
+            'net_adjustment' => $adj,
+            'total' => max(0, $expected),
+        ];
     }
 
     // ------------------------------------------------------------- utilidades

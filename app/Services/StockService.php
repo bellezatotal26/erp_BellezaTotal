@@ -2474,9 +2474,15 @@ class StockService
      * Fecha/hora visible en trazabilidad.
      * movement_date es DATE (sin hora); si se usa solo, siempre sale 00:00.
      * Se combina la fecha operativa con la hora real de created_at.
+     * Para compras con factura importada, preferir el resumen subida+confirmación.
      */
     public static function formatMovementDisplayAt(array $m): string
     {
+        $purchaseSummary = self::formatPurchaseTraceDatesSummary($m);
+        if ($purchaseSummary !== '') {
+            return $purchaseSummary;
+        }
+
         $created = trim((string)($m['created_at'] ?? ''));
         $mov = trim((string)($m['movement_date'] ?? ''));
         if ($mov === '' || $mov === '0000-00-00' || str_starts_with($mov, '0000-00-00')) {
@@ -2498,6 +2504,205 @@ class StockService
         }
 
         return date('d/m/Y H:i', strtotime($datePart . ' 00:00:00'));
+    }
+
+    /** @return list<array{label:string,value:string}> */
+    public static function purchaseTraceDateLines(array $m): array
+    {
+        $ref = (string)($m['reference_type'] ?? '');
+        if (!in_array($ref, ['purchase_order', 'purchase', 'purchase_cancel', 'purchase_credit_note'], true)) {
+            return [];
+        }
+
+        $fmt = static function (?string $raw, bool $withTime = true): string {
+            $raw = trim((string)$raw);
+            if ($raw === '' || str_starts_with($raw, '0000-00-00')) {
+                return '';
+            }
+            $ts = strtotime($raw);
+            if ($ts === false) {
+                return '';
+            }
+            return $withTime ? date('d/m/Y H:i', $ts) : date('d/m/Y', $ts);
+        };
+
+        $uploaded = $fmt((string)($m['invoice_uploaded_at'] ?? ''), true);
+        $confirmed = $fmt(
+            (string)($m['invoice_confirmed_at'] ?? $m['purchase_received_at'] ?? $m['created_at'] ?? ''),
+            true
+        );
+        $warehouseRaw = trim((string)($m['purchase_warehouse_date'] ?? $m['movement_date'] ?? ''));
+        $warehouse = $fmt($warehouseRaw, false);
+
+        $lines = [];
+        if ($uploaded !== '') {
+            $lines[] = ['label' => 'Subida factura', 'value' => $uploaded];
+        }
+        if ($confirmed !== '') {
+            // Evitar duplicar si coincide exactamente con la subida.
+            if ($uploaded === '' || $confirmed !== $uploaded) {
+                $lines[] = ['label' => 'Confirmación / ingreso', 'value' => $confirmed];
+            }
+        }
+        if ($warehouse !== '') {
+            $whDay = substr($warehouseRaw, 0, 10);
+            $confDay = '';
+            $confRaw = trim((string)($m['invoice_confirmed_at'] ?? $m['purchase_received_at'] ?? $m['created_at'] ?? ''));
+            if ($confRaw !== '' && !str_starts_with($confRaw, '0000-00-00')) {
+                $confDay = date('Y-m-d', strtotime($confRaw) ?: time());
+            }
+            // Mostrar bodega si difiere del día de confirmación, o si no hay confirmación.
+            if ($confirmed === '' || ($whDay !== '' && $whDay !== $confDay)) {
+                $lines[] = ['label' => 'Recepción bodega', 'value' => $warehouse];
+            }
+        }
+
+        return $lines;
+    }
+
+    /** Texto compacto para cabeceras: «Subida … · Confirmada …» (solo facturas importadas). */
+    public static function formatPurchaseTraceDatesSummary(array $m): string
+    {
+        // Sin carga de factura: conservar el display simple de movement_date/created_at.
+        if (trim((string)($m['invoice_uploaded_at'] ?? '')) === '') {
+            return '';
+        }
+        $lines = self::purchaseTraceDateLines($m);
+        if ($lines === []) {
+            return '';
+        }
+        $parts = [];
+        foreach ($lines as $line) {
+            $label = (string)($line['label'] ?? '');
+            $value = (string)($line['value'] ?? '');
+            if ($value === '') {
+                continue;
+            }
+            if ($label === 'Subida factura') {
+                $parts[] = 'Subida ' . $value;
+            } elseif ($label === 'Confirmación / ingreso') {
+                $parts[] = 'Confirmada ' . $value;
+            } elseif ($label === 'Recepción bodega') {
+                $parts[] = 'Bodega ' . $value;
+            } else {
+                $parts[] = $label . ' ' . $value;
+            }
+        }
+        return implode(' · ', $parts);
+    }
+
+    /**
+     * Adjunta fechas de carga/confirmación de factura importada a movimientos de compra.
+     *
+     * @param list<array<string,mixed>> $movements
+     * @return list<array<string,mixed>>
+     */
+    public static function attachPurchaseTraceDates(\PDO $db, array $movements): array
+    {
+        $orderIds = [];
+        foreach ($movements as $m) {
+            if (in_array((string)($m['reference_type'] ?? ''), ['purchase_order', 'purchase', 'purchase_cancel', 'purchase_credit_note'], true)
+                && (int)($m['reference_id'] ?? 0) > 0
+            ) {
+                $orderIds[(int)$m['reference_id']] = true;
+            }
+        }
+        if ($orderIds === []) {
+            return $movements;
+        }
+
+        $byOrder = [];
+        foreach (array_chunk(array_keys($orderIds), 400) as $chunk) {
+            $ph = implode(',', array_fill(0, count($chunk), '?'));
+            try {
+                $st = $db->prepare(
+                    "SELECT id, warehouse_date, received_at, created_at, invoice_import_id
+                     FROM purchase_orders
+                     WHERE id IN ($ph)"
+                );
+                $st->execute($chunk);
+                foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $po) {
+                    $oid = (int)$po['id'];
+                    $byOrder[$oid] = [
+                        'purchase_warehouse_date' => (string)($po['warehouse_date'] ?? ''),
+                        'purchase_received_at' => (string)($po['received_at'] ?? ''),
+                        'purchase_created_at' => (string)($po['created_at'] ?? ''),
+                        'invoice_uploaded_at' => '',
+                        'invoice_confirmed_at' => '',
+                        'invoice_import_id' => (int)($po['invoice_import_id'] ?? 0),
+                    ];
+                }
+            } catch (\Throwable $e) {
+                return $movements;
+            }
+
+            try {
+                $st = $db->prepare(
+                    "SELECT id, purchase_order_id, created_at, confirmed_at, warehouse_date
+                     FROM purchase_invoice_imports
+                     WHERE purchase_order_id IN ($ph)
+                        OR id IN (
+                            SELECT invoice_import_id FROM purchase_orders
+                            WHERE id IN ($ph) AND invoice_import_id IS NOT NULL AND invoice_import_id > 0
+                        )
+                     ORDER BY id ASC"
+                );
+                $st->execute(array_merge($chunk, $chunk));
+                foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $imp) {
+                    $oid = (int)($imp['purchase_order_id'] ?? 0);
+                    if ($oid <= 0) {
+                        // Resolver por invoice_import_id → order.
+                        foreach ($byOrder as $candId => $row) {
+                            if ((int)($row['invoice_import_id'] ?? 0) === (int)$imp['id']) {
+                                $oid = (int)$candId;
+                                break;
+                            }
+                        }
+                    }
+                    if ($oid <= 0 || !isset($byOrder[$oid])) {
+                        continue;
+                    }
+                    // Preferir el import más reciente / el vinculado.
+                    $prefer = ((int)($byOrder[$oid]['invoice_import_id'] ?? 0) === (int)$imp['id'])
+                        || $byOrder[$oid]['invoice_uploaded_at'] === '';
+                    if (!$prefer) {
+                        continue;
+                    }
+                    $byOrder[$oid]['invoice_uploaded_at'] = (string)($imp['created_at'] ?? '');
+                    $byOrder[$oid]['invoice_confirmed_at'] = (string)($imp['confirmed_at'] ?? '');
+                    if (trim((string)($byOrder[$oid]['purchase_warehouse_date'] ?? '')) === ''
+                        && trim((string)($imp['warehouse_date'] ?? '')) !== ''
+                    ) {
+                        $byOrder[$oid]['purchase_warehouse_date'] = (string)$imp['warehouse_date'];
+                    }
+                }
+            } catch (\Throwable $e) {
+                // Sin tabla de imports: solo fechas de OC.
+            }
+        }
+
+        foreach ($movements as &$m) {
+            $oid = (int)($m['reference_id'] ?? 0);
+            if ($oid <= 0 || !isset($byOrder[$oid])) {
+                continue;
+            }
+            $info = $byOrder[$oid];
+            $m['purchase_warehouse_date'] = $info['purchase_warehouse_date'] !== ''
+                ? $info['purchase_warehouse_date']
+                : (string)($m['purchase_warehouse_date'] ?? $m['movement_date'] ?? '');
+            $m['purchase_received_at'] = $info['purchase_received_at'] !== ''
+                ? $info['purchase_received_at']
+                : (string)($m['purchase_received_at'] ?? '');
+            $m['invoice_uploaded_at'] = $info['invoice_uploaded_at'];
+            $m['invoice_confirmed_at'] = $info['invoice_confirmed_at'] !== ''
+                ? $info['invoice_confirmed_at']
+                : ($info['purchase_received_at'] !== '' ? $info['purchase_received_at'] : (string)($m['created_at'] ?? ''));
+            $m['trace_date_lines'] = self::purchaseTraceDateLines($m);
+            $m['display_at'] = self::formatMovementDisplayAt($m);
+        }
+        unset($m);
+
+        return $movements;
     }
 
     /**
@@ -2672,6 +2877,13 @@ class StockService
             $lines[] = 'Entrada por devolución de venta';
         } elseif ($ref === 'purchase' || $ref === 'purchase_order') {
             $lines[] = 'Entrada por compra a proveedor';
+            foreach (self::purchaseTraceDateLines($m) as $dl) {
+                $lab = trim((string)($dl['label'] ?? ''));
+                $val = trim((string)($dl['value'] ?? ''));
+                if ($lab !== '' && $val !== '') {
+                    $lines[] = $lab . ': ' . $val;
+                }
+            }
         } elseif ($ref === 'purchase_credit_note') {
             $lines[] = 'Ajuste por nota de crédito de compra';
         } elseif ($ref === 'purchase_cancel') {
@@ -3404,7 +3616,8 @@ class StockService
         // Cargar un ventana amplia de líneas, agrupar y paginar grupos.
         // Evita partir una misma OC entre páginas.
         $scan = $this->listMovements($filters, 2500, 0);
-        $allGroups = self::buildMovementGroups($scan['rows']);
+        $scanRows = self::attachPurchaseTraceDates($this->db, $scan['rows']);
+        $allGroups = self::buildMovementGroups($scanRows);
         $totalGroups = count($allGroups);
         $limit = max(1, min(100, $limit));
         $offset = max(0, $offset);
@@ -3425,8 +3638,22 @@ class StockService
         ) ?: [];
         foreach ($enriched as $key => $line) {
             [$gi, $li] = array_map('intval', explode(':', (string)$key));
+            $line['display_at'] = self::formatMovementDisplayAt($line);
+            $line['trace_date_lines'] = self::purchaseTraceDateLines($line);
             $pageGroups[$gi]['lines'][$li] = $line;
         }
+        foreach ($pageGroups as &$group) {
+            $headLine = $group['lines'][0] ?? [];
+            foreach ($group['lines'] as $line) {
+                $ca = (string)($line['created_at'] ?? '');
+                $cb = (string)($headLine['created_at'] ?? '');
+                if ($ca !== '' && ($cb === '' || strcmp($ca, $cb) > 0)) {
+                    $headLine = $line;
+                }
+            }
+            $group['display_at'] = self::formatMovementDisplayAt($headLine);
+        }
+        unset($group);
 
         return [
             'groups' => $pageGroups,

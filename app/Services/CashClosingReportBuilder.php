@@ -558,6 +558,143 @@ class CashClosingReportBuilder
     }
 
     /**
+     * Adjunta ítems (productos) de cada venta para desglose en PDF / Excel / detalles.
+     *
+     * @param list<array<string,mixed>> $sales
+     * @return list<array<string,mixed>>
+     */
+    public static function attachSaleItems(\PDO $db, array $sales): array
+    {
+        $ids = [];
+        foreach ($sales as $s) {
+            $id = (int)($s['id'] ?? 0);
+            if ($id > 0) {
+                $ids[$id] = true;
+            }
+        }
+        if ($ids === []) {
+            return $sales;
+        }
+        $idList = array_keys($ids);
+        $ph = implode(',', array_fill(0, count($idList), '?'));
+        $bySale = [];
+        $itemRows = [];
+        foreach ([true, false] as $hideDocHidden) {
+            try {
+                $hiddenSql = $hideDocHidden ? ' AND COALESCE(si.document_hidden, 0) = 0' : '';
+                $st = $db->prepare(
+                    "SELECT si.sale_id, si.product_name, si.quantity, si.unit_price,
+                            COALESCE(si.subtotal, si.quantity * si.unit_price, 0) AS line_total,
+                            COALESCE(p.code, '') AS product_code,
+                            COALESCE(p.name, '') AS catalog_name
+                     FROM sale_items si
+                     LEFT JOIN products p ON p.id = si.product_id
+                     WHERE si.sale_id IN ($ph){$hiddenSql}
+                     ORDER BY si.sale_id ASC, si.id ASC"
+                );
+                $st->execute($idList);
+                $itemRows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+                break;
+            } catch (\Throwable $e) {
+                $itemRows = [];
+            }
+        }
+
+        foreach ($itemRows as $row) {
+            $sid = (int)($row['sale_id'] ?? 0);
+            if ($sid <= 0) {
+                continue;
+            }
+            $name = trim((string)($row['product_name'] ?? ''));
+            if ($name === '') {
+                $name = trim((string)($row['catalog_name'] ?? ''));
+            }
+            if ($name === '') {
+                $name = 'Producto';
+            }
+            $bySale[$sid][] = [
+                'product_name' => $name,
+                'product_code' => trim((string)($row['product_code'] ?? '')),
+                'quantity' => (float)($row['quantity'] ?? 0),
+                'unit_price' => round((float)($row['unit_price'] ?? 0), 2),
+                'line_total' => round((float)($row['line_total'] ?? 0), 2),
+            ];
+        }
+
+        foreach ($sales as &$s) {
+            $sid = (int)($s['id'] ?? 0);
+            $s['items'] = $bySale[$sid] ?? [];
+        }
+        unset($s);
+
+        return $sales;
+    }
+
+    /**
+     * Texto del desglose de productos (una línea por ítem, separadas por \\n).
+     * Ej.: "2× Crema facial · $ 20.000,00"
+     *
+     * @param array<string,mixed> $sale
+     * @param callable(float):string $fmt
+     */
+    public static function formatSaleItemsDetail(array $sale, callable $fmt): string
+    {
+        $items = $sale['items'] ?? [];
+        if (!is_array($items) || $items === []) {
+            return '';
+        }
+        $lines = [];
+        foreach ($items as $it) {
+            if (!is_array($it)) {
+                continue;
+            }
+            $qty = (float)($it['quantity'] ?? 0);
+            $qtyStr = abs($qty - round($qty)) < 0.001
+                ? (string)(int)round($qty)
+                : number_format($qty, 2, ',', '.');
+            $name = trim((string)($it['product_name'] ?? 'Producto'));
+            $code = trim((string)($it['product_code'] ?? ''));
+            $label = $code !== '' ? ($code . ' · ' . $name) : $name;
+            $lineTot = round((float)($it['line_total'] ?? 0), 2);
+            $unit = round((float)($it['unit_price'] ?? 0), 2);
+            $txt = $qtyStr . '× ' . $label;
+            if ($unit > 0.009 && abs(($unit * $qty) - $lineTot) > 0.02) {
+                $txt .= ' @ ' . $fmt($unit);
+            }
+            $txt .= ' · ' . $fmt($lineTot);
+            $lines[] = $txt;
+        }
+        return implode("\n", $lines);
+    }
+
+    /**
+     * HTML compacto de productos para notas del PDF.
+     *
+     * @param array<string,mixed> $sale
+     * @param callable(float):string $fmt
+     */
+    public static function formatSaleItemsHtml(array $sale, callable $fmt, string $noteStyle = ''): string
+    {
+        $detail = self::formatSaleItemsDetail($sale, $fmt);
+        if ($detail === '') {
+            return '';
+        }
+        $style = $noteStyle !== ''
+            ? $noteStyle
+            : 'display:block;margin-top:2px;font-size:10px;';
+        $html = '<span style="' . $style . 'color:#334155;"><strong>Productos:</strong>';
+        foreach (explode("\n", $detail) as $line) {
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+            $html .= '<br>· ' . htmlspecialchars($line);
+        }
+        $html .= '</span>';
+        return $html;
+    }
+
+    /**
      * Texto compacto del desglose: «Efectivo $ 5.000,00 + Nequi $ 4.000,00».
      *
      * @param list<array<string,mixed>> $payments
@@ -622,6 +759,30 @@ class CashClosingReportBuilder
     }
 
     /**
+     * Detalle de descuento de una venta (PDF / Excel / modal detalles).
+     * Ej.: "Descuento aplicado: -$ 425,00 (5,0%) · subtotal $ 8.500,00"
+     *
+     * @param array<string,mixed> $sale
+     * @param callable(float):string $fmt
+     */
+    public static function formatSaleDiscountDetail(array $sale, callable $fmt): string
+    {
+        $disc = round((float)($sale['discount'] ?? 0), 2);
+        if ($disc <= 0.009) {
+            return '';
+        }
+        $sub = round((float)($sale['subtotal'] ?? 0), 2);
+        $pct = $sub > 0.009
+            ? ' (' . number_format($disc / $sub * 100, 1, ',', '.') . '%)'
+            : '';
+        $txt = 'Descuento aplicado: -' . $fmt($disc) . $pct;
+        if ($sub > 0.009) {
+            $txt .= ' · subtotal ' . $fmt($sub);
+        }
+        return $txt;
+    }
+
+    /**
      * Línea de tiempo unificada: ventas + movimientos de caja no ligados a venta.
      *
      * @param list<array<string,mixed>> $sales
@@ -670,14 +831,18 @@ class CashClosingReportBuilder
             if ($disc > 0.009) {
                 $discountCount++;
                 $discountSum += $disc;
-                $sub = round((float)($sale['subtotal'] ?? 0), 2);
-                $pct = $sub > 0.009 ? ' (' . number_format($disc / $sub * 100, 1, ',', '.') . '%)' : '';
-                $notes .= '<span style="' . $noteStyle . 'color:#B45309;">Descuento aplicado: -'
-                    . htmlspecialchars($fmt($disc)) . $pct
-                    . ($sub > 0.009 ? ' · subtotal ' . htmlspecialchars($fmt($sub)) : '')
-                    . '</span>';
+                $discDetail = self::formatSaleDiscountDetail($sale, $fmt);
+                if ($discDetail !== '') {
+                    $notes .= '<span style="' . $noteStyle . 'color:#B45309;">'
+                        . htmlspecialchars($discDetail) . '</span>';
+                }
                 $flags[] = 'Desc.';
                 $bg = '#FFFBEB';
+            }
+
+            $itemsHtml = self::formatSaleItemsHtml($sale, $fmt, $noteStyle);
+            if ($itemsHtml !== '') {
+                $notes .= $itemsHtml;
             }
 
             $ncTot = round((float)($sale['credit_note_total'] ?? 0), 2);

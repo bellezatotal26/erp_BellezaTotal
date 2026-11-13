@@ -457,7 +457,19 @@ function openPurchaseLimitModal() {
 .po-pct-wrap { position: relative; display: flex; align-items: center; width: 100%; max-width: 96px; }
 .po-pct-wrap .form-control { padding-right: 26px; width: 100%; }
 .po-pct-wrap .po-pct-affix { position: absolute; right: 8px; font-size: 13px; font-weight: 600; color: var(--color-text-secondary); pointer-events: none; }
-.po-com-disc-fields { display: grid; grid-template-columns: 96px minmax(140px, 1fr); gap: 8px; align-items: center; max-width: 420px; }
+.po-com-disc-fields { display: grid; grid-template-columns: 96px minmax(120px, 1fr); gap: 8px; align-items: center; }
+.po-com-adj-row { display: grid; grid-template-columns: minmax(200px, 1fr) 110px 150px; gap: 10px 14px; align-items: end; max-width: 720px; }
+.po-com-adj-row__adj .po-net-adj-input,
+.po-com-adj-row__target .po-net-target-input { width: 100%; max-width: 150px; }
+.po-com-adj-row label { display: block; margin-bottom: 4px; }
+.po-com-adj-row__target label { font-size: 12.5px; line-height: 1.25; }
+@media (max-width: 720px) {
+    .po-com-adj-row { grid-template-columns: 1fr 1fr; max-width: 480px; }
+    .po-com-adj-row__disc { grid-column: 1 / -1; }
+}
+@media (max-width: 480px) {
+    .po-com-adj-row { grid-template-columns: 1fr; max-width: 420px; }
+}
 </style>
 
 <?php if ($isFacturasTab): ?>
@@ -810,6 +822,7 @@ function openPurchaseLimitModal() {
                     if ($comDiscAmt <= 0.009 && $comDiscPct > 0.009) {
                         $comDiscAmt = round((float)($o['subtotal'] ?? 0) * $comDiscPct / 100, 2);
                     }
+                    $netAdjList = round((float)($o['net_adjustment'] ?? 0), 2);
                     ?>
                     <tr<?php echo ($fullyCredited || $isVoided) ? ' style="opacity:0.78;"' : ''; ?>>
                         <?php if ($isFacturasTab): ?>
@@ -821,6 +834,12 @@ function openPurchaseLimitModal() {
                                     <div><span class="badge badge-warning" title="Totalmente acreditada / devolución">Devuelta</span></div>
                                 <?php elseif ($creditTot > 0.009): ?>
                                     <div><span class="badge badge-info" title="Tiene nota(s) de crédito">Con NC</span></div>
+                                <?php endif; ?>
+                                <?php if (abs($netAdjList) > 0.009): ?>
+                                    <div style="font-size:11px;color:var(--dmc-1D4ED8, #1D4ED8);font-weight:600;"
+                                         title="Ajuste al valor neto vs factura impresa">
+                                        Aj. <?php echo ($netAdjList < 0 ? '−' : '+') . fmtC(abs($netAdjList), $currency); ?>
+                                    </div>
                                 <?php endif; ?>
                             </td>
                             <td><?php echo htmlspecialchars($o['order_number']); ?></td>
@@ -1119,13 +1138,25 @@ function openPurchaseLimitModal() {
                 </div>
                 <input type="hidden" name="early_payment_discount_pct" id="receiveEarlyDiscount" value="0">
                 <div class="form-group" style="margin:0;grid-column:1/-1;">
-                    <label>Desc. comercial <span class="field-tip" data-tip="Descuento general sobre el subtotal (antes de IVA). Indique % con hasta 2 decimales (0–100) o monto $; si hay monto, manda el $." tabindex="0">?</span></label>
-                    <div class="po-com-disc-fields">
-                        <div class="po-pct-wrap">
-                            <input type="number" step="0.01" min="0" max="100" inputmode="decimal" name="commercial_discount_pct" id="receiveCommercialPct" class="form-control" value="" placeholder="0" title="Porcentaje con hasta 2 decimales" oninput="poClampCommercialPct(this)">
-                            <span class="po-pct-affix">%</span>
+                    <div class="po-com-adj-row">
+                        <div class="po-com-adj-row__disc">
+                            <label>Desc. comercial <span class="field-tip" data-tip="Descuento general sobre el subtotal (antes de IVA). Indique % con hasta 2 decimales (0–100) o monto $; si hay monto, manda el $." tabindex="0">?</span></label>
+                            <div class="po-com-disc-fields">
+                                <div class="po-pct-wrap">
+                                    <input type="number" step="0.01" min="0" max="100" inputmode="decimal" name="commercial_discount_pct" id="receiveCommercialPct" class="form-control" value="" placeholder="0" title="Porcentaje con hasta 2 decimales" oninput="poClampCommercialPct(this)">
+                                    <span class="po-pct-affix">%</span>
+                                </div>
+                                <input type="text" inputmode="decimal" name="commercial_discount_amount" id="receiveCommercialAmt" class="form-control money-input" data-money="1" value="" placeholder="$ monto" autocomplete="off">
+                            </div>
                         </div>
-                        <input type="text" inputmode="decimal" name="commercial_discount_amount" id="receiveCommercialAmt" class="form-control money-input" data-money="1" value="" placeholder="$ monto" autocomplete="off">
+                        <div class="po-com-adj-row__adj">
+                            <label>Ajuste neto (±) <span class="field-tip" data-tip="Sume o reste centavos para igualar el valor impreso del proveedor (ej. -2,44). Digite la coma libremente. Afecta CxP y el asiento." tabindex="0">?</span></label>
+                            <input type="text" inputmode="decimal" name="net_adjustment" id="receiveNetAdjustment" class="form-control po-net-adj-input" data-money="0" value="" placeholder="-2,44" autocomplete="off" title="Positivo suma; negativo resta. Ejemplo: -2,44" oninput="onReceiveNetAdjInput()">
+                        </div>
+                        <div class="po-com-adj-row__target">
+                            <label>O coloca el neto final <span class="field-tip" data-tip="Escriba el valor neto impreso de la factura. El sistema calcula solo el ajuste (±) necesario." tabindex="0">?</span></label>
+                            <input type="text" inputmode="decimal" id="receiveTargetNet" class="form-control po-net-target-input" data-money="0" value="" placeholder="1.400.308" autocomplete="off" title="Valor neto esperado de la factura" oninput="onReceiveTargetNetInput()">
+                        </div>
                     </div>
                 </div>
                 <div class="form-group" style="margin:0;">
@@ -1300,7 +1331,7 @@ function openPurchaseLimitModal() {
                 <small id="payInvoiceHint" style="color:var(--color-text-secondary);display:block;margin-top:4px;"></small>
             </div>
             <div class="form-group">
-                <label>Dcto. Pronto Pago <span class="field-tip" data-tip="Descuento que el proveedor concede por pagar antes del vencimiento. Escriba el porcentaje o el monto: el otro se calcula solo sobre el Valor de Factura. Reduce el saldo a pagar y contablemente se reconoce como ingreso por descuentos (421040)." tabindex="0">?</span></label>
+                <label>Dcto. Pronto Pago <span class="field-tip" data-tip="Descuento por pagar antes del vencimiento (ingreso 421040). Puede escribir % o monto: el abono se ajusta solo. Si en cambio escribe el valor del abono (lo transferido), el dcto. se ajusta solo para liquidar la diferencia y dejar restante en $0." tabindex="0">?</span></label>
                 <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
                     <div class="po-pct-wrap">
                         <input type="number" step="0.01" min="0" max="100" inputmode="decimal" name="discount_pct" id="payDiscountPct" class="form-control" placeholder="0">
@@ -1311,11 +1342,12 @@ function openPurchaseLimitModal() {
                         <input type="text" inputmode="decimal" name="discount_amount" id="payDiscountAmount" class="form-control money-input" data-money="1" placeholder="$ 0">
                     </div>
                 </div>
-                <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">Escriba el % o el monto; el otro valor se calcula automáticamente.</small>
+                <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">Escriba el % o el monto del dcto. (ajusta el abono), o el abono (ajusta el dcto. para cerrar en $0).</small>
             </div>
             <div class="form-group">
-                <label>Valor del abono * <span class="field-tip" data-tip="Monto que paga ahora al proveedor. No puede superar el restante: Valor de Factura − dcto. pronto pago − abonos y notas de crédito anteriores." tabindex="0">?</span></label>
+                <label>Valor del abono * <span class="field-tip" data-tip="Monto real pagado al proveedor (transferencia, efectivo, etc.). Si es menor al saldo, el dcto. pronto pago se completa solo con la diferencia para liquidar la factura. No puede superar Valor de Factura − abonos/NC anteriores." tabindex="0">?</span></label>
                 <input type="text" inputmode="decimal" name="amount" id="payAmount" class="form-control money-input" data-money="1" required placeholder="0">
+                <small style="color:var(--color-text-secondary);display:block;margin-top:4px;">Si digita lo transferido y es menor al saldo, el dcto. absorbe la diferencia y el restante queda en $0.</small>
             </div>
             <div class="form-group">
                 <label>Fecha del pago * <span class="field-tip" data-tip="Fecha real del desembolso. Define la fecha del asiento contable del abono." tabindex="0">?</span></label>
@@ -1868,7 +1900,12 @@ function openPurchaseLimitModal() {
                                accept=".csv,.txt,.pdf,.xml,.zip,.xlsx,.xlsm,.ods,.docx,image/*">
                         <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
                             Preferible <strong>.xlsx</strong> o <strong>CSV</strong> con la plantilla Seri.
-                            Separador <strong>;</strong>. Columnas: Referencia, EAN, Descripcion, Cantidad, Bonif, Costo_factura, IVA, Descuento, Total_linea, Lote, Vencimiento, Costo_inventario, Precio_venta.
+                            Separador <strong>;</strong>. Columnas: Referencia, EAN, Descripcion, Cantidad, Bonif, Costo_factura, IVA, Descuento_pct, Total_linea, Lote, Vencimiento, Costo_inventario, Precio_venta.
+                        </small>
+                        <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
+                            <strong>Descuento_pct:</strong> porcentaje de descuento de la línea (0–100), ej. <strong>10</strong> o <strong>14,30</strong>.
+                            No use formato «%» de Excel (guarda 0,1 en vez de 10). También se acepta el encabezado <em>Descuento</em>.
+                            Si deja el % en 0 pero pone un <em>Total_linea</em> menor, el sistema infiere el descuento.
                         </small>
                         <small style="color:var(--color-text-secondary);display:block;margin-top:6px;">
                             <strong>Costo_factura:</strong> costo unitario de la factura (contabilidad y CxP; también acepta el encabezado antiguo Costo_unitario).
@@ -2547,6 +2584,19 @@ function persistInvoiceReviewDraft() {
                     if (el) el.value = formatInvoiceDiscPct(it.discount_pct);
                 });
             }
+            // Tras reconciliar en servidor, sincroniza ajuste/neto del pie con lo persistido.
+            if (d.import) {
+                var adjSaved = parseFloat(d.import.net_adjustment);
+                var adjElSaved = form.querySelector('input[name="net_adjustment"]');
+                if (adjElSaved && isFinite(adjSaved)) {
+                    adjElSaved.value = formatNetAdjDisplay(adjSaved);
+                }
+                var totSaved = parseFloat(d.import.total);
+                var tgtSaved = document.getElementById('reviewTargetNet');
+                if (tgtSaved && isFinite(totSaved) && Math.abs(totSaved) > 0.009) {
+                    tgtSaved.value = formatTargetNetDisplay(totSaved);
+                }
+            }
             resolve(d);
         })
         .catch(reject)
@@ -3126,7 +3176,11 @@ function renderInvoiceReview(imp, items) {
     h += '<input type="hidden" name="early_payment_discount_pct" value="0">';
     var comPctRaw = parseFloat(String(imp.commercial_discount_pct != null ? imp.commercial_discount_pct : '').toString().replace(',', '.')) || 0;
     var comPctVal = Math.max(0, Math.min(100, Math.round(comPctRaw * 100) / 100));
-    h += '<div class="form-group" style="margin:0;grid-column:1/-1;"><label>Desc. comercial' + tip('Descuento general sobre el subtotal (antes de IVA). Indique % con hasta 2 decimales (0–100) o monto $; si hay monto, manda el $.') + '</label>' +
+    var netAdjRaw = parseFloat(imp.net_adjustment != null && imp.net_adjustment !== '' ? imp.net_adjustment : 0) || 0;
+    h += '<div class="form-group" style="margin:0;grid-column:1/-1;">' +
+         '<div class="po-com-adj-row">' +
+         '<div class="po-com-adj-row__disc">' +
+         '<label>Desc. comercial' + tip('Descuento general sobre el subtotal (antes de IVA). Indique % con hasta 2 decimales (0–100) o monto $; si hay monto, manda el $.') + '</label>' +
          '<div class="po-com-disc-fields">' +
          '<div class="po-pct-wrap">' +
          '<input type="number" step="0.01" min="0" max="100" inputmode="decimal" name="commercial_discount_pct" class="form-control" value="' +
@@ -3138,7 +3192,21 @@ function renderInvoiceReview(imp, items) {
             ? SeriMoney.format(imp.commercial_discount_amount != null && imp.commercial_discount_amount !== '' ? imp.commercial_discount_amount : 0)
             : (imp.commercial_discount_amount != null && imp.commercial_discount_amount !== '' ? imp.commercial_discount_amount : '0')) +
          '" placeholder="$ monto" oninput="recalcInvoiceReviewTotals()" autocomplete="off">' +
-         '</div></div>';
+         '</div></div>' +
+         '<div class="po-com-adj-row__adj">' +
+         '<label>Ajuste neto (±)' +
+         tip('Sume o reste centavos para igualar el valor impreso del proveedor (ej. -2,44). Digite la coma libremente; no se autocompleta. Afecta CxP y el asiento.') +
+         '</label>' +
+         '<input type="text" inputmode="decimal" name="net_adjustment" id="reviewNetAdjustment" class="form-control po-net-adj-input" data-money="0" value="' +
+         esc(formatNetAdjDisplay(netAdjRaw)) +
+         '" placeholder="-2,44" oninput="onReviewNetAdjInput()" autocomplete="off" title="Positivo suma; negativo resta">' +
+         '</div>' +
+         '<div class="po-com-adj-row__target">' +
+         '<label>O coloca el neto final' +
+         tip('Escriba el valor neto impreso de la factura del proveedor. El sistema calcula solo el ajuste (±) necesario (resta o suma).') +
+         '</label>' +
+         '<input type="text" inputmode="decimal" id="reviewTargetNet" class="form-control po-net-target-input" data-money="0" value="" placeholder="1400308" autocomplete="off" title="Valor neto esperado de la factura" oninput="onReviewTargetNetInput()">' +
+         '</div></div></div>';
     h += '<div class="form-group" style="margin:0;"><label>Forma de pago' + tip('Crédito = CxP. Efectivo: elija cajón u otro origen. Transferencia/tarjeta = bancos.') + '</label><select name="payment_mode" id="reviewPaymentMode" class="form-control" onchange="syncInvoiceCashSourceUi(\'review\')">';
     [['payable','Crédito (CxP)'],['cash','Efectivo'],['transfer','Transferencia'],['card','Tarjeta']].forEach(function(o) {
         h += '<option value="' + o[0] + '"' + (imp.payment_mode === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
@@ -3377,7 +3445,14 @@ function renderInvoiceReview(imp, items) {
     bindInvoiceProductPicker();
     bindInvoiceLineTotals();
     enableInvoiceReviewColResize();
+    window._invReviewNetDrive = 'adj';
     recalcInvoiceReviewTotals();
+    if (Math.abs(netAdjRaw) > 0.009) {
+        var tgtOpen = document.getElementById('reviewTargetNet');
+        if (tgtOpen && window._invReviewLastPayable != null) {
+            tgtOpen.value = formatTargetNetDisplay(window._invReviewLastPayable);
+        }
+    }
     if (window.SeriMoney && typeof SeriMoney.enhanceAll === 'function') {
         SeriMoney.enhanceAll(document.getElementById('invoiceReviewBody') || document);
     }
@@ -3811,7 +3886,7 @@ function bindLinkedOrderSelect() {
 }
 
 function invoiceParseQty(raw) {
-    var s = String(raw == null ? '' : raw).trim().replace(/\s/g, '').replace(',', '.');
+    var s = String(raw == null ? '' : raw).trim().replace(/\s/g, '').replace(/\u2212/g, '-').replace(',', '.');
     var n = parseFloat(s);
     return isNaN(n) ? 0 : n;
 }
@@ -3823,6 +3898,80 @@ function formatInvoiceDiscPct(raw) {
         ? String(Math.round(n))
         : n.toFixed(2);
     return s.replace('.', ',');
+}
+
+/** Ajuste neto ±: muestra con coma, sin forzar ,00 ni máscara al digitar. */
+function formatNetAdjDisplay(raw) {
+    var n = Math.round(invoiceParseQty(raw) * 100) / 100;
+    if (Math.abs(n) < 0.0005) return '';
+    var abs = Math.abs(n);
+    var s = (Math.abs(abs - Math.round(abs)) < 0.0005)
+        ? String(Math.round(abs))
+        : abs.toFixed(2);
+    return (n < 0 ? '-' : '') + s.replace('.', ',');
+}
+
+/** Neto final esperado: coma libre, sin autocompletar al digitar. */
+function formatTargetNetDisplay(raw) {
+    var n = Math.round(invoiceParseMoneyVal(raw) * 100) / 100;
+    if (n < 0) n = 0;
+    if (Math.abs(n) < 0.0005 && String(raw == null ? '' : raw).trim() === '') return '';
+    var s = (Math.abs(n - Math.round(n)) < 0.0005)
+        ? String(Math.round(n))
+        : n.toFixed(2);
+    return s.replace('.', ',');
+}
+
+function onReviewTargetNetInput() {
+    window._invReviewNetDrive = 'target';
+    recalcInvoiceReviewTotals();
+}
+
+function onReviewNetAdjInput() {
+    window._invReviewNetDrive = 'adj';
+    recalcInvoiceReviewTotals();
+}
+
+/** Ajuste = neto final − valor neto calculado (antes del ajuste). */
+function applyTargetNetToAdjustment(targetEl, adjEl, payableBeforeAdj) {
+    if (!targetEl || !adjEl) return 0;
+    var raw = String(targetEl.value || '').trim();
+    if (raw === '' || raw === '-' || raw === ',' || raw === '.') {
+        return Math.round(invoiceParseQty(adjEl.value) * 100) / 100;
+    }
+    var target = Math.round(invoiceParseMoneyVal(raw) * 100) / 100;
+    if (target < 0) target = 0;
+    var adj = Math.round((target - payableBeforeAdj) * 100) / 100;
+    adjEl.value = formatNetAdjDisplay(adj);
+    return adj;
+}
+
+function onReceiveTargetNetInput() {
+    window._receiveNetDrive = 'target';
+    syncReceiveNetAdjustment();
+}
+
+function onReceiveNetAdjInput() {
+    window._receiveNetDrive = 'adj';
+    syncReceiveNetAdjustment();
+}
+
+function syncReceiveNetAdjustment() {
+    var adjEl = document.getElementById('receiveNetAdjustment');
+    var targetEl = document.getElementById('receiveTargetNet');
+    var before = parseFloat(window._receivePayableBeforeAdj);
+    if (!isFinite(before)) return;
+    var drive = window._receiveNetDrive || 'adj';
+    if (drive === 'target' && targetEl && String(targetEl.value || '').trim() !== '') {
+        applyTargetNetToAdjustment(targetEl, adjEl, before);
+        return;
+    }
+    if (drive === 'adj' && adjEl && targetEl) {
+        var adj = Math.round(invoiceParseQty(adjEl.value) * 100) / 100;
+        if (String(targetEl.value || '').trim() !== '' || Math.abs(adj) > 0.009) {
+            targetEl.value = formatTargetNetDisplay(Math.max(0, Math.round((before + adj) * 100) / 100));
+        }
+    }
 }
 
 /** Cantidades de factura/inventario: siempre enteros. */
@@ -3949,7 +4098,8 @@ function bindInvoiceLineTotals() {
         if (!t || !t.name) return;
         if (!/\[(quantity|unit_cost|inventory_cost|tax_rate|discount_pct|sale_price)\]$/.test(t.name)
             && t.id !== 'reviewTaxOverrideAmount'
-            && !/early_payment_discount_pct|commercial_discount/.test(t.name)) {
+            && t.id !== 'reviewTargetNet'
+            && !/early_payment_discount_pct|commercial_discount|net_adjustment/.test(t.name)) {
             return;
         }
         if (/\[quantity\]$/.test(t.name)) {
@@ -3964,13 +4114,13 @@ function bindInvoiceLineTotals() {
             t.dataset.fromCatalog = '0';
         }
         scheduleRecalc();
-        if (/\[discount_pct\]$/.test(t.name) || /commercial_discount/.test(t.name)) {
+        if (/\[discount_pct\]$/.test(t.name) || /commercial_discount|net_adjustment/.test(t.name) || t.id === 'reviewTargetNet') {
             scheduleInvoiceReviewAutosave();
         }
     });
     body.addEventListener('change', function(e) {
         var t = e.target;
-        if (!t || !t.name) return;
+        if (!t || (!t.name && t.id !== 'reviewTargetNet')) return;
         if (/\[quantity\]$/.test(t.name)) {
             t.value = String(invoiceParseIntQty(t.value));
         }
@@ -4000,7 +4150,8 @@ function bindInvoiceLineTotals() {
         }
         if (!/\[(quantity|unit_cost|inventory_cost|tax_rate|discount_pct|sale_price|row_action|matched_product_id)\]$/.test(t.name)
             && t.id !== 'reviewTaxOverrideAmount'
-            && !/early_payment_discount_pct|commercial_discount/.test(t.name)) {
+            && t.id !== 'reviewTargetNet'
+            && !/early_payment_discount_pct|commercial_discount|net_adjustment/.test(t.name || '')) {
             return;
         }
         scheduleRecalc();
@@ -4011,6 +4162,25 @@ function bindInvoiceLineTotals() {
         if (!t || !t.name) return;
         if (/\[discount_pct\]$/.test(t.name) || t.name === 'commercial_discount_pct' || t.name === 'early_payment_discount_pct') {
             t.value = formatInvoiceDiscPct(t.value);
+            scheduleRecalc();
+            scheduleInvoiceReviewAutosave();
+            return;
+        }
+        if (t.name === 'net_adjustment') {
+            // Solo normaliza al salir; al digitar no autocompleta (coma libre).
+            if (String(t.value || '').trim() !== '') {
+                t.value = formatNetAdjDisplay(t.value);
+            }
+            window._invReviewNetDrive = 'adj';
+            scheduleRecalc();
+            scheduleInvoiceReviewAutosave();
+            return;
+        }
+        if (t.id === 'reviewTargetNet') {
+            if (String(t.value || '').trim() !== '') {
+                t.value = formatTargetNetDisplay(t.value);
+            }
+            window._invReviewNetDrive = String(t.value || '').trim() !== '' ? 'target' : 'adj';
             scheduleRecalc();
             scheduleInvoiceReviewAutosave();
             return;
@@ -4211,8 +4381,9 @@ function recalcInvoiceReviewTotals() {
         var disc = discEl ? Math.max(0, Math.min(100, Math.round(invoiceParseQty(discEl.value) * 100) / 100)) : 0;
         var action = actionEl ? actionEl.value : 'add_stock';
         var lineGross = qty * cost;
-        var lineDiscAmt = lineGross * (disc / 100);
-        var base = lineGross - lineDiscAmt;
+        // Mismo redondeo que PHP refreshTotals: ROUND(qty*cost*(1-dcto/100), 2) por línea.
+        var base = Math.round(lineGross * (1 - disc / 100) * 100) / 100;
+        var lineDiscAmt = Math.round((lineGross - base) * 100) / 100;
         // Total de línea = neto (sin IVA). El IVA se suma al Sub total en el pie → Valor neto.
         // F. Electrónica: el costo ya trae IVA; la línea es ese bruto.
         var line = base;
@@ -4232,12 +4403,13 @@ function recalcInvoiceReviewTotals() {
         }
         productDiscTotal += lineDiscAmt;
         if (vatInCost && tax > 0.009) {
-            var net = line / (1 + tax / 100);
+            var net = Math.round((line / (1 + tax / 100)) * 100) / 100;
+            var embTax = Math.round((line - net) * 100) / 100;
             subtotal += net;
-            taxTotal += (line - net);
+            taxTotal += embTax;
         } else {
             subtotal += base;
-            taxTotal += customVat ? 0 : (base * (tax / 100));
+            taxTotal += customVat ? 0 : Math.round(base * (tax / 100) * 100) / 100;
         }
         grand += line;
     });
@@ -4254,19 +4426,54 @@ function recalcInvoiceReviewTotals() {
     var form = body.closest('form') || document.getElementById('invoiceReviewForm');
     var comPctEl = form ? form.querySelector('input[name="commercial_discount_pct"]') : null;
     var comAmtEl = form ? form.querySelector('input[name="commercial_discount_amount"]') : null;
+    var netAdjEl = form ? form.querySelector('input[name="net_adjustment"]') : null;
+    var targetNetEl = document.getElementById('reviewTargetNet');
     var comPct = comPctEl ? Math.max(0, Math.min(100, Math.round(invoiceParseQty(comPctEl.value)))) : 0;
     var comAmtIn = comAmtEl ? Math.max(0, invoiceParseMoneyVal(comAmtEl.value)) : 0;
-    // Orden: Total bruto → dcto. → Sub total → IVA (sobre Sub total) → Valor neto.
-    var totalBruto = subtotal + productDiscTotal;
-    var commercialAmt = comAmtIn > 0.009 ? Math.min(comAmtIn, subtotal) : (subtotal * comPct / 100);
-    var subAfterDisc = Math.max(0, subtotal - commercialAmt);
+    // Orden: Total bruto → dcto. → Sub total → IVA (sobre Sub total) → Valor neto → ajuste ±.
+    var totalBruto = Math.round((subtotal + productDiscTotal) * 100) / 100;
+    var commercialAmt = comAmtIn > 0.009
+        ? Math.min(comAmtIn, subtotal)
+        : Math.round(subtotal * comPct / 100 * 100) / 100;
+    var subAfterDisc = Math.max(0, Math.round((subtotal - commercialAmt) * 100) / 100);
     // IVA personalizado = monto exacto de la factura. IVA % = prorrateo sobre Sub total (no sobre bruto).
     if (!customVat && subtotal > 0.009 && commercialAmt > 0.009) {
-        taxTotal = taxTotal * (subAfterDisc / subtotal);
+        taxTotal = Math.round(taxTotal * (subAfterDisc / subtotal) * 100) / 100;
     } else if (!customVat && subtotal <= 0.009) {
         taxTotal = 0;
+    } else {
+        taxTotal = Math.round(taxTotal * 100) / 100;
     }
-    var payable = Math.max(0, subAfterDisc + taxTotal);
+    var payableBeforeAdj = Math.max(0, Math.round((subAfterDisc + taxTotal) * 100) / 100);
+    window._invReviewPayableBeforeAdj = payableBeforeAdj;
+    var targetRaw = targetNetEl ? String(targetNetEl.value || '').trim() : '';
+    var drive = window._invReviewNetDrive || 'adj';
+    var netAdj;
+    if (drive === 'target' && targetRaw !== '') {
+        // Neto final manda: recalcula el ajuste (±) aunque cambien líneas o desc. comercial.
+        netAdj = applyTargetNetToAdjustment(targetNetEl, netAdjEl, payableBeforeAdj);
+    } else {
+        netAdj = netAdjEl ? Math.round(invoiceParseQty(netAdjEl.value) * 100) / 100 : 0;
+    }
+    var payable = Math.max(0, Math.round((payableBeforeAdj + netAdj) * 100) / 100);
+    var appliedAdj = Math.round((payable - payableBeforeAdj) * 100) / 100;
+    window._invReviewLastPayable = payable;
+    // Si el usuario edita el ajuste a mano, el neto final refleja el resultado.
+    if (drive !== 'target' && targetNetEl && (targetRaw !== '' || Math.abs(netAdj) > 0.009)) {
+        targetNetEl.value = formatTargetNetDisplay(payable);
+    }
+    // Valor neto del pie → servidor (listado/confirmación) para igualar centavos exactos.
+    var expectedEl = document.getElementById('reviewExpectedNetTotal');
+    if (!expectedEl && form) {
+        expectedEl = document.createElement('input');
+        expectedEl.type = 'hidden';
+        expectedEl.name = 'expected_net_total';
+        expectedEl.id = 'reviewExpectedNetTotal';
+        form.appendChild(expectedEl);
+    }
+    if (expectedEl) {
+        expectedEl.value = payable > 0.009 ? String(payable.toFixed(2)) : '';
+    }
 
     var foot = body.querySelector('.inv-review-foot');
     if (foot) {
@@ -4279,6 +4486,9 @@ function recalcInvoiceReviewTotals() {
                 : '') +
             '<span>Sub total: ' + poMoney(subAfterDisc) + '</span>' +
             '<span>IVA' + (vatInCost ? ' (en costo)' : (customVat ? ' (personalizado)' : '')) + ': ' + poMoney(taxTotal) + '</span>' +
+            (Math.abs(appliedAdj) > 0.009
+                ? '<span style="color:var(--dmc-1D4ED8, #1D4ED8);">Ajuste: ' + (appliedAdj > 0 ? '+' : '−') + poMoney(Math.abs(appliedAdj)) + '</span>'
+                : '') +
             '<span><strong>Valor neto: ' + poMoney(payable) + '</strong></span>';
     }
 
@@ -5348,8 +5558,30 @@ function openReceiveModal(id, number) {
     if (comPct) comPct.value = '';
     var comAmt = document.getElementById('receiveCommercialAmt');
     if (comAmt) comAmt.value = '';
+    var netAdjRecv = document.getElementById('receiveNetAdjustment');
+    if (netAdjRecv) netAdjRecv.value = '';
+    var tgtRecv = document.getElementById('receiveTargetNet');
+    if (tgtRecv) tgtRecv.value = '';
+    window._receivePayableBeforeAdj = null;
+    window._receiveNetDrive = 'adj';
     syncInvoiceCashSourceUi('receive');
     document.getElementById('receiveModal').style.display = 'flex';
+    fetch(window.poDetailUrl + '&id=' + id, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (!d || !d.success || !d.order) return;
+            var o = d.order;
+            var total = parseFloat(o.total) || 0;
+            var adj = parseFloat(o.net_adjustment) || 0;
+            window._receivePayableBeforeAdj = Math.round((total - adj) * 100) / 100;
+            if (netAdjRecv && Math.abs(adj) > 0.009) {
+                netAdjRecv.value = formatNetAdjDisplay(adj);
+            }
+            if (tgtRecv && (Math.abs(adj) > 0.009 || total > 0.009)) {
+                tgtRecv.value = formatTargetNetDisplay(total);
+            }
+        })
+        .catch(function() {});
 }
 
 /** Origen efectivo en carga/recepción/edición de factura (misma lógica que abonos). */
@@ -5562,49 +5794,74 @@ function payMoneyVal(id) {
     return el ? (poParseMoney(el.value) || 0) : 0;
 }
 
-var payDiscountDriver = 'pct';
+var payDiscountDriver = 'pct'; // pct | amount | payment
+
+function paySetMoneyField(el, value) {
+    if (!el) return;
+    el.value = window.SeriMoney ? SeriMoney.format(value) : Number(value).toFixed(2);
+    if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(el);
+}
 
 function recalcPayTotals(autofillAmount, source) {
     var invoice = payMoneyVal('payInvoiceValue');
+    var previous = payCtx.previous || 0;
     var pctEl = document.getElementById('payDiscountPct');
     var amtEl = document.getElementById('payDiscountAmount');
+    var amountEl = document.getElementById('payAmount');
+    var round2 = function (v) { return Math.round(v * 100) / 100; };
+    var maxWithoutDisc = Math.max(0, round2(invoice - previous));
     var pct = pctEl ? parseFloat(String(pctEl.value).replace(',', '.')) || 0 : 0;
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
-    var discount;
-    var round2 = function (v) { return Math.round(v * 100) / 100; };
-    if (source === 'discountAmount') {
-        // El usuario escribió el monto: se deriva el %.
-        discount = round2(payMoneyVal('payDiscountAmount'));
-        pct = invoice > 0 ? round2(discount / invoice * 100) : 0;
-        if (pctEl) pctEl.value = pct ? String(pct) : '';
-    } else {
-        // Manda el % (también al cambiar el Valor de Factura, salvo que el último dato haya sido el monto).
-        if (source === 'invoice' && payDiscountDriver === 'amount') {
-            discount = round2(payMoneyVal('payDiscountAmount'));
-            pct = invoice > 0 ? round2(discount / invoice * 100) : 0;
-            if (pctEl) pctEl.value = pct ? String(pct) : '';
-        } else {
-            discount = round2(invoice * pct / 100);
-            if (amtEl) {
-                amtEl.value = window.SeriMoney ? SeriMoney.format(discount) : discount.toFixed(2);
-                if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(amtEl);
-            }
-        }
-    }
-    var previous = payCtx.previous || 0;
-    var payableNow = Math.max(0, round2(invoice - discount - previous));
+    var discount = 0;
+    var amount = 0;
+    var fromPayment = source === 'payment'
+        || (source === 'invoice' && payDiscountDriver === 'payment')
+        || (!source && payDiscountDriver === 'payment' && !autofillAmount);
 
-    var amountEl = document.getElementById('payAmount');
-    if (autofillAmount && amountEl) {
-        amountEl.value = window.SeriMoney ? SeriMoney.format(payableNow) : payableNow.toFixed(2);
-        if (window.SeriMoney && typeof SeriMoney.enhance === 'function') SeriMoney.enhance(amountEl);
+    if (fromPayment) {
+        // El abono manda: dcto. = lo que falta para liquidar (restante → $0).
+        amount = round2(payMoneyVal('payAmount'));
+        if (amount < 0) amount = 0;
+        if (amount - maxWithoutDisc > 0.009) {
+            discount = 0;
+            pct = 0;
+            if (pctEl) pctEl.value = '';
+            if (amtEl) paySetMoneyField(amtEl, 0);
+        } else {
+            discount = round2(Math.max(0, maxWithoutDisc - amount));
+            pct = invoice > 0.009 ? round2(discount / invoice * 100) : 0;
+            if (pctEl) pctEl.value = discount > 0.009 ? String(pct) : '';
+            if (amtEl) paySetMoneyField(amtEl, discount);
+        }
+    } else if (source === 'discountAmount'
+        || (source === 'invoice' && payDiscountDriver === 'amount')) {
+        // El monto de dcto. manda: se deriva el % y se puede autocompletar el abono.
+        discount = round2(payMoneyVal('payDiscountAmount'));
+        if (discount < 0) discount = 0;
+        if (discount - maxWithoutDisc > 0.009) discount = maxWithoutDisc;
+        pct = invoice > 0.009 ? round2(discount / invoice * 100) : 0;
+        if (pctEl) pctEl.value = discount > 0.009 ? String(pct) : '';
+        if (amtEl) paySetMoneyField(amtEl, discount);
+    } else {
+        // El % manda (default): se deriva el monto de dcto.
+        discount = round2(invoice * pct / 100);
+        if (discount - maxWithoutDisc > 0.009) {
+            discount = maxWithoutDisc;
+            pct = invoice > 0.009 ? round2(discount / invoice * 100) : 0;
+            if (pctEl) pctEl.value = discount > 0.009 ? String(pct) : '';
+        }
+        if (amtEl) paySetMoneyField(amtEl, discount);
     }
-    var amount = payMoneyVal('payAmount');
+
+    var payableNow = Math.max(0, round2(invoice - discount - previous));
+    if (autofillAmount && amountEl && !fromPayment) {
+        paySetMoneyField(amountEl, payableNow);
+    }
+    amount = round2(payMoneyVal('payAmount'));
     var remaining = round2(invoice - discount - previous - amount);
 
     var set = function (id, txt) { var n = document.getElementById(id); if (n) n.textContent = txt; };
-    // El saldo pendiente del encabezado también se mueve con el Valor de Factura (y el dcto.).
     set('payBalanceLabel', 'Saldo pendiente: ' + poMoney(Math.max(0, round2(invoice - discount - previous))));
     set('paySumInvoice', poMoney(invoice));
     set('paySumDiscount', '− ' + poMoney(discount));
@@ -5794,13 +6051,19 @@ document.addEventListener('DOMContentLoaded', function () {
         el.addEventListener('change', syncPayCashSourceUi);
     });
     var payInvoiceEl = document.getElementById('payInvoiceValue');
-    if (payInvoiceEl) payInvoiceEl.addEventListener('input', function () { recalcPayTotals(true, 'invoice'); });
+    if (payInvoiceEl) payInvoiceEl.addEventListener('input', function () {
+        // Si el abono mandaba, se reajusta el dcto.; si no, se reajusta el abono.
+        recalcPayTotals(payDiscountDriver !== 'payment', 'invoice');
+    });
     var payPctEl = document.getElementById('payDiscountPct');
     if (payPctEl) payPctEl.addEventListener('input', function () { payDiscountDriver = 'pct'; recalcPayTotals(true, 'discountPct'); });
     var payDiscAmtEl = document.getElementById('payDiscountAmount');
     if (payDiscAmtEl) payDiscAmtEl.addEventListener('input', function () { payDiscountDriver = 'amount'; recalcPayTotals(true, 'discountAmount'); });
     var payAmountEl = document.getElementById('payAmount');
-    if (payAmountEl) payAmountEl.addEventListener('input', function () { recalcPayTotals(false); });
+    if (payAmountEl) payAmountEl.addEventListener('input', function () {
+        payDiscountDriver = 'payment';
+        recalcPayTotals(false, 'payment');
+    });
     var fixPctEl = document.getElementById('fixDiscountPct');
     if (fixPctEl) fixPctEl.addEventListener('input', function () { recalcFixDiscount('pct'); });
     var fixAmtEl = document.getElementById('fixDiscountAmount');
@@ -5824,7 +6087,11 @@ document.addEventListener('DOMContentLoaded', function () {
             else alert(msg);
             return;
         }
-        if (recalcPayTotals(false) < -0.009) {
+        // Antes de enviar: si el abono mandó, sincroniza dcto./% en el FormData.
+        var syncSrc = payDiscountDriver === 'payment'
+            ? 'payment'
+            : (payDiscountDriver === 'amount' ? 'discountAmount' : 'discountPct');
+        if (recalcPayTotals(payDiscountDriver !== 'payment', syncSrc) < -0.009) {
             ev.preventDefault();
             var err = document.getElementById('payTotalsError');
             if (err) err.style.display = 'block';
@@ -6026,6 +6293,10 @@ function viewPurchase(id) {
             }
             h += '<div><strong>Sub total:</strong> ' + poMoney(subAfter) + '</div>';
             h += '<div><strong>IVA:</strong> ' + poMoney(ivaShow) + '</div>';
+            var netAdjShow = parseFloat(o.net_adjustment || 0) || 0;
+            if (Math.abs(netAdjShow) > 0.009) {
+                h += '<div><strong>Ajuste valor neto:</strong> ' + (netAdjShow > 0 ? '+' : '−') + poMoney(Math.abs(netAdjShow)) + '</div>';
+            }
             h += '<div><strong>Valor neto:</strong> ' + poMoney(neto) + '</div>';
             h += '<div><strong>Notas crédito:</strong> ' + poMoney(o.credit_total) + '</div>';
             h += '<div><strong>Neto:</strong> ' + poMoney(Math.max(0, parseFloat(o.total || 0) - parseFloat(o.credit_total || 0))) + '</div>';

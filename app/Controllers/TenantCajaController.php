@@ -1770,7 +1770,10 @@ class TenantCajaController extends TenantController
                 $report['admin_expenses'] ?? [],
                 false
             );
-            $pdf->download($content, 'Cierre_Caja_' . $id . '_' . date('Ymd_His') . '.pdf');
+            $pdf->download(
+                $content,
+                $this->closingReportDownloadFilename($report['session'], $id, 'pdf')
+            );
         } catch (\Throwable $e) {
             error_log('closingPdf: ' . $e->getMessage());
             http_response_code(500);
@@ -1797,7 +1800,7 @@ class TenantCajaController extends TenantController
         try {
             $sheets = \SoftNova\Services\CashClosingExcelBuilder::buildSheets($report, $this->db);
             \SoftNova\Services\SimpleXlsxWriter::downloadSheets(
-                'Cierre_Caja_' . $id . '_' . date('Ymd_His') . '.xlsx',
+                $this->closingReportDownloadFilename($report['session'], $id, 'xlsx'),
                 $sheets
             );
         } catch (\Throwable $e) {
@@ -1898,9 +1901,11 @@ class TenantCajaController extends TenantController
             $salesPayload['gross_margin_pct'] = (float)($totals['gross_margin_pct'] ?? 0);
         }
 
-        // Índice de ventas (crédito / mixto) para enriquecer movimientos y filas informativas.
+        // Índice de ventas (crédito / mixto / otros medios) para enriquecer movimientos
+        // y filas informativas con descuento + productos.
         $creditSalePayload = [];
         $mixedSalePayload = [];
+        $otherMethodSalePayload = [];
         $saleMetaById = [];
         $fmtMoney = fn(float $n): string => $this->formatMoney($n);
         foreach (($report['sales'] ?? []) as $sale) {
@@ -1923,11 +1928,23 @@ class TenantCajaController extends TenantController
                     $this->db
                 )
                 : '';
+            $discNote = \SoftNova\Services\CashClosingReportBuilder::formatSaleDiscountDetail(
+                $sale,
+                $fmtMoney
+            );
+            $productsNote = \SoftNova\Services\CashClosingReportBuilder::formatSaleItemsDetail(
+                $sale,
+                $fmtMoney
+            );
             $saleMetaById[$sid] = [
                 'is_credit' => $isCredit,
                 'is_mixed' => $isMixed,
                 'mixed_parts' => $mixedParts,
                 'invoice' => (string)($sale['invoice_number'] ?? ('#' . $sid)),
+                'discount_note' => $discNote,
+                'has_discount' => $discNote !== '',
+                'products_note' => $productsNote,
+                'has_products' => $productsNote !== '',
             ];
 
             $inv = (string)($sale['invoice_number'] ?? ('#' . $sid));
@@ -1943,6 +1960,10 @@ class TenantCajaController extends TenantController
                     'user_name' => $uSale,
                     'type_label' => 'Venta crédito',
                     'description' => $inv . ' · ' . $cust . ' · Crédito (por cobrar)',
+                    'discount_note' => $discNote,
+                    'has_discount' => $discNote !== '',
+                    'products_note' => $productsNote,
+                    'has_products' => $productsNote !== '',
                     'amount_fmt' => $this->formatMoney((float)($sale['total'] ?? 0)),
                     'is_abono' => false,
                     'is_credit_sale' => true,
@@ -1958,6 +1979,10 @@ class TenantCajaController extends TenantController
                     'type_label' => 'Venta mixta',
                     'description' => $inv . ' · ' . $cust
                         . ($mixedParts !== '' ? ' · Mixto: ' . $mixedParts : ' · Pago mixto'),
+                    'discount_note' => $discNote,
+                    'has_discount' => $discNote !== '',
+                    'products_note' => $productsNote,
+                    'has_products' => $productsNote !== '',
                     'amount_fmt' => $this->formatMoney((float)($sale['total'] ?? 0)),
                     'is_abono' => false,
                     'is_credit_sale' => false,
@@ -1965,6 +1990,28 @@ class TenantCajaController extends TenantController
                     'payment_method_label' => $mixedParts !== '' ? ('Mixto: ' . $mixedParts) : 'Pago mixto',
                     '_sort' => strtotime((string)($sale['sale_date'] ?? '')) ?: 0,
                     '_sale_id' => $sid,
+                ];
+            } elseif (!\SoftNova\Services\PaymentMethodCatalog::affectsCash($pm !== '' ? $pm : 'cash')) {
+                // Nequi / transfer / tarjeta: no dejan movimiento de cajón; listar la venta.
+                $methodLabel = \SoftNova\Services\PaymentMethodCatalog::label(
+                    $pm !== '' ? $pm : 'cash',
+                    $this->db
+                );
+                $otherMethodSalePayload[] = [
+                    'time' => !empty($sale['sale_date']) ? date('H:i', strtotime((string)$sale['sale_date'])) : '—',
+                    'user_name' => $uSale,
+                    'type_label' => 'Venta',
+                    'description' => $inv . ' · ' . $cust . ' · ' . $methodLabel,
+                    'discount_note' => $discNote,
+                    'has_discount' => $discNote !== '',
+                    'products_note' => $productsNote,
+                    'has_products' => $productsNote !== '',
+                    'amount_fmt' => $this->formatMoney((float)($sale['total'] ?? 0)),
+                    'is_abono' => false,
+                    'is_credit_sale' => false,
+                    'is_mixed_sale' => false,
+                    'payment_method_label' => $methodLabel,
+                    '_sort' => strtotime((string)($sale['sale_date'] ?? '')) ?: 0,
                 ];
             }
         }
@@ -2000,11 +2047,28 @@ class TenantCajaController extends TenantController
                 && $rid > 0
                 && !empty($saleMetaById[$rid]['is_mixed']);
             if (!$linkedMixed) {
+                $linkedDisc = '';
+                $linkedProducts = '';
+                if ($rid > 0 && in_array($rt, ['sale', 'sale_cancel', 'sale_payment_adjust', 'sale_payment'], true)
+                    && !empty($saleMetaById[$rid]['discount_note'])
+                ) {
+                    $linkedDisc = (string)$saleMetaById[$rid]['discount_note'];
+                }
+                // Productos solo en la fila de la venta (no en abonos posteriores).
+                if ($rid > 0 && in_array($rt, ['sale', 'sale_cancel', 'sale_payment_adjust'], true)
+                    && !empty($saleMetaById[$rid]['products_note'])
+                ) {
+                    $linkedProducts = (string)$saleMetaById[$rid]['products_note'];
+                }
                 $movPayload[] = [
                     'time' => !empty($m['created_at']) ? date('H:i', strtotime((string)$m['created_at'])) : '—',
                     'user_name' => $uName,
                     'type_label' => $typeLabel,
                     'description' => $desc,
+                    'discount_note' => $linkedDisc,
+                    'has_discount' => $linkedDisc !== '',
+                    'products_note' => $linkedProducts,
+                    'has_products' => $linkedProducts !== '',
                     'amount_fmt' => ($isIn ? '+' : '−') . $this->formatMoney($amt),
                     'is_abono' => $isAbono,
                     'is_credit_sale' => false,
@@ -2065,12 +2129,15 @@ class TenantCajaController extends TenantController
             ];
         }
 
-        // Unir ventas a crédito y mixtas del día a la línea de tiempo.
+        // Unir ventas a crédito, mixtas y otros medios (sin cajón) a la línea de tiempo.
         foreach ($creditSalePayload as $cs) {
             $movPayload[] = $cs;
         }
         foreach ($mixedSalePayload as $ms) {
             $movPayload[] = $ms;
+        }
+        foreach ($otherMethodSalePayload as $os) {
+            $movPayload[] = $os;
         }
         usort($movPayload, static function ($a, $b) {
             return ((int)($a['_sort'] ?? 0) <=> (int)($b['_sort'] ?? 0))
@@ -2194,7 +2261,7 @@ class TenantCajaController extends TenantController
         $company = $this->companySettings();
         $empresa = (string)($company['company_name'] ?? 'Seri ERP');
         $session = $report['session'];
-        $filename = 'Cierre_Caja_' . $id . '.pdf';
+        $filename = $this->closingReportDownloadFilename($session, $id, 'pdf');
         $temporal = null;
         $resultado = ['success' => false, 'message' => 'No se pudo enviar'];
 
@@ -2306,6 +2373,28 @@ class TenantCajaController extends TenantController
     /**
      * @return array{session:array,movements:list,totals:array,sales:list}|null
      */
+    /**
+     * Nombre de descarga PDF/Excel: usa fecha/hora del cierre (no de la descarga).
+     * Ej.: Cierre_Caja_42_20261106_183045.pdf
+     *
+     * @param array<string,mixed> $session
+     */
+    private function closingReportDownloadFilename(array $session, int $id, string $ext): string
+    {
+        $ext = ltrim(strtolower(trim($ext)), '.');
+        if ($ext === '') {
+            $ext = 'pdf';
+        }
+        $raw = trim((string)($session['closing_date'] ?? ''));
+        if ($raw === '' || strtotime($raw) === false) {
+            $raw = trim((string)($session['opening_date'] ?? ''));
+        }
+        $stamp = ($raw !== '' && strtotime($raw) !== false)
+            ? date('Ymd_His', strtotime($raw))
+            : date('Ymd_His');
+        return 'Cierre_Caja_' . $id . '_' . $stamp . '.' . $ext;
+    }
+
     private function loadClosingReport(int $id): ?array
     {
         if ($id <= 0) {
@@ -2367,6 +2456,7 @@ class TenantCajaController extends TenantController
         try {
             $sales = $this->salesForCashSessionReport($session);
             $sales = \SoftNova\Services\CashClosingReportBuilder::attachSalePayments($this->db, $sales);
+            $sales = \SoftNova\Services\CashClosingReportBuilder::attachSaleItems($this->db, $sales);
             $sales = \SoftNova\Services\CashClosingReportBuilder::attachSaleAdjustments($this->db, $sales);
         } catch (\Throwable $e) {
             $sales = [];

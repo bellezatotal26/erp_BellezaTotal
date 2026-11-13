@@ -594,8 +594,10 @@ class TenantInventarioController extends TenantController
         }
 
         $movements = \SoftNova\Services\StockService::attachPurchaseTaxInfo($this->db, $movements);
+        $movements = \SoftNova\Services\StockService::attachPurchaseTraceDates($this->db, $movements);
         foreach ($movements as &$m) {
             $m['display_at'] = \SoftNova\Services\StockService::formatMovementDisplayAt($m);
+            $m['trace_date_lines'] = \SoftNova\Services\StockService::purchaseTraceDateLines($m);
             $m['origin_label'] = $this->movementOriginLabel($m);
             $m['motive'] = \SoftNova\Services\StockService::describeMovementMotive($m);
             $m['related_substitution'] = 0;
@@ -621,10 +623,16 @@ class TenantInventarioController extends TenantController
                         poi.product_name, poi.lot_code, poi.expiry_date,
                         po.id AS purchase_order_id, po.order_number, po.invoice_number,
                         po.invoice_date, po.warehouse_date, po.received_at, po.status,
-                        po.created_at, po.origin, su.name AS supplier_name
+                        po.created_at, po.origin, su.name AS supplier_name,
+                        pii.created_at AS invoice_uploaded_at,
+                        pii.confirmed_at AS invoice_confirmed_at
                  FROM purchase_order_items poi
                  JOIN purchase_orders po ON po.id = poi.purchase_order_id
                  LEFT JOIN suppliers su ON su.id = po.supplier_id
+                 LEFT JOIN purchase_invoice_imports pii ON pii.id = COALESCE(
+                      NULLIF(po.invoice_import_id, 0),
+                      (SELECT MAX(x.id) FROM purchase_invoice_imports x WHERE x.purchase_order_id = po.id)
+                 )
                  WHERE poi.product_id = ?
                  ORDER BY COALESCE(po.received_at, po.warehouse_date, po.created_at) DESC, po.id DESC
                  LIMIT 30";
@@ -632,11 +640,29 @@ class TenantInventarioController extends TenantController
             $purchases = $this->query(sprintf($purchaseSql, 'poi.inventory_cost,'), [$id])->fetchAll();
         } catch (\Throwable $e) {
             try {
-                $purchases = $this->query(sprintf($purchaseSql, ''), [$id])->fetchAll();
+                $purchaseSqlLegacy = "SELECT poi.id, poi.quantity, poi.received_qty, poi.unit_cost, %s poi.tax_rate,
+                        poi.product_name, poi.lot_code, poi.expiry_date,
+                        po.id AS purchase_order_id, po.order_number, po.invoice_number,
+                        po.invoice_date, po.warehouse_date, po.received_at, po.status,
+                        po.created_at, po.origin, su.name AS supplier_name
+                 FROM purchase_order_items poi
+                 JOIN purchase_orders po ON po.id = poi.purchase_order_id
+                 LEFT JOIN suppliers su ON su.id = po.supplier_id
+                 WHERE poi.product_id = ?
+                 ORDER BY COALESCE(po.received_at, po.warehouse_date, po.created_at) DESC, po.id DESC
+                 LIMIT 30";
+                $purchases = $this->query(sprintf($purchaseSqlLegacy, ''), [$id])->fetchAll();
             } catch (\Throwable $e2) {
                 $purchases = [];
             }
         }
+        foreach ($purchases as &$poRow) {
+            $poRow['purchase_warehouse_date'] = (string)($poRow['warehouse_date'] ?? '');
+            $poRow['purchase_received_at'] = (string)($poRow['received_at'] ?? '');
+            $poRow['reference_type'] = 'purchase_order';
+            $poRow['trace_date_lines'] = \SoftNova\Services\StockService::purchaseTraceDateLines($poRow);
+        }
+        unset($poRow);
 
         $costSummary = $this->productCostSummary((int)$id, $product);
         $costHistory = $this->productCostHistoryRows((int)$id);
@@ -678,17 +704,23 @@ class TenantInventarioController extends TenantController
                 'reference_id' => $poId,
                 'notes' => $notes,
                 'created_at' => $at,
-                'movement_date' => substr($at, 0, 10) ?: null,
+                'movement_date' => substr((string)($po['warehouse_date'] ?? $at), 0, 10) ?: null,
                 'user_name' => null,
                 'purchase_order_number' => $po['order_number'] ?? null,
                 'purchase_invoice_number' => $inv !== '' ? $inv : null,
                 'purchase_order_status' => $status,
                 'unit_cost' => $po['unit_cost'] ?? null,
                 'product_id' => $id,
+                'invoice_uploaded_at' => (string)($po['invoice_uploaded_at'] ?? ''),
+                'invoice_confirmed_at' => (string)($po['invoice_confirmed_at'] ?? $po['received_at'] ?? ''),
+                'purchase_warehouse_date' => (string)($po['warehouse_date'] ?? ''),
+                'purchase_received_at' => (string)($po['received_at'] ?? ''),
                 'synthetic' => true,
             ];
             $synthetic = \SoftNova\Services\StockService::attachPurchaseTaxInfo($this->db, [$synthetic])[0];
+            $synthetic = \SoftNova\Services\StockService::attachPurchaseTraceDates($this->db, [$synthetic])[0];
             $synthetic['display_at'] = \SoftNova\Services\StockService::formatMovementDisplayAt($synthetic);
+            $synthetic['trace_date_lines'] = \SoftNova\Services\StockService::purchaseTraceDateLines($synthetic);
             $synthetic['origin_label'] = $this->movementOriginLabel($synthetic);
             $synthetic['motive'] = \SoftNova\Services\StockService::describeMovementMotive($synthetic);
             $movements[] = $synthetic;

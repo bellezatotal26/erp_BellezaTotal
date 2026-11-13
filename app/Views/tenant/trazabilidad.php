@@ -179,7 +179,24 @@ $typeLabels = ['in' => 'Entrada', 'out' => 'Salida', 'adjustment' => 'Ajuste'];
                     <details class="trace-mov-group<?php echo !empty($g['new_products_count']) ? ' has-new-products' : ''; ?>" <?php echo $openByDefault ? 'open' : ''; ?>>
                         <summary class="trace-mov-summary">
                             <span class="trace-mov-summary-main">
-                                <span class="trace-mov-date"><?php echo htmlspecialchars((string)($g['display_at'] ?? '—')); ?></span>
+                                <?php
+                                $traceLines = \SoftNova\Services\StockService::purchaseTraceDateLines($lines[0] ?? []);
+                                if ($traceLines !== [] && trim((string)(($lines[0]['invoice_uploaded_at'] ?? ''))) !== ''):
+                                ?>
+                                    <span class="trace-mov-date trace-mov-dates">
+                                        <?php foreach ($traceLines as $td):
+                                            $tdLabel = (string)($td['label'] ?? '');
+                                            $tdIsUpload = ($tdLabel === 'Subida factura');
+                                            ?>
+                                            <span class="trace-mov-date-line<?php echo $tdIsUpload ? ' is-invoice-upload' : ''; ?>" title="<?php echo htmlspecialchars($tdLabel); ?>">
+                                                <strong><?php echo htmlspecialchars($tdLabel); ?>:</strong>
+                                                <?php echo htmlspecialchars((string)($td['value'] ?? '')); ?>
+                                            </span>
+                                        <?php endforeach; ?>
+                                    </span>
+                                <?php else: ?>
+                                    <span class="trace-mov-date"><?php echo htmlspecialchars((string)($g['display_at'] ?? '—')); ?></span>
+                                <?php endif; ?>
                                 <span class="badge <?php echo $badge; ?>"><?php echo htmlspecialchars($typeLabels[$g['type'] ?? ''] ?? (string)($g['type'] ?? '—')); ?></span>
                                 <strong class="trace-mov-origin"><?php echo htmlspecialchars($refLabel); ?></strong>
                                 <?php if ($poStatusHint !== ''): ?>

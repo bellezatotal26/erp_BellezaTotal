@@ -122,6 +122,7 @@ final class CashClosingExcelBuilder
     private static function sheetVentasYMovimientos(array $sales, array $movements, ?\PDO $db): array
     {
         $rows = [];
+        $seq = 0;
 
         foreach ($sales as $sale) {
             if (($sale['status'] ?? '') === 'cancelled') {
@@ -146,8 +147,22 @@ final class CashClosingExcelBuilder
             }
 
             $tipo = $isCredit ? 'Venta crédito' : ($isMixed ? 'Venta mixta' : 'Venta');
+            $discAmt = round((float)($sale['discount'] ?? 0), 2);
+            $moneyFmt = static fn(float $n): string => '$ ' . number_format($n, 2, ',', '.');
+            $discDetail = CashClosingReportBuilder::formatSaleDiscountDetail($sale, $moneyFmt);
+            $itemCount = is_array($sale['items'] ?? null) ? count($sale['items']) : 0;
+            $notaParts = [];
+            if ($discDetail !== '') {
+                $notaParts[] = $discDetail;
+            }
+            if ($itemCount > 0) {
+                $notaParts[] = $itemCount . ($itemCount === 1 ? ' producto' : ' productos');
+            }
+            $notaParts[] = $isCredit ? 'Informativo' : 'Facturado';
+            $saleSort = strtotime((string)($sale['sale_date'] ?? '')) ?: 0;
             $rows[] = [
-                'sort' => strtotime((string)($sale['sale_date'] ?? '')) ?: 0,
+                'sort' => $saleSort,
+                'seq' => $seq++,
                 'cells' => [
                     $tipo,
                     self::fmtDt($sale['sale_date'] ?? null),
@@ -156,10 +171,49 @@ final class CashClosingExcelBuilder
                     (string)($sale['customer_name'] ?? 'Público general'),
                     $methodLabel,
                     $parts !== '' ? $parts : ($isCredit ? 'Por cobrar' : '—'),
+                    $discAmt > 0.009
+                        ? ['v' => $discAmt, 't' => 'currency']
+                        : '—',
                     ['v' => round((float)($sale['total'] ?? 0), 2), 't' => 'currency'],
-                    $isCredit ? 'Informativo' : 'Facturado',
+                    implode(' · ', $notaParts),
                 ],
             ];
+
+            // Filas hijas: un producto por línea bajo la venta.
+            $items = is_array($sale['items'] ?? null) ? $sale['items'] : [];
+            $itemIdx = 0;
+            foreach ($items as $it) {
+                if (!is_array($it)) {
+                    continue;
+                }
+                $itemIdx++;
+                $qty = (float)($it['quantity'] ?? 0);
+                $qtyStr = abs($qty - round($qty)) < 0.001
+                    ? (string)(int)round($qty)
+                    : number_format($qty, 2, ',', '.');
+                $name = trim((string)($it['product_name'] ?? 'Producto'));
+                $code = trim((string)($it['product_code'] ?? ''));
+                $label = $code !== '' ? ($code . ' · ' . $name) : $name;
+                $unit = round((float)($it['unit_price'] ?? 0), 2);
+                $lineTot = round((float)($it['line_total'] ?? 0), 2);
+                $rows[] = [
+                    // Mantener juntos bajo la venta (mismo sort + seq).
+                    'sort' => $saleSort,
+                    'seq' => $seq++,
+                    'cells' => [
+                        '  · Producto',
+                        self::fmtDt($sale['sale_date'] ?? null),
+                        (string)($sale['user_name'] ?? ''),
+                        (string)($sale['invoice_number'] ?? ('#' . $sid)) . ' · ' . $label,
+                        $qtyStr . '× @ ' . number_format($unit, 2, ',', '.'),
+                        '—',
+                        'Ítem ' . $itemIdx,
+                        '—',
+                        ['v' => $lineTot, 't' => 'currency'],
+                        'Desglose venta',
+                    ],
+                ];
+            }
         }
 
         foreach ($movements as $m) {
@@ -201,6 +255,7 @@ final class CashClosingExcelBuilder
             $amt = round((float)($m['amount'] ?? 0), 2);
             $rows[] = [
                 'sort' => strtotime((string)($m['created_at'] ?? '')) ?: 0,
+                'seq' => $seq++,
                 'cells' => [
                     $tipo,
                     self::fmtDt($m['created_at'] ?? null),
@@ -209,6 +264,7 @@ final class CashClosingExcelBuilder
                     '—',
                     $methodLabel,
                     $rt !== '' ? $rt : '—',
+                    '—',
                     ['v' => $isIn ? $amt : -$amt, 't' => 'currency'],
                     $isMeta ? 'Informativo' : 'Cajón',
                 ],
@@ -217,7 +273,7 @@ final class CashClosingExcelBuilder
 
         usort($rows, static function ($a, $b) {
             return ((int)($a['sort'] ?? 0) <=> (int)($b['sort'] ?? 0))
-                ?: strcmp((string)(($a['cells'][3] ?? '')), (string)(($b['cells'][3] ?? '')));
+                ?: ((int)($a['seq'] ?? 0) <=> (int)($b['seq'] ?? 0));
         });
 
         $out = [];
@@ -229,10 +285,10 @@ final class CashClosingExcelBuilder
             'name' => 'Ventas y movimientos',
             'headers' => [
                 'Tipo', 'Fecha', 'Usuario', 'Factura / descripción', 'Cliente',
-                'Medio', 'Desglose / ref.', 'Monto', 'Nota',
+                'Medio', 'Desglose / ref.', 'Descuento', 'Monto', 'Nota',
             ],
             'rows' => $out,
-            'columnTypes' => [7 => 'currency'],
+            'columnTypes' => [7 => 'currency', 8 => 'currency'],
         ];
     }
 

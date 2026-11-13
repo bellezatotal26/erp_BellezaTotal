@@ -4674,6 +4674,33 @@ class AccountingService
             );
         }
 
+        // Ajuste ± al valor neto (redondeo vs factura impresa): equilibra el asiento.
+        $netAdj = round((float)($order['net_adjustment'] ?? 0), 2);
+        $netAdjLabel = ($netAdj < 0 ? '−' : '+') . number_format(abs($netAdj), 2, ',', '.');
+        if ($netAdj < -0.009) {
+            // Baja lo por pagar → crédito adicional a descuentos en compras.
+            $lines[] = $this->line(
+                $this->setting('purchase_discount_account', '421040'),
+                0,
+                abs($netAdj),
+                'Ajuste valor neto ' . $netAdjLabel . ' ' . $label,
+                'supplier',
+                $order['supplier_id'] ?? null,
+                $order['supplier_name'] ?? null
+            );
+        } elseif ($netAdj > 0.009) {
+            // Sube lo por pagar → débito a gasto de compra sin inventario.
+            $lines[] = $this->line(
+                $this->setting('purchase_non_stock_account', '519595'),
+                $netAdj,
+                0,
+                'Ajuste valor neto ' . $netAdjLabel . ' ' . $label,
+                'supplier',
+                $order['supplier_id'] ?? null,
+                $order['supplier_name'] ?? null
+            );
+        }
+
         $lines[] = $this->line(
             $creditCode,
             0,

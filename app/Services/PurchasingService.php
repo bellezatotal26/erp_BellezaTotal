@@ -97,6 +97,9 @@ class PurchasingService
             if (!isset($cols['supplier_invoice_value'])) {
                 $alters[] = 'ADD COLUMN supplier_invoice_value DECIMAL(14,2) NULL AFTER total';
             }
+            if (!isset($cols['net_adjustment'])) {
+                $alters[] = 'ADD COLUMN net_adjustment DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER commercial_discount_amount';
+            }
             if (!isset($cols['due_date'])) {
                 $alters[] = 'ADD COLUMN due_date DATE NULL AFTER expected_date';
             }
@@ -176,7 +179,8 @@ class PurchasingService
         float $earlyPct = 0.0,
         float $commercialPct = 0.0,
         float $commercialAmountInput = 0.0,
-        bool $taxAlreadyFinal = false
+        bool $taxAlreadyFinal = false,
+        float $netAdjustment = 0.0
     ): array {
         $subtotal = round(max(0, $subtotal), 2);
         $tax = round(max(0, $tax), 2);
@@ -184,8 +188,9 @@ class PurchasingService
         // % comercial siempre entero (0–100).
         $commercialPct = max(0, min(100, (float)(int)round($commercialPct)));
         $commercialAmountInput = max(0, round($commercialAmountInput, 2));
+        $netAdjustment = round($netAdjustment, 2);
 
-        // Orden: Total bruto − dcto. = Sub total → IVA = Sub total × tasa → Valor neto.
+        // Orden: Total bruto − dcto. = Sub total → IVA = Sub total × tasa → Valor neto → ajuste ±.
         // Si hay monto en $, prevalece; el % guardado queda en 0 para no recalcular mal después.
         $amountWins = $commercialAmountInput > 0.009;
         $commercialAmt = $amountWins
@@ -208,7 +213,11 @@ class PurchasingService
         $gross = round($subtotal + $tax, 2);
         $afterCommercial = round($netSubtotal + $taxOnSubtotal, 2);
         $earlyAmt = round($afterCommercial * ($earlyPct / 100), 2);
-        $total = max(0, round($afterCommercial - $earlyAmt, 2));
+        $totalBeforeAdj = max(0, round($afterCommercial - $earlyAmt, 2));
+        // Ajuste por redondeo de % de dcto. vs valor impreso del proveedor (puede ser + o −).
+        $total = max(0, round($totalBeforeAdj + $netAdjustment, 2));
+        // Si el ajuste dejaría el total en 0, limitar el ajuste efectivo.
+        $appliedAdj = round($total - $totalBeforeAdj, 2);
 
         return [
             'gross' => $gross,
@@ -218,6 +227,8 @@ class PurchasingService
             'early_amount' => $earlyAmt,
             'tax' => $taxOnSubtotal,
             'net_subtotal' => $netSubtotal,
+            'total_before_adjustment' => $totalBeforeAdj,
+            'net_adjustment' => $appliedAdj,
             'total' => $total,
         ];
     }
@@ -240,7 +251,8 @@ class PurchasingService
         bool $autoApplyAllyDiscount = true,
         float $commercialDiscountPct = 0.0,
         float $commercialDiscountAmount = 0.0,
-        bool $taxAlreadyFinal = false
+        bool $taxAlreadyFinal = false,
+        float $netAdjustment = 0.0
     ): int {
         if (!in_array($status, ['draft', 'ordered'], true)) {
             $status = 'ordered';
@@ -325,12 +337,14 @@ class PurchasingService
             $earlyPaymentDiscountPct,
             $commercialDiscountPct,
             $commercialDiscountAmount,
-            $taxAlreadyFinal
+            $taxAlreadyFinal,
+            $netAdjustment
         );
         $discountAmt = $disc['early_amount'];
         $commercialAmt = $disc['commercial_amount'];
         $commercialDiscountPct = $disc['commercial_pct'];
         $total = $disc['total'];
+        $netAdjustment = (float)$disc['net_adjustment'];
         // Cabecera: IVA ya sobre Sub total (después de desc. comercial) para CxP / asiento 240802.
         $tax = (float)$disc['tax'];
 
@@ -340,9 +354,9 @@ class PurchasingService
                 "INSERT INTO purchase_orders
                     (order_number, supplier_id, status, order_date, warehouse_date, expected_date, due_date,
                      subtotal, tax, total, early_payment_discount_pct, early_payment_discount_amount,
-                     commercial_discount_pct, commercial_discount_amount,
+                     commercial_discount_pct, commercial_discount_amount, net_adjustment,
                      invoice_number, invoice_date, notes, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     $orderNumber,
                     $supplierId,
@@ -358,6 +372,7 @@ class PurchasingService
                     $discountAmt,
                     $commercialDiscountPct,
                     $commercialAmt,
+                    $netAdjustment,
                     $invoiceNumber,
                     $invoiceDate,
                     $notes !== '' ? $notes : null,
@@ -867,6 +882,7 @@ class PurchasingService
         $earlyPct = (float)($order['early_payment_discount_pct'] ?? 0);
         $commercialPct = (float)($order['commercial_discount_pct'] ?? 0);
         $commercialAmtIn = (float)($order['commercial_discount_amount'] ?? 0);
+        $netAdj = (float)($order['net_adjustment'] ?? 0);
         // Si ya hay monto comercial guardado sin %, úsalo como entrada fija.
         $disc = self::resolvePurchaseDiscounts(
             $subtotal,
@@ -874,7 +890,8 @@ class PurchasingService
             $earlyPct,
             $commercialPct,
             $commercialPct > 0.009 ? 0.0 : $commercialAmtIn,
-            $taxAlreadyFinal
+            $taxAlreadyFinal,
+            $netAdj
         );
         $discountAmt = $disc['early_amount'];
         $commercialAmt = $disc['commercial_amount'];
@@ -888,9 +905,10 @@ class PurchasingService
             $this->query(
                 "UPDATE purchase_orders SET subtotal = ?, tax = ?, total = ?,
                     early_payment_discount_amount = ?,
-                    commercial_discount_amount = ?
+                    commercial_discount_amount = ?,
+                    net_adjustment = ?
                  WHERE id = ?",
-                [round($subtotal, 2), round($tax, 2), $total, $discountAmt, $commercialAmt, $orderId]
+                [round($subtotal, 2), round($tax, 2), $total, $discountAmt, $commercialAmt, $disc['net_adjustment'], $orderId]
             );
         } catch (\Throwable $e) {
             $this->query(
@@ -1135,7 +1153,8 @@ class PurchasingService
      *   due_date?:?string,invoice_due_date?:?string,invoice_date?:?string,invoice_number?:?string,
      *   early_payment_discount_pct?:float|string|null,
      *   commercial_discount_pct?:float|string|null,
-     *   commercial_discount_amount?:float|string|null
+     *   commercial_discount_amount?:float|string|null,
+     *   net_adjustment?:float|string|null
      * } $meta
      */
     public function applyInvoiceMeta(int $orderId, array $meta, bool $taxAlreadyFinal = false): void
@@ -1185,6 +1204,15 @@ class PurchasingService
             $commercialAmtIn = max(0, round((float)($order['commercial_discount_amount'] ?? 0), 2));
         }
 
+        if (array_key_exists('net_adjustment', $meta)
+            && $meta['net_adjustment'] !== ''
+            && $meta['net_adjustment'] !== null
+        ) {
+            $netAdj = round(\SoftNova\Core\parse_money($meta['net_adjustment']), 2);
+        } else {
+            $netAdj = round((float)($order['net_adjustment'] ?? 0), 2);
+        }
+
         $subtotal = (float)($order['subtotal'] ?? 0);
         // IVA de líneas (base antes de desc. comercial). No usar order.tax: puede ya estar prorrateado.
         $taxFromLines = round((float)$this->query(
@@ -1200,7 +1228,8 @@ class PurchasingService
             $earlyPct,
             $commercialPct,
             $commercialAmtIn,
-            $taxAlreadyFinal
+            $taxAlreadyFinal,
+            $netAdj
         );
 
         try {
@@ -1214,6 +1243,7 @@ class PurchasingService
                     early_payment_discount_amount = ?,
                     commercial_discount_pct = ?,
                     commercial_discount_amount = ?,
+                    net_adjustment = ?,
                     tax = ?,
                     total = ?
                  WHERE id = ?",
@@ -1221,6 +1251,7 @@ class PurchasingService
                     $dueDate, $invoiceDueDate, $invoiceDate, $invoiceNumber,
                     $earlyPct, $disc['early_amount'],
                     $disc['commercial_pct'], $disc['commercial_amount'],
+                    $disc['net_adjustment'],
                     $disc['tax'], $disc['total'], $orderId,
                 ]
             );
@@ -1689,12 +1720,15 @@ class PurchasingService
                 $earlyPct = (float)($order['early_payment_discount_pct'] ?? 0);
                 $commercialPct = (float)($order['commercial_discount_pct'] ?? 0);
                 $commercialAmtIn = (float)($order['commercial_discount_amount'] ?? 0);
+                $netAdjKeep = (float)($order['net_adjustment'] ?? 0);
                 $disc = self::resolvePurchaseDiscounts(
                     $subtotal,
                     $tax,
                     $earlyPct,
                     $commercialPct,
-                    $commercialPct > 0.009 ? 0.0 : $commercialAmtIn
+                    $commercialPct > 0.009 ? 0.0 : $commercialAmtIn,
+                    false,
+                    $netAdjKeep
                 );
                 $taxHeader = (float)$disc['tax'];
                 try {
@@ -1702,6 +1736,7 @@ class PurchasingService
                         "UPDATE purchase_orders SET subtotal = ?, tax = ?, total = ?,
                             early_payment_discount_amount = ?,
                             commercial_discount_amount = ?,
+                            net_adjustment = ?,
                             notes = CONCAT(COALESCE(notes,''),
                                 CASE WHEN COALESCE(notes,'') = '' THEN '' ELSE ' | ' END, ?)
                          WHERE id = ?",
@@ -1711,6 +1746,7 @@ class PurchasingService
                             $disc['total'],
                             $disc['early_amount'],
                             $disc['commercial_amount'],
+                            $disc['net_adjustment'],
                             $note !== '' ? $note : 'Recepción parcial aplicada',
                             $orderId,
                         ]
@@ -3062,6 +3098,7 @@ class PurchasingService
 
             // Dcto. pronto pago sobre el valor de factura; nunca supera el saldo vigente.
             // Si el usuario escribió el monto, ese manda (y el % se deriva); si no, manda el %.
+            // El modal también puede mandar el abono como dato rector: dcto. = saldo − abono.
             if ($discountAmountOpt > 0.009) {
                 $discountAmount = min($discountAmountOpt, $balance);
                 $discountPct = $payableBase > 0
@@ -3072,6 +3109,20 @@ class PurchasingService
                     ? min(round($payableBase * ($discountPct / 100), 2), $balance)
                     : 0.0;
             }
+
+            // Si el abono no alcanza el saldo y ya hay dcto. (o el form envió el hueco),
+            // absorber el remanente en el dcto. para no dejar centavos/pesos sueltos en CxP.
+            $afterPay = round($balance - $amount - $discountAmount, 2);
+            if ($afterPay > 0.009 && ($discountAmount > 0.009 || $discountPct > 0.009 || $discountAmountOpt > 0.009)) {
+                $discountAmount = round(min($balance - $amount, $discountAmount + $afterPay), 2);
+                if ($discountAmount < 0) {
+                    $discountAmount = 0.0;
+                }
+                $discountPct = $payableBase > 0
+                    ? round($discountAmount / $payableBase * 100, 2)
+                    : 0.0;
+            }
+
             $balanceAfterDiscount = round($balance - $discountAmount, 2);
             if ($amount - $balanceAfterDiscount > 0.009) {
                 throw new \InvalidArgumentException(
@@ -4366,6 +4417,7 @@ class PurchasingService
                     po.warehouse_date, po.due_date, po.status, po.total, po.paid_total, po.credit_total,
                     po.payment_status, po.accounting_entry_id, po.origin, po.duplicated_from_id,
                     po.received_at, po.created_at, po.sent_at, po.sent_via,
+                    COALESCE(po.net_adjustment, 0) AS net_adjustment,
                     s.name supplier_name,
                     e.entry_number accounting_entry_number,
                     (SELECT COUNT(*) FROM supplier_payments sp
@@ -4665,6 +4717,11 @@ class PurchasingService
             );
         }
 
+        $netAdj = round((float)($order['net_adjustment'] ?? 0), 2);
+        $netAdjTxt = abs($netAdj) > 0.009
+            ? (($netAdj < 0 ? '−' : '+') . number_format(abs($netAdj), 2, ',', '.'))
+            : '';
+
         if (!empty($order['received_at']) || ($order['status'] ?? '') === 'received') {
             $push(
                 $events,
@@ -4675,20 +4732,38 @@ class PurchasingService
                     'Bodega: ' . ($whDateOnly !== '' ? $whDateOnly : '—')
                     . ($invDateOnly !== '' ? ' · Factura: ' . $invDateOnly : '')
                     . ($dueDateOnly !== '' ? ' · Vence: ' . $dueDateOnly : '')
+                    . ($netAdjTxt !== '' ? ' · Ajuste neto ' . $netAdjTxt : '')
                 ),
                 (float)($order['total'] ?? 0)
             );
         }
 
+        if ($netAdjTxt !== '') {
+            $push(
+                $events,
+                (string)($order['received_at'] ?? $order['warehouse_date'] ?? $order['confirmed_at'] ?? $createdAt),
+                'net_adjustment',
+                'Ajuste al valor neto',
+                'Iguala el valor impreso del proveedor (CxP y asiento contable) · ' . $netAdjTxt,
+                $netAdj,
+                ['net_adjustment' => $netAdj]
+            );
+        }
+
         if (!empty($order['accounting_entry_id'])) {
+            $acctDetail = (string)($order['accounting_entry_number'] ?? ('#' . $order['accounting_entry_id']));
+            if ($netAdjTxt !== '') {
+                $acctDetail .= ' · Ajuste neto ' . $netAdjTxt
+                    . ($netAdj < 0 ? ' (421040)' : ' (519595)');
+            }
             $push(
                 $events,
                 (string)($order['received_at'] ?? $order['warehouse_date'] ?? $createdAt),
                 'accounting',
                 'Asiento de compra',
-                (string)($order['accounting_entry_number'] ?? ('#' . $order['accounting_entry_id'])),
+                $acctDetail,
                 (float)($order['total'] ?? 0),
-                ['entry_id' => (int)$order['accounting_entry_id']]
+                ['entry_id' => (int)$order['accounting_entry_id'], 'net_adjustment' => $netAdj]
             );
         }
 

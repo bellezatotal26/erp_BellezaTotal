@@ -2244,14 +2244,38 @@ $cajaBase = $viewInstance->route('app/caja');
                 movs.forEach(function(m) {
                     var isCreditSale = !!m.is_credit_sale;
                     var isMixedSale = !!m.is_mixed_sale;
+                    var hasDisc = !!m.has_discount || !!(m.discount_note);
+                    var hasProducts = !!m.has_products || !!(m.products_note);
                     var rowBg = isCreditSale
                         ? 'background:rgba(100,116,139,.08);'
-                        : (isMixedSale ? 'background:rgba(99,102,241,.08);' : '');
+                        : (isMixedSale ? 'background:rgba(99,102,241,.08);'
+                            : (hasDisc ? 'background:#FFFBEB;' : ''));
+                    var typeCell = cajaEsc(m.type_label || '');
+                    if (hasDisc) {
+                        typeCell += '<div style="margin-top:2px;"><span style="display:inline-block;padding:1px 6px;border-radius:4px;background:#FEF3C7;color:#92400E;font-size:10px;font-weight:700;">Desc.</span></div>';
+                    }
+                    if (hasProducts) {
+                        typeCell += '<div style="margin-top:2px;"><span style="display:inline-block;padding:1px 6px;border-radius:4px;background:#E2E8F0;color:#334155;font-size:10px;font-weight:700;">Prod.</span></div>';
+                    }
+                    var descCell = cajaEsc(m.description || '');
+                    if (m.discount_note) {
+                        descCell += '<div style="margin-top:2px;font-size:11px;color:#B45309;line-height:1.35;">'
+                            + cajaEsc(m.discount_note) + '</div>';
+                    }
+                    if (m.products_note) {
+                        var prodLines = String(m.products_note).split(/\n+/).filter(Boolean).map(function(line) {
+                            return '· ' + cajaEsc(line);
+                        }).join('<br>');
+                        descCell += '<div style="margin-top:3px;font-size:11px;color:#334155;line-height:1.4;">'
+                            + '<strong style="font-size:10px;letter-spacing:.02em;">PRODUCTOS</strong><br>'
+                            + prodLines
+                            + '</div>';
+                    }
                     movHtml += '<tr style="border-top:1px solid var(--color-border,#e5e7eb);' + rowBg + '">'
                         + '<td style="padding:5px 8px;">' + cajaEsc(m.time) + '</td>'
                         + '<td style="padding:5px 8px;"><strong>' + cajaEsc(m.user_name) + '</strong></td>'
-                        + '<td style="padding:5px 8px;">' + cajaEsc(m.type_label) + '</td>'
-                        + '<td style="padding:5px 8px;">' + cajaEsc(m.description) + '</td>'
+                        + '<td style="padding:5px 8px;">' + typeCell + '</td>'
+                        + '<td style="padding:5px 8px;">' + descCell + '</td>'
                         + '<td style="padding:5px 8px;text-align:right;"><strong>'
                         + cajaEsc(m.amount_fmt)
                         + '</strong></td></tr>';

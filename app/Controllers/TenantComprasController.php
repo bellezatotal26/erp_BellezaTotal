@@ -498,6 +498,7 @@ class TenantComprasController extends TenantController
                     'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
                     'commercial_discount_pct' => $this->request->post('commercial_discount_pct', ''),
                     'commercial_discount_amount' => $this->request->post('commercial_discount_amount', ''),
+                    'net_adjustment' => $this->request->post('net_adjustment', ''),
                     'linked_order_id' => (int)$this->request->post('linked_order_id', 0) ?: null,
                     'use_ai' => (string)$this->request->post('use_ai', '') !== '',
                     'document_kind' => (string)$this->request->post('document_kind', ''),
@@ -1046,6 +1047,7 @@ class TenantComprasController extends TenantController
                 'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
                 'commercial_discount_pct' => $this->request->post('commercial_discount_pct', ''),
                 'commercial_discount_amount' => $this->request->post('commercial_discount_amount', ''),
+                'net_adjustment' => $this->request->post('net_adjustment', ''),
                 'linked_order_id' => (int)$this->request->post('linked_order_id', 0) ?: null,
                 'apply_product_vat' => $this->request->post('apply_product_vat', null),
                 'tax_override_amount' => $this->request->post('tax_override_amount', null),
@@ -1056,6 +1058,11 @@ class TenantComprasController extends TenantController
             if (is_array($filas) && $filas) {
                 $service->updateItems($importId, $filas);
             }
+            // Iguala el total del listado al valor neto del pie (evita desfase de centavos JS vs PHP).
+            $service->reconcileNetToExpected(
+                $importId,
+                $this->request->post('expected_net_total', '')
+            );
 
             $resultado = $service->confirm(
                 $importId,
@@ -1140,6 +1147,7 @@ class TenantComprasController extends TenantController
                 'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
                 'commercial_discount_pct' => $this->request->post('commercial_discount_pct', ''),
                 'commercial_discount_amount' => $this->request->post('commercial_discount_amount', ''),
+                'net_adjustment' => $this->request->post('net_adjustment', ''),
                 'linked_order_id' => (int)$this->request->post('linked_order_id', 0) ?: null,
                 'apply_product_vat' => $this->request->post('apply_product_vat', null),
                 'tax_override_amount' => $this->request->post('tax_override_amount', null),
@@ -1150,6 +1158,10 @@ class TenantComprasController extends TenantController
             if (is_array($filas) && $filas) {
                 $service->updateItems($importId, $filas);
             }
+            $reconciled = $service->reconcileNetToExpected(
+                $importId,
+                $this->request->post('expected_net_total', '')
+            );
 
             $service->logLifecycleEvent(
                 $importId,
@@ -1157,14 +1169,23 @@ class TenantComprasController extends TenantController
                 'invoice_edited',
                 'Borrador editado en revisión',
                 'Se guardaron cambios de cabecera y/o líneas sin ingresar al inventario'
+                    . (!empty($reconciled['net_adjustment'])
+                        ? (' · Ajuste neto ' . ((float)$reconciled['net_adjustment'] < 0 ? '−' : '+')
+                            . number_format(abs((float)$reconciled['net_adjustment']), 2, ',', '.'))
+                        : '')
             );
 
             $preview = $service->get($importId);
+            if ($preview && !empty($preview['import']) && is_array($reconciled)) {
+                $preview['import']['net_adjustment'] = $reconciled['net_adjustment'];
+                $preview['import']['total'] = $reconciled['total'];
+            }
             $this->json([
                 'success' => true,
                 'message' => 'Borrador guardado (IVA y descuentos incluidos)',
                 'import' => $preview['import'] ?? null,
                 'items' => $preview['items'] ?? [],
+                'reconciled' => $reconciled,
             ]);
         } catch (\Throwable $e) {
             $this->json(['success' => false, 'message' => $this->clientErrorMessage($e, 'No se pudo completar la operación')]);
@@ -2509,6 +2530,7 @@ class TenantComprasController extends TenantController
                 'early_payment_discount_pct' => $this->request->post('early_payment_discount_pct', ''),
                 'commercial_discount_pct' => $this->request->post('commercial_discount_pct', ''),
                 'commercial_discount_amount' => $this->request->post('commercial_discount_amount', ''),
+                'net_adjustment' => $this->request->post('net_adjustment', ''),
             ]);
             $recv = $this->doReceive(
                 $orderId,

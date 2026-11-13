@@ -663,7 +663,20 @@ function viewDetail(id) {
                     t = 'Salida';
                     bc = 'badge-danger';
                 }
-                var when = String(x.display_at || x.created_at || x.movement_date || '').substr(0, 19);
+                var dateLines = Array.isArray(x.trace_date_lines) ? x.trace_date_lines : [];
+                var whenHtml = '';
+                if (dateLines.length && String(x.invoice_uploaded_at || '').trim() !== '') {
+                    dateLines.forEach(function(dl) {
+                        var isUpload = String(dl.label || '') === 'Subida factura';
+                        var lineCls = isUpload ? ' class="trace-date-upload"' : '';
+                        var labelColor = isUpload ? '#059669' : 'var(--color-text-secondary)';
+                        whenHtml += '<div' + lineCls + ' style="line-height:1.35;"><strong style="font-size:10px;color:'
+                            + labelColor + ';">'
+                            + esc(dl.label || '') + '</strong><br>' + esc(dl.value || '') + '</div>';
+                    });
+                } else {
+                    whenHtml = esc(String(x.display_at || x.created_at || x.movement_date || '').substr(0, 19));
+                }
                 var origin = x.origin_label || x.reference_type || 'Movimiento';
                 if (isRelatedSub || isRelatedOrigin) {
                     var relCode = String(x.related_product_code || '').trim();
@@ -683,7 +696,7 @@ function viewDetail(id) {
                     qtyCell = '<span title="No altera el stock de este SKU">' + qtyCell + '*</span>';
                 }
                 h += '<tr' + (isRelatedSub || isRelatedOrigin || hasSub ? ' style="background:rgba(245,158,11,.08);"' : '') + '>';
-                h += '<td style="white-space:nowrap;font-size:12px;">' + esc(when) + '</td>';
+                h += '<td style="white-space:nowrap;font-size:12px;">' + whenHtml + '</td>';
                 h += '<td style="font-size:12px;">' + origin + '</td>';
                 h += '<td><span class="badge ' + bc + '">' + t + '</span></td>';
                 h += '<td>' + qtyCell + '</td>';
@@ -697,17 +710,30 @@ function viewDetail(id) {
         if (!purchases.length) {
             h += '<p style="text-align:center;color:var(--color-text-secondary);">Sin compras ni facturas de proveedor vinculadas</p>';
         } else {
-            h += '<table><thead><tr><th>OC / Factura</th><th>Proveedor</th><th>Fecha</th><th>Cant</th>' +
+            h += '<table><thead><tr><th>OC / Factura</th><th>Proveedor</th><th>Fechas</th><th>Cant</th>' +
                 '<th title="Costo unitario de la factura (contabilidad)">Costo factura</th>' +
                 '<th title="Costo con el que entró al inventario (promedio). Vacío = igual al costo factura">Costo inv.</th>' +
                 '<th>Estado</th></tr></thead><tbody>';
             purchases.forEach(function(x) {
                 var oc = String(x.order_number || ('#' + (x.purchase_order_id || '')));
                 var inv = String(x.invoice_number || '').trim();
-                var when = String(x.received_at || x.warehouse_date || x.invoice_date || x.created_at || '').substr(0, 16);
+                var dateLines = Array.isArray(x.trace_date_lines) ? x.trace_date_lines : [];
+                var whenHtml = '';
+                if (dateLines.length && String(x.invoice_uploaded_at || '').trim() !== '') {
+                    dateLines.forEach(function(dl) {
+                        var isUpload = String(dl.label || '') === 'Subida factura';
+                        var lineCls = isUpload ? ' class="trace-date-upload"' : '';
+                        var labelColor = isUpload ? '#059669' : 'var(--color-text-secondary)';
+                        whenHtml += '<div' + lineCls + ' style="line-height:1.35;font-size:12px;"><strong style="font-size:10px;color:'
+                            + labelColor + ';">'
+                            + esc(dl.label || '') + '</strong><br>' + esc(dl.value || '') + '</div>';
+                    });
+                } else {
+                    whenHtml = esc(String(x.received_at || x.warehouse_date || x.invoice_date || x.created_at || '').substr(0, 16) || '—');
+                }
                 h += '<tr><td>' + esc(oc) + (inv ? ('<div style="font-size:11px;color:var(--color-text-secondary);">Fact. ' + esc(inv) + '</div>') : '') + '</td>';
                 h += '<td>' + esc(x.supplier_name || '—') + '</td>';
-                h += '<td style="font-size:12px;">' + esc(when || '—') + '</td>';
+                h += '<td style="white-space:nowrap;">' + whenHtml + '</td>';
                 h += '<td>' + (x.received_qty != null && x.received_qty !== '' ? x.received_qty : (x.quantity || 0)) + '</td>';
                 h += '<td>' + moneyVal(x.unit_cost) + '</td>';
                 var invC = parseFloat(x.inventory_cost) || 0;

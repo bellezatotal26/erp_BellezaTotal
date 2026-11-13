@@ -903,6 +903,7 @@ class TenantContabilidadController extends TenantController
                     substr((string)($o['due_date'] ?? ''), 0, 10),
                     $o['status'] ?? '',
                     $o['total'] ?? 0,
+                    $o['net_adjustment'] ?? 0,
                     $o['paid_total'] ?? 0,
                     $o['credit_total'] ?? 0,
                     $balance,
@@ -916,7 +917,7 @@ class TenantContabilidadController extends TenantController
                 'trazabilidad_facturas_' . $from . '_' . $to . '.csv',
                 [
                     'OC', 'Factura', 'Proveedor', 'Fecha factura', 'Fecha bodega', 'Vence',
-                    'Estado', 'Total', 'Pagado', 'NC', 'Saldo', 'Asiento', 'Abonos', 'Notas crédito', 'Origen',
+                    'Estado', 'Total', 'Ajuste neto', 'Pagado', 'NC', 'Saldo', 'Asiento', 'Abonos', 'Notas crédito', 'Origen',
                 ],
                 $rows
             );

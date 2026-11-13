@@ -1893,6 +1893,14 @@ foreach ($accounts as $account) {
                                     </td>
                                     <td>
                                         <?php echo acctFmt((float)$o['total'], $currency); ?>
+                                        <?php
+                                        $traceNetAdj = round((float)($o['net_adjustment'] ?? 0), 2);
+                                        if (abs($traceNetAdj) > 0.009):
+                                        ?>
+                                            <div style="font-size:11px;color:var(--dmc-1D4ED8, #1D4ED8);">
+                                                Ajuste <?php echo ($traceNetAdj < 0 ? '−' : '+') . acctFmt(abs($traceNetAdj), $currency); ?>
+                                            </div>
+                                        <?php endif; ?>
                                         <?php if ($bal > 0.009): ?>
                                             <div style="font-size:11px;color:var(--dmc-DC2626, #DC2626);">Saldo <?php echo acctFmt($bal, $currency); ?></div>
                                         <?php endif; ?>
@@ -1943,10 +1951,15 @@ foreach ($accounts as $account) {
                     'Timeline · ' + (o.order_number || ('#' + id));
                 var sym = document.querySelector('meta[name="currency-symbol"]')?.content || '$';
                 var dec = parseInt(document.querySelector('meta[name="currency-decimals"]')?.content || '0', 10);
+                var netAdjMeta = parseFloat(o.net_adjustment || 0) || 0;
+                var netAdjMetaTxt = Math.abs(netAdjMeta) > 0.009
+                    ? ((netAdjMeta < 0 ? '−' : '+') + Math.abs(netAdjMeta).toFixed(dec))
+                    : '';
                 document.getElementById('invoiceTimelineMeta').innerHTML =
                     '<strong>' + esc(o.supplier_name || 'Sin proveedor') + '</strong>'
                     + ' · Factura ' + esc(o.invoice_number || '—')
                     + ' · Total ' + sym + parseFloat(o.total || 0).toFixed(dec)
+                    + (netAdjMetaTxt ? (' · Ajuste neto ' + netAdjMetaTxt) : '')
                     + (o.balance != null ? (' · Saldo ' + sym + parseFloat(o.balance || 0).toFixed(dec)) : '')
                     + '<div style="margin-top:10px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;">'
                     + '<div style="padding:8px 10px;border-radius:8px;background:rgba(30,58,138,0.08);border:1px solid rgba(30,58,138,0.2);">'
